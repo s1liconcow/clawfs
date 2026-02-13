@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+const CLIENT_STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientState {
     pub client_id: String,
     pub inode_next: u64,
@@ -28,6 +30,12 @@ impl Default for ClientState {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredClientState {
+    version: u32,
+    state: ClientState,
+}
+
 pub struct ClientStateManager {
     path: PathBuf,
     state: Mutex<ClientState>,
@@ -41,14 +49,24 @@ impl ClientStateManager {
             File::open(&path)
                 .with_context(|| format!("opening client state {}", path.display()))?
                 .read_to_end(&mut buf)?;
-            serde_json::from_slice(&buf).with_context(|| "parsing client state")?
+            let stored: StoredClientState =
+                deserialize_flex(&buf).with_context(|| "parsing client state")?;
+            anyhow::ensure!(
+                stored.version == CLIENT_STATE_VERSION,
+                "unsupported client state version {}",
+                stored.version
+            );
+            stored.state
         } else {
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating client state dir {}", parent.display()))?;
             let state = ClientState::default();
             let mut file = File::create(&path)?;
-            let data = serde_json::to_vec_pretty(&state)?;
+            let data = serialize_flex(&StoredClientState {
+                version: CLIENT_STATE_VERSION,
+                state: state.clone(),
+            })?;
             file.write_all(&data)?;
             state
         };
@@ -113,11 +131,25 @@ impl ClientStateManager {
     }
 
     fn persist_locked(&self, state: &ClientState) -> Result<()> {
-        let data = serde_json::to_vec_pretty(state)?;
+        let data = serialize_flex(&StoredClientState {
+            version: CLIENT_STATE_VERSION,
+            state: state.clone(),
+        })?;
         let mut file = File::create(&self.path)?;
         file.write_all(&data)?;
         Ok(())
     }
+}
+
+fn serialize_flex<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = flexbuffers::FlexbufferSerializer::new();
+    value.serialize(&mut serializer)?;
+    Ok(serializer.take_buffer())
+}
+
+fn deserialize_flex<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
+    let reader = flexbuffers::Reader::get_root(bytes)?;
+    Ok(T::deserialize(reader)?)
 }
 
 #[cfg(test)]
@@ -128,7 +160,7 @@ mod tests {
     #[test]
     fn state_persists_across_instances() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("state.json");
+        let path = dir.path().join("state.bin");
         let manager = ClientStateManager::load(&path).unwrap();
         let first = manager.next_inode_id(4, |_| Ok(100)).unwrap();
         assert_eq!(first, 100);

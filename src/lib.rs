@@ -1,7 +1,10 @@
+pub mod codec;
 pub mod config;
 pub mod fs;
 pub mod inode;
+pub mod journal;
 pub mod metadata;
+pub mod perf;
 pub mod segment;
 pub mod state;
 pub mod superblock;

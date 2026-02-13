@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euox pipefail
+set -euo pipefail
+set -x
 
 ROOT_DIR=$(cd -- "$(dirname -- "$0")/.." && pwd)
 TARGET_DIR="$ROOT_DIR/target/release"
@@ -7,26 +8,58 @@ OSAGE_BIN="$TARGET_DIR/osagefs"
 
 MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
-STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.json}"
+STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
 PENDING_BYTES="${PENDING_BYTES:-$((64*1024*1024))}"
 INLINE_THRESHOLD="${INLINE_THRESHOLD:-1024}"
 LINUX_VERSION="${LINUX_VERSION:-}"
+HOME_PREFIX="${HOME_PREFIX:-/home}"
+PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
+DO_CLEANUP=1
+EXTRA_FLAGS=(--disable-cleanup --disable-journal)
+
+usage() {
+  cat <<USAGE
+Usage: ${0##*/} [--no_cleanup]
+
+  --no_cleanup   Leave OsageFS mounted and running after the script finishes.
+USAGE
+}
+
+while [[ ${1:-} != "" ]]; do
+  case "$1" in
+    --no_cleanup)
+      DO_CLEANUP=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+HOME_PREFIX_TRIMMED="${HOME_PREFIX#/}"
+HOME_PREFIX_TRIMMED="${HOME_PREFIX_TRIMMED%/}"
 
 cleanup_mounts() {
   set +e
   if mountpoint -q "$MOUNT_PATH"; then
     fusermount -u "$MOUNT_PATH" 2>/dev/null || sudo fusermount -u "$MOUNT_PATH"
   fi
-  sudo rm -rf "$MOUNT_PATH" "$STORE_PATH"
+  rm -rf "$MOUNT_PATH" "$STORE_PATH"
   mkdir -p "$MOUNT_PATH" "$STORE_PATH"
-  [[ -f "$STATE_PATH" ]] && sudo rm -f "$STATE_PATH"
-  set -e
 }
 
 cleanup_mounts
-trap cleanup_mounts EXIT
+if [[ $DO_CLEANUP -eq 1 ]]; then
+  trap cleanup_mounts EXIT
+fi
 
 mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
 
@@ -71,18 +104,39 @@ if [[ ! -x "$OSAGE_BIN" ]]; then
 fi
 
 echo "Starting OsageFS..."
-"$OSAGE_BIN" \
-  --mount-path "$MOUNT_PATH" \
-  --store-path "$STORE_PATH" \
-  --inline-threshold "$INLINE_THRESHOLD" \
-  --pending-bytes "$PENDING_BYTES" \
-  --object-provider local \
-  --state-path "$STATE_PATH" \
-  --foreground &
+CMD=(
+  "$OSAGE_BIN"
+  --mount-path "$MOUNT_PATH"
+  --store-path "$STORE_PATH"
+  --inline-threshold "$INLINE_THRESHOLD"
+  --pending-bytes "$PENDING_BYTES"
+  --object-provider local
+  --state-path "$STATE_PATH"
+  --home-prefix "$HOME_PREFIX"
+  --foreground
+  "${EXTRA_FLAGS[@]}"
+)
+if [[ -n "$PERF_LOG_PATH" ]]; then
+  CMD+=(--perf-log "$PERF_LOG_PATH")
+  echo "Perf trace -> $PERF_LOG_PATH"
+fi
+"${CMD[@]}" &
 OSAGE_PID=$!
 sleep 2
 
-pushd "$MOUNT_PATH" >/dev/null
+if [[ $EUID -eq 0 ]]; then
+  WORKDIR="$MOUNT_PATH"
+else
+  USER_NAME="${USER:-uid$EUID}"
+  if [[ -n "$HOME_PREFIX_TRIMMED" ]]; then
+    WORKDIR="${MOUNT_PATH%/}/${HOME_PREFIX_TRIMMED}/${USER_NAME}"
+  else
+    WORKDIR="${MOUNT_PATH%/}/${USER_NAME}"
+  fi
+fi
+mkdir -p "$WORKDIR"
+
+pushd "$WORKDIR" >/dev/null
 /usr/bin/time -f "extract elapsed %E" -o "$LOG_FILE" -a tar xf "$CACHE_TARBALL"
 cd "linux-$LINUX_VERSION"
 /usr/bin/time -f "defconfig elapsed %E" -o "$LOG_FILE" -a make defconfig >/dev/null
@@ -90,5 +144,10 @@ cd "linux-$LINUX_VERSION"
 popd >/dev/null
 
 echo "Build timings recorded in $LOG_FILE"
-kill "$OSAGE_PID" >/dev/null 2>&1 || true
-cleanup_mounts
+if [[ $DO_CLEANUP -eq 1 ]]; then
+  kill "$OSAGE_PID" >/dev/null 2>&1 || true
+  cleanup_mounts
+else
+  echo "Leaving OsageFS running (PID $OSAGE_PID). Mount available at $MOUNT_PATH"
+  echo "To stop it manually: kill $OSAGE_PID && fusermount -u $MOUNT_PATH"
+fi

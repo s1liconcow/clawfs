@@ -1,16 +1,22 @@
-use std::fs;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use log::info;
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{Error as ObjectError, ObjectStore, PutPayload};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::config::{Config, ObjectStoreProvider};
 
@@ -28,10 +34,40 @@ pub struct SegmentEntry {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedChunk {
+    pub path: PathBuf,
+    pub offset: u64,
+    pub len: u64,
+}
+
 pub struct SegmentManager {
     store: Arc<dyn ObjectStore>,
     handle: Handle,
     root_prefix: String,
+    stage_dir: PathBuf,
+    cache_dir: PathBuf,
+    cache_limit: u64,
+    cache_state: Mutex<SegmentCache>,
+    stage_state: Mutex<StageState>,
+}
+
+#[derive(Default)]
+struct SegmentCache {
+    total_bytes: u64,
+    entries: VecDeque<(PathBuf, u64)>,
+}
+
+#[derive(Default)]
+struct StageState {
+    active: Option<ActiveStage>,
+    ref_counts: HashMap<PathBuf, usize>,
+}
+
+struct ActiveStage {
+    path: PathBuf,
+    file: File,
+    len: u64,
 }
 
 impl SegmentManager {
@@ -76,11 +112,27 @@ impl SegmentManager {
                 (store, segment_prefix(&config.object_prefix))
             }
         };
+        let stage_dir = config.store_path.join("segment_stage");
+        let cache_dir = config.store_path.join("segment_cache");
+        fs::create_dir_all(&stage_dir)?;
+        fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             store,
             handle,
             root_prefix: prefix,
+            stage_dir,
+            cache_dir,
+            cache_limit: config.segment_cache_bytes,
+            cache_state: Mutex::new(SegmentCache::default()),
+            stage_state: Mutex::new(StageState::default()),
         })
+    }
+
+    fn ensure_active_stage<'a>(&'a self, state: &'a mut StageState) -> Result<&'a mut ActiveStage> {
+        if state.active.is_none() {
+            state.active = Some(ActiveStage::new(&self.stage_dir)?);
+        }
+        Ok(state.active.as_mut().expect("active stage must exist"))
     }
 
     pub fn write_batch(
@@ -114,10 +166,14 @@ impl SegmentManager {
                 },
             ));
         }
+        let total_bytes = buffer.len();
         let object_path = self.segment_path(generation, segment_id);
         let object_path_clone = object_path.clone();
         let store = self.store.clone();
-        let payload = Bytes::from(buffer);
+        let payload = Bytes::from(buffer.clone());
+        if self.cache_limit > 0 {
+            self.write_cache_file(generation, segment_id, &buffer)?;
+        }
         self.run_store(
             async move {
                 store
@@ -127,19 +183,113 @@ impl SegmentManager {
             },
             || format!("writing segment {}", object_path),
         )?;
+        info!(
+            target: "backing",
+            "synced backing file path={} type=segment generation={} segment_id={} entries={} bytes={}",
+            object_path.to_string(),
+            generation,
+            segment_id,
+            pointers.len(),
+            total_bytes
+        );
         Ok(pointers)
     }
 
     pub fn read_pointer(&self, pointer: &SegmentPointer) -> Result<Vec<u8>> {
-        let path = self.segment_path(pointer.generation, pointer.segment_id);
+        if let Some(bytes) = self.read_from_cache(pointer)? {
+            return Ok(bytes);
+        }
+        let full = self.fetch_segment(pointer.generation, pointer.segment_id)?;
+        if self.cache_limit > 0 {
+            self.write_cache_file(pointer.generation, pointer.segment_id, &full)?;
+        }
+        let start = pointer.offset as usize;
+        let end = start + pointer.length as usize;
+        Ok(full[start..end].to_vec())
+    }
+
+    pub fn stage_payload(&self, data: &[u8]) -> Result<StagedChunk> {
+        let mut state = self.stage_state.lock();
+        let stage = self.ensure_active_stage(&mut state)?;
+        let offset = stage.append(data)?;
+        let chunk = StagedChunk {
+            path: stage.path.clone(),
+            offset,
+            len: data.len() as u64,
+        };
+        *state.ref_counts.entry(chunk.path.clone()).or_insert(0) += 1;
+        Ok(chunk)
+    }
+
+    pub fn rotate_stage_file(&self) {
+        let mut state = self.stage_state.lock();
+        state.active = None;
+    }
+
+    pub fn read_staged_chunk(&self, chunk: &StagedChunk) -> Result<Vec<u8>> {
+        let mut file = File::open(&chunk.path)
+            .with_context(|| format!("opening staged payload {}", chunk.path.display()))?;
+        file.seek(SeekFrom::Start(chunk.offset))?;
+        let mut buffer = vec![0u8; chunk.len as usize];
+        file.read_exact(&mut buffer)
+            .with_context(|| format!("reading staged payload {}", chunk.path.display()))?;
+        Ok(buffer)
+    }
+
+    pub fn release_staged_chunk(&self, chunk: &StagedChunk) -> Result<()> {
+        let mut state = self.stage_state.lock();
+        if let Some(count) = state.ref_counts.get_mut(&chunk.path) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                state.ref_counts.remove(&chunk.path);
+                if let Some(active) = state.active.as_mut() {
+                    if active.path == chunk.path {
+                        active.reset()?;
+                        return Ok(());
+                    }
+                }
+                let _ = fs::remove_file(&chunk.path);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prefetch_segment(&self, pointer: &SegmentPointer) -> Result<()> {
+        if self.cache_limit == 0 {
+            return Ok(());
+        }
+        if self
+            .cache_path(pointer.generation, pointer.segment_id)
+            .exists()
+        {
+            return Ok(());
+        }
+        let data = self.fetch_segment(pointer.generation, pointer.segment_id)?;
+        self.write_cache_file(pointer.generation, pointer.segment_id, &data)
+    }
+
+    pub fn delete_segment(&self, generation: u64, segment_id: u64) -> Result<()> {
+        let path = self.segment_path(generation, segment_id);
         let path_clone = path.clone();
-        let range = pointer.offset..(pointer.offset + pointer.length);
         let store = self.store.clone();
-        let bytes = self.run_store(
-            async move { store.get_range(&path_clone, range).await },
-            || format!("reading segment {}", path),
-        )?;
-        Ok(bytes.to_vec())
+        let delete_result = self
+            .handle
+            .block_on(async move { store.delete(&path_clone).await });
+        match delete_result {
+            Ok(_) => {}
+            Err(ObjectError::NotFound { .. }) => {
+                log::debug!("segment {} already removed", path);
+            }
+            Err(err) => {
+                return Err(anyhow::Error::from(err))
+                    .with_context(|| format!("deleting segment {}", path));
+            }
+        }
+        let cache_path = self.cache_path(generation, segment_id);
+        let _ = fs::remove_file(cache_path);
+        Ok(())
     }
 
     fn segment_path(&self, generation: u64, segment_id: u64) -> ObjectPath {
@@ -161,6 +311,92 @@ impl SegmentManager {
             .block_on(fut)
             .map_err(anyhow::Error::from)
             .with_context(ctx)
+    }
+
+    fn cache_path(&self, generation: u64, segment_id: u64) -> PathBuf {
+        self.cache_dir
+            .join(format!("s_{generation:020}_{segment_id:020}.bin"))
+    }
+
+    fn write_cache_file(&self, generation: u64, segment_id: u64, data: &[u8]) -> Result<()> {
+        if self.cache_limit == 0 {
+            return Ok(());
+        }
+        let path = self.cache_path(generation, segment_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, data)?;
+        let mut cache = self.cache_state.lock();
+        cache.entries.push_back((path.clone(), data.len() as u64));
+        cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
+        while cache.total_bytes > self.cache_limit {
+            if let Some((old_path, size)) = cache.entries.pop_front() {
+                cache.total_bytes = cache.total_bytes.saturating_sub(size);
+                let _ = fs::remove_file(old_path);
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_from_cache(&self, pointer: &SegmentPointer) -> Result<Option<Vec<u8>>> {
+        let path = self.cache_path(pointer.generation, pointer.segment_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(pointer.offset))?;
+        let mut buffer = vec![0u8; pointer.length as usize];
+        file.read_exact(&mut buffer)?;
+        Ok(Some(buffer))
+    }
+
+    fn fetch_segment(&self, generation: u64, segment_id: u64) -> Result<Vec<u8>> {
+        let path = self.segment_path(generation, segment_id);
+        let store = self.store.clone();
+        let path_for_fetch = path.clone();
+        let bytes = self.run_store(
+            async move {
+                let result = store.get(&path_for_fetch).await?;
+                let data = result.bytes().await?;
+                Ok::<Bytes, object_store::Error>(data)
+            },
+            || format!("fetching segment {}", path),
+        )?;
+        Ok(bytes.to_vec())
+    }
+}
+
+impl ActiveStage {
+    fn new(stage_dir: &Path) -> Result<Self> {
+        let filename = format!("stage_{}.bin", Uuid::new_v4());
+        let path = stage_dir.join(filename);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("creating staged segment {}", path.display()))?;
+        Ok(Self { path, file, len: 0 })
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<u64> {
+        let offset = self.len;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        self.file.sync_data()?;
+        self.len += data.len() as u64;
+        Ok(offset)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.flush()?;
+        self.file.sync_data()?;
+        self.len = 0;
+        Ok(())
     }
 }
 
@@ -195,8 +431,21 @@ mod tests {
             endpoint: None,
             object_prefix: "".into(),
             gcs_service_account: None,
-            state_path: root.join("state.json"),
+            state_path: root.join("state.bin"),
             foreground: false,
+            home_prefix: "/home".into(),
+            perf_log: None,
+            disable_journal: false,
+            fsync_on_close: false,
+            flush_interval_ms: 0,
+            disable_cleanup: false,
+            lookup_cache_ttl_ms: 0,
+            dir_cache_ttl_ms: 0,
+            metadata_poll_interval_ms: 0,
+            segment_cache_bytes: 0,
+            log_file: None,
+            debug_log: false,
+            imap_delta_batch: 32,
         }
     }
 

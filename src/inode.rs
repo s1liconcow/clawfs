@@ -11,6 +11,7 @@ pub const ROOT_INODE: u64 = 1;
 pub enum InodeKind {
     File,
     Directory { children: BTreeMap<String, u64> },
+    Symlink,
     Tombstone,
 }
 
@@ -95,6 +96,35 @@ impl InodeRecord {
         }
     }
 
+    pub fn new_symlink(
+        inode: u64,
+        parent: u64,
+        name: String,
+        path: String,
+        uid: u32,
+        gid: u32,
+        target: Vec<u8>,
+    ) -> Self {
+        let now = OffsetDateTime::now_utc();
+        let size = target.len() as u64;
+        Self {
+            inode,
+            parent,
+            name,
+            path,
+            kind: InodeKind::Symlink,
+            size,
+            mode: 0o120777,
+            uid,
+            gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            link_count: 1,
+            storage: FileStorage::Inline(target),
+        }
+    }
+
     pub fn tombstone(inode: u64) -> Self {
         let now = OffsetDateTime::now_utc();
         Self {
@@ -126,6 +156,10 @@ impl InodeRecord {
         matches!(self.kind, InodeKind::Directory { .. })
     }
 
+    pub fn is_symlink(&self) -> bool {
+        matches!(self.kind, InodeKind::Symlink)
+    }
+
     pub fn children(&self) -> Option<&BTreeMap<String, u64>> {
         match &self.kind {
             InodeKind::Directory { children } => Some(children),
@@ -137,6 +171,16 @@ impl InodeRecord {
         match &mut self.kind {
             InodeKind::Directory { children } => Some(children),
             _ => None,
+        }
+    }
+
+    pub fn symlink_target_bytes(&self) -> Option<&[u8]> {
+        if !self.is_symlink() {
+            return None;
+        }
+        match &self.storage {
+            FileStorage::Inline(bytes) => Some(bytes),
+            FileStorage::Segment(_) => None,
         }
     }
 

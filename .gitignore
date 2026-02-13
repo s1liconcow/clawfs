@@ -1,1 +1,4 @@
 /target
+osagefs-nfs-gateway/target
+*.log
+*.jsonl
