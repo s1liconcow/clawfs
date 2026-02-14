@@ -46,11 +46,15 @@ pub struct OsageFs {
     handle: Handle,
     client_state: Arc<ClientStateManager>,
     pending_inodes: Mutex<HashMap<u64, PendingEntry>>,
+    mutating_inodes: Mutex<HashMap<u64, PendingEntry>>,
+    flushing_inodes: Mutex<HashMap<u64, PendingEntry>>,
     pending_bytes: Mutex<u64>,
     perf: Option<Arc<PerfLogger>>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
     last_flush: Mutex<Instant>,
+    flush_lock: Mutex<()>,
+    mutation_lock: Mutex<()>,
     lookup_cache_ttl: Duration,
     dir_cache_ttl: Duration,
     journal: Option<Arc<JournalManager>>,
@@ -83,11 +87,15 @@ impl OsageFs {
             handle,
             client_state,
             pending_inodes: Mutex::new(HashMap::new()),
+            mutating_inodes: Mutex::new(HashMap::new()),
+            flushing_inodes: Mutex::new(HashMap::new()),
             pending_bytes: Mutex::new(0),
             perf,
             fsync_on_close,
             flush_interval,
             last_flush: Mutex::new(Instant::now()),
+            flush_lock: Mutex::new(()),
+            mutation_lock: Mutex::new(()),
             lookup_cache_ttl,
             dir_cache_ttl,
             journal,
@@ -239,17 +247,48 @@ impl OsageFs {
             }
             return Ok(entry.record.clone());
         }
+        if let Some(entry) = self.mutating_inodes.lock().get(&ino) {
+            if matches!(entry.record.kind, InodeKind::Tombstone) {
+                return Err(ENOENT);
+            }
+            return Ok(entry.record.clone());
+        }
+        if let Some(entry) = self.flushing_inodes.lock().get(&ino) {
+            if matches!(entry.record.kind, InodeKind::Tombstone) {
+                return Err(ENOENT);
+            }
+            return Ok(entry.record.clone());
+        }
         self.block_on(self.metadata.get_inode_with_ttl(
             ino,
             self.lookup_cache_ttl,
             self.dir_cache_ttl,
         ))
         .map_err(|_| EIO)?
-        .ok_or(ENOENT)
+        .ok_or_else(|| {
+            debug!(
+                "load_inode miss ino={} pending={} mutating={} flushing={}",
+                ino,
+                self.pending_inodes.lock().contains_key(&ino),
+                self.mutating_inodes.lock().contains_key(&ino),
+                self.flushing_inodes.lock().contains_key(&ino)
+            );
+            ENOENT
+        })
     }
 
     fn read_file_bytes(&self, record: &InodeRecord) -> Result<Vec<u8>> {
         if let Some(entry) = self.pending_inodes.lock().get(&record.inode) {
+            if let Some(data) = &entry.data {
+                return self.read_pending_bytes(data);
+            }
+        }
+        if let Some(entry) = self.mutating_inodes.lock().get(&record.inode) {
+            if let Some(data) = &entry.data {
+                return self.read_pending_bytes(data);
+            }
+        }
+        if let Some(entry) = self.flushing_inodes.lock().get(&record.inode) {
             if let Some(data) = &entry.data {
                 return self.read_pending_bytes(data);
             }
@@ -474,8 +513,18 @@ impl OsageFs {
         });
         let prev_entry = {
             let mut map = self.pending_inodes.lock();
-            map.remove(&inode)
+            let entry = map.remove(&inode);
+            let mut mutating = self.mutating_inodes.lock();
+            mutating.insert(
+                inode,
+                entry.clone().unwrap_or(PendingEntry {
+                    record: record.clone(),
+                    data: None,
+                }),
+            );
+            entry
         };
+        let original_entry = prev_entry.clone();
         let mut prev_data = prev_entry.and_then(|entry| entry.data);
         let prev_len = prev_data.as_ref().map(|d| d.len()).unwrap_or(0);
         let inline_cap = self.config.inline_threshold as u64;
@@ -488,22 +537,46 @@ impl OsageFs {
             let mut segments = match prev_data.take() {
                 Some(PendingData::Staged(segs)) => segs,
                 Some(PendingData::Inline(bytes)) => {
-                    let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
+                    let chunk = match self.segments.stage_payload(&bytes) {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            self.restore_mutation_on_error(inode, original_entry);
+                            return Err(EIO);
+                        }
+                    };
                     PendingSegments::from_chunk(chunk)
                 }
                 None => PendingSegments::new(),
             };
             if segments.total_len == 0 {
-                let chunk = self.segments.stage_payload(&data).map_err(|_| EIO)?;
+                let chunk = match self.segments.stage_payload(&data) {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        self.restore_mutation_on_error(inode, original_entry);
+                        return Err(EIO);
+                    }
+                };
                 PendingData::Staged(PendingSegments::from_chunk(chunk))
             } else if let Some(range) = append_range {
                 if range.start < range.end {
-                    let chunk = self.segments.stage_payload(&data[range]).map_err(|_| EIO)?;
+                    let chunk = match self.segments.stage_payload(&data[range]) {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            self.restore_mutation_on_error(inode, original_entry);
+                            return Err(EIO);
+                        }
+                    };
                     segments.append(chunk);
                 }
                 PendingData::Staged(segments)
             } else {
-                let chunk = self.segments.stage_payload(&data).map_err(|_| EIO)?;
+                let chunk = match self.segments.stage_payload(&data) {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        self.restore_mutation_on_error(inode, original_entry);
+                        return Err(EIO);
+                    }
+                };
                 let old = segments;
                 let pending = PendingData::Staged(PendingSegments::from_chunk(chunk));
                 self.release_pending_data(PendingData::Staged(old));
@@ -525,6 +598,7 @@ impl OsageFs {
                 },
             );
         }
+        self.mutating_inodes.lock().remove(&inode);
 
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
@@ -692,8 +766,18 @@ impl OsageFs {
         record.update_times();
         let prev_entry = {
             let mut map = self.pending_inodes.lock();
-            map.remove(&inode)
+            let entry = map.remove(&inode);
+            let mut mutating = self.mutating_inodes.lock();
+            mutating.insert(
+                inode,
+                entry.clone().unwrap_or(PendingEntry {
+                    record: record.clone(),
+                    data: None,
+                }),
+            );
+            entry
         };
+        let original_entry = prev_entry.clone();
         let mut entry = prev_entry.unwrap_or(PendingEntry {
             record: record.clone(),
             data: None,
@@ -701,20 +785,38 @@ impl OsageFs {
         entry.record = record.clone();
         let mut data_state = entry.data.take();
         if data_state.is_none() {
-            let existing = self.read_file_bytes(&entry.record).map_err(|_| EIO)?;
+            let existing = match self.read_file_bytes(&entry.record) {
+                Ok(existing) => existing,
+                Err(_) => {
+                    self.restore_mutation_on_error(inode, original_entry);
+                    return Err(EIO);
+                }
+            };
             if existing.is_empty() {
                 data_state = Some(PendingData::Staged(PendingSegments::new()));
             } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
                 data_state = Some(PendingData::Inline(existing));
             } else {
-                let chunk = self.segments.stage_payload(&existing).map_err(|_| EIO)?;
+                let chunk = match self.segments.stage_payload(&existing) {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        self.restore_mutation_on_error(inode, original_entry);
+                        return Err(EIO);
+                    }
+                };
                 data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
             }
         }
         let mut segments = match data_state {
             Some(PendingData::Staged(segs)) => segs,
             Some(PendingData::Inline(bytes)) => {
-                let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
+                let chunk = match self.segments.stage_payload(&bytes) {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        self.restore_mutation_on_error(inode, original_entry);
+                        return Err(EIO);
+                    }
+                };
                 PendingSegments::from_chunk(chunk)
             }
             None => PendingSegments::new(),
@@ -722,11 +824,20 @@ impl OsageFs {
         let prev_len = segments.total_len;
         if let Err(_) = segments.ensure_offset(&self.segments, offset) {
             self.release_pending_data(PendingData::Staged(segments));
+            self.restore_mutation_on_error(inode, original_entry);
             return Err(EIO);
         }
-        let staged_chunk = self.segments.stage_payload(data).map_err(|_| EIO)?;
+        let staged_chunk = match self.segments.stage_payload(data) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                self.release_pending_data(PendingData::Staged(segments));
+                self.restore_mutation_on_error(inode, original_entry);
+                return Err(EIO);
+            }
+        };
         if let Err(_) = segments.write_range(&self.segments, offset, staged_chunk) {
             self.release_pending_data(PendingData::Staged(segments));
+            self.restore_mutation_on_error(inode, original_entry);
             return Err(EIO);
         }
         let new_len = segments.total_len;
@@ -745,6 +856,7 @@ impl OsageFs {
             let mut map = self.pending_inodes.lock();
             map.insert(inode, entry);
         }
+        self.mutating_inodes.lock().remove(&inode);
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
         if delta >= 0 {
@@ -798,10 +910,27 @@ impl OsageFs {
         Ok(())
     }
 
+    fn restore_mutation_on_error(&self, inode: u64, original: Option<PendingEntry>) {
+        {
+            let mut map = self.pending_inodes.lock();
+            match original {
+                Some(entry) => {
+                    map.insert(inode, entry);
+                }
+                None => {
+                    map.remove(&inode);
+                }
+            }
+        }
+        self.mutating_inodes.lock().remove(&inode);
+    }
+
     fn flush_pending(&self) -> std::result::Result<(), i32> {
+        let _flush_guard = self.flush_lock.lock();
         let pid = process::id();
         let tid = format!("{:?}", thread::current().id());
         let mut prepared_generation: Option<u64> = None;
+        let mut drained_pending: Option<HashMap<u64, PendingEntry>> = None;
         let result = (|| {
             let start = Instant::now();
             let pending = {
@@ -816,8 +945,17 @@ impl OsageFs {
                 if has_staged {
                     self.segments.rotate_stage_file();
                 }
-                std::mem::take(&mut *guard)
+                let drained = std::mem::take(&mut *guard);
+                let mut flushing = self.flushing_inodes.lock();
+                for (inode, entry) in drained.iter() {
+                    flushing.insert(*inode, entry.clone());
+                }
+                drained
             };
+            drained_pending = Some(pending);
+            let pending = drained_pending
+                .as_ref()
+                .expect("drained pending map must be present");
             debug!(
                 "flush_pending pid={} tid={} preparing {} inodes",
                 pid,
@@ -839,11 +977,11 @@ impl OsageFs {
             let mut segment_bytes: u64 = 0;
             let mut metadata_only = 0;
             let mut flushed_inodes = Vec::new();
-            for (inode, pending_entry) in pending.into_iter() {
-                flushed_inodes.push(inode);
-                match pending_entry.data {
+            for (inode, pending_entry) in pending.iter() {
+                flushed_inodes.push(*inode);
+                match &pending_entry.data {
                     Some(PendingData::Inline(data_bytes)) => {
-                        let mut record = pending_entry.record;
+                        let mut record = pending_entry.record.clone();
                         let data_len = data_bytes.len() as u64;
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
                         record.size = data_len;
@@ -856,7 +994,7 @@ impl OsageFs {
                             segment_entries.push(SegmentEntry {
                                 inode: record.inode,
                                 path: record.path.clone(),
-                                data: data_bytes,
+                                data: data_bytes.clone(),
                             });
                             record.storage = FileStorage::Inline(Vec::new());
                             segment_files += 1;
@@ -865,18 +1003,12 @@ impl OsageFs {
                         }
                     }
                     Some(PendingData::Staged(segments)) => {
-                        let mut record = pending_entry.record;
+                        let mut record = pending_entry.record.clone();
                         let mut data_bytes = Vec::with_capacity(record.size as usize);
-                        for chunk in segments.chunks {
+                        for chunk in &segments.chunks {
                             let chunk_bytes =
                                 self.segments.read_staged_chunk(&chunk).map_err(|_| EIO)?;
                             data_bytes.extend_from_slice(&chunk_bytes);
-                            if let Err(err) = self.segments.release_staged_chunk(&chunk) {
-                                log::warn!(
-                                    "failed to release staged payload {}: {err:?}",
-                                    chunk.path.display()
-                                );
-                            }
                         }
                         let data_len = data_bytes.len() as u64;
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
@@ -893,7 +1025,7 @@ impl OsageFs {
                     }
                     None => {
                         metadata_only += 1;
-                        records.push(pending_entry.record);
+                        records.push(pending_entry.record.clone());
                     }
                 }
             }
@@ -945,8 +1077,29 @@ impl OsageFs {
             *total = total.saturating_sub(flushed_bytes);
             let pending_remaining = *total;
             drop(total);
+            let flushed_entries = drained_pending
+                .take()
+                .expect("drained pending map must exist until flush commit");
+            {
+                let mut flushing = self.flushing_inodes.lock();
+                for inode in flushed_entries.keys() {
+                    flushing.remove(inode);
+                }
+            }
+            for pending_entry in flushed_entries.into_values() {
+                if let Some(data) = pending_entry.data {
+                    self.release_pending_data(data);
+                }
+            }
             if let Some(journal) = &self.journal {
-                for inode in flushed_inodes {
+                let clearable_inodes = {
+                    let guard = self.pending_inodes.lock();
+                    flushed_inodes
+                        .into_iter()
+                        .filter(|inode| !guard.contains_key(inode))
+                        .collect::<Vec<_>>()
+                };
+                for inode in clearable_inodes {
                     journal.clear_entry(inode).map_err(|_| EIO)?;
                 }
             }
@@ -988,9 +1141,41 @@ impl OsageFs {
             if let Some(pending_gen) = prepared_generation.take() {
                 self.superblock.abort_generation(pending_gen);
             }
+            if let Some(pending) = drained_pending.take() {
+                self.restore_pending_after_failed_flush(pending);
+            }
             error!("flush_pending failed pid={} tid={} code={}", pid, tid, code);
         }
         result
+    }
+
+    fn restore_pending_after_failed_flush(&self, restored: HashMap<u64, PendingEntry>) {
+        let mut dropped_bytes = 0u64;
+        let restored_inodes: Vec<u64> = restored.keys().copied().collect();
+        let mut map = self.pending_inodes.lock();
+        for (inode, entry) in restored {
+            match map.entry(inode) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(entry);
+                }
+                Entry::Occupied(_) => {
+                    if let Some(data) = entry.data {
+                        dropped_bytes = dropped_bytes.saturating_add(data.len());
+                        self.release_pending_data(data);
+                    }
+                }
+            }
+        }
+        drop(map);
+        let mut flushing = self.flushing_inodes.lock();
+        for inode in restored_inodes {
+            flushing.remove(&inode);
+        }
+        drop(flushing);
+        if dropped_bytes > 0 {
+            let mut total = self.pending_bytes.lock();
+            *total = total.saturating_sub(dropped_bytes);
+        }
     }
 
     fn log_perf(&self, event: &str, duration: Duration, details: serde_json::Value) {
@@ -1025,6 +1210,356 @@ impl OsageFs {
             "{} failed pid={} tid={} {} errno={}",
             op, pid, tid, detail, code
         );
+    }
+
+    pub fn nfs_lookup(&self, parent: u64, name: &str) -> std::result::Result<InodeRecord, i32> {
+        let parent_inode = self.load_inode(parent)?;
+        let child = parent_inode
+            .children()
+            .and_then(|children| children.get(name).copied())
+            .ok_or(ENOENT)?;
+        self.load_inode(child)
+    }
+
+    pub fn nfs_getattr(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
+        self.load_inode(ino)
+    }
+
+    pub fn nfs_readdir(&self, ino: u64) -> std::result::Result<Vec<(u64, String)>, i32> {
+        let inode = self.load_inode(ino)?;
+        if !inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let mut entries = Vec::new();
+        if let Some(children) = inode.children() {
+            entries.reserve(children.len());
+            for (name, child) in children {
+                entries.push((*child, name.clone()));
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn nfs_setattr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut record = self.load_inode(ino)?;
+        if let Some(new_mode) = mode {
+            record.mode = (record.mode & !0o7777) | (new_mode & 0o7777);
+        }
+        if let Some(new_uid) = uid {
+            record.uid = new_uid;
+        }
+        if let Some(new_gid) = gid {
+            record.gid = new_gid;
+        }
+        let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+        if let Some(target_size) = size {
+            if record.is_dir() {
+                return Err(EISDIR);
+            }
+            data.resize(target_size as usize, 0);
+        }
+        record.update_times();
+        self.stage_file(record.clone(), data, None)?;
+        Ok(record)
+    }
+
+    pub fn nfs_create(
+        &self,
+        parent: u64,
+        name: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut parent_inode = self.load_inode(parent)?;
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let name = name.to_string();
+        if parent_inode
+            .children()
+            .map(|children| children.contains_key(&name))
+            .unwrap_or(false)
+        {
+            return Err(EEXIST);
+        }
+        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+        let path = Self::build_child_path(&parent_inode, &name);
+        let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
+        file.update_times();
+        self.stage_inode(file.clone())?;
+        self.update_parent(&mut parent_inode, name, inode_id)?;
+        if self.load_inode(inode_id).is_err() {
+            error!(
+                "nfs_create visibility check failed ino={} parent={} pending={} flushing={}",
+                inode_id,
+                parent,
+                self.pending_inodes.lock().contains_key(&inode_id),
+                self.flushing_inodes.lock().contains_key(&inode_id)
+            );
+        }
+        Ok(file)
+    }
+
+    pub fn nfs_mkdir(
+        &self,
+        parent: u64,
+        name: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut parent_inode = self.load_inode(parent)?;
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let name = name.to_string();
+        if parent_inode
+            .children()
+            .map(|children| children.contains_key(&name))
+            .unwrap_or(false)
+        {
+            return Err(EEXIST);
+        }
+        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+        let path = Self::build_child_path(&parent_inode, &name);
+        let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
+        dir.update_times();
+        self.stage_inode(dir.clone())?;
+        self.update_parent(&mut parent_inode, name, inode_id)?;
+        Ok(dir)
+    }
+
+    pub fn nfs_symlink(
+        &self,
+        parent: u64,
+        name: &str,
+        target: Vec<u8>,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut parent_inode = self.load_inode(parent)?;
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let name = name.to_string();
+        if parent_inode
+            .children()
+            .map(|children| children.contains_key(&name))
+            .unwrap_or(false)
+        {
+            return Err(EEXIST);
+        }
+        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+        let path = Self::build_child_path(&parent_inode, &name);
+        let record =
+            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
+        self.stage_inode(record.clone())?;
+        self.update_parent(&mut parent_inode, name, inode_id)?;
+        Ok(record)
+    }
+
+    pub fn nfs_read(&self, ino: u64, offset: u64, size: u32) -> std::result::Result<Vec<u8>, i32> {
+        let record = self.load_inode(ino)?;
+        if record.is_dir() {
+            return Err(EISDIR);
+        }
+        let data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+        let offset = offset as usize;
+        if offset >= data.len() {
+            return Ok(Vec::new());
+        }
+        let end = std::cmp::min(offset + size as usize, data.len());
+        Ok(data[offset..end].to_vec())
+    }
+
+    pub fn nfs_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {
+        let record = self.load_inode(ino)?;
+        if let Some(target) = record.symlink_target_bytes() {
+            Ok(target.to_vec())
+        } else {
+            Err(EINVAL)
+        }
+    }
+
+    pub fn nfs_write(&self, ino: u64, offset: u64, data: &[u8]) -> std::result::Result<u32, i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut record = match self.load_inode(ino) {
+            Ok(record) => record,
+            Err(code) => {
+                let metadata_exists = self
+                    .block_on(self.metadata.get_inode(ino))
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false);
+                error!(
+                    "nfs_write load_inode failed ino={} code={} offset={} len={} pending={} flushing={} metadata_exists={}",
+                    ino,
+                    code,
+                    offset,
+                    data.len(),
+                    self.pending_inodes.lock().contains_key(&ino),
+                    self.flushing_inodes.lock().contains_key(&ino),
+                    metadata_exists
+                );
+                return Err(code);
+            }
+        };
+        if record.is_dir() {
+            return Err(EISDIR);
+        }
+        let prev_size = record.size;
+        let write_end = offset.saturating_add(data.len() as u64);
+        if offset == prev_size {
+            if write_end <= self.config.inline_threshold as u64 {
+                self.append_file(record, data)?;
+            } else {
+                self.write_large_segments(record, offset, data)?;
+            }
+            return Ok(data.len() as u32);
+        }
+        if write_end > self.config.inline_threshold as u64 {
+            self.write_large_segments(record, offset, data)?;
+            return Ok(data.len() as u32);
+        }
+        let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
+        let offset = offset as usize;
+        if offset > existing.len() {
+            existing.resize(offset, 0);
+        }
+        if offset + data.len() > existing.len() {
+            existing.resize(offset + data.len(), 0);
+        }
+        existing[offset..offset + data.len()].copy_from_slice(data);
+        record.update_times();
+        let ctx = StageWriteContext {
+            prev_size,
+            write_offset: offset as u64,
+        };
+        self.stage_file(record, existing, Some(ctx))?;
+        Ok(data.len() as u32)
+    }
+
+    pub fn nfs_remove_file(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut parent_inode = self.load_inode(parent)?;
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let child_ino = parent_inode
+            .children()
+            .and_then(|children| children.get(name).copied())
+            .ok_or(ENOENT)?;
+        let mut child = self.load_inode(child_ino)?;
+        if child.is_dir() {
+            return Err(EISDIR);
+        }
+        self.unlink_file_entry(&mut parent_inode, name, &mut child)
+    }
+
+    pub fn nfs_remove_dir(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut parent_inode = self.load_inode(parent)?;
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let child_ino = parent_inode
+            .children()
+            .and_then(|children| children.get(name).copied())
+            .ok_or(ENOENT)?;
+        let child = self.load_inode(child_ino)?;
+        if !child.is_dir() {
+            return Err(ENOTDIR);
+        }
+        if child.children().map(|c| !c.is_empty()).unwrap_or(false) {
+            return Err(ENOTEMPTY);
+        }
+        let tombstone = InodeRecord::tombstone(child_ino);
+        self.stage_inode(tombstone)?;
+        self.remove_from_parent(&mut parent_inode, name)?;
+        Ok(())
+    }
+
+    pub fn nfs_rename(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+    ) -> std::result::Result<(), i32> {
+        let _mutation_guard = self.mutation_lock.lock();
+        if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
+            return Err(EINVAL);
+        }
+        let mut src_parent = self.load_inode(parent)?;
+        if !src_parent.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let mut dst_parent = self.load_inode(newparent)?;
+        if !dst_parent.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let old_name = name.to_string();
+        let new_name = newname.to_string();
+        let child_ino = src_parent
+            .children()
+            .and_then(|children| children.get(&old_name).copied())
+            .ok_or(ENOENT)?;
+        if parent == newparent && old_name == new_name {
+            return Ok(());
+        }
+        let mut target = self.load_inode(child_ino)?;
+        if target.is_dir() && self.is_descendant(target.inode, newparent)? {
+            return Err(EINVAL);
+        }
+        if let Some(existing) = dst_parent
+            .children()
+            .and_then(|children| children.get(&new_name).copied())
+        {
+            if flags & RENAME_NOREPLACE_FLAG != 0 {
+                return Err(EEXIST);
+            }
+            if existing != target.inode {
+                let mut victim = self.load_inode(existing)?;
+                if victim.is_dir() {
+                    if !target.is_dir() {
+                        return Err(EISDIR);
+                    }
+                    if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
+                        return Err(ENOTEMPTY);
+                    }
+                    self.remove_from_parent(&mut dst_parent, &new_name)?;
+                    let tombstone = InodeRecord::tombstone(victim.inode);
+                    self.stage_inode(tombstone)?;
+                } else {
+                    self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
+                }
+            }
+        }
+        self.remove_from_parent(&mut src_parent, &old_name)?;
+        self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
+        target.parent = dst_parent.inode;
+        target.name = new_name;
+        target.path = Self::build_child_path(&dst_parent, &target.name);
+        target.update_times();
+        self.stage_inode(target.clone())?;
+        if target.is_dir() {
+            self.refresh_descendant_paths(&target)?;
+        }
+        Ok(())
+    }
+
+    pub fn nfs_flush(&self) -> std::result::Result<(), i32> {
+        self.flush_pending()
     }
 }
 
@@ -1219,7 +1754,7 @@ impl Filesystem for OsageFs {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        flags: i32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         let uid = req.uid();
@@ -1249,7 +1784,8 @@ impl Filesystem for OsageFs {
             Ok(file) => {
                 let attr = Self::record_attr(&file);
                 let generation = self.superblock.snapshot().generation;
-                reply.created(&TTL, &attr, generation, 0, flags as u32);
+                // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
+                reply.created(&TTL, &attr, generation, 0, 0);
             }
             Err(code) => {
                 let detail = format!("parent={} name={}", parent, name.to_string_lossy());
@@ -1301,9 +1837,12 @@ impl Filesystem for OsageFs {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         match self.load_inode(ino) {
-            Ok(_) => reply.opened(0, flags as u32),
+            Ok(_) => {
+                // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
+                reply.opened(0, 0)
+            }
             Err(code) => reply.error(code),
         }
     }
@@ -1679,6 +2218,7 @@ fn to_system_time(ts: OffsetDateTime) -> SystemTime {
     }
 }
 
+#[derive(Clone)]
 struct PendingEntry {
     record: InodeRecord,
     data: Option<PendingData>,
@@ -1690,6 +2230,7 @@ struct StageWriteContext {
     write_offset: u64,
 }
 
+#[derive(Clone)]
 enum PendingData {
     Inline(Vec<u8>),
     Staged(PendingSegments),
@@ -1816,7 +2357,8 @@ mod tests {
     use super::*;
     use std::env;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     use crate::config::ObjectStoreProvider;
@@ -2515,5 +3057,83 @@ mod tests {
         assert_eq!(attrs_after.mode & 0o777, 0o700);
         assert_eq!(attrs_after.uid, 777);
         assert_eq!(attrs_after.gid, 888);
+    }
+
+    #[test]
+    fn concurrent_flush_does_not_hide_pending_inodes() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(dir.path(), "concurrent_flush.bin", 1 << 30, |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+        });
+        let file = harness.fs.nfs_create(ROOT_INODE, "race.bin", 0, 0).unwrap();
+
+        thread::scope(|scope| {
+            let fs = &harness.fs;
+            let inode = file.inode;
+            let writer = scope.spawn(move || {
+                let payload = vec![0x5Au8; 8192];
+                for i in 0..64u64 {
+                    fs.nfs_write(inode, i * payload.len() as u64, &payload)
+                        .unwrap();
+                }
+            });
+            let flusher = scope.spawn(move || {
+                for _ in 0..64 {
+                    fs.flush_pending().unwrap();
+                }
+            });
+            writer.join().unwrap();
+            flusher.join().unwrap();
+        });
+
+        harness.fs.flush_pending().unwrap();
+        let stored = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(file.inode))
+            .unwrap()
+            .unwrap();
+        assert!(stored.size > 0);
+    }
+
+    #[test]
+    fn load_inode_visible_during_large_segment_mutation() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(dir.path(), "visibility.bin", 1 << 30, |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+        });
+        let file = harness.fs.nfs_create(ROOT_INODE, "visibility.dat", 0, 0).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let write_payload = vec![0x33u8; 256 * 1024];
+
+        thread::scope(|scope| {
+            let fs = &harness.fs;
+            let start = barrier.clone();
+            let inode = file.inode;
+            let writer = scope.spawn(move || {
+                start.wait();
+                for i in 0..128u64 {
+                    let record = fs.load_inode(inode).unwrap();
+                    fs.write_large_segments(record, i * write_payload.len() as u64, &write_payload)
+                        .unwrap();
+                }
+            });
+            let fs = &harness.fs;
+            let start = barrier.clone();
+            let inode = file.inode;
+            let reader = scope.spawn(move || {
+                start.wait();
+                for _ in 0..50_000 {
+                    let record = fs.load_inode(inode);
+                    assert!(
+                        !matches!(record, Err(code) if code == ENOENT),
+                        "inode visibility hole during mutation"
+                    );
+                }
+            });
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
     }
 }

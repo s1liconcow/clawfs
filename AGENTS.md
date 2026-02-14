@@ -1,5 +1,8 @@
 # OsageFS Assistant Notes
 
+## Living Document
+Please continuously update this document with useful things you figure out that will make future workflows smoother.  
+
 ## Project Overview
 - OsageFS: a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
 - Close-time durability uses a local journal under `$STORE/journal`: every staged inode (data or metadata) is serialized with its payload path/bytes so a crash can replay the journal and flush pending writes before the mount finishes. You can disable this (unsafe) path via `--disable-journal` when benchmarking raw throughput.
@@ -27,19 +30,123 @@
 - `cargo test`: runs unit tests (including new integration-like tests in `fs.rs`, `segment.rs`, `state.rs`).
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
-- `osagefs-nfs-gateway/`: stand-alone crate that exports an existing OsageFS mount over NFS (user-mode NFSv3 via `nfsserve`, or NFSv4 by shelling out to `ganesha.nfsd`).
+- `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount), or exports an existing path for NFSv4 via `ganesha.nfsd` with `--use-existing-mount`.
+- When CLI flags/config defaults change, double-check and update `scripts/` launchers in the same PR so script argument sets stay in sync with binaries.
 
 ## Common Issues / Fixes
 - FUSE error `allow_other`: ensure `user_allow_other` in `/etc/fuse.conf` when running without sudo.
 - Root-owned leftovers from sudo runs: unmount and `sudo rm -rf` mount/store dirs before re-running.
 - Kernel build dependencies (flex/bison) needed for `make defconfig`.
 - Pending bytes threshold + `--flush-interval-ms` ensure `flush_pending()` runs automatically; staged payloads append to `$STORE/segment_stage/stage_*.bin` and only one of those files exists per in-flight flush. Metadata poller + TTLs keep cached attrs fresh, while cleanup leases prevent `/imap_deltas/` and `/segs/` from growing without bound.
+- Troubleshooting policy: reproduce with a failing automated test before fixing. For NFS/data-path issues, first capture logs (`write error`, `load_inode miss`, etc.), then codify the failure as a focused regression test in `src/fs.rs`; only after the test fails should code changes be made. Keep the test to prevent regressions.
 
 ## Useful Commands
 - Clean mount/store/state: `fusermount -u /tmp/osagefs-mnt; sudo rm -rf /tmp/osagefs-mnt /tmp/osagefs-store ~/.osagefs_state.bin`.
 - Run perf test: `LOG_FILE=$HOME/linux_build_timings.log ./scripts/linux_kernel_perf.sh`.
 - `scripts/run_osagefs.sh` defaults to `$ROOT/osagefs-perf.jsonl`; set `PERF_LOG_PATH=` to disable tracing when needed.
 - Enable perf tracing for other invocations by exporting `PERF_LOG_PATH=/tmp/osagefs-perf.jsonl` (empty string disables logging when scripts default it). Use `--fsync-on-close` to restore immediate durability, `--flush-interval-ms` to adjust opportunistic flush cadence (0 disables timer), and `--disable-cleanup` when cleanup will be handled by an external agent.
-- Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --mount-path /tmp/osagefs-mnt --listen 0.0.0.0:2049`. Add `--protocol v4 --ganesha-binary /usr/bin/ganesha.nfsd` to delegate to ganesha for a full NFSv4 server.
+- Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`. Add `--protocol v4 --use-existing-mount --mount-path /tmp/osagefs-mnt --ganesha-binary /usr/bin/ganesha.nfsd` for a full NFSv4 server.
 
 Keep this file updated with future design decisions, scripts, and troubleshooting steps.
+
+# Using Sprites
+
+## Goal
+Privileged execution must happen inside a Fly.io Sprite VM (Linux sandbox),
+NOT on the developer machine. Use the `sprite` CLI to run commands remotely.
+
+## Requirements
+- `sprite` CLI installed and available on PATH
+- `SPRITES_TOKEN` set in the environment
+- A sprite name to use (default: `iotest`)
+
+## Sprite bootstrap dependencies
+On a fresh sprite, install the tools used by build/stress/debug flows before running tests:
+- Rust toolchain (`cargo`, `rustc`)
+- `python3`
+- `fuse3` userspace tools (`fusermount`)
+- `util-linux` (`mount`, `umount`, `findmnt`, `mountpoint`)
+- `coreutils` (`dd`, `truncate`, `stat`, `tail`, `sync`, `timeout`)
+- `findutils` (`find`)
+- `procps` + `psmisc` (`ps`, `pkill`)
+- `tar`, `gzip`
+- `ripgrep` (`rg`) for diagnostics
+- `strace` for syscall-level failure triage
+
+Example bootstrap (Debian/Ubuntu sprite):
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'apt-get update && apt-get install -y python3 fuse3 util-linux coreutils findutils procps psmisc tar gzip ripgrep strace'`
+
+## Hard rules for agents
+- Do not run privileged commands locally.
+- Do not mount FUSE or run NFS services locally.
+- Privileged commands MUST be executed in the sprite via `sprite exec -s <sprite> -- <cmd...>`.
+- Prefer idempotent steps: the sprite may be fresh or may contain old state.
+
+## Sprite name
+Use this sprite unless explicitly told otherwise:
+- `SPRITE_NAME=iotest`
+
+If the sprite does not exist, create it:
+- `sprite create iotest`
+
+(If create fails because it already exists, continue.)
+
+## How to run commands
+Always wrap commands like this:
+
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc '<command>'`
+
+Use `bash -lc` so PATH, login-shell behavior, and chaining works.
+
+## Getting code into the sprite
+Assume the sprite does NOT automatically have the repo.
+Use one of these strategies, in order:
+
+### Strategy: Tar stream from local into sprite (works for local-only repos)
+Create a tarball locally and extract in the sprite:
+
+- `tar -czf - . | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/osagefs && mkdir -p /work/osagefs && tar -xzf - -C /work/osagefs'`
+
+Do not include giant build artifacts if possible (respect .gitignore).
+
+## Build + test entrypoints
+### Minimal “smoke” (no mounts)
+Use this first to validate toolchains:
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && cargo build --release && ./target/release/osagefs --help >/dev/null'`
+
+
+### Integration tests that require mounting (FUSE/NFS)
+If integration tests need mounts/services, they must run inside the sprite.
+Use the repo script that already handles launch, workload, verification, and cleanup:
+
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && ./scripts/stress_e2e.sh'`
+
+Useful knobs for repeated runs:
+- `LOG_FILE=/work/osagefs/osagefs.log`
+- `PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl`
+- `PID_FILE=/tmp/osagefs-stress.pid`
+- `MOUNT_PATH=/tmp/osagefs-mnt`
+- `STORE_PATH=/tmp/osagefs-store`
+- `LOCAL_CACHE_PATH=/tmp/osagefs-cache`
+- `STATE_PATH=$HOME/.osagefs/state/client_state.bin`
+
+Example with explicit paths:
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl ./scripts/stress_e2e.sh'`
+
+## Sprite FUSE Troubleshooting
+If stress fails with `Input/output error` (for example during `cp` in the attribute test), collect these immediately:
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'tail -n 200 /work/osagefs/osagefs.log || true'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'tail -n 200 /work/osagefs/osagefs-perf.jsonl || true'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cat /tmp/osagefs-stress.pid 2>/dev/null; ps -ef | rg osagefs || true'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'mount | rg /tmp/osagefs-mnt || true; ls -la /tmp/osagefs-mnt || true'`
+
+When iterating on fixes, follow this order:
+1) Reproduce with `./scripts/stress_e2e.sh` in sprite.
+2) Add/adjust a focused regression test in `src/fs.rs` for the failing behavior.
+3) Implement the fix and rerun the same sprite stress command.
+
+## Artifact capture
+If tests fail, capture logs from the sprite:
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'dmesg | tail -200 || true'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'journalctl -n 200 --no-pager || true'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'ls -la /tmp/osagefs-it || true'`

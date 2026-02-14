@@ -69,9 +69,28 @@ require() {
   fi
 }
 
+require_path() {
+  if [[ ! -x "$1" ]]; then
+    echo "Missing dependency: $1" >&2
+    exit 1
+  fi
+}
+
 require curl
 require python3
 require pv
+require tar
+require xz
+require make
+require gcc
+require ld
+require bc
+require bison
+require flex
+require perl
+require rsync
+require cpio
+require_path /usr/bin/time
 
 latest_kernel_version() {
   python3 - "$@" <<'PY'

@@ -1,0 +1,12 @@
+[package]
+name = "loopback-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+parking_lot = "0.12"
+time = "0.3"

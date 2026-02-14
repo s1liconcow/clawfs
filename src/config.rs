@@ -14,7 +14,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub store_path: PathBuf,
 
-    /// Path on the local filesystem for client-side caches/journals (defaults to store path).
+    /// Path on the local filesystem for client-side caches/journals (defaults to ~/.osagefs/cache).
     #[arg(long, value_name = "PATH")]
     pub local_cache_path: Option<PathBuf>,
 
@@ -163,10 +163,11 @@ pub struct Config {
 
 impl From<Cli> for Config {
     fn from(cli: Cli) -> Self {
+        let config_root = default_user_config_root();
         let state_path = cli
             .state_path
             .clone()
-            .unwrap_or_else(|| default_state_path(&cli.mount_path));
+            .unwrap_or_else(|| default_state_path(&config_root));
         let log_file = cli
             .log_file
             .clone()
@@ -175,7 +176,7 @@ impl From<Cli> for Config {
         let local_cache_path = cli
             .local_cache_path
             .clone()
-            .unwrap_or_else(|| store_path.clone());
+            .unwrap_or_else(|| default_local_cache_path(&config_root));
         Config {
             mount_path: cli.mount_path,
             store_path,
@@ -211,8 +212,19 @@ impl From<Cli> for Config {
     }
 }
 
-fn default_state_path(mount: &PathBuf) -> PathBuf {
-    mount.join(".osagefs_state.bin")
+fn default_user_config_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".osagefs")
+}
+
+fn default_state_path(root: &PathBuf) -> PathBuf {
+    root.join("state").join("client_state.bin")
+}
+
+fn default_local_cache_path(root: &PathBuf) -> PathBuf {
+    root.join("cache")
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

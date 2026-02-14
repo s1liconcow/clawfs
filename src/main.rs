@@ -29,6 +29,23 @@ const DELTA_COMPACT_THRESHOLD: usize = 128;
 const DELTA_COMPACT_KEEP: usize = 32;
 const SEGMENT_COMPACT_BATCH: usize = 8;
 const SEGMENT_COMPACT_LAG: u64 = 3;
+const WELCOME_FILENAME: &str = "WELCOME.txt";
+const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
+\n\
+OsageFS is a log-structured, object-store-backed filesystem designed for fast,\n\
+shared access to large working sets with durable metadata and batched writes.\n\
+\n\
+Great use cases:\n\
+- AI training data and model artifacts shared across multiple machines\n\
+- Shared home directories for teams, labs, or ephemeral compute nodes\n\
+- High-throughput team access to large binaries, build outputs, and datasets\n\
+\n\
+Why teams use it:\n\
+- Immutable segment writes for efficient object-store IO\n\
+- Batched metadata updates for lower API overhead\n\
+- Local staging, caching, and journal replay for practical durability and speed\n\
+\n\
+Enjoy building on OsageFS.\n";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -162,6 +179,14 @@ fn ensure_root(
         return Err(err);
     }
     runtime.block_on(superblock.commit_generation(generation))?;
+    ensure_welcome_file(
+        runtime,
+        metadata.clone(),
+        superblock.clone(),
+        config,
+        uid,
+        gid,
+    )?;
     if !config.home_prefix.is_empty() {
         ensure_directory_path(
             runtime,
@@ -181,6 +206,60 @@ fn ensure_root(
             runtime, metadata, superblock, config, &user_path, uid, gid, 0o40755,
         )?;
     }
+    Ok(())
+}
+
+fn ensure_welcome_file(
+    runtime: &tokio::runtime::Runtime,
+    metadata: Arc<MetadataStore>,
+    superblock: Arc<SuperblockManager>,
+    config: &Config,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    let mut root = runtime
+        .block_on(metadata.get_inode(ROOT_INODE))?
+        .ok_or_else(|| anyhow::anyhow!("missing root inode {}", ROOT_INODE))?;
+    if root
+        .children()
+        .map(|children| children.contains_key(WELCOME_FILENAME))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let new_inode = runtime.block_on(superblock.reserve_inodes(1))?;
+    let snapshot = superblock.prepare_dirty_generation()?;
+    let generation = snapshot.generation;
+
+    let mut welcome = InodeRecord::new_file(
+        new_inode,
+        ROOT_INODE,
+        WELCOME_FILENAME.to_string(),
+        format!("/{}", WELCOME_FILENAME),
+        uid,
+        gid,
+    );
+    let bytes = WELCOME_CONTENT.as_bytes().to_vec();
+    welcome.size = bytes.len() as u64;
+    welcome.storage = FileStorage::Inline(bytes);
+    welcome.mode = 0o100644;
+
+    if let Err(err) =
+        runtime.block_on(metadata.persist_inode(&welcome, generation, config.shard_size))
+    {
+        superblock.abort_generation(generation);
+        return Err(err);
+    }
+    if let Some(children) = root.children_mut() {
+        children.insert(WELCOME_FILENAME.to_string(), new_inode);
+    }
+    if let Err(err) = runtime.block_on(metadata.persist_inode(&root, generation, config.shard_size))
+    {
+        superblock.abort_generation(generation);
+        return Err(err);
+    }
+    runtime.block_on(superblock.commit_generation(generation))?;
     Ok(())
 }
 

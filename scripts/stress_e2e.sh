@@ -69,7 +69,7 @@ cleanup() {
     if kill -0 "$PID" 2>/dev/null; then
       echo "Stopping osagefs PID $PID"
       kill "$PID"
-      wait "$PID" 2>/dev/null
+      wait "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
   fi

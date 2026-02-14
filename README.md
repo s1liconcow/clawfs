@@ -185,26 +185,27 @@ behalf.
 
 ### NFS gateway
 
-Run `osagefs-nfs-gateway` when you want to export an existing OsageFS mount over
-NFS without installing a Windows FUSE driver. By default it uses the
+Run `osagefs-nfs-gateway` when you want to export OsageFS over NFS without
+running a FUSE mount. The default `--protocol v3` backend talks to OsageFS
+metadata/segments directly and serves them over NFS. It uses the
 [`nfsserve`](https://github.com/xetdata/nfsserve) user-mode NFSv3 server so it
 works with the Windows built-in client. Example:
 
 ```
 cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- \
-  --mount-path /tmp/osagefs-mnt \
+  --store-path /tmp/osagefs-store \
   --listen 0.0.0.0:2049
 ```
 
 If you need a compliant NFSv4 endpoint, add `--protocol v4` and point the
-gateway at a `ganesha.nfsd` binary. The gateway generates a temporary export
-definition rooted at the supplied OsageFS mount and manages the ganesha process
-lifecycle so that Windows or Linux clients can mount it like any other v4
-export.
+gateway at a `ganesha.nfsd` binary. This mode exports a real POSIX path, so you
+must supply `--use-existing-mount` and point `--mount-path` at an existing
+mounted directory.
 
 ```
 cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- \
   --mount-path /tmp/osagefs-mnt \
+  --use-existing-mount \
   --protocol v4 \
   --ganesha-binary /usr/bin/ganesha.nfsd \
   --listen 10.0.0.5:2049
