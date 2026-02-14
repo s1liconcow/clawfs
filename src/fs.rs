@@ -32,6 +32,11 @@ const TTL: Duration = Duration::from_secs(1);
 const STATFS_BLOCK_SIZE: u32 = 4096;
 const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
 const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
+const ADAPTIVE_PENDING_MULTIPLIER: u64 = 16;
+const ADAPTIVE_PENDING_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const ADAPTIVE_INTERVAL_DEFER_MULTIPLIER: u32 = 5;
+const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
+const ADAPTIVE_MIN_MAX_DEFER_SECS: u64 = 5;
 
 #[cfg(target_os = "linux")]
 const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
@@ -865,7 +870,8 @@ impl OsageFs {
             *total = total.saturating_sub((-delta) as u64);
         }
         let pending_total = *total;
-        let should_flush = pending_total >= self.config.pending_bytes;
+        let pending_limit = self.pending_flush_limit_for_write(offset == prev_len, data.len());
+        let should_flush = pending_total >= pending_limit;
         drop(total);
         if let (Some(journal), Some(payload)) = (&self.journal, journal_payload) {
             let journal_entry = JournalEntry {
@@ -884,6 +890,7 @@ impl OsageFs {
                 "write_offset": offset,
                 "write_len": data.len(),
                 "pending_total": pending_total,
+                "pending_limit": pending_limit,
                 "triggered_flush": should_flush,
                 "filename": path,
             }),
@@ -891,7 +898,7 @@ impl OsageFs {
         let pid = process::id();
         let tid = format!("{:?}", thread::current().id());
         debug!(
-            "stage_segments pid={} tid={} inode={} path={} offset={} len={} new_size={} pending={} flush_triggered={}",
+            "stage_segments pid={} tid={} inode={} path={} offset={} len={} new_size={} pending={} pending_limit={} flush_triggered={}",
             pid,
             tid,
             inode,
@@ -900,6 +907,7 @@ impl OsageFs {
             data.len(),
             new_len,
             pending_total,
+            pending_limit,
             should_flush
         );
         if should_flush {
@@ -1184,18 +1192,81 @@ impl OsageFs {
         }
     }
 
+    fn adaptive_pending_limit(&self) -> u64 {
+        let base = self.config.pending_bytes;
+        let scaled = base.saturating_mul(ADAPTIVE_PENDING_MULTIPLIER);
+        scaled.max(base).min(ADAPTIVE_PENDING_MAX_BYTES.max(base))
+    }
+
+    fn pending_flush_limit_for_write(&self, is_append: bool, write_len: usize) -> u64 {
+        let base = self.config.pending_bytes;
+        if self.journal.is_none() {
+            return base;
+        }
+        if !is_append || (write_len as u64) < ADAPTIVE_LARGE_WRITE_MIN_BYTES {
+            return base;
+        }
+        let by_write_size = (write_len as u64).saturating_mul(8);
+        self.adaptive_pending_limit().max(by_write_size).max(base)
+    }
+
+    fn should_defer_interval_flush(&self, elapsed: Duration) -> bool {
+        if self.journal.is_none() {
+            return false;
+        }
+        let Some(interval) = self.flush_interval else {
+            return false;
+        };
+        let max_defer = interval
+            .checked_mul(ADAPTIVE_INTERVAL_DEFER_MULTIPLIER)
+            .unwrap_or(Duration::MAX);
+        let bounded_max_defer = max_defer.max(Duration::from_secs(ADAPTIVE_MIN_MAX_DEFER_SECS));
+        if elapsed >= bounded_max_defer {
+            return false;
+        }
+        let pending_total = *self.pending_bytes.lock();
+        if pending_total == 0 {
+            return false;
+        }
+        let adaptive_limit = self.adaptive_pending_limit();
+        if pending_total >= adaptive_limit {
+            return false;
+        }
+        let pending = self.pending_inodes.lock();
+        if pending.len() != 1 {
+            return false;
+        }
+        let Some(entry) = pending.values().next() else {
+            return false;
+        };
+        let Some(PendingData::Staged(staged)) = &entry.data else {
+            return false;
+        };
+        staged.total_len > self.config.inline_threshold as u64
+    }
+
     fn flush_if_interval_elapsed(&self) -> std::result::Result<(), i32> {
         let Some(interval) = self.flush_interval else {
             return Ok(());
         };
-        let should_flush = {
+        let elapsed = {
             let guard = self.last_flush.lock();
-            guard.elapsed() >= interval
+            guard.elapsed()
         };
-        if should_flush {
-            debug!("flush_interval {:?} elapsed, triggering flush", interval);
-            self.flush_pending()?;
+        if elapsed < interval {
+            return Ok(());
         }
+        if self.should_defer_interval_flush(elapsed) {
+            debug!(
+                "deferring interval flush elapsed={:?} pending_total={} adaptive_limit={}",
+                elapsed,
+                *self.pending_bytes.lock(),
+                self.adaptive_pending_limit()
+            );
+            return Ok(());
+        }
+        debug!("flush_interval {:?} elapsed, triggering flush", interval);
+        self.flush_pending()?;
         Ok(())
     }
 
@@ -2725,6 +2796,45 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_append_meets_perf_target_with_journal_and_interval() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "adaptive_perf.bin", 1024 * 1024, |cfg| {
+                cfg.disable_journal = false;
+                cfg.flush_interval_ms = 1;
+            });
+        let inode = stage_named_file(&harness, "adaptive-throughput.dat", Vec::new());
+        let chunk_size = 512 * 1024;
+        let iterations = 128;
+        let total_bytes = chunk_size * iterations;
+        let payload = vec![0xCD; chunk_size];
+        let start = Instant::now();
+        for i in 0..iterations {
+            let offset = (i * chunk_size) as u64;
+            let record = harness.fs.load_inode(inode).unwrap();
+            harness
+                .fs
+                .write_large_segments(record, offset, &payload)
+                .unwrap();
+        }
+        harness.fs.flush_pending().unwrap();
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64();
+        assert!(secs > 0.0, "elapsed time too small for measurement");
+        let throughput = (total_bytes as f64 / (1024.0 * 1024.0)) / secs;
+        eprintln!(
+            "adaptive_append_meets_perf_target_with_journal_and_interval throughput={:.2} MiB/s elapsed={:?}",
+            throughput, elapsed
+        );
+        assert!(
+            throughput >= 5.0,
+            "adaptive throughput {:.2} MiB/s below 5 MiB/s in {:?}",
+            throughput,
+            elapsed
+        );
+    }
+
+    #[test]
     fn untar_style_perf_mixture() {
         if env::var("OSAGEFS_RUN_PERF").is_err() {
             eprintln!("skipping untar_style_perf_mixture; set OSAGEFS_RUN_PERF=1 to enable");
@@ -2813,6 +2923,79 @@ mod tests {
             .unwrap();
         assert_eq!(stored.size, 5);
         assert!(matches!(stored.storage, FileStorage::Inline(_)));
+    }
+
+    #[test]
+    fn adaptive_large_append_keeps_data_pending_with_journal() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "adaptive_pending.bin", 1024 * 1024, |cfg| {
+                cfg.disable_journal = false;
+                cfg.flush_interval_ms = 1000;
+            });
+        let inode = stage_named_file(&harness, "stream.bin", Vec::new());
+        let chunk = vec![0xAB; 512 * 1024];
+        for i in 0..6 {
+            let record = harness.fs.load_inode(inode).unwrap();
+            harness
+                .fs
+                .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
+                .unwrap();
+        }
+        let pending_total = *harness.fs.pending_bytes.lock();
+        assert!(
+            pending_total > harness.fs.config.pending_bytes,
+            "expected adaptive pending to exceed base threshold, got {} vs {}",
+            pending_total,
+            harness.fs.config.pending_bytes
+        );
+        let record = harness.fs.load_inode(inode).unwrap();
+        let staged = harness.fs.read_file_bytes(&record).unwrap();
+        assert_eq!(staged.len(), chunk.len() * 6);
+        harness.fs.flush_pending().unwrap();
+    }
+
+    #[test]
+    fn adaptive_large_append_replays_after_crash() {
+        let dir = tempdir().unwrap();
+        let inode_id;
+        let chunk = vec![0x5E; 512 * 1024];
+        {
+            let harness =
+                TestHarness::with_config(dir.path(), "adaptive_replay.bin", 1024 * 1024, |cfg| {
+                    cfg.disable_journal = false;
+                    cfg.flush_interval_ms = 1000;
+                });
+            inode_id = stage_named_file(&harness, "stream.bin", Vec::new());
+            for i in 0..6 {
+                let record = harness.fs.load_inode(inode_id).unwrap();
+                harness
+                    .fs
+                    .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
+                    .unwrap();
+            }
+            let pending_total = *harness.fs.pending_bytes.lock();
+            assert!(
+                pending_total > harness.fs.config.pending_bytes,
+                "expected replay setup to leave pending data"
+            );
+            // drop without explicit flush to simulate crash
+        }
+        let harness =
+            TestHarness::with_config(dir.path(), "adaptive_replay.bin", 1024 * 1024, |cfg| {
+                cfg.disable_journal = false;
+                cfg.flush_interval_ms = 1000;
+            });
+        let replayed = harness.fs.replay_journal().unwrap();
+        assert!(replayed >= 1);
+        let stored = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(inode_id))
+            .unwrap()
+            .unwrap();
+        let bytes = harness.fs.read_file_bytes(&stored).unwrap();
+        assert_eq!(bytes.len(), chunk.len() * 6);
+        assert_eq!(&bytes[..chunk.len()], &chunk[..]);
     }
 
     #[test]
@@ -3062,10 +3245,11 @@ mod tests {
     #[test]
     fn concurrent_flush_does_not_hide_pending_inodes() {
         let dir = tempdir().unwrap();
-        let harness = TestHarness::with_config(dir.path(), "concurrent_flush.bin", 1 << 30, |cfg| {
-            cfg.disable_journal = true;
-            cfg.flush_interval_ms = 0;
-        });
+        let harness =
+            TestHarness::with_config(dir.path(), "concurrent_flush.bin", 1 << 30, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
         let file = harness.fs.nfs_create(ROOT_INODE, "race.bin", 0, 0).unwrap();
 
         thread::scope(|scope| {
@@ -3103,7 +3287,10 @@ mod tests {
             cfg.disable_journal = true;
             cfg.flush_interval_ms = 0;
         });
-        let file = harness.fs.nfs_create(ROOT_INODE, "visibility.dat", 0, 0).unwrap();
+        let file = harness
+            .fs
+            .nfs_create(ROOT_INODE, "visibility.dat", 0, 0)
+            .unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let write_payload = vec![0x33u8; 256 * 1024];
 
