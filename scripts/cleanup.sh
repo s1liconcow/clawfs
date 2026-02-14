@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
-STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
-LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
-STATE_PATH="${STATE_PATH:-$HOME/.osagefs/state/client_state.bin}"
-LOG_FILE="${LOG_FILE:-$PWD/osagefs.log}"
+source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
+osage_set_defaults
+
 NFS_LOG_FILE="${NFS_LOG_FILE:-$PWD/osagefs-nfs-gateway.log}"
-PERF_LOG_PATH="${PERF_LOG_PATH:-$PWD/osagefs-perf.jsonl}"
 NFS_GATEWAY_PID_FILE="${NFS_GATEWAY_PID_FILE:-/tmp/osagefs-nfs-gateway.pid}"
 
 is_mounted() {

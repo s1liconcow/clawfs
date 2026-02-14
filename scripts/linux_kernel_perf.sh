@@ -2,27 +2,29 @@
 set -euo pipefail
 set -x
 
-ROOT_DIR=$(cd -- "$(dirname -- "$0")/.." && pwd)
+source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
+osage_set_defaults
+
 TARGET_DIR="$ROOT_DIR/target/release"
 OSAGE_BIN="$TARGET_DIR/osagefs"
 
-MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
-STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
-LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
-STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
 LINUX_VERSION="${LINUX_VERSION:-}"
 HOME_PREFIX="${HOME_PREFIX:-/home}"
-PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
 DO_CLEANUP=1
+SKIP_EXTRACT=0
+REUSE_TREE=0
 EXTRA_FLAGS=(--disable-cleanup --disable-journal)
+RUN_CLEANUP="$ROOT_DIR/scripts/cleanup.sh"
 
 usage() {
   cat <<USAGE
 Usage: ${0##*/} [--no_cleanup]
 
   --no_cleanup   Leave OsageFS mounted and running after the script finishes.
+  --skip_extract Skip tar extraction and reuse linux-\$LINUX_VERSION already in WORKDIR.
+  --reuse_tree   Reuse existing mount/store and extracted tree for faster reruns.
 USAGE
 }
 
@@ -30,6 +32,16 @@ while [[ ${1:-} != "" ]]; do
   case "$1" in
     --no_cleanup)
       DO_CLEANUP=0
+      shift
+      ;;
+    --skip_extract)
+      SKIP_EXTRACT=1
+      shift
+      ;;
+    --reuse_tree)
+      REUSE_TREE=1
+      DO_CLEANUP=0
+      SKIP_EXTRACT=1
       shift
       ;;
     -h|--help)
@@ -48,49 +60,45 @@ HOME_PREFIX_TRIMMED="${HOME_PREFIX_TRIMMED%/}"
 
 cleanup_mounts() {
   set +e
-  if mountpoint -q "$MOUNT_PATH"; then
-    fusermount -u "$MOUNT_PATH" 2>/dev/null || sudo fusermount -u "$MOUNT_PATH"
-  fi
-  rm -rf "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
+  MOUNT_PATH="$MOUNT_PATH" \
+    STORE_PATH="$STORE_PATH" \
+    LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
+    STATE_PATH="$STATE_PATH" \
+    LOG_FILE="$ROOT_DIR/osagefs.log" \
+    PERF_LOG_PATH="$PERF_LOG_PATH" \
+    "$RUN_CLEANUP" >/dev/null 2>&1 || true
   mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
 }
 
-cleanup_mounts
+if [[ $REUSE_TREE -eq 0 ]]; then
+  cleanup_mounts
+else
+  mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
+fi
 if [[ $DO_CLEANUP -eq 1 ]]; then
   trap cleanup_mounts EXIT
 fi
 
 mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
 
-require() {
-  if ! command -v "$1" >/dev/null; then
-    echo "Missing dependency: $1" >&2
-    exit 1
-  fi
-}
-
-require_path() {
-  if [[ ! -x "$1" ]]; then
-    echo "Missing dependency: $1" >&2
-    exit 1
-  fi
-}
-
-require curl
-require python3
-require pv
-require tar
-require xz
-require make
-require gcc
-require ld
-require bc
-require bison
-require flex
-require perl
-require rsync
-require cpio
-require_path /usr/bin/time
+osage_require_cmd curl
+osage_require_cmd python3
+osage_require_cmd pv
+osage_require_cmd tar
+osage_require_cmd xz
+osage_require_cmd make
+osage_require_cmd gcc
+osage_require_cmd ld
+osage_require_cmd bc
+osage_require_cmd bison
+osage_require_cmd flex
+osage_require_cmd perl
+osage_require_cmd rsync
+osage_require_cmd cpio
+osage_require_path /usr/bin/time
+if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+  osage_require_cmd umount
+fi
 
 latest_kernel_version() {
   python3 - "$@" <<'PY'
@@ -117,10 +125,7 @@ else
   echo "Using cached tarball $CACHE_TARBALL"
 fi
 
-if [[ ! -x "$OSAGE_BIN" ]]; then
-  echo "Building osagefs --release ..."
-  (cd "$ROOT_DIR" && cargo build --release)
-fi
+osage_ensure_release_binary "$OSAGE_BIN"
 
 echo "Starting OsageFS..."
 CMD=(
@@ -131,6 +136,7 @@ CMD=(
   --object-provider local
   --state-path "$STATE_PATH"
   --home-prefix "$HOME_PREFIX"
+  --metadata-poll-interval-ms 0
   --foreground
   "${EXTRA_FLAGS[@]}"
 )
@@ -155,9 +161,16 @@ fi
 mkdir -p "$WORKDIR"
 
 pushd "$WORKDIR" >/dev/null
-echo "Extracting $tarball (progress shown via pv)..."
-/usr/bin/time -f "extract elapsed %E" -o "$LOG_FILE" -a \
-  bash -c 'pv -ptebar "$1" | tar xJf -' bash "$CACHE_TARBALL"
+if [[ $SKIP_EXTRACT -eq 1 && -d "linux-$LINUX_VERSION" ]]; then
+  echo "Skipping extract: reusing $(pwd)/linux-$LINUX_VERSION"
+else
+  if [[ $SKIP_EXTRACT -eq 1 ]]; then
+    echo "--skip_extract requested but linux-$LINUX_VERSION not present; extracting once."
+  fi
+  echo "Extracting $tarball (progress shown via pv)..."
+  /usr/bin/time -f "extract elapsed %E" -o "$LOG_FILE" -a \
+    bash -c 'pv -ptebar "$1" | tar xJf -' bash "$CACHE_TARBALL"
+fi
 cd "linux-$LINUX_VERSION"
 /usr/bin/time -f "defconfig elapsed %E" -o "$LOG_FILE" -a make defconfig >/dev/null
 /usr/bin/time -f "build elapsed %E" -o "$LOG_FILE" -a make -j"$(nproc)"

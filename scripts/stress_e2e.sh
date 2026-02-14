@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
 
-ROOT_DIR=$(cd -- "$(dirname -- "$0")/.." && pwd)
-MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
-STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
-LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
-STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
-LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs.log}"
-PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
+source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
+osage_set_defaults
+
 PID_FILE="${PID_FILE:-/tmp/osagefs-stress.pid}"
 OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_osagefs.sh}"
 CLEANUP="$ROOT_DIR/scripts/cleanup.sh"

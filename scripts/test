@@ -1,1 +1,1 @@
- RUST_LOG=osagefs=trace,fuser=debug cargo run --release -- --mount-path /tmp/osagefs-mnt --store-path /tmp/osagefs-store   --state-path ~/.osagefs_state.bin --inline-threshold 1024 --pending-bytes 67108864 --home-prefix /home --object-provider local --foreground
+RUST_LOG=osagefs=trace,fuser=debug cargo run --release -- --mount-path /tmp/osagefs-mnt --store-path /tmp/osagefs-store --state-path ~/.osagefs/state/client_state.bin --inline-threshold 1024 --pending-bytes 67108864 --home-prefix /home --object-provider local --foreground
