@@ -15,6 +15,7 @@ pub enum JournalPayload {
     None,
     Inline(Vec<u8>),
     StageFile(StagedChunk),
+    StageChunks(Vec<StagedChunk>),
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +36,8 @@ pub struct JournalManager {
 }
 
 impl JournalManager {
-    pub fn new<P: AsRef<Path>>(store_root: P) -> Result<Self> {
-        let dir = store_root.as_ref().join("journal");
+    pub fn new<P: AsRef<Path>>(local_root: P) -> Result<Self> {
+        let dir = local_root.as_ref().join("journal");
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating journal dir {}", dir.display()))?;
         Ok(Self { dir })

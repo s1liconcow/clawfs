@@ -1,16 +1,16 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use log::info;
+use log::debug;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{deserialize_flex, write_flexbuffer};
 use crate::inode::{FileStorage, InodeRecord, InodeShard};
-use crate::segment::SegmentPointer;
 use crate::superblock::Superblock;
 
 const SUPERBLOCK_FILE: &str = "superblock.bin";
@@ -56,10 +56,15 @@ pub struct MetadataStore {
     cache: Mutex<HashMap<u64, CacheEntry>>,
     shards: Mutex<HashMap<u64, ShardEntry>>,
     last_delta_generation: Mutex<u64>,
+    log_storage_io: bool,
 }
 
 impl MetadataStore {
-    pub async fn open<P: AsRef<Path>>(store_root: P, shard_size: u64) -> Result<Self> {
+    pub async fn open<P: AsRef<Path>>(
+        store_root: P,
+        shard_size: u64,
+        log_storage_io: bool,
+    ) -> Result<Self> {
         let metadata_root = store_root.as_ref().join("metadata");
         let imap_dir = metadata_root.join("imaps");
         let delta_dir = metadata_root.join("imap_deltas");
@@ -75,9 +80,18 @@ impl MetadataStore {
             cache: Mutex::new(HashMap::new()),
             shards: Mutex::new(HashMap::new()),
             last_delta_generation: Mutex::new(0),
+            log_storage_io,
         };
         store.load_latest_imaps()?;
         Ok(store)
+    }
+
+    fn log_backing(&self, args: fmt::Arguments<'_>) {
+        if self.log_storage_io {
+            log::info!(target: "backing", "{}", args);
+        } else {
+            debug!(target: "backing", "{}", args);
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -106,12 +120,11 @@ impl MetadataStore {
             block: sb.clone(),
         };
         write_flexbuffer(&self.superblock_path, &stored)?;
-        info!(
-            target: "backing",
+        self.log_backing(format_args!(
             "synced backing file path={} type=superblock generation={}",
             self.superblock_path.display(),
             sb.generation
-        );
+        ));
         Ok(())
     }
 
@@ -248,14 +261,13 @@ impl MetadataStore {
             },
         );
         write_flexbuffer(&path, &stored)?;
-        info!(
-            target: "backing",
+        self.log_backing(format_args!(
             "synced backing file path={} type=imap shard={} generation={} entries={}",
             path.display(),
             shard.shard_id,
             generation,
             shard.inodes.len()
-        );
+        ));
         Ok(())
     }
 
@@ -278,13 +290,12 @@ impl MetadataStore {
             *guard = (*guard).max(generation);
         }
         write_flexbuffer(&path, &file)?;
-        info!(
-            target: "backing",
+        self.log_backing(format_args!(
             "synced backing file path={} type=delta generation={} records={}",
             path.display(),
             generation,
             records.len()
-        );
+        ));
         Ok(())
     }
 
@@ -436,18 +447,26 @@ impl MetadataStore {
         Ok(removed)
     }
 
-    pub fn segment_candidates(&self, max: usize) -> Result<Vec<(InodeRecord, SegmentPointer)>> {
+    pub fn segment_candidates(&self, max: usize) -> Result<Vec<InodeRecord>> {
         let mut candidates = Vec::new();
         let shards = self.shards.lock();
         for entry in shards.values() {
             for record in entry.shard.inodes.values() {
-                if let FileStorage::Segment(ptr) = &record.storage {
-                    candidates.push((record.clone(), ptr.clone()));
+                if matches!(
+                    record.storage,
+                    FileStorage::LegacySegment(_) | FileStorage::Segments(_)
+                ) {
+                    candidates.push(record.clone());
                 }
             }
         }
         drop(shards);
-        candidates.sort_by_key(|(_, ptr)| (ptr.generation, ptr.segment_id));
+        candidates.sort_by_key(|record| {
+            record
+                .segment_pointer()
+                .map(|ptr| (ptr.generation, ptr.segment_id))
+                .unwrap_or((u64::MAX, u64::MAX))
+        });
         if candidates.len() > max {
             candidates.truncate(max);
         }
@@ -557,8 +576,10 @@ fn parse_delta_filename(name: &str) -> Option<u64> {
 
 impl CacheEntry {
     fn new(record: InodeRecord) -> Self {
+        let mut normalized = record;
+        normalized.normalize_storage();
         Self {
-            record,
+            record: normalized,
             refreshed: Instant::now(),
         }
     }

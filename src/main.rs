@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::env;
 
 use osagefs::config::{Cli, Config};
 use osagefs::fs::OsageFs;
-use osagefs::inode::{FileStorage, InodeRecord, ROOT_INODE};
+use osagefs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use osagefs::journal::JournalManager;
 use osagefs::metadata::MetadataStore;
 use osagefs::perf::PerfLogger;
@@ -38,8 +38,11 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
-    let metadata =
-        Arc::new(runtime.block_on(MetadataStore::open(&config.store_path, config.shard_size))?);
+    let metadata = Arc::new(runtime.block_on(MetadataStore::open(
+        &config.store_path,
+        config.shard_size,
+        config.log_storage_io,
+    ))?);
     let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
         metadata.clone(),
         config.shard_size,
@@ -78,7 +81,7 @@ fn main() -> Result<()> {
     let journal = if config.disable_journal {
         None
     } else {
-        Some(Arc::new(JournalManager::new(&config.store_path)?))
+        Some(Arc::new(JournalManager::new(&config.local_cache_path)?))
     };
     let fs = OsageFs::new(
         config.clone(),
@@ -226,10 +229,20 @@ fn spawn_metadata_poller(
             match result {
                 Ok(Ok(records)) => {
                     for record in records {
-                        if let FileStorage::Segment(ptr) = record.storage {
-                            if let Err(err) = segs.prefetch_segment(&ptr) {
-                                warn!("segment prefetch failed: {err:?}");
+                        match record.storage {
+                            FileStorage::LegacySegment(ptr) => {
+                                if let Err(err) = segs.prefetch_segment(&ptr) {
+                                    warn!("segment prefetch failed: {err:?}");
+                                }
                             }
+                            FileStorage::Segments(extents) => {
+                                for extent in extents {
+                                    if let Err(err) = segs.prefetch_segment(&extent.pointer) {
+                                        warn!("segment prefetch failed: {err:?}");
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -298,7 +311,12 @@ fn spawn_cleanup_worker(
                 .unwrap_or_default();
                 let filtered: Vec<_> = candidates
                     .into_iter()
-                    .filter(|(_, ptr)| ptr.generation < cutoff_generation)
+                    .filter(|record| {
+                        record
+                            .segment_pointer()
+                            .map(|ptr| ptr.generation < cutoff_generation)
+                            .unwrap_or(false)
+                    })
                     .collect();
                 if filtered.len() >= 2
                     && superblock
@@ -337,18 +355,38 @@ async fn perform_segment_compaction(
     metadata: Arc<MetadataStore>,
     superblock: Arc<SuperblockManager>,
     segments: Arc<SegmentManager>,
-    candidates: Vec<(InodeRecord, SegmentPointer)>,
+    candidates: Vec<InodeRecord>,
 ) -> Result<()> {
     if candidates.len() < 2 {
         return Ok(());
     }
     let dataset = task::spawn_blocking({
         let segs = segments.clone();
-        move || -> Result<Vec<(InodeRecord, SegmentPointer, Vec<u8>)>> {
+        move || -> Result<Vec<(InodeRecord, Vec<SegmentPointer>, Vec<u8>)>> {
             let mut out = Vec::new();
-            for (record, ptr) in candidates {
-                let data = segs.read_pointer(&ptr)?;
-                out.push((record, ptr, data));
+            for record in candidates {
+                match record.storage.clone() {
+                    FileStorage::LegacySegment(ptr) => {
+                        let data = segs.read_pointer(&ptr)?;
+                        out.push((record, vec![ptr], data));
+                    }
+                    FileStorage::Segments(extents) => {
+                        let mut buffer = vec![0u8; record.size as usize];
+                        let mut pointers = Vec::new();
+                        for extent in extents {
+                            let chunk = segs.read_pointer(&extent.pointer)?;
+                            let start = extent.logical_offset as usize;
+                            let end = start + chunk.len();
+                            if end > buffer.len() {
+                                buffer.resize(end, 0);
+                            }
+                            buffer[start..end].copy_from_slice(&chunk);
+                            pointers.push(extent.pointer);
+                        }
+                        out.push((record, pointers, buffer));
+                    }
+                    FileStorage::Inline(_) => {}
+                }
             }
             Ok(out)
         }
@@ -375,18 +413,18 @@ async fn perform_segment_compaction(
             .map(|res| res.into_iter().collect())
     })
     .await??;
+    let mut segments_to_delete = HashSet::new();
     let result: Result<()> = async {
-        for (mut record, old_ptr, _) in dataset {
+        for (mut record, old_ptrs, _) in dataset {
             if let Some(new_ptr) = pointer_map.get(&record.inode) {
-                record.storage = FileStorage::Segment(new_ptr.clone());
+                record.storage =
+                    FileStorage::Segments(vec![SegmentExtent::new(0, new_ptr.clone())]);
                 metadata
                     .persist_inode(&record, generation, snapshot.shard_size)
                     .await?;
-                let segs = segments.clone();
-                task::spawn_blocking(move || {
-                    segs.delete_segment(old_ptr.generation, old_ptr.segment_id)
-                })
-                .await??;
+                for ptr in old_ptrs {
+                    segments_to_delete.insert((ptr.generation, ptr.segment_id));
+                }
             }
         }
         Ok(())
@@ -397,6 +435,10 @@ async fn perform_segment_compaction(
         return Err(err);
     }
     superblock.commit_generation(generation).await?;
+    for (generation, seg_id) in segments_to_delete {
+        let segs = segments.clone();
+        task::spawn_blocking(move || segs.delete_segment(generation, seg_id)).await??;
+    }
     Ok(())
 }
 

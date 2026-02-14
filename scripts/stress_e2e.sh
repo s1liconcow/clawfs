@@ -4,6 +4,7 @@ set -eEuo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "$0")/.." && pwd)
 MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
 STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs.log}"
 PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
@@ -72,18 +73,18 @@ cleanup() {
     fi
     rm -f "$PID_FILE"
   fi
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1
+  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 # Ensure clean slate unless user wants to keep existing mount/store
 if [[ -z "${SKIP_CLEANUP:-}" ]]; then
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1 || true
+  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1 || true
 fi
 
 mkdir -p "$ROOT_DIR"
 if [[ -z "${SKIP_OSAGE:-}" ]]; then
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" STATE_PATH="$STATE_PATH" "$OSAGE_BIN"
+  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$OSAGE_BIN"
   sleep 2
 else
   echo "SKIP_OSAGE set; assuming daemon already running and PID_FILE populated."

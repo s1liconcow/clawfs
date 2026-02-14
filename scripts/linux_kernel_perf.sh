@@ -8,11 +8,10 @@ OSAGE_BIN="$TARGET_DIR/osagefs"
 
 MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
 STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
-PENDING_BYTES="${PENDING_BYTES:-$((64*1024*1024))}"
-INLINE_THRESHOLD="${INLINE_THRESHOLD:-1024}"
 LINUX_VERSION="${LINUX_VERSION:-}"
 HOME_PREFIX="${HOME_PREFIX:-/home}"
 PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
@@ -52,8 +51,8 @@ cleanup_mounts() {
   if mountpoint -q "$MOUNT_PATH"; then
     fusermount -u "$MOUNT_PATH" 2>/dev/null || sudo fusermount -u "$MOUNT_PATH"
   fi
-  rm -rf "$MOUNT_PATH" "$STORE_PATH"
-  mkdir -p "$MOUNT_PATH" "$STORE_PATH"
+  rm -rf "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
+  mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
 }
 
 cleanup_mounts
@@ -72,6 +71,7 @@ require() {
 
 require curl
 require python3
+require pv
 
 latest_kernel_version() {
   python3 - "$@" <<'PY'
@@ -108,8 +108,7 @@ CMD=(
   "$OSAGE_BIN"
   --mount-path "$MOUNT_PATH"
   --store-path "$STORE_PATH"
-  --inline-threshold "$INLINE_THRESHOLD"
-  --pending-bytes "$PENDING_BYTES"
+  --local-cache-path "$LOCAL_CACHE_PATH"
   --object-provider local
   --state-path "$STATE_PATH"
   --home-prefix "$HOME_PREFIX"
@@ -137,7 +136,9 @@ fi
 mkdir -p "$WORKDIR"
 
 pushd "$WORKDIR" >/dev/null
-/usr/bin/time -f "extract elapsed %E" -o "$LOG_FILE" -a tar xf "$CACHE_TARBALL"
+echo "Extracting $tarball (progress shown via pv)..."
+/usr/bin/time -f "extract elapsed %E" -o "$LOG_FILE" -a \
+  bash -c 'pv -ptebar "$1" | tar xJf -' bash "$CACHE_TARBALL"
 cd "linux-$LINUX_VERSION"
 /usr/bin/time -f "defconfig elapsed %E" -o "$LOG_FILE" -a make defconfig >/dev/null
 /usr/bin/time -f "build elapsed %E" -o "$LOG_FILE" -a make -j"$(nproc)"

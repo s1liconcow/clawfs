@@ -3,6 +3,7 @@ set -euo pipefail
 
 MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
 STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
 LOG_FILE="${LOG_FILE:-$PWD/osagefs.log}"
 PERF_LOG_PATH="${PERF_LOG_PATH:-$PWD/osagefs-perf.jsonl}"
@@ -28,10 +29,12 @@ if is_mounted "$MOUNT_PATH"; then
   fi
 fi
 
-if [[ -d "$STORE_PATH" ]]; then
-  echo "Removing store dir $STORE_PATH ..."
-  rm -rf "$STORE_PATH"
-fi
+for dir in "$STORE_PATH" "$LOCAL_CACHE_PATH"; do
+  if [[ -d "$dir" ]]; then
+    echo "Removing store dir $dir ..."
+    rm -rf "$dir"
+  fi
+done
 
 if [[ -f "$STATE_PATH" ]]; then
   echo "Removing state file $STATE_PATH ..."

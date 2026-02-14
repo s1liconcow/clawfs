@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -7,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::info;
+use log::{debug, info, warn};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
@@ -50,6 +51,7 @@ pub struct SegmentManager {
     cache_limit: u64,
     cache_state: Mutex<SegmentCache>,
     stage_state: Mutex<StageState>,
+    log_storage_io: bool,
 }
 
 #[derive(Default)]
@@ -112,8 +114,8 @@ impl SegmentManager {
                 (store, segment_prefix(&config.object_prefix))
             }
         };
-        let stage_dir = config.store_path.join("segment_stage");
-        let cache_dir = config.store_path.join("segment_cache");
+        let stage_dir = config.local_cache_path.join("segment_stage");
+        let cache_dir = config.local_cache_path.join("segment_cache");
         fs::create_dir_all(&stage_dir)?;
         fs::create_dir_all(&cache_dir)?;
         Ok(Self {
@@ -125,7 +127,24 @@ impl SegmentManager {
             cache_limit: config.segment_cache_bytes,
             cache_state: Mutex::new(SegmentCache::default()),
             stage_state: Mutex::new(StageState::default()),
+            log_storage_io: config.log_storage_io,
         })
+    }
+
+    fn log_backing(&self, args: fmt::Arguments<'_>) {
+        if self.log_storage_io {
+            info!(target: "backing", "{}", args);
+        } else {
+            debug!(target: "backing", "{}", args);
+        }
+    }
+
+    fn log_cache(&self, args: fmt::Arguments<'_>) {
+        if self.log_storage_io {
+            info!(target: "cache", "{}", args);
+        } else {
+            debug!(target: "cache", "{}", args);
+        }
     }
 
     fn ensure_active_stage<'a>(&'a self, state: &'a mut StageState) -> Result<&'a mut ActiveStage> {
@@ -183,15 +202,14 @@ impl SegmentManager {
             },
             || format!("writing segment {}", object_path),
         )?;
-        info!(
-            target: "backing",
+        self.log_backing(format_args!(
             "synced backing file path={} type=segment generation={} segment_id={} entries={} bytes={}",
             object_path.to_string(),
             generation,
             segment_id,
             pointers.len(),
             total_bytes
-        );
+        ));
         Ok(pointers)
     }
 
@@ -221,9 +239,34 @@ impl SegmentManager {
         Ok(chunk)
     }
 
+    pub fn slice_staged_chunk(
+        &self,
+        chunk: &StagedChunk,
+        offset: u64,
+        len: u64,
+    ) -> Result<StagedChunk> {
+        anyhow::ensure!(offset <= chunk.len, "chunk slice offset beyond bounds");
+        anyhow::ensure!(offset + len <= chunk.len, "chunk slice exceeds length");
+        anyhow::ensure!(len > 0, "chunk slice length must be positive");
+        let mut state = self.stage_state.lock();
+        *state.ref_counts.entry(chunk.path.clone()).or_insert(0) += 1;
+        Ok(StagedChunk {
+            path: chunk.path.clone(),
+            offset: chunk.offset + offset,
+            len,
+        })
+    }
+
     pub fn rotate_stage_file(&self) {
         let mut state = self.stage_state.lock();
-        state.active = None;
+        if let Some(mut active) = state.active.take() {
+            if let Err(err) = active.sync() {
+                warn!(
+                    "failed to sync staged segment {}: {err:?}",
+                    active.path.display()
+                );
+            }
+        }
     }
 
     pub fn read_staged_chunk(&self, chunk: &StagedChunk) -> Result<Vec<u8>> {
@@ -280,7 +323,7 @@ impl SegmentManager {
         match delete_result {
             Ok(_) => {}
             Err(ObjectError::NotFound { .. }) => {
-                log::debug!("segment {} already removed", path);
+                debug!("segment {} already removed", path);
             }
             Err(err) => {
                 return Err(anyhow::Error::from(err))
@@ -330,6 +373,11 @@ impl SegmentManager {
         let mut cache = self.cache_state.lock();
         cache.entries.push_back((path.clone(), data.len() as u64));
         cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
+        self.log_cache(format_args!(
+            "synced local cache path={} bytes={}",
+            path.display(),
+            data.len()
+        ));
         while cache.total_bytes > self.cache_limit {
             if let Some((old_path, size)) = cache.entries.pop_front() {
                 cache.total_bytes = cache.total_bytes.saturating_sub(size);
@@ -386,9 +434,13 @@ impl ActiveStage {
         let offset = self.len;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
-        self.file.sync_data()?;
         self.len += data.len() as u64;
         Ok(offset)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -420,6 +472,7 @@ mod tests {
         Config {
             mount_path: root.join("mnt"),
             store_path: root.join("data"),
+            local_cache_path: root.join("cache"),
             inline_threshold: 1024,
             shard_size: 1024,
             inode_batch: 16,
@@ -446,6 +499,7 @@ mod tests {
             log_file: None,
             debug_log: false,
             imap_delta_batch: 32,
+            log_storage_io: false,
         }
     }
 

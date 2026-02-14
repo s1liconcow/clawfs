@@ -7,9 +7,8 @@ OSAGE_BIN="$TARGET_DIR/osagefs"
 
 MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-cache}"
 STATE_PATH="${STATE_PATH:-$HOME/.osagefs_state.bin}"
-PENDING_BYTES="${PENDING_BYTES:-$((64*1024*1024))}"
-INLINE_THRESHOLD="${INLINE_THRESHOLD:-1024}"
 HOME_PREFIX="${HOME_PREFIX:-/home}"
 OBJECT_PROVIDER="${OBJECT_PROVIDER:-local}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs.log}"
@@ -22,7 +21,7 @@ if [[ ! -x "$OSAGE_BIN" ]]; then
   (cd "$ROOT_DIR" && cargo build --release)
 fi
 
-mkdir -p "$MOUNT_PATH" "$STORE_PATH"
+mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
 
 CMD=(
   "$OSAGE_BIN"
@@ -30,9 +29,8 @@ CMD=(
   --disable-journal
   --mount-path "$MOUNT_PATH"
   --store-path "$STORE_PATH"
+  --local-cache-path "$LOCAL_CACHE_PATH"
   --state-path "$STATE_PATH"
-  --inline-threshold "$INLINE_THRESHOLD"
-  --pending-bytes "$PENDING_BYTES"
   --home-prefix "$HOME_PREFIX"
   --object-provider "$OBJECT_PROVIDER"
   --log-file "$LOG_FILE"

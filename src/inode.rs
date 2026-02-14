@@ -36,7 +36,15 @@ pub struct InodeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FileStorage {
     Inline(Vec<u8>),
-    Segment(SegmentPointer),
+    #[serde(rename = "Segment")]
+    LegacySegment(SegmentPointer),
+    Segments(Vec<SegmentExtent>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentExtent {
+    pub logical_offset: u64,
+    pub pointer: SegmentPointer,
 }
 
 impl InodeRecord {
@@ -180,7 +188,7 @@ impl InodeRecord {
         }
         match &self.storage {
             FileStorage::Inline(bytes) => Some(bytes),
-            FileStorage::Segment(_) => None,
+            _ => None,
         }
     }
 
@@ -203,9 +211,42 @@ impl InodeRecord {
 
     pub fn segment_pointer(&self) -> Option<&SegmentPointer> {
         match &self.storage {
-            FileStorage::Segment(ptr) => Some(ptr),
+            FileStorage::LegacySegment(ptr) => Some(ptr),
+            FileStorage::Segments(extents) => extents.first().map(|ext| &ext.pointer),
             _ => None,
         }
+    }
+
+    pub fn normalize_storage(&mut self) {
+        if let FileStorage::LegacySegment(ptr) = &self.storage {
+            self.storage = FileStorage::Segments(vec![SegmentExtent::new(0, ptr.clone())]);
+        }
+    }
+
+    pub fn segment_extents(&self) -> Option<&[SegmentExtent]> {
+        match &self.storage {
+            FileStorage::Segments(extents) => Some(extents),
+            _ => None,
+        }
+    }
+
+    pub fn segment_extents_mut(&mut self) -> Option<&mut Vec<SegmentExtent>> {
+        if matches!(self.storage, FileStorage::LegacySegment(_)) {
+            if let FileStorage::LegacySegment(ptr) =
+                std::mem::replace(&mut self.storage, FileStorage::Inline(Vec::new()))
+            {
+                self.storage = FileStorage::Segments(vec![SegmentExtent::new(0, ptr)]);
+            }
+        }
+        match &mut self.storage {
+            FileStorage::Segments(extents) => Some(extents),
+            _ => None,
+        }
+    }
+
+    pub fn set_segment_extents(&mut self, mut extents: Vec<SegmentExtent>) {
+        extents.sort_by_key(|ext| ext.logical_offset);
+        self.storage = FileStorage::Segments(extents);
     }
 
     pub fn inc_links(&mut self) {
@@ -214,6 +255,15 @@ impl InodeRecord {
 
     pub fn dec_links(&mut self) {
         self.link_count = self.link_count.saturating_sub(1);
+    }
+}
+
+impl SegmentExtent {
+    pub fn new(logical_offset: u64, pointer: SegmentPointer) -> Self {
+        Self {
+            logical_offset,
+            pointer,
+        }
     }
 }
 
@@ -235,7 +285,9 @@ impl InodeShard {
         if matches!(record.kind, InodeKind::Tombstone) {
             self.inodes.remove(&record.inode);
         } else {
-            self.inodes.insert(record.inode, record);
+            let mut normalized = record;
+            normalized.normalize_storage();
+            self.inodes.insert(normalized.inode, normalized);
         }
     }
 }

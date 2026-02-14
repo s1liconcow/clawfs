@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process;
@@ -17,7 +18,7 @@ use time::OffsetDateTime;
 use tokio::runtime::Handle;
 
 use crate::config::Config;
-use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
+use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExtent};
 use crate::journal::{JournalEntry, JournalManager, JournalPayload};
 use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
@@ -28,6 +29,9 @@ use log::{debug, error, info};
 use serde_json::json;
 
 const TTL: Duration = Duration::from_secs(1);
+const STATFS_BLOCK_SIZE: u32 = 4096;
+const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
+const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
 
 #[cfg(target_os = "linux")]
 const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
@@ -107,7 +111,7 @@ impl OsageFs {
                 JournalPayload::Inline(bytes) => Some(PendingData::Inline(bytes)),
                 JournalPayload::StageFile(chunk) => {
                     if chunk.path.exists() {
-                        Some(PendingData::Staged(chunk))
+                        Some(PendingData::Staged(PendingSegments::from_chunk(chunk)))
                     } else {
                         log::warn!(
                             "staged payload {} missing for inode {}",
@@ -115,6 +119,29 @@ impl OsageFs {
                             inode
                         );
                         None
+                    }
+                }
+                JournalPayload::StageChunks(chunks) => {
+                    let mut present = Vec::new();
+                    for chunk in chunks {
+                        if chunk.path.exists() {
+                            present.push(chunk);
+                        } else {
+                            log::warn!(
+                                "staged payload {} missing for inode {}",
+                                chunk.path.display(),
+                                inode
+                            );
+                        }
+                    }
+                    if present.is_empty() {
+                        None
+                    } else {
+                        let total = present.iter().map(|c| c.len).sum();
+                        Some(PendingData::Staged(PendingSegments {
+                            chunks: present,
+                            total_len: total,
+                        }))
                     }
                 }
             };
@@ -229,7 +256,22 @@ impl OsageFs {
         }
         match &record.storage {
             FileStorage::Inline(bytes) => Ok(bytes.clone()),
-            FileStorage::Segment(ptr) => self.segments.read_pointer(ptr),
+            FileStorage::LegacySegment(ptr) => self.segments.read_pointer(ptr),
+            FileStorage::Segments(extents) => {
+                let mut buffer = vec![0u8; record.size as usize];
+                let mut ordered = extents.to_vec();
+                ordered.sort_by_key(|ext| ext.logical_offset);
+                for extent in ordered {
+                    let start = extent.logical_offset as usize;
+                    let bytes = self.segments.read_pointer(&extent.pointer)?;
+                    let end = start + bytes.len();
+                    if end > buffer.len() {
+                        buffer.resize(end, 0);
+                    }
+                    buffer[start..end].copy_from_slice(&bytes);
+                }
+                Ok(buffer)
+            }
         }
     }
 
@@ -294,27 +336,36 @@ impl OsageFs {
     fn snapshot_journal_payload(&self, data: &PendingData) -> JournalPayload {
         match data {
             PendingData::Inline(bytes) => JournalPayload::Inline(bytes.clone()),
-            PendingData::Staged(chunk) => JournalPayload::StageFile(chunk.clone()),
+            PendingData::Staged(segments) => JournalPayload::StageChunks(segments.chunks.clone()),
         }
     }
 
     fn read_pending_bytes(&self, data: &PendingData) -> Result<Vec<u8>> {
         match data {
             PendingData::Inline(bytes) => Ok(bytes.clone()),
-            PendingData::Staged(chunk) => self
-                .segments
-                .read_staged_chunk(chunk)
-                .map_err(|err| anyhow!("pending read failed: {err:?}")),
+            PendingData::Staged(segments) => {
+                let mut buffer = Vec::with_capacity(segments.total_len as usize);
+                for chunk in &segments.chunks {
+                    let bytes = self
+                        .segments
+                        .read_staged_chunk(chunk)
+                        .map_err(|err| anyhow!("pending read failed: {err:?}"))?;
+                    buffer.extend_from_slice(&bytes);
+                }
+                Ok(buffer)
+            }
         }
     }
 
     fn release_pending_data(&self, data: PendingData) {
-        if let PendingData::Staged(chunk) = data {
-            if let Err(err) = self.segments.release_staged_chunk(&chunk) {
-                log::warn!(
-                    "failed to release staged payload {}: {err:?}",
-                    chunk.path.display()
-                );
+        if let PendingData::Staged(segments) = data {
+            for chunk in segments.chunks {
+                if let Err(err) = self.segments.release_staged_chunk(&chunk) {
+                    log::warn!(
+                        "failed to release staged payload {}: {err:?}",
+                        chunk.path.display()
+                    );
+                }
             }
         }
     }
@@ -403,40 +454,77 @@ impl OsageFs {
         Ok(false)
     }
 
-    fn stage_file(&self, mut record: InodeRecord, data: Vec<u8>) -> std::result::Result<(), i32> {
+    fn stage_file(
+        &self,
+        mut record: InodeRecord,
+        data: Vec<u8>,
+        ctx: Option<StageWriteContext>,
+    ) -> std::result::Result<(), i32> {
         let start = Instant::now();
         record.size = data.len() as u64;
         record.update_times();
         let inode = record.inode;
         let new_len = data.len() as u64;
-        let pending_data = if new_len <= self.config.inline_threshold as u64 {
+        let append_range = ctx.and_then(|context| {
+            if context.prev_size <= context.write_offset && context.prev_size <= new_len {
+                Some(context.prev_size as usize..data.len())
+            } else {
+                None
+            }
+        });
+        let prev_entry = {
+            let mut map = self.pending_inodes.lock();
+            map.remove(&inode)
+        };
+        let mut prev_data = prev_entry.and_then(|entry| entry.data);
+        let prev_len = prev_data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let inline_cap = self.config.inline_threshold as u64;
+        let pending_data = if new_len <= inline_cap {
+            if let Some(old) = prev_data.take() {
+                self.release_pending_data(old);
+            }
             PendingData::Inline(data)
         } else {
-            let chunk = self.segments.stage_payload(&data).map_err(|_| EIO)?;
-            PendingData::Staged(chunk)
+            let mut segments = match prev_data.take() {
+                Some(PendingData::Staged(segs)) => segs,
+                Some(PendingData::Inline(bytes)) => {
+                    let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
+                    PendingSegments::from_chunk(chunk)
+                }
+                None => PendingSegments::new(),
+            };
+            if segments.total_len == 0 {
+                let chunk = self.segments.stage_payload(&data).map_err(|_| EIO)?;
+                PendingData::Staged(PendingSegments::from_chunk(chunk))
+            } else if let Some(range) = append_range {
+                if range.start < range.end {
+                    let chunk = self.segments.stage_payload(&data[range]).map_err(|_| EIO)?;
+                    segments.append(chunk);
+                }
+                PendingData::Staged(segments)
+            } else {
+                let chunk = self.segments.stage_payload(&data).map_err(|_| EIO)?;
+                let old = segments;
+                let pending = PendingData::Staged(PendingSegments::from_chunk(chunk));
+                self.release_pending_data(PendingData::Staged(old));
+                pending
+            }
         };
         let journal_payload = if self.journal.is_some() {
             Some(self.snapshot_journal_payload(&pending_data))
         } else {
             None
         };
-        let mut map = self.pending_inodes.lock();
-        let prev_len = map
-            .get(&inode)
-            .and_then(|p| p.data.as_ref().map(|d| d.len()))
-            .unwrap_or(0);
-        if let Some(old) = map.insert(
-            inode,
-            PendingEntry {
-                record: record.clone(),
-                data: Some(pending_data),
-            },
-        ) {
-            if let Some(data) = old.data {
-                self.release_pending_data(data);
-            }
+        {
+            let mut map = self.pending_inodes.lock();
+            map.insert(
+                inode,
+                PendingEntry {
+                    record: record.clone(),
+                    data: Some(pending_data),
+                },
+            );
         }
-        drop(map);
 
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
@@ -455,6 +543,7 @@ impl OsageFs {
             };
             journal.persist_entry(&journal_entry).map_err(|_| EIO)?;
         }
+        let path = record.path.clone();
         self.log_perf(
             "stage_file",
             start.elapsed(),
@@ -463,6 +552,7 @@ impl OsageFs {
                 "bytes": new_len,
                 "pending_total": pending_total,
                 "triggered_flush": should_flush,
+                "filename": path,
             }),
         );
         let pid = process::id();
@@ -470,6 +560,235 @@ impl OsageFs {
         debug!(
             "stage_file pid={} tid={} inode={} path={} bytes={} pending={} flush_triggered={}",
             pid, tid, inode, record.path, new_len, pending_total, should_flush
+        );
+        if should_flush {
+            self.flush_pending()?;
+        } else {
+            self.flush_if_interval_elapsed()?;
+        }
+        Ok(())
+    }
+
+    fn append_file(&self, mut record: InodeRecord, data: &[u8]) -> std::result::Result<(), i32> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let inode = record.inode;
+        record.update_times();
+        let current_size = record.size;
+        let new_len = current_size.saturating_add(data.len() as u64);
+        let inline_cap = self.config.inline_threshold as u64;
+        if new_len > inline_cap {
+            return self.write_large_segments(record, current_size, data);
+        }
+        let mut needs_existing = false;
+        {
+            let mut map = self.pending_inodes.lock();
+            let entry = map.entry(inode).or_insert_with(|| PendingEntry {
+                record: record.clone(),
+                data: None,
+            });
+            if entry.data.is_none() {
+                entry.data = Some(PendingData::Inline(Vec::new()));
+                needs_existing = record.size > 0;
+            }
+        }
+        if needs_existing {
+            let existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            let mut map = self.pending_inodes.lock();
+            if let Some(entry) = map.get_mut(&inode) {
+                entry.data = Some(PendingData::Inline(existing));
+            }
+        }
+        let appended = data.len() as u64;
+        let (prev_len, new_len, journal_payload) = {
+            let mut map = self.pending_inodes.lock();
+            let entry = map.get_mut(&inode).expect("pending entry must exist");
+            entry.record = record.clone();
+            let slot = entry
+                .data
+                .as_mut()
+                .expect("pending data must exist before append");
+            let prev_len = slot.len();
+            match slot {
+                PendingData::Inline(buf) => {
+                    if buf.len() as u64 != record.size {
+                        buf.resize(record.size as usize, 0);
+                    }
+                    buf.extend_from_slice(data);
+                    if buf.len() as u64 > inline_cap {
+                        let bytes = std::mem::take(buf);
+                        let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
+                        *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
+                    }
+                }
+                PendingData::Staged(_) => unreachable!("staged append handled elsewhere"),
+            }
+            let current_len = slot.len();
+            entry.record.size = current_len;
+            record.size = current_len;
+            let payload = self
+                .journal
+                .as_ref()
+                .map(|_| self.snapshot_journal_payload(slot));
+            (prev_len, current_len, payload)
+        };
+        let delta = new_len as i64 - prev_len as i64;
+        let mut total = self.pending_bytes.lock();
+        if delta >= 0 {
+            *total = total.saturating_add(delta as u64);
+        } else {
+            *total = total.saturating_sub((-delta) as u64);
+        }
+        let pending_total = *total;
+        let should_flush = pending_total >= self.config.pending_bytes;
+        drop(total);
+        if let (Some(journal), Some(payload)) = (&self.journal, journal_payload) {
+            let entry = JournalEntry {
+                record: record.clone(),
+                payload,
+            };
+            journal.persist_entry(&entry).map_err(|_| EIO)?;
+        }
+        let path = record.path.clone();
+        self.log_perf(
+            "stage_file",
+            start.elapsed(),
+            json!({
+                "inode": inode,
+                "bytes": new_len,
+                "appended_bytes": appended,
+                "pending_total": pending_total,
+                "triggered_flush": should_flush,
+                "filename": path,
+            }),
+        );
+        let pid = process::id();
+        let tid = format!("{:?}", thread::current().id());
+        debug!(
+            "append_file pid={} tid={} inode={} path={} appended={} new_size={} pending={} flush_triggered={}",
+            pid, tid, inode, record.path, appended, new_len, pending_total, should_flush
+        );
+        if should_flush {
+            self.flush_pending()?;
+        } else {
+            self.flush_if_interval_elapsed()?;
+        }
+        Ok(())
+    }
+
+    fn write_large_segments(
+        &self,
+        mut record: InodeRecord,
+        offset: u64,
+        data: &[u8],
+    ) -> std::result::Result<(), i32> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let inode = record.inode;
+        record.update_times();
+        let prev_entry = {
+            let mut map = self.pending_inodes.lock();
+            map.remove(&inode)
+        };
+        let mut entry = prev_entry.unwrap_or(PendingEntry {
+            record: record.clone(),
+            data: None,
+        });
+        entry.record = record.clone();
+        let mut data_state = entry.data.take();
+        if data_state.is_none() {
+            let existing = self.read_file_bytes(&entry.record).map_err(|_| EIO)?;
+            if existing.is_empty() {
+                data_state = Some(PendingData::Staged(PendingSegments::new()));
+            } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
+                data_state = Some(PendingData::Inline(existing));
+            } else {
+                let chunk = self.segments.stage_payload(&existing).map_err(|_| EIO)?;
+                data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+            }
+        }
+        let mut segments = match data_state {
+            Some(PendingData::Staged(segs)) => segs,
+            Some(PendingData::Inline(bytes)) => {
+                let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
+                PendingSegments::from_chunk(chunk)
+            }
+            None => PendingSegments::new(),
+        };
+        let prev_len = segments.total_len;
+        if let Err(_) = segments.ensure_offset(&self.segments, offset) {
+            self.release_pending_data(PendingData::Staged(segments));
+            return Err(EIO);
+        }
+        let staged_chunk = self.segments.stage_payload(data).map_err(|_| EIO)?;
+        if let Err(_) = segments.write_range(&self.segments, offset, staged_chunk) {
+            self.release_pending_data(PendingData::Staged(segments));
+            return Err(EIO);
+        }
+        let new_len = segments.total_len;
+        entry.record.size = new_len;
+        record.size = new_len;
+        entry.data = Some(PendingData::Staged(segments));
+        let journal_payload = if self.journal.is_some() {
+            entry
+                .data
+                .as_ref()
+                .map(|data| self.snapshot_journal_payload(data))
+        } else {
+            None
+        };
+        {
+            let mut map = self.pending_inodes.lock();
+            map.insert(inode, entry);
+        }
+        let delta = new_len as i64 - prev_len as i64;
+        let mut total = self.pending_bytes.lock();
+        if delta >= 0 {
+            *total = total.saturating_add(delta as u64);
+        } else {
+            *total = total.saturating_sub((-delta) as u64);
+        }
+        let pending_total = *total;
+        let should_flush = pending_total >= self.config.pending_bytes;
+        drop(total);
+        if let (Some(journal), Some(payload)) = (&self.journal, journal_payload) {
+            let journal_entry = JournalEntry {
+                record: record.clone(),
+                payload,
+            };
+            journal.persist_entry(&journal_entry).map_err(|_| EIO)?;
+        }
+        let path = record.path.clone();
+        self.log_perf(
+            "stage_segments",
+            start.elapsed(),
+            json!({
+                "inode": inode,
+                "bytes": new_len,
+                "write_offset": offset,
+                "write_len": data.len(),
+                "pending_total": pending_total,
+                "triggered_flush": should_flush,
+                "filename": path,
+            }),
+        );
+        let pid = process::id();
+        let tid = format!("{:?}", thread::current().id());
+        debug!(
+            "stage_segments pid={} tid={} inode={} path={} offset={} len={} new_size={} pending={} flush_triggered={}",
+            pid,
+            tid,
+            inode,
+            record.path,
+            offset,
+            data.len(),
+            new_len,
+            pending_total,
+            should_flush
         );
         if should_flush {
             self.flush_pending()?;
@@ -545,17 +864,21 @@ impl OsageFs {
                             records.push(record);
                         }
                     }
-                    Some(PendingData::Staged(chunk)) => {
+                    Some(PendingData::Staged(segments)) => {
                         let mut record = pending_entry.record;
-                        let data_bytes =
-                            self.segments.read_staged_chunk(&chunk).map_err(|_| EIO)?;
-                        let data_len = data_bytes.len() as u64;
-                        if let Err(err) = self.segments.release_staged_chunk(&chunk) {
-                            log::warn!(
-                                "failed to release staged payload {}: {err:?}",
-                                chunk.path.display()
-                            );
+                        let mut data_bytes = Vec::with_capacity(record.size as usize);
+                        for chunk in segments.chunks {
+                            let chunk_bytes =
+                                self.segments.read_staged_chunk(&chunk).map_err(|_| EIO)?;
+                            data_bytes.extend_from_slice(&chunk_bytes);
+                            if let Err(err) = self.segments.release_staged_chunk(&chunk) {
+                                log::warn!(
+                                    "failed to release staged payload {}: {err:?}",
+                                    chunk.path.display()
+                                );
+                            }
                         }
+                        let data_len = data_bytes.len() as u64;
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
                         record.size = data_len;
                         segment_entries.push(SegmentEntry {
@@ -592,7 +915,8 @@ impl OsageFs {
             for record in records.iter_mut() {
                 if record.size > self.config.inline_threshold as u64 {
                     if let Some(ptr) = pointer_map.get(&record.inode) {
-                        record.storage = FileStorage::Segment(ptr.clone());
+                        record.storage =
+                            FileStorage::Segments(vec![SegmentExtent::new(0, ptr.clone())]);
                     } else {
                         return Err(EIO);
                     }
@@ -760,7 +1084,7 @@ impl Filesystem for OsageFs {
             }
             record.update_times();
             let attr = Self::record_attr(&record);
-            self.stage_file(record, data)?;
+            self.stage_file(record, data, None)?;
             Ok(attr)
         })();
         match res {
@@ -1044,6 +1368,20 @@ impl Filesystem for OsageFs {
             if record.is_dir() {
                 return Err(EISDIR);
             }
+            let prev_size = record.size;
+            let write_end = (offset as u64).saturating_add(data.len() as u64);
+            if offset as u64 == prev_size {
+                if write_end <= self.config.inline_threshold as u64 {
+                    self.append_file(record, data)?;
+                } else {
+                    self.write_large_segments(record, offset as u64, data)?;
+                }
+                return Ok(data.len() as u32);
+            }
+            if write_end > self.config.inline_threshold as u64 {
+                self.write_large_segments(record, offset as u64, data)?;
+                return Ok(data.len() as u32);
+            }
             let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
             let offset = offset as usize;
             if offset > existing.len() {
@@ -1054,7 +1392,11 @@ impl Filesystem for OsageFs {
             }
             existing[offset..offset + data.len()].copy_from_slice(data);
             record.update_times();
-            self.stage_file(record, existing)?;
+            let ctx = StageWriteContext {
+                prev_size,
+                write_offset: offset as u64,
+            };
+            self.stage_file(record, existing, Some(ctx))?;
             Ok(data.len() as u32)
         })();
         match res {
@@ -1239,7 +1581,16 @@ impl Filesystem for OsageFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        reply.statfs(1_000_000, 500_000, 500_000, 1_000_000, 0, 4096, 255, 0);
+        reply.statfs(
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_BLOCKS,
+            STATFS_FILES,
+            STATFS_FILES,
+            STATFS_BLOCK_SIZE,
+            255,
+            STATFS_BLOCK_SIZE,
+        );
     }
 
     fn flush(
@@ -1333,16 +1684,129 @@ struct PendingEntry {
     data: Option<PendingData>,
 }
 
+#[derive(Clone, Copy)]
+struct StageWriteContext {
+    prev_size: u64,
+    write_offset: u64,
+}
+
 enum PendingData {
     Inline(Vec<u8>),
-    Staged(StagedChunk),
+    Staged(PendingSegments),
+}
+
+#[derive(Clone)]
+struct PendingSegments {
+    chunks: Vec<StagedChunk>,
+    total_len: u64,
+}
+
+impl PendingSegments {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            total_len: 0,
+        }
+    }
+
+    fn from_chunk(chunk: StagedChunk) -> Self {
+        let mut segments = Self::new();
+        segments.append(chunk);
+        segments
+    }
+
+    fn append(&mut self, chunk: StagedChunk) {
+        if chunk.len == 0 {
+            return;
+        }
+        self.total_len = self.total_len.saturating_add(chunk.len);
+        self.chunks.push(chunk);
+    }
+
+    fn ensure_offset(&mut self, manager: &SegmentManager, target: u64) -> Result<()> {
+        if target <= self.total_len {
+            return Ok(());
+        }
+        let gap = target - self.total_len;
+        if gap == 0 {
+            return Ok(());
+        }
+        let gap_len = usize::try_from(gap).map_err(|_| anyhow!("gap too large"))?;
+        let zeros = vec![0u8; gap_len];
+        let chunk = manager
+            .stage_payload(&zeros)
+            .map_err(|_| anyhow!("stage gap"))?;
+        self.append(chunk);
+        Ok(())
+    }
+
+    fn write_range(
+        &mut self,
+        manager: &SegmentManager,
+        offset: u64,
+        chunk: StagedChunk,
+    ) -> Result<()> {
+        if chunk.len == 0 {
+            return Ok(());
+        }
+        let write_end = offset.saturating_add(chunk.len);
+        let mut cursor = 0u64;
+        let mut pending_chunk = Some(chunk);
+        let mut result = Vec::with_capacity(self.chunks.len() + 1);
+        for existing in self.chunks.drain(..) {
+            let chunk_len = existing.len;
+            let chunk_start = cursor;
+            let chunk_end = chunk_start + chunk_len;
+            if chunk_end <= offset || chunk_start >= write_end {
+                if chunk_start >= write_end {
+                    if let Some(new_chunk) = pending_chunk.take() {
+                        result.push(new_chunk);
+                    }
+                }
+                result.push(existing);
+            } else {
+                if chunk_start < offset {
+                    let left_len = offset - chunk_start;
+                    if left_len > 0 {
+                        let left = manager
+                            .slice_staged_chunk(&existing, 0, left_len)
+                            .map_err(|_| anyhow!("slice left"))?;
+                        result.push(left);
+                    }
+                }
+                if let Some(new_chunk) = pending_chunk.take() {
+                    result.push(new_chunk);
+                }
+                if chunk_end > write_end {
+                    let right_offset = write_end - chunk_start;
+                    let right_len = chunk_end - write_end;
+                    if right_len > 0 {
+                        let right = manager
+                            .slice_staged_chunk(&existing, right_offset, right_len)
+                            .map_err(|_| anyhow!("slice right"))?;
+                        result.push(right);
+                    }
+                }
+                manager
+                    .release_staged_chunk(&existing)
+                    .map_err(|_| anyhow!("release chunk"))?;
+            }
+            cursor = chunk_end;
+        }
+        if let Some(new_chunk) = pending_chunk.take() {
+            result.push(new_chunk);
+        }
+        self.chunks = result;
+        self.total_len = self.total_len.max(write_end);
+        Ok(())
+    }
 }
 
 impl PendingData {
     fn len(&self) -> u64 {
         match self {
             PendingData::Inline(bytes) => bytes.len() as u64,
-            PendingData::Staged(chunk) => chunk.len,
+            PendingData::Staged(segments) => segments.total_len,
         }
     }
 }
@@ -1350,6 +1814,7 @@ impl PendingData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1366,11 +1831,23 @@ mod tests {
 
     impl TestHarness {
         fn new(root: &Path, state_name: &str, pending_bytes: u64) -> Self {
-            let config = test_config(root, state_name, pending_bytes);
+            Self::with_config(root, state_name, pending_bytes, |_| {})
+        }
+
+        fn with_config<F>(root: &Path, state_name: &str, pending_bytes: u64, tweak: F) -> Self
+        where
+            F: FnOnce(&mut Config),
+        {
+            let mut config = test_config(root, state_name, pending_bytes);
+            tweak(&mut config);
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let metadata = Arc::new(
                 runtime
-                    .block_on(MetadataStore::open(&config.store_path, config.shard_size))
+                    .block_on(MetadataStore::open(
+                        &config.store_path,
+                        config.shard_size,
+                        config.log_storage_io,
+                    ))
                     .unwrap(),
             );
             let superblock = Arc::new(
@@ -1384,8 +1861,14 @@ mod tests {
             ensure_root_for_tests(&runtime, metadata.clone(), superblock.clone(), &config);
             let segments =
                 Arc::new(SegmentManager::new(&config, runtime.handle().clone()).unwrap());
-            let journal = Some(Arc::new(JournalManager::new(&config.store_path).unwrap()));
             let client_state = Arc::new(ClientStateManager::load(&config.state_path).unwrap());
+            let journal = if config.disable_journal {
+                None
+            } else {
+                Some(Arc::new(
+                    JournalManager::new(&config.local_cache_path).unwrap(),
+                ))
+            };
             let fs = OsageFs::new(
                 config.clone(),
                 metadata.clone(),
@@ -1409,6 +1892,7 @@ mod tests {
         Config {
             mount_path: root.join("mnt"),
             store_path: root.join("store"),
+            local_cache_path: root.join("cache"),
             inline_threshold: 512,
             shard_size: 64,
             inode_batch: 8,
@@ -1435,6 +1919,7 @@ mod tests {
             log_file: None,
             debug_log: false,
             imap_delta_batch: 32,
+            log_storage_io: false,
         }
     }
 
@@ -1490,13 +1975,13 @@ mod tests {
         }
         bytes[offset..offset + payload.len()].copy_from_slice(payload);
         record.update_times();
-        fs.stage_file(record, bytes).unwrap();
+        fs.stage_file(record, bytes, None).unwrap();
     }
 
     fn stage_named_file(harness: &TestHarness, name: &str, data: Vec<u8>) -> u64 {
         let inode = harness.fs.allocate_inode_id().unwrap();
         let record = make_file(inode, name);
-        harness.fs.stage_file(record, data).unwrap();
+        harness.fs.stage_file(record, data, None).unwrap();
         let mut root = harness.fs.load_inode(ROOT_INODE).unwrap();
         harness
             .fs
@@ -1544,13 +2029,16 @@ mod tests {
         let record_inline = make_file(inode_inline, "foo.txt");
         harness
             .fs
-            .stage_file(record_inline, b"hello".to_vec())
+            .stage_file(record_inline, b"hello".to_vec(), None)
             .unwrap();
 
         let inode_seg = harness.fs.allocate_inode_id().unwrap();
         let record_seg = make_file(inode_seg, "bar.bin");
         let data = vec![7u8; harness.config.inline_threshold + 128];
-        harness.fs.stage_file(record_seg, data.clone()).unwrap();
+        harness
+            .fs
+            .stage_file(record_seg, data.clone(), None)
+            .unwrap();
         harness.fs.flush_pending().unwrap();
 
         let stored_inline = harness
@@ -1569,7 +2057,7 @@ mod tests {
             .unwrap()
             .unwrap();
         match stored_seg.storage {
-            FileStorage::Segment(_) => {
+            FileStorage::Segments(_) => {
                 let roundtrip = harness.fs.read_file_bytes(&stored_seg).unwrap();
                 assert_eq!(roundtrip, data);
             }
@@ -1585,7 +2073,10 @@ mod tests {
             let harness = TestHarness::new(dir.path(), "client_one.bin", 8 * 1024 * 1024);
             let inode = harness.fs.allocate_inode_id().unwrap();
             let record = make_file(inode, "client1.txt");
-            harness.fs.stage_file(record, b"alpha".to_vec()).unwrap();
+            harness
+                .fs
+                .stage_file(record, b"alpha".to_vec(), None)
+                .unwrap();
             harness.fs.flush_pending().unwrap();
             inode
         };
@@ -1594,7 +2085,10 @@ mod tests {
             let harness = TestHarness::new(dir.path(), "client_two.bin", 8 * 1024 * 1024);
             let inode = harness.fs.allocate_inode_id().unwrap();
             let record = make_file(inode, "client2.txt");
-            harness.fs.stage_file(record, b"beta".to_vec()).unwrap();
+            harness
+                .fs
+                .stage_file(record, b"beta".to_vec(), None)
+                .unwrap();
             harness.fs.flush_pending().unwrap();
             inode
         };
@@ -1619,6 +2113,113 @@ mod tests {
     }
 
     #[test]
+    fn staged_extents_handle_random_writes() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "random.bin", 64 * 1024 * 1024);
+        let inode = stage_named_file(&harness, "random.dat", Vec::new());
+        let patterns: Vec<(usize, Vec<u8>)> = vec![
+            (0, vec![1u8; 512 * 1024]),
+            (256 * 1024, vec![2u8; 256 * 1024]),
+            (768 * 1024, vec![3u8; 192 * 1024]),
+            (512 * 1024, vec![4u8; 128 * 1024]),
+            (1_200_000, vec![5u8; 400 * 1024]),
+        ];
+        let total_len = patterns
+            .iter()
+            .map(|(offset, bytes)| offset + bytes.len())
+            .max()
+            .unwrap();
+        let mut expected = vec![0u8; total_len];
+        for (offset, payload) in &patterns {
+            expected[*offset..*offset + payload.len()].copy_from_slice(payload);
+            let record = harness.fs.load_inode(inode).unwrap();
+            harness
+                .fs
+                .write_large_segments(record, *offset as u64, payload)
+                .unwrap();
+        }
+        harness.fs.flush_pending().unwrap();
+        let stored = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(inode))
+            .unwrap()
+            .unwrap();
+        let bytes = harness.fs.read_file_bytes(&stored).unwrap();
+        assert_eq!(&bytes[..total_len], &expected[..]);
+    }
+
+    #[test]
+    fn write_path_meets_perf_target() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "throughput.bin", 256 * 1024 * 1024, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
+        let inode = stage_named_file(&harness, "throughput.dat", Vec::new());
+        let chunk_size = 256 * 1024;
+        let iterations = 80;
+        let total_bytes = chunk_size * iterations;
+        let payload = vec![0xAB; chunk_size];
+        let start = Instant::now();
+        for i in 0..iterations {
+            let offset = (i * chunk_size) as u64;
+            let record = harness.fs.load_inode(inode).unwrap();
+            harness
+                .fs
+                .write_large_segments(record, offset, &payload)
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64();
+        assert!(secs > 0.0, "elapsed time too small for measurement");
+        let throughput = (total_bytes as f64 / (1024.0 * 1024.0)) / secs;
+        assert!(
+            throughput >= 10.0,
+            "throughput {:.2} MiB/s below 10 MiB/s in {:?}",
+            throughput,
+            elapsed
+        );
+    }
+
+    #[test]
+    fn untar_style_perf_mixture() {
+        if env::var("OSAGEFS_RUN_PERF").is_err() {
+            eprintln!("skipping untar_style_perf_mixture; set OSAGEFS_RUN_PERF=1 to enable");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(dir.path(), "untar.bin", 256 * 1024 * 1024, |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+        });
+        let mut sizes = Vec::new();
+        sizes.extend(std::iter::repeat(4 * 1024).take(2000));
+        sizes.extend(std::iter::repeat(64 * 1024).take(512));
+        sizes.extend(std::iter::repeat(512 * 1024).take(64));
+        let mut total_bytes = 0usize;
+        let start = Instant::now();
+        for (idx, size) in sizes.into_iter().enumerate() {
+            let inode = harness.fs.allocate_inode_id().unwrap();
+            let record = make_file(inode, &format!("untar_{idx}"));
+            let payload = vec![(idx & 0xff) as u8; size];
+            harness.fs.stage_file(record, payload, None).unwrap();
+            total_bytes += size;
+        }
+        harness.fs.flush_pending().unwrap();
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64();
+        assert!(secs > 0.0, "elapsed time too small for throughput");
+        let throughput = (total_bytes as f64 / (1024.0 * 1024.0)) / secs;
+        assert!(
+            throughput >= 10.0,
+            "untar-style throughput {:.2} MiB/s below 10 MiB/s in {:?}",
+            throughput,
+            elapsed
+        );
+    }
+
+    #[test]
     fn stress_flush_respects_pending_threshold() {
         let dir = tempdir().unwrap();
         let harness = TestHarness::new(dir.path(), "stress.bin", 1024);
@@ -1626,7 +2227,10 @@ mod tests {
         for i in 0..10 {
             let inode = harness.fs.allocate_inode_id().unwrap();
             let record = make_file(inode, &format!("stress{i}"));
-            harness.fs.stage_file(record, vec![i as u8; 600]).unwrap();
+            harness
+                .fs
+                .stage_file(record, vec![i as u8; 600], None)
+                .unwrap();
             inodes.push(inode);
         }
         harness.fs.flush_pending().unwrap();
@@ -1650,7 +2254,10 @@ mod tests {
             let harness = TestHarness::new(dir.path(), "journal.bin", 8 * 1024 * 1024);
             inode_id = harness.fs.allocate_inode_id().unwrap();
             let record = make_file(inode_id, "pending.txt");
-            harness.fs.stage_file(record, b"hello".to_vec()).unwrap();
+            harness
+                .fs
+                .stage_file(record, b"hello".to_vec(), None)
+                .unwrap();
             // drop harness without flushing to simulate crash
         }
 
@@ -1699,7 +2306,7 @@ mod tests {
         let file = make_file(inode, primary_name);
         harness
             .fs
-            .stage_file(file.clone(), b"payload".to_vec())
+            .stage_file(file.clone(), b"payload".to_vec(), None)
             .unwrap();
         let mut root = harness.fs.load_inode(ROOT_INODE).unwrap();
         harness
@@ -1760,7 +2367,7 @@ mod tests {
         let record_single = make_file(inode_single, "single.txt");
         harness
             .fs
-            .stage_file(record_single.clone(), b"alpha".to_vec())
+            .stage_file(record_single.clone(), b"alpha".to_vec(), None)
             .unwrap();
         harness.fs.flush_pending().unwrap();
         let stored_single = harness
@@ -1782,7 +2389,7 @@ mod tests {
             record.mode = 0o100600;
             let len = 32 + (i % 128) as usize;
             let data = vec![(i & 0xff) as u8; len];
-            harness.fs.stage_file(record, data.clone()).unwrap();
+            harness.fs.stage_file(record, data.clone(), None).unwrap();
             if i % 200 == 0 {
                 samples.push((inode, data));
             }
@@ -1803,7 +2410,7 @@ mod tests {
         let base = make_file(inode_offsets, "offsets.bin");
         harness
             .fs
-            .stage_file(base.clone(), vec![0u8; 4096])
+            .stage_file(base.clone(), vec![0u8; 4096], None)
             .unwrap();
         harness.fs.flush_pending().unwrap();
         apply_write(&harness.fs, inode_offsets, 0, b"START");
@@ -1825,7 +2432,7 @@ mod tests {
         let attr_file = make_file(attr_inode, "attrs");
         harness
             .fs
-            .stage_file(attr_file.clone(), b"data".to_vec())
+            .stage_file(attr_file.clone(), b"data".to_vec(), None)
             .unwrap();
         harness.fs.flush_pending().unwrap();
         let mut record = harness.fs.load_inode(attr_inode).unwrap();

@@ -14,6 +14,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub store_path: PathBuf,
 
+    /// Path on the local filesystem for client-side caches/journals (defaults to store path).
+    #[arg(long, value_name = "PATH")]
+    pub local_cache_path: Option<PathBuf>,
+
+    /// Log backing-store and cache writes at INFO.
+    #[arg(long, default_value_t = false)]
+    pub log_storage_io: bool,
+
     /// Object store provider (local filesystem, AWS S3, or Google Cloud Storage).
     #[arg(long, value_enum, default_value_t = ObjectStoreProvider::Local)]
     pub object_provider: ObjectStoreProvider,
@@ -123,6 +131,8 @@ pub struct Cli {
 pub struct Config {
     pub mount_path: PathBuf,
     pub store_path: PathBuf,
+    pub local_cache_path: PathBuf,
+    pub log_storage_io: bool,
     pub inline_threshold: usize,
     pub shard_size: u64,
     pub inode_batch: u64,
@@ -161,9 +171,16 @@ impl From<Cli> for Config {
             .log_file
             .clone()
             .or_else(|| Some(PathBuf::from("osagefs.log")));
+        let store_path = cli.store_path;
+        let local_cache_path = cli
+            .local_cache_path
+            .clone()
+            .unwrap_or_else(|| store_path.clone());
         Config {
             mount_path: cli.mount_path,
-            store_path: cli.store_path,
+            store_path,
+            local_cache_path,
+            log_storage_io: cli.log_storage_io,
             inline_threshold: cli.inline_threshold,
             shard_size: cli.shard_size,
             inode_batch: cli.inode_batch.max(1),
