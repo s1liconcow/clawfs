@@ -1,7 +1,7 @@
 # OsageFS Assistant Notes
 
 ## Living Document
-Please continuously update this document with useful things you figure out that will make future workflows smoother.  
+Please continuously update this document with useful things you figure out that will make future workflows smoother and increase iteration speed.  
 
 ## Project Overview
 - OsageFS: a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
@@ -40,6 +40,8 @@ Please continuously update this document with useful things you figure out that 
 - Kernel build dependencies (flex/bison) needed for `make defconfig`.
 - Pending bytes threshold + `--flush-interval-ms` ensure `flush_pending()` runs automatically; staged payloads append to `$STORE/segment_stage/stage_*.bin` and only one of those files exists per in-flight flush. Metadata poller + TTLs keep cached attrs fresh, while cleanup leases prevent `/imap_deltas/` and `/segs/` from growing without bound.
 - Troubleshooting policy: reproduce with a failing automated test before fixing. For NFS/data-path issues, first capture logs (`write error`, `load_inode miss`, etc.), then codify the failure as a focused regression test in `src/fs.rs`; only after the test fails should code changes be made. Keep the test to prevent regressions.
+- `scripts/stress_e2e.sh` always runs `scripts/cleanup.sh` on exit, which removes both `LOG_FILE` and `PERF_LOG_PATH`; when you need post-run perf analysis, run an equivalent custom workload (or copy logs elsewhere) before cleanup.
+- In Sprite VMs, long `apt-get install` runs can sometimes end with `Error: connection closed` / non-zero transport exit even after package `Setting up ...` lines complete; verify required tools explicitly (`fusermount3`, `rg`, `strace`) before retrying full bootstrap.
 
 ## Useful Commands
 - Clean mount/store/state: `fusermount -u /tmp/osagefs-mnt; sudo rm -rf /tmp/osagefs-mnt /tmp/osagefs-store ~/.osagefs_state.bin`.
@@ -84,11 +86,24 @@ Example bootstrap (Debian/Ubuntu sprite):
 - Prefer idempotent steps: the sprite may be fresh or may contain old state.
 
 ## Sprite name
-Use this sprite unless explicitly told otherwise:
-- `SPRITE_NAME=iotest`
+Use deterministic sprite names per worktree/task so repeated runs reuse VM state.
+One task may use multiple sprites (for example: build, stress, perf, cleanup-agent), as long as each sprite name is deterministic.
 
-If the sprite does not exist, create it:
-- `sprite create iotest`
+Recommended naming rule:
+- `SPRITE_NAME="iotest-$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')-$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"`
+
+Multi-sprite naming rule (recommended):
+- `SPRITE_BASENAME="iotest-$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')-$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"`
+- `SPRITE_NAME="${SPRITE_BASENAME}-${ROLE}"` where `ROLE` is stable (`build`, `stress`, `perf-a`, `perf-b`, `cleanup`).
+
+Operational policy:
+- For a new worktree or task branch, derive a stable base name and reuse it.
+- You may allocate multiple sprites for the same task, but each must use a stable role suffix and deterministic name.
+- Keep `iotest` as a shared fallback only when you explicitly need a common long-lived sprite.
+- After task completion, destroy all task sprites (`sprite destroy --force "$SPRITE_NAME"`), unless you intentionally keep specific ones for checkpoints.
+
+If the deterministic sprite does not exist, create it:
+- `sprite create "$SPRITE_NAME"`
 
 (If create fails because it already exists, continue.)
 
@@ -145,6 +160,27 @@ When iterating on fixes, follow this order:
 1) Reproduce with `./scripts/stress_e2e.sh` in sprite.
 2) Add/adjust a focused regression test in `src/fs.rs` for the failing behavior.
 3) Implement the fix and rerun the same sprite stress command.
+
+## Sprite Checkpoints
+Use sprite checkpoints to avoid repeated Linux untar/build setup cost.
+
+Recommended loop:
+1) Seed a reusable checkpoint once (cold run):
+- `scripts/sprite_perf_loop.sh --sprite iotest --mode cold --create-checkpoint --comment "linux tree prepared"`
+2) Iterate quickly from that checkpoint (restore + sync + perf reuse):
+- `scripts/sprite_perf_loop.sh --sprite iotest --restore v2 --mode fast`
+3) For one-off perf experiments, use ephemeral sprites that auto-clean on exit:
+- `scripts/sprite_perf_loop.sh --ephemeral --mode fast`
+- Add `--keep-sprite` to preserve the ephemeral sprite, or `--cleanup-stale` to delete other leftover `iotest-perf-*` sprites automatically.
+
+Direct checkpoint commands:
+- `sprite checkpoint list -s iotest`
+- `sprite checkpoint create -s iotest --comment "note"`
+- `sprite restore -s iotest v2`
+
+Notes:
+- `--mode fast` adds `--reuse_tree` to `scripts/linux_kernel_perf.sh` so it skips cleanup + extract.
+- Keep tarball + extracted kernel tree in the checkpoint you restore from, then only sync code deltas each run.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:

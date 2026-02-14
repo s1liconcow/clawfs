@@ -76,6 +76,11 @@ fn main() -> Result<()> {
         );
     }
     let client_state = Arc::new(ClientStateManager::load(&config.state_path)?);
+    let superblock_snapshot = superblock.snapshot();
+    client_state.reconcile_with_minimums(
+        superblock_snapshot.next_inode,
+        superblock_snapshot.next_segment,
+    )?;
     let client_id = client_state.client_id();
     if !config.disable_cleanup {
         spawn_cleanup_worker(

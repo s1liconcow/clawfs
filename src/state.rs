@@ -102,6 +102,25 @@ impl ClientStateManager {
         )
     }
 
+    pub fn reconcile_with_minimums(&self, min_inode: u64, min_segment: u64) -> Result<()> {
+        let mut guard = self.state.lock();
+        let mut changed = false;
+        if guard.inode_next < min_inode {
+            guard.inode_next = min_inode;
+            guard.inode_remaining = 0;
+            changed = true;
+        }
+        if guard.segment_next < min_segment {
+            guard.segment_next = min_segment;
+            guard.segment_remaining = 0;
+            changed = true;
+        }
+        if changed {
+            self.persist_locked(&guard)?;
+        }
+        Ok(())
+    }
+
     fn next_id<F, G>(&self, selector: F, batch: u64, mut reserve: G) -> Result<u64>
     where
         F: Fn(&mut ClientState) -> (&mut u64, &mut u64),
@@ -171,5 +190,24 @@ mod tests {
         let manager = ClientStateManager::load(&path).unwrap();
         let third = manager.next_inode_id(4, |_| Ok(300)).unwrap();
         assert_eq!(third, 102);
+    }
+
+    #[test]
+    fn reconcile_discards_stale_pools() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = ClientStateManager::load(&path).unwrap();
+
+        // Seed an old inode pool [100..103].
+        assert_eq!(manager.next_inode_id(4, |_| Ok(100)).unwrap(), 100);
+        // Seed an old segment pool [200..203].
+        assert_eq!(manager.next_segment_id(4, |_| Ok(200)).unwrap(), 200);
+
+        // Fresh store/superblock requires newer ids.
+        manager.reconcile_with_minimums(500, 600).unwrap();
+
+        // Reconciliation should force a fresh reservation from new minimums.
+        assert_eq!(manager.next_inode_id(4, |_| Ok(500)).unwrap(), 500);
+        assert_eq!(manager.next_segment_id(4, |_| Ok(600)).unwrap(), 600);
     }
 }
