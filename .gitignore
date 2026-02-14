@@ -3,3 +3,5 @@ osagefs-nfs-gateway/target
 loopback-bench/target
 *.log
 *.jsonl
+
+.local/ZeroFS/
