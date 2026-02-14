@@ -66,6 +66,29 @@ pub struct OsageFs {
 }
 
 impl OsageFs {
+    fn summarize_inode_kind(kind: &InodeKind) -> String {
+        match kind {
+            InodeKind::Directory { children } => {
+                let child_count = children.len();
+                let mut sample: Vec<&str> = children.keys().map(String::as_str).take(8).collect();
+                sample.sort_unstable();
+                if child_count > sample.len() {
+                    format!(
+                        "Directory(children={}, sample={:?}, truncated={})",
+                        child_count,
+                        sample,
+                        child_count - sample.len()
+                    )
+                } else {
+                    format!("Directory(children={}, sample={:?})", child_count, sample)
+                }
+            }
+            InodeKind::File => "File".to_string(),
+            InodeKind::Symlink => "Symlink".to_string(),
+            InodeKind::Tombstone => "Tombstone".to_string(),
+        }
+    }
+
     pub fn new(
         config: Config,
         metadata: Arc<MetadataStore>,
@@ -264,13 +287,26 @@ impl OsageFs {
             }
             return Ok(entry.record.clone());
         }
-        self.block_on(self.metadata.get_inode_with_ttl(
+        let fetched = self.block_on(self.metadata.get_inode_with_ttl(
             ino,
             self.lookup_cache_ttl,
             self.dir_cache_ttl,
-        ))
-        .map_err(|_| EIO)?
-        .ok_or_else(|| {
+        ));
+        let fetched = match fetched {
+            Ok(record) => record,
+            Err(err) => {
+                error!(
+                    "load_inode metadata error ino={} pending={} mutating={} flushing={} err={:#}",
+                    ino,
+                    self.pending_inodes.lock().contains_key(&ino),
+                    self.mutating_inodes.lock().contains_key(&ino),
+                    self.flushing_inodes.lock().contains_key(&ino),
+                    err
+                );
+                return Err(EIO);
+            }
+        };
+        fetched.ok_or_else(|| {
             debug!(
                 "load_inode miss ino={} pending={} mutating={} flushing={}",
                 ino,
@@ -344,7 +380,7 @@ impl OsageFs {
             }
         }
         drop(map);
-        let kind = record.kind.clone();
+        let kind_summary = Self::summarize_inode_kind(&record.kind);
         if let Some(journal) = &self.journal {
             let entry = JournalEntry {
                 record,
@@ -353,8 +389,8 @@ impl OsageFs {
             journal.persist_entry(&entry).map_err(|_| EIO)?;
         }
         debug!(
-            "stage_inode inode={} kind={:?} metadata-staged",
-            inode, kind
+            "stage_inode inode={} kind={} metadata-staged",
+            inode, kind_summary
         );
         self.flush_if_interval_elapsed()?;
         Ok(())
@@ -1670,6 +1706,7 @@ impl Filesystem for OsageFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut record = self.load_inode(ino)?;
             if let Some(new_mode) = mode {
@@ -1784,6 +1821,7 @@ impl Filesystem for OsageFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -1828,6 +1866,7 @@ impl Filesystem for OsageFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -1874,6 +1913,7 @@ impl Filesystem for OsageFs {
         link: &Path,
         reply: ReplyEntry,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -1914,7 +1954,11 @@ impl Filesystem for OsageFs {
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
                 reply.opened(0, 0)
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                let detail = format!("ino={}", ino);
+                self.log_fuse_error("open", &detail, code);
+                reply.error(code);
+            }
         }
     }
 
@@ -1973,6 +2017,7 @@ impl Filesystem for OsageFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut record = self.load_inode(ino)?;
             if record.is_dir() {
@@ -2020,6 +2065,7 @@ impl Filesystem for OsageFs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut parent_inode = self.load_inode(parent)?;
             if !parent_inode.is_dir() {
@@ -2039,11 +2085,16 @@ impl Filesystem for OsageFs {
         })();
         match res {
             Ok(()) => reply.ok(),
-            Err(code) => reply.error(code),
+            Err(code) => {
+                let detail = format!("parent={} name={}", parent, name.to_string_lossy());
+                self.log_fuse_error("unlink", &detail, code);
+                reply.error(code);
+            }
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut parent_inode = self.load_inode(parent)?;
             if !parent_inode.is_dir() {
@@ -2082,6 +2133,7 @@ impl Filesystem for OsageFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
                 return Err(EINVAL);
@@ -2157,6 +2209,7 @@ impl Filesystem for OsageFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut file = self.load_inode(ino)?;
             if file.is_dir() {
@@ -2534,6 +2587,18 @@ mod tests {
             imap_delta_batch: 32,
             log_storage_io: false,
         }
+    }
+
+    #[test]
+    fn summarize_inode_kind_truncates_directory_children() {
+        let mut children = std::collections::BTreeMap::new();
+        for i in 0..20u64 {
+            children.insert(format!("f_{i}"), i + 10);
+        }
+        let summary = OsageFs::summarize_inode_kind(&InodeKind::Directory { children });
+        assert!(summary.contains("Directory(children=20"));
+        assert!(summary.contains("truncated="));
+        assert!(summary.len() < 300);
     }
 
     fn ensure_root_for_tests(
