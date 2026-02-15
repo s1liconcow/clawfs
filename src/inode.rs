@@ -36,9 +36,28 @@ pub struct InodeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FileStorage {
     Inline(Vec<u8>),
+    InlineEncoded(InlinePayload),
     #[serde(rename = "Segment")]
     LegacySegment(SegmentPointer),
     Segments(Vec<SegmentExtent>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlinePayload {
+    pub codec: InlinePayloadCodec,
+    pub payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<[u8; 12]>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InlinePayloadCodec {
+    None,
+    Lz4,
+    ChaCha20Poly1305,
+    Lz4ChaCha20Poly1305,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

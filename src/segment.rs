@@ -19,7 +19,12 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
+use crate::codec::{InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::{Config, ObjectStoreProvider};
+use crate::inode::InlinePayloadCodec;
+
+const SEGMENT_MAGIC_V2: &[u8; 4] = b"OSG2";
+const SEGMENT_ENTRY_CODEC_HEADER_LEN: usize = 1 + 8 + 8 + 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentPointer {
@@ -40,15 +45,6 @@ pub enum SegmentPayload {
     Staged(Vec<StagedChunk>),
 }
 
-impl SegmentPayload {
-    fn len(&self) -> u64 {
-        match self {
-            SegmentPayload::Bytes(bytes) => bytes.len() as u64,
-            SegmentPayload::Staged(chunks) => chunks.iter().map(|chunk| chunk.len).sum(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedChunk {
     pub path: PathBuf,
@@ -66,6 +62,8 @@ pub struct SegmentManager {
     cache_state: Mutex<SegmentCache>,
     stage_state: Mutex<StageState>,
     log_storage_io: bool,
+    segment_compression: bool,
+    segment_encryption_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -142,6 +140,8 @@ impl SegmentManager {
             cache_state: Mutex::new(SegmentCache::default()),
             stage_state: Mutex::new(StageState::default()),
             log_storage_io: config.log_storage_io,
+            segment_compression: config.segment_compression,
+            segment_encryption_key: config.segment_encryption_key.clone(),
         })
     }
 
@@ -168,6 +168,13 @@ impl SegmentManager {
         Ok(state.active.as_mut().expect("active stage must exist"))
     }
 
+    fn segment_codec_config(&self) -> InlineCodecConfig {
+        InlineCodecConfig {
+            compression: self.segment_compression,
+            encryption_key: self.segment_encryption_key.clone(),
+        }
+    }
+
     pub fn write_batch(
         &self,
         generation: u64,
@@ -178,47 +185,52 @@ impl SegmentManager {
             return Ok(Vec::new());
         }
         let mut estimated_size = 4usize + 8usize;
-        for entry in &entries {
-            let payload_len = usize::try_from(entry.payload.len())
-                .with_context(|| format!("segment payload too large for inode {}", entry.inode))?;
+        let mut encoded_entries: Vec<(u64, String, u64, crate::codec::EncodedBytes)> =
+            Vec::with_capacity(entries.len());
+        let codec_config = self.segment_codec_config();
+        for entry in entries {
+            let plain_bytes = match entry.payload {
+                SegmentPayload::Bytes(bytes) => bytes,
+                SegmentPayload::Staged(chunks) => {
+                    let total_len = chunks.iter().map(|chunk| chunk.len).sum();
+                    self.read_staged_chunks(&chunks, total_len)?
+                }
+            };
+            let plain_len = plain_bytes.len() as u64;
+            let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
+                format!("segment payload encoding failed for inode {}", entry.inode)
+            })?;
             let path_len = entry.path.len();
             estimated_size = estimated_size
                 .saturating_add(8)
                 .saturating_add(8)
                 .saturating_add(path_len)
-                .saturating_add(8)
-                .saturating_add(payload_len);
+                .saturating_add(SEGMENT_ENTRY_CODEC_HEADER_LEN)
+                .saturating_add(encoded.payload.len());
+            encoded_entries.push((entry.inode, entry.path, plain_len, encoded));
         }
         let mut buffer = Vec::with_capacity(estimated_size);
-        buffer.extend_from_slice(b"OSG1");
-        buffer.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        let mut pointers = Vec::with_capacity(entries.len());
-        for entry in entries {
-            buffer.extend_from_slice(&entry.inode.to_le_bytes());
-            let path_bytes = entry.path.as_bytes();
+        buffer.extend_from_slice(SEGMENT_MAGIC_V2);
+        buffer.extend_from_slice(&(encoded_entries.len() as u64).to_le_bytes());
+        let mut pointers = Vec::with_capacity(encoded_entries.len());
+        for (inode, path, plain_len, encoded) in encoded_entries {
+            buffer.extend_from_slice(&inode.to_le_bytes());
+            let path_bytes = path.as_bytes();
             buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
             buffer.extend_from_slice(path_bytes);
-            let data_len = entry.payload.len();
-            buffer.extend_from_slice(&data_len.to_le_bytes());
             let offset = buffer.len() as u64;
-            match entry.payload {
-                SegmentPayload::Bytes(bytes) => buffer.extend_from_slice(&bytes),
-                SegmentPayload::Staged(chunks) => {
-                    let appended = self.append_staged_chunks(&mut buffer, &chunks)?;
-                    anyhow::ensure!(
-                        appended == data_len,
-                        "staged payload length mismatch for inode {}",
-                        entry.inode
-                    );
-                }
-            }
+            buffer.push(codec_to_u8(encoded.codec));
+            buffer.extend_from_slice(&plain_len.to_le_bytes());
+            buffer.extend_from_slice(&(encoded.payload.len() as u64).to_le_bytes());
+            buffer.extend_from_slice(&encoded.nonce.unwrap_or([0u8; 12]));
+            buffer.extend_from_slice(&encoded.payload);
             pointers.push((
-                entry.inode,
+                inode,
                 SegmentPointer {
                     segment_id,
                     generation,
                     offset,
-                    length: data_len,
+                    length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded.payload.len()) as u64,
                 },
             ));
         }
@@ -258,9 +270,67 @@ impl SegmentManager {
         if self.cache_limit > 0 {
             self.write_cache_file(pointer.generation, pointer.segment_id, &full)?;
         }
+        self.decode_pointer_from_segment(&full, pointer)
+    }
+
+    fn decode_pointer_from_segment(
+        &self,
+        full: &[u8],
+        pointer: &SegmentPointer,
+    ) -> Result<Vec<u8>> {
+        if full.len() < 4 {
+            anyhow::bail!("segment too small");
+        }
+        if !full.starts_with(SEGMENT_MAGIC_V2) {
+            anyhow::bail!("unsupported segment magic");
+        }
         let start = pointer.offset as usize;
         let end = start + pointer.length as usize;
-        Ok(full[start..end].to_vec())
+        anyhow::ensure!(end <= full.len(), "segment pointer out of bounds");
+        let slice = &full[start..end];
+        anyhow::ensure!(
+            slice.len() >= SEGMENT_ENTRY_CODEC_HEADER_LEN,
+            "segment entry too small for codec header"
+        );
+        let codec = codec_from_u8(slice[0])?;
+        let plain_len = u64::from_le_bytes(
+            slice[1..9]
+                .try_into()
+                .expect("slice length already validated"),
+        );
+        let encoded_len = u64::from_le_bytes(
+            slice[9..17]
+                .try_into()
+                .expect("slice length already validated"),
+        ) as usize;
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&slice[17..29]);
+        anyhow::ensure!(
+            SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded_len == slice.len(),
+            "segment encoded length mismatch expected={} actual={}",
+            encoded_len,
+            slice.len().saturating_sub(SEGMENT_ENTRY_CODEC_HEADER_LEN)
+        );
+        let nonce_opt = if matches!(
+            codec,
+            InlinePayloadCodec::ChaCha20Poly1305 | InlinePayloadCodec::Lz4ChaCha20Poly1305
+        ) {
+            Some(nonce)
+        } else {
+            None
+        };
+        let original_len = matches!(
+            codec,
+            InlinePayloadCodec::Lz4 | InlinePayloadCodec::Lz4ChaCha20Poly1305
+        )
+        .then_some(plain_len);
+        decode_bytes(
+            codec,
+            &slice[SEGMENT_ENTRY_CODEC_HEADER_LEN..],
+            original_len,
+            nonce_opt,
+            self.segment_encryption_key.as_deref(),
+        )
     }
 
     pub fn stage_payload(&self, data: &[u8]) -> Result<StagedChunk> {
@@ -443,11 +513,8 @@ impl SegmentManager {
         if !path.exists() {
             return Ok(None);
         }
-        let mut file = File::open(&path)?;
-        file.seek(SeekFrom::Start(pointer.offset))?;
-        let mut buffer = vec![0u8; pointer.length as usize];
-        file.read_exact(&mut buffer)?;
-        Ok(Some(buffer))
+        let full = fs::read(path)?;
+        Ok(Some(self.decode_pointer_from_segment(&full, pointer)?))
     }
 
     fn fetch_segment(&self, generation: u64, segment_id: u64) -> Result<Vec<u8>> {
@@ -543,6 +610,25 @@ fn segment_prefix(user_prefix: &str) -> String {
     }
 }
 
+fn codec_to_u8(codec: InlinePayloadCodec) -> u8 {
+    match codec {
+        InlinePayloadCodec::None => 0,
+        InlinePayloadCodec::Lz4 => 1,
+        InlinePayloadCodec::ChaCha20Poly1305 => 2,
+        InlinePayloadCodec::Lz4ChaCha20Poly1305 => 3,
+    }
+}
+
+fn codec_from_u8(raw: u8) -> Result<InlinePayloadCodec> {
+    match raw {
+        0 => Ok(InlinePayloadCodec::None),
+        1 => Ok(InlinePayloadCodec::Lz4),
+        2 => Ok(InlinePayloadCodec::ChaCha20Poly1305),
+        3 => Ok(InlinePayloadCodec::Lz4ChaCha20Poly1305),
+        _ => anyhow::bail!("unknown segment codec id {}", raw),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +642,10 @@ mod tests {
             store_path: root.join("data"),
             local_cache_path: root.join("cache"),
             inline_threshold: 1024,
+            inline_compression: true,
+            inline_encryption_key: None,
+            segment_compression: true,
+            segment_encryption_key: None,
             shard_size: 1024,
             inode_batch: 16,
             segment_batch: 32,

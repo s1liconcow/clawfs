@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 /// CLI configuration for launching OsageFS.
 #[derive(Parser, Debug)]
@@ -53,6 +53,22 @@ pub struct Cli {
     /// Inline write threshold in bytes; payloads <= threshold stay inside metadata objects.
     #[arg(long, default_value_t = 4 * 1024)]
     pub inline_threshold: usize,
+
+    /// Enable inline payload compression for metadata-resident file/symlink data.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub inline_compression: bool,
+
+    /// Optional passphrase for inline payload encryption (enables encryption when set).
+    #[arg(long)]
+    pub inline_encryption_key: Option<String>,
+
+    /// Enable immutable-segment payload compression.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub segment_compression: bool,
+
+    /// Optional passphrase for immutable-segment payload encryption.
+    #[arg(long)]
+    pub segment_encryption_key: Option<String>,
 
     /// Number of inodes mapped to a shard file.
     #[arg(long, default_value_t = 2048)]
@@ -134,6 +150,10 @@ pub struct Config {
     pub local_cache_path: PathBuf,
     pub log_storage_io: bool,
     pub inline_threshold: usize,
+    pub inline_compression: bool,
+    pub inline_encryption_key: Option<String>,
+    pub segment_compression: bool,
+    pub segment_encryption_key: Option<String>,
     pub shard_size: u64,
     pub inode_batch: u64,
     pub segment_batch: u64,
@@ -183,6 +203,14 @@ impl From<Cli> for Config {
             local_cache_path,
             log_storage_io: cli.log_storage_io,
             inline_threshold: cli.inline_threshold,
+            inline_compression: cli.inline_compression,
+            inline_encryption_key: cli
+                .inline_encryption_key
+                .and_then(|value| (!value.trim().is_empty()).then_some(value)),
+            segment_compression: cli.segment_compression,
+            segment_encryption_key: cli
+                .segment_encryption_key
+                .and_then(|value| (!value.trim().is_empty()).then_some(value)),
             shard_size: cli.shard_size,
             inode_batch: cli.inode_batch.max(1),
             segment_batch: cli.segment_batch.max(1),

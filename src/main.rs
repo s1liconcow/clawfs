@@ -469,7 +469,7 @@ async fn perform_segment_compaction(
                         }
                         out.push((record, pointers, buffer));
                     }
-                    FileStorage::Inline(_) => {}
+                    FileStorage::Inline(_) | FileStorage::InlineEncoded(_) => {}
                 }
             }
             Ok(out)

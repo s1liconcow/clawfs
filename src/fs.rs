@@ -17,6 +17,10 @@ use parking_lot::Mutex;
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
 
+use crate::codec::{
+    InlineCodecConfig, decode_inline_storage as decode_inline_payload_storage,
+    encode_inline_storage as encode_inline_payload_storage,
+};
 use crate::config::Config;
 use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExtent};
 use crate::journal::{JournalEntry, JournalManager, JournalPayload};
@@ -335,7 +339,9 @@ impl OsageFs {
             }
         }
         match &record.storage {
-            FileStorage::Inline(bytes) => Ok(bytes.clone()),
+            FileStorage::Inline(_) | FileStorage::InlineEncoded(_) => {
+                self.decode_inline_storage(&record.storage)
+            }
             FileStorage::LegacySegment(ptr) => self.segments.read_pointer(ptr),
             FileStorage::Segments(extents) => {
                 let mut buffer = vec![0u8; record.size as usize];
@@ -353,6 +359,21 @@ impl OsageFs {
                 Ok(buffer)
             }
         }
+    }
+
+    fn inline_codec_config(&self) -> InlineCodecConfig {
+        InlineCodecConfig {
+            compression: self.config.inline_compression,
+            encryption_key: self.config.inline_encryption_key.clone(),
+        }
+    }
+
+    fn encode_inline_storage(&self, bytes: &[u8]) -> Result<FileStorage> {
+        encode_inline_payload_storage(bytes, &self.inline_codec_config())
+    }
+
+    fn decode_inline_storage(&self, storage: &FileStorage) -> Result<Vec<u8>> {
+        decode_inline_payload_storage(storage, self.config.inline_encryption_key.as_deref())
     }
 
     fn stage_inode(&self, record: InodeRecord) -> std::result::Result<(), i32> {
@@ -1023,7 +1044,8 @@ impl OsageFs {
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
                         record.size = data_len;
                         if data_len <= self.config.inline_threshold as u64 {
-                            record.storage = FileStorage::Inline(data_bytes.clone());
+                            record.storage =
+                                self.encode_inline_storage(data_bytes).map_err(|_| EIO)?;
                             inline_files += 1;
                             inline_bytes = inline_bytes.saturating_add(data_len);
                             records.push(record);
@@ -1478,11 +1500,10 @@ impl OsageFs {
 
     pub fn nfs_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {
         let record = self.load_inode(ino)?;
-        if let Some(target) = record.symlink_target_bytes() {
-            Ok(target.to_vec())
-        } else {
-            Err(EINVAL)
+        if !record.is_symlink() {
+            return Err(EINVAL);
         }
+        self.read_file_bytes(&record).map_err(|_| EIO)
     }
 
     pub fn nfs_write(&self, ino: u64, offset: u64, data: &[u8]) -> std::result::Result<u32, i32> {
@@ -1982,10 +2003,13 @@ impl Filesystem for OsageFs {
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         match self.load_inode(ino) {
             Ok(record) => {
-                if let Some(target) = record.symlink_target_bytes() {
-                    reply.data(target);
-                } else {
+                if !record.is_symlink() {
                     reply.error(EINVAL);
+                    return;
+                }
+                match self.read_file_bytes(&record) {
+                    Ok(target) => reply.data(&target),
+                    Err(_) => reply.error(EIO),
                 }
             }
             Err(code) => reply.error(code),
@@ -2547,6 +2571,10 @@ mod tests {
             store_path: root.join("store"),
             local_cache_path: root.join("cache"),
             inline_threshold: 512,
+            inline_compression: true,
+            inline_encryption_key: None,
+            segment_compression: true,
+            segment_encryption_key: None,
             shard_size: 64,
             inode_batch: 8,
             segment_batch: 8,
@@ -2711,10 +2739,10 @@ mod tests {
             .block_on(harness.metadata.get_inode(inode_inline))
             .unwrap()
             .unwrap();
-        match stored_inline.storage {
-            FileStorage::Inline(ref bytes) => assert_eq!(bytes, b"hello"),
-            _ => panic!("expected inline storage"),
-        }
+        assert_eq!(
+            harness.fs.read_file_bytes(&stored_inline).unwrap(),
+            b"hello"
+        );
 
         let stored_seg = harness
             .runtime
@@ -2769,8 +2797,14 @@ mod tests {
             .block_on(harness.metadata.get_inode(inode_b))
             .unwrap()
             .unwrap();
-        assert!(matches!(a.storage, FileStorage::Inline(_)));
-        assert!(matches!(b.storage, FileStorage::Inline(_)));
+        assert!(matches!(
+            a.storage,
+            FileStorage::Inline(_) | FileStorage::InlineEncoded(_)
+        ));
+        assert!(matches!(
+            b.storage,
+            FileStorage::Inline(_) | FileStorage::InlineEncoded(_)
+        ));
 
         let state_a = std::fs::read(dir.path().join("client_one.bin")).unwrap();
         let state_b = std::fs::read(dir.path().join("client_two.bin")).unwrap();
@@ -2974,7 +3008,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.size, 5);
-        assert!(matches!(stored.storage, FileStorage::Inline(_)));
+        assert!(matches!(
+            stored.storage,
+            FileStorage::Inline(_) | FileStorage::InlineEncoded(_)
+        ));
     }
 
     #[test]
@@ -3070,7 +3107,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stored.is_symlink());
-        assert_eq!(stored.symlink_target_bytes().unwrap(), b"/tmp/actual");
+        assert_eq!(harness.fs.read_file_bytes(&stored).unwrap(), b"/tmp/actual");
     }
 
     #[test]
