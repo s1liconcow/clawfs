@@ -40,6 +40,7 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/fio_workloads.sh`: Starts OsageFS, runs mixed fio profiles (sequential, random, mixed, small-file sync), and writes per-workload JSON plus `summary.md` under `fio-results-*`.
 - `scripts/cleanup.sh`: unmounts, deletes store dir, and removes the state file to give perf scripts a clean slate.
 - `scripts/stress_e2e.sh`: Light-weight FUSE smoke test that launches the daemon via `run_osagefs.sh`, performs single-file, burst, large-file, offset-write, and chmod checks directly against the mounted filesystem, and tears everything down afterward.
+- `scripts/micro_workflows.sh`: Micro-workflow benchmark harness that runs practical dev/data/AI loops (`dev_smallfile_burst`, `dev_scan_and_status`, `data_csv_etl`, `ai_checkpoint_loop`, optional `dev_incremental_build`) on OsageFS and local disk, then emits `results.jsonl` + `summary.md` with side-by-side timing ratios.
 
 ## Testing / Tools
 - `cargo test`: runs unit tests (including new integration-like tests in `fs.rs`, `segment.rs`, `state.rs`).
@@ -47,6 +48,7 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
 - `scripts/fio_workloads.sh`: fio benchmark harness; requires `fio`, `python3`, and FUSE support in the runtime environment (prefer sprite execution for mount tests).
 - `scripts/fio_workloads.sh` supports iteration knobs: `WORKLOADS` (comma-separated workload names, or `all`) and `FAST_REPRO=1` (2s runtime, small sizes) for quick repro loops. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
+- `scripts/micro_workflows.sh`: Run `MODE=both BUILD_MODE=check ./scripts/micro_workflows.sh` for an OsageFS-vs-local baseline comparison. Use `WORKFLOW_PROFILE=quick|realistic|all` to choose synthetic micro loops, realistic OSS/data/AI flows, or both. Realistic knobs: `OSS_REPO_URL`/`OSS_BUILD_CMD`/`OSS_TEST_CMD`, `DUCKDB_DATASET=cancer|nyc_taxi`, and Imagenette training controls (`AI_EPOCHS`, `AI_MAX_BATCHES`, `AI_SUBSET_IMAGES`). Dependency policy: missing system tools auto-install by default (`ALLOW_SYSTEM_INSTALL=1`), and missing Python modules (`duckdb`, `torch`, `torchvision`) auto-install by default (`ALLOW_PIP_INSTALL=1`).
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
 - `scripts/run_osagefs.sh` + `scripts/run_nfs_gateway.sh`: set `REPLAY_LOG_PATH=/path/replay.jsonl.gz` to pass `--replay-log` and capture replay traces for FUSE or direct NFS traffic.
 - `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
@@ -224,6 +226,7 @@ Notes:
 FIO note:
 - In sprite runs, `smallfiles_sync` may return `Input/output error` during high-concurrency open/create (`filesetup.c:open(...)`) while larger sequential/random workloads still complete. Keep the workload in the matrix for regression tracking, but do not let that single failure abort summary generation.
 - Regression check for this class of issue: `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` should pass repeatedly with `fsync=1` once FUSE generation is stable.
+- `scripts/micro_workflows.sh` `dev_scan_and_status` can expose transient `.git/config.lock` behavior on OsageFS during `git init/config/status`; the harness now retries and clears stale lock files so the suite can complete while preserving this workflow signal.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:
