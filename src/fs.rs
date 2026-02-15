@@ -12,7 +12,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM};
+use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL, O_TRUNC};
 use parking_lot::Mutex;
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
@@ -34,6 +34,7 @@ use log::{debug, error, info};
 use serde_json::json;
 
 const TTL: Duration = Duration::from_secs(1);
+const FUSE_NODE_GENERATION: u64 = 1;
 const STATFS_BLOCK_SIZE: u32 = 4096;
 const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
 const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
@@ -847,6 +848,11 @@ impl OsageFs {
             let existing = match self.read_file_bytes(&entry.record) {
                 Ok(existing) => existing,
                 Err(_) => {
+                    self.log_fuse_error(
+                        "write_large_segments",
+                        &format!("ino={} stage=read_existing", inode),
+                        EIO,
+                    );
                     self.restore_mutation_on_error(inode, original_entry);
                     return Err(EIO);
                 }
@@ -859,6 +865,11 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(&existing) {
                     Ok(chunk) => chunk,
                     Err(_) => {
+                        self.log_fuse_error(
+                            "write_large_segments",
+                            &format!("ino={} stage=stage_existing_inline", inode),
+                            EIO,
+                        );
                         self.restore_mutation_on_error(inode, original_entry);
                         return Err(EIO);
                     }
@@ -883,6 +894,11 @@ impl OsageFs {
         let prev_len = segments.total_len;
         if let Err(_) = segments.ensure_offset(&self.segments, offset) {
             self.release_pending_data(PendingData::Staged(segments));
+            self.log_fuse_error(
+                "write_large_segments",
+                &format!("ino={} stage=ensure_offset offset={}", inode, offset),
+                EIO,
+            );
             self.restore_mutation_on_error(inode, original_entry);
             return Err(EIO);
         }
@@ -890,12 +906,27 @@ impl OsageFs {
             Ok(chunk) => chunk,
             Err(_) => {
                 self.release_pending_data(PendingData::Staged(segments));
+                self.log_fuse_error(
+                    "write_large_segments",
+                    &format!("ino={} stage=stage_new_payload len={}", inode, data.len()),
+                    EIO,
+                );
                 self.restore_mutation_on_error(inode, original_entry);
                 return Err(EIO);
             }
         };
         if let Err(_) = segments.write_range(&self.segments, offset, staged_chunk) {
             self.release_pending_data(PendingData::Staged(segments));
+            self.log_fuse_error(
+                "write_large_segments",
+                &format!(
+                    "ino={} stage=write_range offset={} len={}",
+                    inode,
+                    offset,
+                    data.len()
+                ),
+                EIO,
+            );
             self.restore_mutation_on_error(inode, original_entry);
             return Err(EIO);
         }
@@ -988,6 +1019,33 @@ impl OsageFs {
     }
 
     fn flush_pending(&self) -> std::result::Result<(), i32> {
+        self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all")
+    }
+
+    #[cfg(test)]
+    fn flush_pending_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
+        self.flush_pending_selected(
+            |guard| {
+                let mut selected = HashMap::new();
+                if let Some(entry) = guard.remove(&ino) {
+                    let parent = entry.record.parent;
+                    selected.insert(ino, entry);
+                    if parent != ino {
+                        if let Some(parent_entry) = guard.remove(&parent) {
+                            selected.insert(parent, parent_entry);
+                        }
+                    }
+                }
+                selected
+            },
+            "inode",
+        )
+    }
+
+    fn flush_pending_selected<F>(&self, selector: F, scope: &str) -> std::result::Result<(), i32>
+    where
+        F: FnOnce(&mut HashMap<u64, PendingEntry>) -> HashMap<u64, PendingEntry>,
+    {
         let _flush_guard = self.flush_lock.lock();
         let pid = process::id();
         let tid = format!("{:?}", thread::current().id());
@@ -1001,13 +1059,17 @@ impl OsageFs {
                     self.touch_last_flush();
                     return Ok(());
                 }
-                let has_staged = guard
+                let drained = selector(&mut guard);
+                if drained.is_empty() {
+                    self.touch_last_flush();
+                    return Ok(());
+                }
+                let has_staged = drained
                     .values()
                     .any(|entry| matches!(entry.data, Some(PendingData::Staged(_))));
                 if has_staged {
                     self.segments.rotate_stage_file();
                 }
-                let drained = std::mem::take(&mut *guard);
                 let mut flushing = self.flushing_inodes.lock();
                 for (inode, entry) in drained.iter() {
                     flushing.insert(*inode, entry.clone());
@@ -1019,9 +1081,10 @@ impl OsageFs {
                 .as_ref()
                 .expect("drained pending map must be present");
             debug!(
-                "flush_pending pid={} tid={} preparing {} inodes",
+                "flush_pending pid={} tid={} scope={} preparing {} inodes",
                 pid,
                 tid,
+                scope,
                 pending.len()
             );
             let snapshot = self
@@ -1164,6 +1227,7 @@ impl OsageFs {
                 "flush_pending",
                 start.elapsed(),
                 json!({
+                    "scope": scope,
                     "target_generation": target_generation,
                     "files": inline_files + segment_files,
                     "inline_files": inline_files,
@@ -1180,9 +1244,10 @@ impl OsageFs {
                 }),
             );
             debug!(
-                "flush_pending pid={} tid={} gen={} inline_files={} segment_files={} metadata_only={} inline_bytes={} segment_bytes={} pending_remaining={}",
+                "flush_pending pid={} tid={} scope={} gen={} inline_files={} segment_files={} metadata_only={} inline_bytes={} segment_bytes={} pending_remaining={}",
                 pid,
                 tid,
+                scope,
                 target_generation,
                 inline_files,
                 segment_files,
@@ -1201,7 +1266,10 @@ impl OsageFs {
             if let Some(pending) = drained_pending.take() {
                 self.restore_pending_after_failed_flush(pending);
             }
-            error!("flush_pending failed pid={} tid={} code={}", pid, tid, code);
+            error!(
+                "flush_pending failed pid={} tid={} scope={} code={}",
+                pid, tid, scope, code
+            );
         }
         result
     }
@@ -1550,6 +1618,81 @@ impl OsageFs {
         result
     }
 
+    // FUSE create semantics differ from nfs_create: O_CREAT without O_EXCL should open
+    // an existing file instead of returning EEXIST when a parallel creator won the race.
+    fn fuse_create_file(
+        &self,
+        parent: u64,
+        name: &str,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> std::result::Result<(InodeRecord, bool), i32> {
+        let mut parent_inode = match self.load_inode(parent) {
+            Ok(parent_inode) => parent_inode,
+            Err(code) => {
+                self.log_fuse_error(
+                    "fuse_create_file.load_parent",
+                    &format!("parent={} name={}", parent, name),
+                    code,
+                );
+                return Err(code);
+            }
+        };
+        if !parent_inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        if let Some(existing_ino) = parent_inode
+            .children()
+            .and_then(|children| children.get(name).copied())
+        {
+            if flags & O_EXCL != 0 {
+                return Err(EEXIST);
+            }
+            let mut existing = self.load_inode(existing_ino)?;
+            if existing.is_dir() {
+                return Err(EISDIR);
+            }
+            if flags & O_TRUNC != 0 && existing.size > 0 {
+                existing.update_times();
+                self.stage_file(existing.clone(), Vec::new(), None)?;
+                existing = self.load_inode(existing_ino)?;
+            }
+            return Ok((existing, false));
+        }
+        let inode_id = match self.allocate_inode_id() {
+            Ok(inode_id) => inode_id,
+            Err(_) => {
+                self.log_fuse_error(
+                    "fuse_create_file.allocate_inode",
+                    &format!("parent={} name={}", parent, name),
+                    EIO,
+                );
+                return Err(EIO);
+            }
+        };
+        let path = Self::build_child_path(&parent_inode, name);
+        let mut file = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, gid);
+        file.update_times();
+        if let Err(code) = self.stage_inode(file.clone()) {
+            self.log_fuse_error(
+                "fuse_create_file.stage_inode",
+                &format!("parent={} name={} ino={}", parent, name, inode_id),
+                code,
+            );
+            return Err(code);
+        }
+        if let Err(code) = self.update_parent(&mut parent_inode, name.to_string(), inode_id) {
+            self.log_fuse_error(
+                "fuse_create_file.update_parent",
+                &format!("parent={} name={} ino={}", parent, name, inode_id),
+                code,
+            );
+            return Err(code);
+        }
+        Ok((file, true))
+    }
+
     pub fn nfs_symlink(
         &self,
         parent: u64,
@@ -1872,7 +2015,10 @@ impl OsageFs {
 }
 
 impl Filesystem for OsageFs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        // Allow deeper in-flight queues under fsync-heavy small-file workloads.
+        let _ = config.set_max_background(1024);
+        let _ = config.set_congestion_threshold(768);
         Ok(())
     }
 
@@ -1991,8 +2137,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name_str, "ino": inode.inode }),
                 );
                 let attr = Self::record_attr(&inode);
-                let generation = self.superblock.snapshot().generation;
-                reply.entry(&TTL, &attr, generation);
+                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -2002,6 +2147,10 @@ impl Filesystem for OsageFs {
                     Some(code),
                     json!({ "parent": parent, "name": name_str }),
                 );
+                if code != ENOENT {
+                    let detail = format!("parent={} name={}", parent, name_str);
+                    self.log_fuse_error("lookup", &detail, code);
+                }
                 reply.error(code)
             }
         }
@@ -2124,8 +2273,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": dir.inode }),
                 );
                 let attr = Self::record_attr(&dir);
-                let generation = self.superblock.snapshot().generation;
-                reply.entry(&TTL, &attr, generation);
+                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -2147,7 +2295,7 @@ impl Filesystem for OsageFs {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let replay = self.replay_start();
@@ -2155,39 +2303,21 @@ impl Filesystem for OsageFs {
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
-            let mut parent_inode = self.load_inode(parent)?;
-            if !parent_inode.is_dir() {
-                return Err(ENOTDIR);
-            }
             let name = name.to_str().ok_or(EINVAL)?.to_string();
-            if parent_inode
-                .children()
-                .map(|children| children.contains_key(&name))
-                .unwrap_or(false)
-            {
-                return Err(EEXIST);
-            }
-            let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
-            let path = Self::build_child_path(&parent_inode, &name);
-            let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
-            file.update_times();
-            self.stage_inode(file.clone())?;
-            self.update_parent(&mut parent_inode, name, inode_id)?;
-            Ok(file)
+            self.fuse_create_file(parent, &name, uid, gid, flags)
         })();
         match res {
-            Ok(file) => {
+            Ok((file, created)) => {
                 self.log_replay(
                     "fuse",
                     "create",
                     replay,
                     None,
-                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": file.inode }),
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": file.inode, "created": created }),
                 );
                 let attr = Self::record_attr(&file);
-                let generation = self.superblock.snapshot().generation;
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
-                reply.created(&TTL, &attr, generation, 0, 0);
+                reply.created(&TTL, &attr, FUSE_NODE_GENERATION, 0, 0);
             }
             Err(code) => {
                 self.log_replay(
@@ -2249,8 +2379,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "target_len": target_len, "ino": record.inode }),
                 );
                 let attr = Self::record_attr(&record);
-                let generation = self.superblock.snapshot().generation;
-                reply.entry(&TTL, &attr, generation);
+                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -2390,7 +2519,13 @@ impl Filesystem for OsageFs {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
-            let mut record = self.load_inode(ino)?;
+            let mut record = match self.load_inode(ino) {
+                Ok(record) => record,
+                Err(code) => {
+                    self.log_fuse_error("write.load_inode", &format!("ino={}", ino), code);
+                    return Err(code);
+                }
+            };
             if record.is_dir() {
                 return Err(EISDIR);
             }
@@ -2398,17 +2533,62 @@ impl Filesystem for OsageFs {
             let write_end = (offset as u64).saturating_add(data.len() as u64);
             if offset as u64 == prev_size {
                 if write_end <= self.config.inline_threshold as u64 {
-                    self.append_file(record, data)?;
+                    if let Err(code) = self.append_file(record, data) {
+                        self.log_fuse_error(
+                            "write.append_file",
+                            &format!(
+                                "ino={} offset={} len={} prev_size={}",
+                                ino,
+                                offset,
+                                data.len(),
+                                prev_size
+                            ),
+                            code,
+                        );
+                        return Err(code);
+                    }
                 } else {
-                    self.write_large_segments(record, offset as u64, data)?;
+                    if let Err(code) = self.write_large_segments(record, offset as u64, data) {
+                        self.log_fuse_error(
+                            "write.large_append",
+                            &format!(
+                                "ino={} offset={} len={} prev_size={}",
+                                ino,
+                                offset,
+                                data.len(),
+                                prev_size
+                            ),
+                            code,
+                        );
+                        return Err(code);
+                    }
                 }
                 return Ok(data.len() as u32);
             }
             if write_end > self.config.inline_threshold as u64 {
-                self.write_large_segments(record, offset as u64, data)?;
+                if let Err(code) = self.write_large_segments(record, offset as u64, data) {
+                    self.log_fuse_error(
+                        "write.large_overwrite",
+                        &format!(
+                            "ino={} offset={} len={} prev_size={}",
+                            ino,
+                            offset,
+                            data.len(),
+                            prev_size
+                        ),
+                        code,
+                    );
+                    return Err(code);
+                }
                 return Ok(data.len() as u32);
             }
-            let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            let mut existing = match self.read_file_bytes(&record) {
+                Ok(existing) => existing,
+                Err(_) => {
+                    self.log_fuse_error("write.read_file_bytes", &format!("ino={}", ino), EIO);
+                    return Err(EIO);
+                }
+            };
             let offset = offset as usize;
             if offset > existing.len() {
                 existing.resize(offset, 0);
@@ -2698,8 +2878,7 @@ impl Filesystem for OsageFs {
                     json!({ "ino": ino, "newparent": newparent, "newname": newname.to_string_lossy() }),
                 );
                 let attr = Self::record_attr(&record);
-                let generation = self.superblock.snapshot().generation;
-                reply.entry(&TTL, &attr, generation);
+                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -2737,6 +2916,7 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
+            let _mutation_guard = self.mutation_lock.lock();
             match self.flush_pending() {
                 Ok(()) => {
                     self.log_replay("fuse", "flush", replay, None, json!({ "ino": ino }));
@@ -2744,6 +2924,7 @@ impl Filesystem for OsageFs {
                 }
                 Err(code) => {
                     self.log_replay("fuse", "flush", replay, Some(code), json!({ "ino": ino }));
+                    self.log_fuse_error("flush", &format!("ino={}", ino), code);
                     reply.error(code)
                 }
             }
@@ -2768,6 +2949,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEmpty,
     ) {
         let replay = self.replay_start();
+        let _mutation_guard = self.mutation_lock.lock();
         match self.flush_pending() {
             Ok(()) => {
                 self.log_replay("fuse", "fsync", replay, None, json!({ "ino": ino }));
@@ -2775,6 +2957,7 @@ impl Filesystem for OsageFs {
             }
             Err(code) => {
                 self.log_replay("fuse", "fsync", replay, Some(code), json!({ "ino": ino }));
+                self.log_fuse_error("fsync", &format!("ino={}", ino), code);
                 reply.error(code)
             }
         }
@@ -2792,6 +2975,7 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
+            let _mutation_guard = self.mutation_lock.lock();
             match self.flush_pending() {
                 Ok(()) => {
                     self.log_replay("fuse", "release", replay, None, json!({ "ino": ino }));
@@ -2799,6 +2983,7 @@ impl Filesystem for OsageFs {
                 }
                 Err(code) => {
                     self.log_replay("fuse", "release", replay, Some(code), json!({ "ino": ino }));
+                    self.log_fuse_error("release", &format!("ino={}", ino), code);
                     reply.error(code)
                 }
             }
@@ -3826,6 +4011,87 @@ mod tests {
         assert_eq!(attrs_after.mode & 0o777, 0o700);
         assert_eq!(attrs_after.uid, 777);
         assert_eq!(attrs_after.gid, 888);
+    }
+
+    #[test]
+    fn fuse_create_allows_existing_without_excl() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "fuse_create_existing.bin", 1 << 20);
+        let file = harness
+            .fs
+            .nfs_create(ROOT_INODE, "existing.dat", 0, 0)
+            .unwrap();
+        harness.fs.nfs_write(file.inode, 0, b"hello").unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let (opened, created) = harness
+            .fs
+            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, 0)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(opened.inode, file.inode);
+
+        let result =
+            harness
+                .fs
+                .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, libc::O_EXCL);
+        assert!(matches!(result, Err(code) if code == EEXIST));
+    }
+
+    #[test]
+    fn fuse_create_truncates_existing_when_requested() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "fuse_create_trunc.bin", 1 << 20);
+        let file = harness
+            .fs
+            .nfs_create(ROOT_INODE, "truncate.dat", 0, 0)
+            .unwrap();
+        harness.fs.nfs_write(file.inode, 0, b"payload").unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let (opened, created) = harness
+            .fs
+            .fuse_create_file(ROOT_INODE, "truncate.dat", 0, 0, libc::O_TRUNC)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(opened.inode, file.inode);
+        assert_eq!(opened.size, 0);
+        assert_eq!(harness.fs.nfs_read(file.inode, 0, 64).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn flush_pending_for_inode_keeps_other_pending_entries() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "flush_inode_only.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
+        let file_a = harness.fs.nfs_create(ROOT_INODE, "a.dat", 0, 0).unwrap();
+        let file_b = harness.fs.nfs_create(ROOT_INODE, "b.dat", 0, 0).unwrap();
+        harness.fs.nfs_write(file_a.inode, 0, b"aaaa").unwrap();
+        harness.fs.nfs_write(file_b.inode, 0, b"bbbb").unwrap();
+
+        harness.fs.flush_pending_for_inode(file_a.inode).unwrap();
+
+        assert!(
+            harness.fs.pending_inodes.lock().contains_key(&file_b.inode),
+            "expected unrelated inode to remain pending"
+        );
+        let stored_a = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(file_a.inode))
+            .unwrap()
+            .unwrap();
+        assert_eq!(harness.fs.read_file_bytes(&stored_a).unwrap(), b"aaaa");
+
+        harness.fs.flush_pending().unwrap();
+        let stored_b = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(file_b.inode))
+            .unwrap()
+            .unwrap();
+        assert_eq!(harness.fs.read_file_bytes(&stored_b).unwrap(), b"bbbb");
     }
 
     #[test]

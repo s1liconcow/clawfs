@@ -23,6 +23,8 @@ RAND_IODEPTH="${RAND_IODEPTH:-32}"
 SMALLFILE_COUNT="${SMALLFILE_COUNT:-4000}"
 SMALLFILE_SIZE="${SMALLFILE_SIZE:-16k}"
 SMALLFILE_NUMJOBS="${SMALLFILE_NUMJOBS:-8}"
+WORKLOADS="${WORKLOADS:-all}"
+FAST_REPRO="${FAST_REPRO:-0}"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/fio-results-$(date +%Y%m%d-%H%M%S)}"
 
 WORK_ROOT="$MOUNT_PATH/home/${USER:-$(whoami)}/fio"
@@ -33,6 +35,25 @@ FAILED_WORKLOADS=()
 
 osage_require_cmd fio
 osage_require_cmd python3
+
+if osage_is_true "$FAST_REPRO"; then
+  RUNTIME_SEC=2
+  SEQ_SIZE=16M
+  RAND_SIZE=16M
+  RAND_NUMJOBS=1
+  RAND_IODEPTH=2
+  SMALLFILE_COUNT=300
+  SMALLFILE_SIZE=8k
+  SMALLFILE_NUMJOBS=8
+fi
+
+workload_enabled() {
+  local name=$1
+  if [[ "$WORKLOADS" == "all" ]]; then
+    return 0
+  fi
+  [[ ",$WORKLOADS," == *",$name,"* ]]
+}
 
 cleanup_daemon() {
   set +e
@@ -111,85 +132,100 @@ run_fio() {
   fi
 }
 
-# Pre-create read targets so read-only workloads operate on allocated data.
-run_fio prefill_seq \
-  --filename="$WORK_ROOT/seq.bin" \
-  --rw=write \
-  --bs=1m \
-  --size="$SEQ_SIZE" \
-  --ioengine=sync \
-  --direct="$DIRECT_IO"
+if workload_enabled "seq_read_1m"; then
+  run_fio prefill_seq \
+    --filename="$WORK_ROOT/seq.bin" \
+    --rw=write \
+    --bs=1m \
+    --size="$SEQ_SIZE" \
+    --ioengine=sync \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio prefill_rand \
-  --filename="$WORK_ROOT/rand.bin" \
-  --rw=write \
-  --bs=4k \
-  --size="$RAND_SIZE" \
-  --ioengine=libaio \
-  --iodepth="$RAND_IODEPTH" \
-  --numjobs="$RAND_NUMJOBS" \
-  --direct="$DIRECT_IO"
+if workload_enabled "randread_4k" || workload_enabled "randrw_70r_30w_4k"; then
+  run_fio prefill_rand \
+    --filename="$WORK_ROOT/rand.bin" \
+    --rw=write \
+    --bs=4k \
+    --size="$RAND_SIZE" \
+    --ioengine=libaio \
+    --iodepth="$RAND_IODEPTH" \
+    --numjobs="$RAND_NUMJOBS" \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio seq_write_1m \
-  --filename="$WORK_ROOT/seq.bin" \
-  --rw=write \
-  --bs=1m \
-  --size="$SEQ_SIZE" \
-  --ioengine=sync \
-  --direct="$DIRECT_IO"
+if workload_enabled "seq_write_1m"; then
+  run_fio seq_write_1m \
+    --filename="$WORK_ROOT/seq.bin" \
+    --rw=write \
+    --bs=1m \
+    --size="$SEQ_SIZE" \
+    --ioengine=sync \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio seq_read_1m \
-  --filename="$WORK_ROOT/seq.bin" \
-  --rw=read \
-  --bs=1m \
-  --size="$SEQ_SIZE" \
-  --ioengine=sync \
-  --direct="$DIRECT_IO"
+if workload_enabled "seq_read_1m"; then
+  run_fio seq_read_1m \
+    --filename="$WORK_ROOT/seq.bin" \
+    --rw=read \
+    --bs=1m \
+    --size="$SEQ_SIZE" \
+    --ioengine=sync \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio randread_4k \
-  --filename="$WORK_ROOT/rand.bin" \
-  --rw=randread \
-  --bs=4k \
-  --size="$RAND_SIZE" \
-  --ioengine=libaio \
-  --iodepth="$RAND_IODEPTH" \
-  --numjobs="$RAND_NUMJOBS" \
-  --direct="$DIRECT_IO"
+if workload_enabled "randread_4k"; then
+  run_fio randread_4k \
+    --filename="$WORK_ROOT/rand.bin" \
+    --rw=randread \
+    --bs=4k \
+    --size="$RAND_SIZE" \
+    --ioengine=libaio \
+    --iodepth="$RAND_IODEPTH" \
+    --numjobs="$RAND_NUMJOBS" \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio randwrite_4k \
-  --filename="$WORK_ROOT/rand.bin" \
-  --rw=randwrite \
-  --bs=4k \
-  --size="$RAND_SIZE" \
-  --ioengine=libaio \
-  --iodepth="$RAND_IODEPTH" \
-  --numjobs="$RAND_NUMJOBS" \
-  --direct="$DIRECT_IO"
+if workload_enabled "randwrite_4k"; then
+  run_fio randwrite_4k \
+    --filename="$WORK_ROOT/rand.bin" \
+    --rw=randwrite \
+    --bs=4k \
+    --size="$RAND_SIZE" \
+    --ioengine=libaio \
+    --iodepth="$RAND_IODEPTH" \
+    --numjobs="$RAND_NUMJOBS" \
+    --direct="$DIRECT_IO"
+fi
 
-run_fio randrw_70r_30w_4k \
-  --filename="$WORK_ROOT/rand.bin" \
-  --rw=randrw \
-  --rwmixread=70 \
-  --bs=4k \
-  --size="$RAND_SIZE" \
-  --ioengine=libaio \
-  --iodepth="$RAND_IODEPTH" \
-  --numjobs="$RAND_NUMJOBS" \
-  --direct="$DIRECT_IO"
+if workload_enabled "randrw_70r_30w_4k"; then
+  run_fio randrw_70r_30w_4k \
+    --filename="$WORK_ROOT/rand.bin" \
+    --rw=randrw \
+    --rwmixread=70 \
+    --bs=4k \
+    --size="$RAND_SIZE" \
+    --ioengine=libaio \
+    --iodepth="$RAND_IODEPTH" \
+    --numjobs="$RAND_NUMJOBS" \
+    --direct="$DIRECT_IO"
+fi
 
 mkdir -p "$WORK_ROOT/smallfiles"
-run_fio smallfiles_sync \
-  --directory="$WORK_ROOT/smallfiles" \
-  --rw=randwrite \
-  --numjobs="$SMALLFILE_NUMJOBS" \
-  --nrfiles="$SMALLFILE_COUNT" \
-  --filesize="$SMALLFILE_SIZE" \
-  --openfiles=128 \
-  --file_service_type=random \
-  --create_on_open=1 \
-  --ioengine=sync \
-  --fsync=1 \
-  --direct=0
+if workload_enabled "smallfiles_sync"; then
+  run_fio smallfiles_sync \
+    --directory="$WORK_ROOT/smallfiles" \
+    --rw=randwrite \
+    --numjobs="$SMALLFILE_NUMJOBS" \
+    --nrfiles="$SMALLFILE_COUNT" \
+    --filesize="$SMALLFILE_SIZE" \
+    --openfiles=128 \
+    --file_service_type=random \
+    --create_on_open=1 \
+    --ioengine=sync \
+    --fsync=1 \
+    --direct=0
+fi
 
 python3 - "$RAW_DIR" "$SUMMARY_MD" <<'PY'
 import json

@@ -46,6 +46,7 @@ Please continuously update this document with useful things you figure out that 
 - `OSAGEFS_RUN_PERF=1 cargo test --test perf_local -- --nocapture`: local performance suite includes stage throughput, batched segment throughput, and small-file IOPS checks.
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
 - `scripts/fio_workloads.sh`: fio benchmark harness; requires `fio`, `python3`, and FUSE support in the runtime environment (prefer sprite execution for mount tests).
+- `scripts/fio_workloads.sh` supports iteration knobs: `WORKLOADS` (comma-separated workload names, or `all`) and `FAST_REPRO=1` (2s runtime, small sizes) for quick repro loops. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
 - `scripts/run_osagefs.sh` + `scripts/run_nfs_gateway.sh`: set `REPLAY_LOG_PATH=/path/replay.jsonl.gz` to pass `--replay-log` and capture replay traces for FUSE or direct NFS traffic.
 - `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
@@ -64,6 +65,8 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/stress_e2e.sh` always runs `scripts/cleanup.sh` on exit, which removes both `LOG_FILE` and `PERF_LOG_PATH`; when you need post-run perf analysis, run an equivalent custom workload (or copy logs elsewhere) before cleanup.
 - `scripts/stress_e2e.sh` now wraps `scripts/cleanup.sh` via a shared `run_cleanup_script()` helper for both initial cleanup and EXIT teardown, matching the common script pattern used by other harnesses.
 - In Sprite VMs, long `apt-get install` runs can sometimes end with `Error: connection closed` / non-zero transport exit even after package `Setting up ...` lines complete; verify required tools explicitly (`fusermount3`, `rg`, `strace`) before retrying full bootstrap.
+- Concurrent `smallfiles_sync` (`numjobs=8`) can expose create/open races; when reproducing, start with `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` and inspect `/work/osagefs/fio-small*.json` for `open(..., O_CREAT) = -1 EIO`.
+- Update (2026-02-15): `smallfiles_sync` `open(..., O_CREAT) = -1 EIO` under `fsync=1` / `numjobs=8` was traced to unstable FUSE inode generation values in `ReplyEntry`/`ReplyCreate`. Do not use superblock generation there; use a stable node generation constant (`1`) per inode lifetime.
 
 ## Useful Commands
 - Clean mount/store/state: `fusermount -u /tmp/osagefs-mnt; sudo rm -rf /tmp/osagefs-mnt /tmp/osagefs-store ~/.osagefs_state.bin`.
@@ -220,6 +223,7 @@ Notes:
 
 FIO note:
 - In sprite runs, `smallfiles_sync` may return `Input/output error` during high-concurrency open/create (`filesetup.c:open(...)`) while larger sequential/random workloads still complete. Keep the workload in the matrix for regression tracking, but do not let that single failure abort summary generation.
+- Regression check for this class of issue: `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` should pass repeatedly with `fsync=1` once FUSE generation is stable.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:
