@@ -10,6 +10,8 @@ PID_FILE="${PID_FILE:-/tmp/osagefs.pid}"
 FOREGROUND="${FOREGROUND:-0}"
 DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
 DEBUG_LOG="${DEBUG_LOG:-0}"
+MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
+REPLAY_LOG_PATH="${REPLAY_LOG_PATH:-}"
 
 osage_ensure_release_binary "$OSAGE_BIN"
 
@@ -37,6 +39,9 @@ fi
 if [[ -n "$PERF_LOG_PATH" ]]; then
   CMD+=(--perf-log "$PERF_LOG_PATH")
 fi
+if [[ -n "$REPLAY_LOG_PATH" ]]; then
+  CMD+=(--replay-log "$REPLAY_LOG_PATH")
+fi
 
 if osage_is_true "$FOREGROUND"; then
   exec "${CMD[@]}"
@@ -47,4 +52,12 @@ mkdir -p "$(dirname "$LOG_FILE")"
 nohup "${CMD[@]}" >"$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
+if ! osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"; then
+  if kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" >/dev/null 2>&1 || true
+    wait "$PID" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  exit 1
+fi
 echo "osagefs running as PID $PID (log: $LOG_FILE, pid file: $PID_FILE)"

@@ -29,6 +29,8 @@ Please continuously update this document with useful things you figure out that 
 - `src/config.rs`: CLI -> Config mapping. Important fields: `mount_path`, `store_path`, `inline_threshold`, `shard_size`, `inode_batch`, `segment_batch`, `pending_bytes`, `object_provider`, `bucket`, `region`, `endpoint`, `object_prefix`, `gcs_service_account`, `state_path`, `perf_log`, `fsync_on_close`, `flush_interval_ms`, `lookup_cache_ttl_ms`, `dir_cache_ttl_ms`, `metadata_poll_interval_ms`, `segment_cache_bytes`, `foreground`.
 - Logging: `--log-file` defaults to `osagefs.log` and mirrors every log (now defaulting to DEBUG when a file is used) so tailing that file shows detailed staging/flush info.
 - `src/perf.rs`: JSONL perf logger that captures `stage_file` / `flush_pending` events when `--perf-log` is supplied.
+- `src/replay.rs`: Compressed replay logger (`.jsonl.gz`) for request-layer traces; records ordered FUSE/NFS ops with timing, errno, and metadata (inode/offset/length/path identifiers) but not payload bytes.
+- Replay logs now include a startup metadata event (`layer=meta`, `op=fs_config`) with key runtime knobs (`home_prefix`, inline/pending/flush/cache settings, journal/fsync flags, bootstrap user) so replay can align config with capture.
 - `src/state.rs`: `ClientStateManager` handles per-client pools, persisted via JSON. Tests ensure persistence across runs.
 - `src/metadata.rs`: Handles inode caching, writes shard snapshots under `/imaps`, emits delta logs with bloom-filtered filenames, and performs CAS updates on `metadata/superblock.bin`.
 - `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` uses range reads. Tests verify write/read.
@@ -45,6 +47,10 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
 - `scripts/fio_workloads.sh`: fio benchmark harness; requires `fio`, `python3`, and FUSE support in the runtime environment (prefer sprite execution for mount tests).
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
+- `scripts/run_osagefs.sh` + `scripts/run_nfs_gateway.sh`: set `REPLAY_LOG_PATH=/path/replay.jsonl.gz` to pass `--replay-log` and capture replay traces for FUSE or direct NFS traffic.
+- `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
+- `src/bin/osagefs_replay.rs` brute-force mode: `--iterations N` replays from fresh-init state N times with deterministic seeds (`--seed`) and optional chaos knobs (`--jitter-us`, `--chaos-sleep-prob`, `--chaos-sleep-max-us`, `--chaos-flush-prob`) to shake out timing-sensitive issues.
+- Mount validation: `scripts/common.sh` now provides `osage_assert_welcome_file` and mount-oriented scripts assert `${MOUNT_PATH}/WELCOME.txt` (or `${NFS_MOUNT_PATH}/WELCOME.txt` for NFS auto-mount) to fail fast when the mount did not come up correctly. Tune wait time with `MOUNT_CHECK_TIMEOUT_SEC` (default `10`).
 - `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount), or exports an existing path for NFSv4 via `ganesha.nfsd` with `--use-existing-mount`.
 - When CLI flags/config defaults change, double-check and update `scripts/` launchers in the same PR so script argument sets stay in sync with binaries.
 
@@ -63,6 +69,8 @@ Please continuously update this document with useful things you figure out that 
 - Run perf test: `LOG_FILE=$HOME/linux_build_timings.log ./scripts/linux_kernel_perf.sh`.
 - Run fio workload sweep: `RESULTS_DIR=/work/osagefs/fio-results LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl ./scripts/fio_workloads.sh`.
 - `scripts/run_osagefs.sh` defaults to `$ROOT/osagefs-perf.jsonl`; set `PERF_LOG_PATH=` to disable tracing when needed.
+- Replay trace capture: `REPLAY_LOG_PATH=/work/osagefs/replay.jsonl.gz ./scripts/run_osagefs.sh` (or `./scripts/run_nfs_gateway.sh`). Inspect with `gzip -dc /work/osagefs/replay.jsonl.gz | tail -n 50`.
+- Direct API replay: `cargo run --release --bin osagefs_replay -- --trace-path /work/osagefs/replay.jsonl.gz --store-path /tmp/osagefs-replay-store --local-cache-path /tmp/osagefs-replay-cache --state-path /tmp/osagefs-replay-state.bin --layer fuse --speed 1.0` (add `--ignore-timing` for max-throughput replay).
 - Enable perf tracing for other invocations by exporting `PERF_LOG_PATH=/tmp/osagefs-perf.jsonl` (empty string disables logging when scripts default it). Use `--fsync-on-close` to restore immediate durability, `--flush-interval-ms` to adjust opportunistic flush cadence (0 disables timer), and `--disable-cleanup` when cleanup will be handled by an external agent.
 - Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`. Add `--protocol v4 --use-existing-mount --mount-path /tmp/osagefs-mnt --ganesha-binary /usr/bin/ganesha.nfsd` for a full NFSv4 server.
 

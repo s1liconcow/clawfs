@@ -19,6 +19,7 @@ use osagefs::fs::OsageFs;
 use osagefs::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
 use osagefs::journal::JournalManager;
 use osagefs::metadata::MetadataStore;
+use osagefs::replay::ReplayLogger;
 use osagefs::segment::SegmentManager;
 use osagefs::state::ClientStateManager;
 use osagefs::superblock::SuperblockManager;
@@ -27,6 +28,7 @@ use tokio::process::Command;
 use tokio::signal;
 use tokio::task;
 use tracing::info;
+use serde_json::json;
 
 const ROOT_ID: fileid3 = ROOT_INODE;
 const DEFAULT_V4_EXPORT: &str = "/osagefs";
@@ -102,6 +104,10 @@ struct Cli {
     /// Disable close-time journal in direct mode (higher throughput, lower crash durability).
     #[arg(long, default_value_t = true)]
     disable_journal: bool,
+
+    /// Optional compressed replay log path (.jsonl.gz) for operation-level tracing.
+    #[arg(long, value_name = "PATH")]
+    replay_log: Option<PathBuf>,
 
     /// Address for the user-mode NFS server to bind to (ip:port).
     #[arg(long, default_value = "0.0.0.0:2049")]
@@ -312,6 +318,34 @@ impl OsageDirectFs {
             Some(Arc::new(JournalManager::new(&config.local_cache_path)?))
         };
 
+        let replay_logger = config
+            .replay_log
+            .as_ref()
+            .map(ReplayLogger::new)
+            .transpose()?
+            .map(Arc::new);
+        if let Some(logger) = &replay_logger {
+            logger.log_meta(
+                "fs_config",
+                json!({
+                    "mode": "nfs-direct",
+                    "home_prefix": config.home_prefix.clone(),
+                    "inline_threshold": config.inline_threshold,
+                    "pending_bytes": config.pending_bytes,
+                    "fsync_on_close": config.fsync_on_close,
+                    "flush_interval_ms": config.flush_interval_ms,
+                    "disable_journal": config.disable_journal,
+                    "lookup_cache_ttl_ms": config.lookup_cache_ttl_ms,
+                    "dir_cache_ttl_ms": config.dir_cache_ttl_ms,
+                    "metadata_poll_interval_ms": config.metadata_poll_interval_ms,
+                    "segment_cache_bytes": config.segment_cache_bytes,
+                    "imap_delta_batch": config.imap_delta_batch,
+                    "bootstrap_user": std::env::var("USER")
+                        .or_else(|_| std::env::var("LOGNAME"))
+                        .ok(),
+                }),
+            );
+        }
         let fs = Arc::new(OsageFs::new(
             config,
             metadata,
@@ -321,6 +355,7 @@ impl OsageDirectFs {
             handle,
             client_state,
             None,
+            replay_logger,
         ));
 
         let fs_for_replay = fs.clone();
@@ -745,6 +780,7 @@ fn build_config(cli: &Cli) -> Config {
         gcs_service_account: cli.gcs_service_account.clone(),
         state_path,
         perf_log: None,
+        replay_log: cli.replay_log.clone(),
         disable_journal: cli.disable_journal,
         fsync_on_close: false,
         flush_interval_ms: 30_000,

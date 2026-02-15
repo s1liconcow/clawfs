@@ -660,6 +660,7 @@ mod tests {
             foreground: false,
             home_prefix: "/home".into(),
             perf_log: None,
+            replay_log: None,
             disable_journal: false,
             fsync_on_close: false,
             flush_interval_ms: 0,

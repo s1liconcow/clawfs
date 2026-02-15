@@ -26,6 +26,7 @@ use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExten
 use crate::journal::{JournalEntry, JournalManager, JournalPayload};
 use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
+use crate::replay::ReplayLogger;
 use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, StagedChunk};
 use crate::state::ClientStateManager;
 use crate::superblock::SuperblockManager;
@@ -59,6 +60,7 @@ pub struct OsageFs {
     flushing_inodes: Mutex<HashMap<u64, PendingEntry>>,
     pending_bytes: Mutex<u64>,
     perf: Option<Arc<PerfLogger>>,
+    replay: Option<Arc<ReplayLogger>>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
     last_flush: Mutex<Instant>,
@@ -102,6 +104,7 @@ impl OsageFs {
         handle: Handle,
         client_state: Arc<ClientStateManager>,
         perf: Option<Arc<PerfLogger>>,
+        replay: Option<Arc<ReplayLogger>>,
     ) -> Self {
         let fsync_on_close = config.fsync_on_close;
         let flush_interval = if config.flush_interval_ms == 0 {
@@ -123,6 +126,7 @@ impl OsageFs {
             flushing_inodes: Mutex::new(HashMap::new()),
             pending_bytes: Mutex::new(0),
             perf,
+            replay,
             fsync_on_close,
             flush_interval,
             last_flush: Mutex::new(Instant::now()),
@@ -1237,6 +1241,33 @@ impl OsageFs {
         }
     }
 
+    fn replay_start(&self) -> Option<Instant> {
+        self.replay.as_ref().map(|_| Instant::now())
+    }
+
+    fn log_replay(
+        &self,
+        layer: &str,
+        op: &str,
+        start: Option<Instant>,
+        errno: Option<i32>,
+        mut details: serde_json::Value,
+    ) {
+        let (Some(logger), Some(started)) = (&self.replay, start) else {
+            return;
+        };
+        if let serde_json::Value::Object(ref mut map) = details {
+            map.insert("pid".to_string(), json!(process::id()));
+            map.insert(
+                "tid".to_string(),
+                json!(format!("{:?}", thread::current().id())),
+            );
+        }
+        let duration = started.elapsed();
+        let start_offset = logger.elapsed_since_start(started);
+        logger.log_op(layer, op, start_offset, duration, errno, details);
+    }
+
     fn adaptive_pending_limit(&self) -> u64 {
         let base = self.config.pending_bytes;
         let scaled = base.saturating_mul(ADAPTIVE_PENDING_MULTIPLIER);
@@ -1329,31 +1360,62 @@ impl OsageFs {
     }
 
     pub fn nfs_lookup(&self, parent: u64, name: &str) -> std::result::Result<InodeRecord, i32> {
-        let parent_inode = self.load_inode(parent)?;
-        let child = parent_inode
-            .children()
-            .and_then(|children| children.get(name).copied())
-            .ok_or(ENOENT)?;
-        self.load_inode(child)
+        let replay = self.replay_start();
+        let result = (|| {
+            let parent_inode = self.load_inode(parent)?;
+            let child = parent_inode
+                .children()
+                .and_then(|children| children.get(name).copied())
+                .ok_or(ENOENT)?;
+            self.load_inode(child)
+        })();
+        self.log_replay(
+            "nfs",
+            "lookup",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name, "ino": result.as_ref().ok().map(|record| record.inode) }),
+        );
+        result
     }
 
     pub fn nfs_getattr(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
-        self.load_inode(ino)
+        let replay = self.replay_start();
+        let result = self.load_inode(ino);
+        self.log_replay(
+            "nfs",
+            "getattr",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "ino": ino }),
+        );
+        result
     }
 
     pub fn nfs_readdir(&self, ino: u64) -> std::result::Result<Vec<(u64, String)>, i32> {
-        let inode = self.load_inode(ino)?;
-        if !inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let mut entries = Vec::new();
-        if let Some(children) = inode.children() {
-            entries.reserve(children.len());
-            for (name, child) in children {
-                entries.push((*child, name.clone()));
+        let replay = self.replay_start();
+        let result = (|| {
+            let inode = self.load_inode(ino)?;
+            if !inode.is_dir() {
+                return Err(ENOTDIR);
             }
-        }
-        Ok(entries)
+            let mut entries = Vec::new();
+            if let Some(children) = inode.children() {
+                entries.reserve(children.len());
+                for (name, child) in children {
+                    entries.push((*child, name.clone()));
+                }
+            }
+            Ok(entries)
+        })();
+        self.log_replay(
+            "nfs",
+            "readdir",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0, |entries| entries.len()) }),
+        );
+        result
     }
 
     pub fn nfs_setattr(
@@ -1364,27 +1426,38 @@ impl OsageFs {
         gid: Option<u32>,
         size: Option<u64>,
     ) -> std::result::Result<InodeRecord, i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut record = self.load_inode(ino)?;
-        if let Some(new_mode) = mode {
-            record.mode = (record.mode & !0o7777) | (new_mode & 0o7777);
-        }
-        if let Some(new_uid) = uid {
-            record.uid = new_uid;
-        }
-        if let Some(new_gid) = gid {
-            record.gid = new_gid;
-        }
-        let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        if let Some(target_size) = size {
-            if record.is_dir() {
-                return Err(EISDIR);
+        let result = (|| {
+            let mut record = self.load_inode(ino)?;
+            if let Some(new_mode) = mode {
+                record.mode = (record.mode & !0o7777) | (new_mode & 0o7777);
             }
-            data.resize(target_size as usize, 0);
-        }
-        record.update_times();
-        self.stage_file(record.clone(), data, None)?;
-        Ok(record)
+            if let Some(new_uid) = uid {
+                record.uid = new_uid;
+            }
+            if let Some(new_gid) = gid {
+                record.gid = new_gid;
+            }
+            let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            if let Some(target_size) = size {
+                if record.is_dir() {
+                    return Err(EISDIR);
+                }
+                data.resize(target_size as usize, 0);
+            }
+            record.update_times();
+            self.stage_file(record.clone(), data, None)?;
+            Ok(record)
+        })();
+        self.log_replay(
+            "nfs",
+            "setattr",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "ino": ino, "mode": mode, "uid": uid, "gid": gid, "size": size }),
+        );
+        result
     }
 
     pub fn nfs_create(
@@ -1394,35 +1467,46 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut parent_inode = self.load_inode(parent)?;
-        if !parent_inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let name = name.to_string();
-        if parent_inode
-            .children()
-            .map(|children| children.contains_key(&name))
-            .unwrap_or(false)
-        {
-            return Err(EEXIST);
-        }
-        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
-        let path = Self::build_child_path(&parent_inode, &name);
-        let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
-        file.update_times();
-        self.stage_inode(file.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
-        if self.load_inode(inode_id).is_err() {
-            error!(
-                "nfs_create visibility check failed ino={} parent={} pending={} flushing={}",
-                inode_id,
-                parent,
-                self.pending_inodes.lock().contains_key(&inode_id),
-                self.flushing_inodes.lock().contains_key(&inode_id)
-            );
-        }
-        Ok(file)
+        let result = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let name = name.to_string();
+            if parent_inode
+                .children()
+                .map(|children| children.contains_key(&name))
+                .unwrap_or(false)
+            {
+                return Err(EEXIST);
+            }
+            let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+            let path = Self::build_child_path(&parent_inode, &name);
+            let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
+            file.update_times();
+            self.stage_inode(file.clone())?;
+            self.update_parent(&mut parent_inode, name, inode_id)?;
+            if self.load_inode(inode_id).is_err() {
+                error!(
+                    "nfs_create visibility check failed ino={} parent={} pending={} flushing={}",
+                    inode_id,
+                    parent,
+                    self.pending_inodes.lock().contains_key(&inode_id),
+                    self.flushing_inodes.lock().contains_key(&inode_id)
+                );
+            }
+            Ok(file)
+        })();
+        self.log_replay(
+            "nfs",
+            "create",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
+        );
+        result
     }
 
     pub fn nfs_mkdir(
@@ -1432,26 +1516,38 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut parent_inode = self.load_inode(parent)?;
-        if !parent_inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let name = name.to_string();
-        if parent_inode
-            .children()
-            .map(|children| children.contains_key(&name))
-            .unwrap_or(false)
-        {
-            return Err(EEXIST);
-        }
-        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
-        let path = Self::build_child_path(&parent_inode, &name);
-        let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
-        dir.update_times();
-        self.stage_inode(dir.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
-        Ok(dir)
+        let result = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let name = name.to_string();
+            if parent_inode
+                .children()
+                .map(|children| children.contains_key(&name))
+                .unwrap_or(false)
+            {
+                return Err(EEXIST);
+            }
+            let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+            let path = Self::build_child_path(&parent_inode, &name);
+            let mut dir =
+                InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
+            dir.update_times();
+            self.stage_inode(dir.clone())?;
+            self.update_parent(&mut parent_inode, name, inode_id)?;
+            Ok(dir)
+        })();
+        self.log_replay(
+            "nfs",
+            "mkdir",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
+        );
+        result
     }
 
     pub fn nfs_symlink(
@@ -1462,145 +1558,222 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
+        let replay = self.replay_start();
+        let target_len = target.len();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut parent_inode = self.load_inode(parent)?;
-        if !parent_inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let name = name.to_string();
-        if parent_inode
-            .children()
-            .map(|children| children.contains_key(&name))
-            .unwrap_or(false)
-        {
-            return Err(EEXIST);
-        }
-        let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
-        let path = Self::build_child_path(&parent_inode, &name);
-        let record =
-            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
-        self.stage_inode(record.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
-        Ok(record)
+        let result = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let name = name.to_string();
+            if parent_inode
+                .children()
+                .map(|children| children.contains_key(&name))
+                .unwrap_or(false)
+            {
+                return Err(EEXIST);
+            }
+            let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+            let path = Self::build_child_path(&parent_inode, &name);
+            let record =
+                InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
+            self.stage_inode(record.clone())?;
+            self.update_parent(&mut parent_inode, name, inode_id)?;
+            Ok(record)
+        })();
+        self.log_replay(
+            "nfs",
+            "symlink",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "target_len": target_len, "ino": result.as_ref().ok().map(|record| record.inode) }),
+        );
+        result
     }
 
     pub fn nfs_read(&self, ino: u64, offset: u64, size: u32) -> std::result::Result<Vec<u8>, i32> {
-        let record = self.load_inode(ino)?;
-        if record.is_dir() {
-            return Err(EISDIR);
-        }
-        let data = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        let offset = offset as usize;
-        if offset >= data.len() {
-            return Ok(Vec::new());
-        }
-        let end = std::cmp::min(offset + size as usize, data.len());
-        Ok(data[offset..end].to_vec())
+        let replay = self.replay_start();
+        let result = (|| {
+            let record = self.load_inode(ino)?;
+            if record.is_dir() {
+                return Err(EISDIR);
+            }
+            let data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            let offset = offset as usize;
+            if offset >= data.len() {
+                return Ok(Vec::new());
+            }
+            let end = std::cmp::min(offset + size as usize, data.len());
+            Ok(data[offset..end].to_vec())
+        })();
+        self.log_replay(
+            "nfs",
+            "read",
+            replay,
+            result.as_ref().err().copied(),
+            json!({
+                "ino": ino,
+                "offset": offset,
+                "requested": size,
+                "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()),
+            }),
+        );
+        result
     }
 
     pub fn nfs_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {
-        let record = self.load_inode(ino)?;
-        if !record.is_symlink() {
-            return Err(EINVAL);
-        }
-        self.read_file_bytes(&record).map_err(|_| EIO)
+        let replay = self.replay_start();
+        let result = (|| {
+            let record = self.load_inode(ino)?;
+            if !record.is_symlink() {
+                return Err(EINVAL);
+            }
+            self.read_file_bytes(&record).map_err(|_| EIO)
+        })();
+        self.log_replay(
+            "nfs",
+            "readlink",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "ino": ino, "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()) }),
+        );
+        result
     }
 
     pub fn nfs_write(&self, ino: u64, offset: u64, data: &[u8]) -> std::result::Result<u32, i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut record = match self.load_inode(ino) {
-            Ok(record) => record,
-            Err(code) => {
-                let metadata_exists = self
-                    .block_on(self.metadata.get_inode(ino))
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false);
-                error!(
-                    "nfs_write load_inode failed ino={} code={} offset={} len={} pending={} flushing={} metadata_exists={}",
-                    ino,
-                    code,
-                    offset,
-                    data.len(),
-                    self.pending_inodes.lock().contains_key(&ino),
-                    self.flushing_inodes.lock().contains_key(&ino),
-                    metadata_exists
-                );
-                return Err(code);
+        let result = (|| {
+            let mut record = match self.load_inode(ino) {
+                Ok(record) => record,
+                Err(code) => {
+                    let metadata_exists = self
+                        .block_on(self.metadata.get_inode(ino))
+                        .map(|opt| opt.is_some())
+                        .unwrap_or(false);
+                    error!(
+                        "nfs_write load_inode failed ino={} code={} offset={} len={} pending={} flushing={} metadata_exists={}",
+                        ino,
+                        code,
+                        offset,
+                        data.len(),
+                        self.pending_inodes.lock().contains_key(&ino),
+                        self.flushing_inodes.lock().contains_key(&ino),
+                        metadata_exists
+                    );
+                    return Err(code);
+                }
+            };
+            if record.is_dir() {
+                return Err(EISDIR);
             }
-        };
-        if record.is_dir() {
-            return Err(EISDIR);
-        }
-        let prev_size = record.size;
-        let write_end = offset.saturating_add(data.len() as u64);
-        if offset == prev_size {
-            if write_end <= self.config.inline_threshold as u64 {
-                self.append_file(record, data)?;
-            } else {
+            let prev_size = record.size;
+            let write_end = offset.saturating_add(data.len() as u64);
+            if offset == prev_size {
+                if write_end <= self.config.inline_threshold as u64 {
+                    self.append_file(record, data)?;
+                } else {
+                    self.write_large_segments(record, offset, data)?;
+                }
+                return Ok(data.len() as u32);
+            }
+            if write_end > self.config.inline_threshold as u64 {
                 self.write_large_segments(record, offset, data)?;
+                return Ok(data.len() as u32);
             }
-            return Ok(data.len() as u32);
-        }
-        if write_end > self.config.inline_threshold as u64 {
-            self.write_large_segments(record, offset, data)?;
-            return Ok(data.len() as u32);
-        }
-        let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        let offset = offset as usize;
-        if offset > existing.len() {
-            existing.resize(offset, 0);
-        }
-        if offset + data.len() > existing.len() {
-            existing.resize(offset + data.len(), 0);
-        }
-        existing[offset..offset + data.len()].copy_from_slice(data);
-        record.update_times();
-        let ctx = StageWriteContext {
-            prev_size,
-            write_offset: offset as u64,
-        };
-        self.stage_file(record, existing, Some(ctx))?;
-        Ok(data.len() as u32)
+            let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            let offset = offset as usize;
+            if offset > existing.len() {
+                existing.resize(offset, 0);
+            }
+            if offset + data.len() > existing.len() {
+                existing.resize(offset + data.len(), 0);
+            }
+            existing[offset..offset + data.len()].copy_from_slice(data);
+            record.update_times();
+            let ctx = StageWriteContext {
+                prev_size,
+                write_offset: offset as u64,
+            };
+            self.stage_file(record, existing, Some(ctx))?;
+            Ok(data.len() as u32)
+        })();
+        self.log_replay(
+            "nfs",
+            "write",
+            replay,
+            result.as_ref().err().copied(),
+            json!({
+                "ino": ino,
+                "offset": offset,
+                "len": data.len(),
+                "written": result.as_ref().ok().copied().unwrap_or(0),
+            }),
+        );
+        result
     }
 
     pub fn nfs_remove_file(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut parent_inode = self.load_inode(parent)?;
-        if !parent_inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let child_ino = parent_inode
-            .children()
-            .and_then(|children| children.get(name).copied())
-            .ok_or(ENOENT)?;
-        let mut child = self.load_inode(child_ino)?;
-        if child.is_dir() {
-            return Err(EISDIR);
-        }
-        self.unlink_file_entry(&mut parent_inode, name, &mut child)
+        let result = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let child_ino = parent_inode
+                .children()
+                .and_then(|children| children.get(name).copied())
+                .ok_or(ENOENT)?;
+            let mut child = self.load_inode(child_ino)?;
+            if child.is_dir() {
+                return Err(EISDIR);
+            }
+            self.unlink_file_entry(&mut parent_inode, name, &mut child)
+        })();
+        self.log_replay(
+            "nfs",
+            "unlink",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name }),
+        );
+        result
     }
 
     pub fn nfs_remove_dir(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let mut parent_inode = self.load_inode(parent)?;
-        if !parent_inode.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let child_ino = parent_inode
-            .children()
-            .and_then(|children| children.get(name).copied())
-            .ok_or(ENOENT)?;
-        let child = self.load_inode(child_ino)?;
-        if !child.is_dir() {
-            return Err(ENOTDIR);
-        }
-        if child.children().map(|c| !c.is_empty()).unwrap_or(false) {
-            return Err(ENOTEMPTY);
-        }
-        let tombstone = InodeRecord::tombstone(child_ino);
-        self.stage_inode(tombstone)?;
-        self.remove_from_parent(&mut parent_inode, name)?;
-        Ok(())
+        let result = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let child_ino = parent_inode
+                .children()
+                .and_then(|children| children.get(name).copied())
+                .ok_or(ENOENT)?;
+            let child = self.load_inode(child_ino)?;
+            if !child.is_dir() {
+                return Err(ENOTDIR);
+            }
+            if child.children().map(|c| !c.is_empty()).unwrap_or(false) {
+                return Err(ENOTEMPTY);
+            }
+            let tombstone = InodeRecord::tombstone(child_ino);
+            self.stage_inode(tombstone)?;
+            self.remove_from_parent(&mut parent_inode, name)?;
+            Ok(())
+        })();
+        self.log_replay(
+            "nfs",
+            "rmdir",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name }),
+        );
+        result
     }
 
     pub fn nfs_rename(
@@ -1611,70 +1784,90 @@ impl OsageFs {
         newname: &str,
         flags: u32,
     ) -> std::result::Result<(), i32> {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
-            return Err(EINVAL);
-        }
-        let mut src_parent = self.load_inode(parent)?;
-        if !src_parent.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let mut dst_parent = self.load_inode(newparent)?;
-        if !dst_parent.is_dir() {
-            return Err(ENOTDIR);
-        }
-        let old_name = name.to_string();
-        let new_name = newname.to_string();
-        let child_ino = src_parent
-            .children()
-            .and_then(|children| children.get(&old_name).copied())
-            .ok_or(ENOENT)?;
-        if parent == newparent && old_name == new_name {
-            return Ok(());
-        }
-        let mut target = self.load_inode(child_ino)?;
-        if target.is_dir() && self.is_descendant(target.inode, newparent)? {
-            return Err(EINVAL);
-        }
-        if let Some(existing) = dst_parent
-            .children()
-            .and_then(|children| children.get(&new_name).copied())
-        {
-            if flags & RENAME_NOREPLACE_FLAG != 0 {
-                return Err(EEXIST);
+        let result = (|| {
+            if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
+                return Err(EINVAL);
             }
-            if existing != target.inode {
-                let mut victim = self.load_inode(existing)?;
-                if victim.is_dir() {
-                    if !target.is_dir() {
-                        return Err(EISDIR);
+            let mut src_parent = self.load_inode(parent)?;
+            if !src_parent.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let mut dst_parent = self.load_inode(newparent)?;
+            if !dst_parent.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let old_name = name.to_string();
+            let new_name = newname.to_string();
+            let child_ino = src_parent
+                .children()
+                .and_then(|children| children.get(&old_name).copied())
+                .ok_or(ENOENT)?;
+            if parent == newparent && old_name == new_name {
+                return Ok(());
+            }
+            let mut target = self.load_inode(child_ino)?;
+            if target.is_dir() && self.is_descendant(target.inode, newparent)? {
+                return Err(EINVAL);
+            }
+            if let Some(existing) = dst_parent
+                .children()
+                .and_then(|children| children.get(&new_name).copied())
+            {
+                if flags & RENAME_NOREPLACE_FLAG != 0 {
+                    return Err(EEXIST);
+                }
+                if existing != target.inode {
+                    let mut victim = self.load_inode(existing)?;
+                    if victim.is_dir() {
+                        if !target.is_dir() {
+                            return Err(EISDIR);
+                        }
+                        if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
+                            return Err(ENOTEMPTY);
+                        }
+                        self.remove_from_parent(&mut dst_parent, &new_name)?;
+                        let tombstone = InodeRecord::tombstone(victim.inode);
+                        self.stage_inode(tombstone)?;
+                    } else {
+                        self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
                     }
-                    if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
-                        return Err(ENOTEMPTY);
-                    }
-                    self.remove_from_parent(&mut dst_parent, &new_name)?;
-                    let tombstone = InodeRecord::tombstone(victim.inode);
-                    self.stage_inode(tombstone)?;
-                } else {
-                    self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
                 }
             }
-        }
-        self.remove_from_parent(&mut src_parent, &old_name)?;
-        self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
-        target.parent = dst_parent.inode;
-        target.name = new_name;
-        target.path = Self::build_child_path(&dst_parent, &target.name);
-        target.update_times();
-        self.stage_inode(target.clone())?;
-        if target.is_dir() {
-            self.refresh_descendant_paths(&target)?;
-        }
-        Ok(())
+            self.remove_from_parent(&mut src_parent, &old_name)?;
+            self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
+            target.parent = dst_parent.inode;
+            target.name = new_name;
+            target.path = Self::build_child_path(&dst_parent, &target.name);
+            target.update_times();
+            self.stage_inode(target.clone())?;
+            if target.is_dir() {
+                self.refresh_descendant_paths(&target)?;
+            }
+            Ok(())
+        })();
+        self.log_replay(
+            "nfs",
+            "rename",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "parent": parent, "name": name, "newparent": newparent, "newname": newname, "flags": flags }),
+        );
+        result
     }
 
     pub fn nfs_flush(&self) -> std::result::Result<(), i32> {
-        self.flush_pending()
+        let replay = self.replay_start();
+        let result = self.flush_pending();
+        self.log_replay(
+            "nfs",
+            "flush",
+            replay,
+            result.as_ref().err().copied(),
+            json!({}),
+        );
+        result
     }
 }
 
@@ -1714,6 +1907,7 @@ impl Filesystem for OsageFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut record = self.load_inode(ino)?;
@@ -1739,15 +1933,41 @@ impl Filesystem for OsageFs {
             Ok(attr)
         })();
         match res {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(code) => reply.error(code),
+            Ok(attr) => {
+                self.log_replay(
+                    "fuse",
+                    "setattr",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "size": size, "mode": mode, "uid": uid, "gid": gid }),
+                );
+                reply.attr(&TTL, &attr)
+            }
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "setattr",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "size": size, "mode": mode, "uid": uid, "gid": gid }),
+                );
+                reply.error(code)
+            }
         }
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let replay = self.replay_start();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
+                self.log_replay(
+                    "fuse",
+                    "lookup",
+                    replay,
+                    Some(EINVAL),
+                    json!({ "parent": parent, "name": name.to_string_lossy() }),
+                );
                 reply.error(EINVAL);
                 return;
             }
@@ -1763,21 +1983,42 @@ impl Filesystem for OsageFs {
         })();
         match response {
             Ok(inode) => {
+                self.log_replay(
+                    "fuse",
+                    "lookup",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name_str, "ino": inode.inode }),
+                );
                 let attr = Self::record_attr(&inode);
                 let generation = self.superblock.snapshot().generation;
                 reply.entry(&TTL, &attr, generation);
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "lookup",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name_str }),
+                );
+                reply.error(code)
+            }
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        let replay = self.replay_start();
         match self.load_inode(ino) {
             Ok(record) => {
+                self.log_replay("fuse", "getattr", replay, None, json!({ "ino": ino }));
                 let attr = Self::record_attr(&record);
                 reply.attr(&TTL, &attr);
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay("fuse", "getattr", replay, Some(code), json!({ "ino": ino }));
+                reply.error(code)
+            }
         }
     }
 
@@ -1789,6 +2030,7 @@ impl Filesystem for OsageFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let replay = self.replay_start();
         let response = (|| {
             let inode = self.load_inode(ino)?;
             if !inode.is_dir() {
@@ -1808,15 +2050,32 @@ impl Filesystem for OsageFs {
         })();
         match response {
             Ok(entries) => {
+                let entry_count = entries.len();
                 for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
                 {
                     if reply.add(ino, (i + 1) as i64, kind, name) {
                         break;
                     }
                 }
+                self.log_replay(
+                    "fuse",
+                    "readdir",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "offset": offset, "entries": entry_count }),
+                );
                 reply.ok();
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "readdir",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "offset": offset }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -1829,6 +2088,7 @@ impl Filesystem for OsageFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
@@ -1856,11 +2116,27 @@ impl Filesystem for OsageFs {
         })();
         match res {
             Ok(dir) => {
+                self.log_replay(
+                    "fuse",
+                    "mkdir",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": dir.inode }),
+                );
                 let attr = Self::record_attr(&dir);
                 let generation = self.superblock.snapshot().generation;
                 reply.entry(&TTL, &attr, generation);
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "mkdir",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -1874,6 +2150,7 @@ impl Filesystem for OsageFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
@@ -1900,12 +2177,26 @@ impl Filesystem for OsageFs {
         })();
         match res {
             Ok(file) => {
+                self.log_replay(
+                    "fuse",
+                    "create",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": file.inode }),
+                );
                 let attr = Self::record_attr(&file);
                 let generation = self.superblock.snapshot().generation;
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
                 reply.created(&TTL, &attr, generation, 0, 0);
             }
             Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "create",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid }),
+                );
                 let detail = format!("parent={} name={}", parent, name.to_string_lossy());
                 self.log_fuse_error("create", &detail, code);
                 reply.error(code);
@@ -1921,9 +2212,11 @@ impl Filesystem for OsageFs {
         link: &Path,
         reply: ReplyEntry,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let uid = req.uid();
         let gid = req.gid();
+        let target_len = path_to_bytes(link).len();
         let res = (|| {
             let mut parent_inode = self.load_inode(parent)?;
             if !parent_inode.is_dir() {
@@ -1948,21 +2241,40 @@ impl Filesystem for OsageFs {
         })();
         match res {
             Ok(record) => {
+                self.log_replay(
+                    "fuse",
+                    "symlink",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "target_len": target_len, "ino": record.inode }),
+                );
                 let attr = Self::record_attr(&record);
                 let generation = self.superblock.snapshot().generation;
                 reply.entry(&TTL, &attr, generation);
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "symlink",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "target_len": target_len }),
+                );
+                reply.error(code)
+            }
         }
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let replay = self.replay_start();
         match self.load_inode(ino) {
             Ok(_) => {
+                self.log_replay("fuse", "open", replay, None, json!({ "ino": ino }));
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
                 reply.opened(0, 0)
             }
             Err(code) => {
+                self.log_replay("fuse", "open", replay, Some(code), json!({ "ino": ino }));
                 let detail = format!("ino={}", ino);
                 self.log_fuse_error("open", &detail, code);
                 reply.error(code);
@@ -1981,6 +2293,7 @@ impl Filesystem for OsageFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let replay = self.replay_start();
         let res: std::result::Result<Vec<u8>, i32> = (|| {
             let record = self.load_inode(ino)?;
             if record.is_dir() {
@@ -1995,12 +2308,31 @@ impl Filesystem for OsageFs {
             Ok(data[offset..end].to_vec())
         })();
         match res {
-            Ok(bytes) => reply.data(&bytes),
-            Err(code) => reply.error(code),
+            Ok(bytes) => {
+                self.log_replay(
+                    "fuse",
+                    "read",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "offset": offset, "requested": size, "returned": bytes.len() }),
+                );
+                reply.data(&bytes)
+            }
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "read",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "offset": offset, "requested": size }),
+                );
+                reply.error(code)
+            }
         }
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let replay = self.replay_start();
         match self.load_inode(ino) {
             Ok(record) => {
                 if !record.is_symlink() {
@@ -2008,11 +2340,38 @@ impl Filesystem for OsageFs {
                     return;
                 }
                 match self.read_file_bytes(&record) {
-                    Ok(target) => reply.data(&target),
-                    Err(_) => reply.error(EIO),
+                    Ok(target) => {
+                        self.log_replay(
+                            "fuse",
+                            "readlink",
+                            replay,
+                            None,
+                            json!({ "ino": ino, "returned": target.len() }),
+                        );
+                        reply.data(&target)
+                    }
+                    Err(_) => {
+                        self.log_replay(
+                            "fuse",
+                            "readlink",
+                            replay,
+                            Some(EIO),
+                            json!({ "ino": ino }),
+                        );
+                        reply.error(EIO)
+                    }
                 }
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "readlink",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -2028,6 +2387,7 @@ impl Filesystem for OsageFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut record = self.load_inode(ino)?;
@@ -2066,8 +2426,24 @@ impl Filesystem for OsageFs {
             Ok(data.len() as u32)
         })();
         match res {
-            Ok(size) => reply.written(size),
+            Ok(size) => {
+                self.log_replay(
+                    "fuse",
+                    "write",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "offset": offset, "len": data.len(), "written": size }),
+                );
+                reply.written(size)
+            }
             Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "write",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "offset": offset, "len": data.len() }),
+                );
                 let detail = format!("ino={} offset={} len={}", ino, offset, data.len());
                 self.log_fuse_error("write", &detail, code);
                 reply.error(code);
@@ -2076,6 +2452,7 @@ impl Filesystem for OsageFs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut parent_inode = self.load_inode(parent)?;
@@ -2095,8 +2472,24 @@ impl Filesystem for OsageFs {
             Ok(())
         })();
         match res {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.log_replay(
+                    "fuse",
+                    "unlink",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy() }),
+                );
+                reply.ok()
+            }
             Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "unlink",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy() }),
+                );
                 let detail = format!("parent={} name={}", parent, name.to_string_lossy());
                 self.log_fuse_error("unlink", &detail, code);
                 reply.error(code);
@@ -2105,6 +2498,7 @@ impl Filesystem for OsageFs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut parent_inode = self.load_inode(parent)?;
@@ -2129,8 +2523,26 @@ impl Filesystem for OsageFs {
             Ok(())
         })();
         match res {
-            Ok(()) => reply.ok(),
-            Err(code) => reply.error(code),
+            Ok(()) => {
+                self.log_replay(
+                    "fuse",
+                    "rmdir",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy() }),
+                );
+                reply.ok()
+            }
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "rmdir",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy() }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -2144,6 +2556,7 @@ impl Filesystem for OsageFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
@@ -2207,8 +2620,38 @@ impl Filesystem for OsageFs {
             Ok(())
         })();
         match res {
-            Ok(()) => reply.ok(),
-            Err(code) => reply.error(code),
+            Ok(()) => {
+                self.log_replay(
+                    "fuse",
+                    "rename",
+                    replay,
+                    None,
+                    json!({
+                        "parent": parent,
+                        "name": name.to_string_lossy(),
+                        "newparent": newparent,
+                        "newname": newname.to_string_lossy(),
+                        "flags": flags,
+                    }),
+                );
+                reply.ok()
+            }
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "rename",
+                    replay,
+                    Some(code),
+                    json!({
+                        "parent": parent,
+                        "name": name.to_string_lossy(),
+                        "newparent": newparent,
+                        "newname": newname.to_string_lossy(),
+                        "flags": flags,
+                    }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -2220,6 +2663,7 @@ impl Filesystem for OsageFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
             let mut file = self.load_inode(ino)?;
@@ -2246,11 +2690,27 @@ impl Filesystem for OsageFs {
         })();
         match res {
             Ok(record) => {
+                self.log_replay(
+                    "fuse",
+                    "link",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "newparent": newparent, "newname": newname.to_string_lossy() }),
+                );
                 let attr = Self::record_attr(&record);
                 let generation = self.superblock.snapshot().generation;
                 reply.entry(&TTL, &attr, generation);
             }
-            Err(code) => reply.error(code),
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "link",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "newparent": newparent, "newname": newname.to_string_lossy() }),
+                );
+                reply.error(code)
+            }
         }
     }
 
@@ -2270,17 +2730,31 @@ impl Filesystem for OsageFs {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        let replay = self.replay_start();
         if self.fsync_on_close {
             match self.flush_pending() {
-                Ok(()) => reply.ok(),
-                Err(code) => reply.error(code),
+                Ok(()) => {
+                    self.log_replay("fuse", "flush", replay, None, json!({ "ino": ino }));
+                    reply.ok()
+                }
+                Err(code) => {
+                    self.log_replay("fuse", "flush", replay, Some(code), json!({ "ino": ino }));
+                    reply.error(code)
+                }
             }
         } else {
+            self.log_replay(
+                "fuse",
+                "flush",
+                replay,
+                None,
+                json!({ "ino": ino, "skipped": true }),
+            );
             reply.ok();
         }
     }
@@ -2288,33 +2762,54 @@ impl Filesystem for OsageFs {
     fn fsync(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let replay = self.replay_start();
         match self.flush_pending() {
-            Ok(()) => reply.ok(),
-            Err(code) => reply.error(code),
+            Ok(()) => {
+                self.log_replay("fuse", "fsync", replay, None, json!({ "ino": ino }));
+                reply.ok()
+            }
+            Err(code) => {
+                self.log_replay("fuse", "fsync", replay, Some(code), json!({ "ino": ino }));
+                reply.error(code)
+            }
         }
     }
 
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let replay = self.replay_start();
         if self.fsync_on_close {
             match self.flush_pending() {
-                Ok(()) => reply.ok(),
-                Err(code) => reply.error(code),
+                Ok(()) => {
+                    self.log_replay("fuse", "release", replay, None, json!({ "ino": ino }));
+                    reply.ok()
+                }
+                Err(code) => {
+                    self.log_replay("fuse", "release", replay, Some(code), json!({ "ino": ino }));
+                    reply.error(code)
+                }
             }
         } else {
+            self.log_replay(
+                "fuse",
+                "release",
+                replay,
+                None,
+                json!({ "ino": ino, "skipped": true }),
+            );
             reply.ok();
         }
     }
@@ -2555,6 +3050,7 @@ mod tests {
                 runtime.handle().clone(),
                 client_state,
                 None,
+                None,
             );
             Self {
                 runtime,
@@ -2589,6 +3085,7 @@ mod tests {
             foreground: false,
             home_prefix: "/home".into(),
             perf_log: None,
+            replay_log: None,
             disable_journal: false,
             fsync_on_close: false,
             flush_interval_ms: 0,

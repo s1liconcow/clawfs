@@ -94,6 +94,10 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub perf_log: Option<PathBuf>,
 
+    /// Optional compressed replay log path (.jsonl.gz) for operation-level tracing.
+    #[arg(long, value_name = "PATH")]
+    pub replay_log: Option<PathBuf>,
+
     /// Disable the per-inode close-time journal (for benchmarking only).
     #[arg(long, default_value_t = false)]
     pub disable_journal: bool,
@@ -167,6 +171,7 @@ pub struct Config {
     pub gcs_service_account: Option<PathBuf>,
     pub state_path: PathBuf,
     pub perf_log: Option<PathBuf>,
+    pub replay_log: Option<PathBuf>,
     pub disable_journal: bool,
     pub fsync_on_close: bool,
     pub flush_interval_ms: u64,
@@ -224,6 +229,7 @@ impl From<Cli> for Config {
             gcs_service_account: cli.gcs_service_account,
             state_path,
             perf_log: cli.perf_log,
+            replay_log: cli.replay_log,
             disable_journal: cli.disable_journal,
             fsync_on_close: cli.fsync_on_close,
             flush_interval_ms: cli.flush_interval_ms,

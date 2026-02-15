@@ -18,12 +18,14 @@ FOREGROUND="${FOREGROUND:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 PID_FILE="${PID_FILE:-/tmp/osagefs-nfs-gateway.pid}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs-nfs-gateway.log}"
+REPLAY_LOG_PATH="${REPLAY_LOG_PATH:-}"
 
 AUTO_MOUNT_NFS="${AUTO_MOUNT_NFS:-1}"
 NFS_MOUNT_PATH="${NFS_MOUNT_PATH:-/tmp/osagefs-mnt}"
 NFS_MOUNT_HOST="${NFS_MOUNT_HOST:-127.0.0.1}"
 NFS_MOUNT_EXPORT="${NFS_MOUNT_EXPORT:-/}"
 MOUNT_WITH_SUDO="${MOUNT_WITH_SUDO:-1}"
+MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 
 GANESHA_BINARY="${GANESHA_BINARY:-}"
 GANESHA_LOG="${GANESHA_LOG:-}"
@@ -33,6 +35,26 @@ is_true() {
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+assert_welcome_file() {
+  local mount_path=$1
+  local timeout_sec=${2:-10}
+  local welcome_path="${mount_path%/}/WELCOME.txt"
+  local start=$SECONDS
+
+  while (( SECONDS - start < timeout_sec )); do
+    if [[ -f "$welcome_path" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "Mount validation failed: expected preset file $welcome_path" >&2
+  if [[ -d "$mount_path" ]]; then
+    ls -la "$mount_path" >&2 || true
+  fi
+  return 1
 }
 
 if ! is_true "$SKIP_BUILD"; then
@@ -72,6 +94,9 @@ if [[ -n "$GANESHA_BINARY" ]]; then
 fi
 if [[ -n "$GANESHA_LOG" ]]; then
   CMD+=(--ganesha-log "$GANESHA_LOG")
+fi
+if [[ -n "$REPLAY_LOG_PATH" ]]; then
+  CMD+=(--replay-log "$REPLAY_LOG_PATH")
 fi
 
 if is_true "$DEBUG_LOG"; then
@@ -125,6 +150,7 @@ if is_true "$AUTO_MOUNT_NFS"; then
     "${NFS_MOUNT_HOST}:${NFS_MOUNT_EXPORT}" \
     "$NFS_MOUNT_PATH"
   echo "Mounted NFS at $NFS_MOUNT_PATH"
+  assert_welcome_file "$NFS_MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
 fi
 
 if is_true "$FOREGROUND"; then

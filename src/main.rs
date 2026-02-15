@@ -10,6 +10,7 @@ use clap::Parser;
 use env_logger::Env;
 use fuser::MountOption;
 use log::{LevelFilter, info, warn};
+use serde_json::json;
 use std::env;
 
 use osagefs::config::{Cli, Config};
@@ -18,6 +19,7 @@ use osagefs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use osagefs::journal::JournalManager;
 use osagefs::metadata::MetadataStore;
 use osagefs::perf::PerfLogger;
+use osagefs::replay::ReplayLogger;
 use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
 use osagefs::state::ClientStateManager;
 use osagefs::superblock::{CleanupTaskKind, SuperblockManager};
@@ -99,6 +101,33 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let replay_logger = if let Some(path) = config.replay_log.clone() {
+        Some(Arc::new(ReplayLogger::new(path)?))
+    } else {
+        None
+    };
+    if let Some(logger) = &replay_logger {
+        logger.log_meta(
+            "fs_config",
+            json!({
+                "mode": "fuse",
+                "home_prefix": config.home_prefix.clone(),
+                "inline_threshold": config.inline_threshold,
+                "pending_bytes": config.pending_bytes,
+                "fsync_on_close": config.fsync_on_close,
+                "flush_interval_ms": config.flush_interval_ms,
+                "disable_journal": config.disable_journal,
+                "lookup_cache_ttl_ms": config.lookup_cache_ttl_ms,
+                "dir_cache_ttl_ms": config.dir_cache_ttl_ms,
+                "metadata_poll_interval_ms": config.metadata_poll_interval_ms,
+                "segment_cache_bytes": config.segment_cache_bytes,
+                "imap_delta_batch": config.imap_delta_batch,
+                "bootstrap_user": env::var("USER")
+                    .or_else(|_| env::var("LOGNAME"))
+                    .ok(),
+            }),
+        );
+    }
 
     let journal = if config.disable_journal {
         None
@@ -114,6 +143,7 @@ fn main() -> Result<()> {
         handle,
         client_state,
         perf_logger.clone(),
+        replay_logger.clone(),
     );
 
     let replayed = fs.replay_journal()?;

@@ -5,6 +5,7 @@ pub mod inode;
 pub mod journal;
 pub mod metadata;
 pub mod perf;
+pub mod replay;
 pub mod segment;
 pub mod state;
 pub mod superblock;

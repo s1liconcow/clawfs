@@ -29,6 +29,7 @@ fn perf_config(root: &PathBuf) -> Config {
         gcs_service_account: None,
         state_path: root.join("state.bin"),
         perf_log: None,
+        replay_log: None,
         disable_journal: true,
         fsync_on_close: false,
         flush_interval_ms: 0,
