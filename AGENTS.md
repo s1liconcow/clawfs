@@ -3,6 +3,14 @@
 ## Living Document
 Please continuously update this document with useful things you figure out that will make future workflows smoother and increase iteration speed.  
 
+## Post-Merge Hygiene
+- After merging a task branch into `master`, automatically clean up temporary git worktrees and local task branches from that effort.
+- Standard cleanup sequence:
+  - `git worktree list`
+  - `git worktree remove <task-worktree-path>`
+  - `git branch -D <task-branch>`
+- If multiple task branches/worktrees were used for the same change, remove all of them once the merge is complete and verified.
+
 ## Project Overview
 - OsageFS: a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
 - Close-time durability uses a local journal under `$STORE/journal`: every staged inode (data or metadata) is serialized with its payload path/bytes so a crash can replay the journal and flush pending writes before the mount finishes. You can disable this (unsafe) path via `--disable-journal` when benchmarking raw throughput.
@@ -95,13 +103,22 @@ Example bootstrap (Debian/Ubuntu sprite):
 ## Sprite name
 Use deterministic sprite names per worktree/task so repeated runs reuse VM state.
 One task may use multiple sprites (for example: build, stress, perf, cleanup-agent), as long as each sprite name is deterministic.
+Sprite names must be `<=55` characters.
 
-Recommended naming rule:
-- `SPRITE_NAME="iotest-$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')-$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"`
+Recommended naming rule (55-char safe):
+- `REPO_SLUG="$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-*//; s/-*$//')"`
+- `BRANCH_SLUG="$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-*//; s/-*$//')"`
+- `RAW_BASE="iotest-${REPO_SLUG}-${BRANCH_SLUG}"`
+- `BASE_HASH="$(printf '%s' "$RAW_BASE" | sha1sum | cut -c1-8)"`
+- `SPRITE_BASENAME="$(printf '%s' "$RAW_BASE" | cut -c1-46 | sed 's/-$//')-${BASE_HASH}"`  (always `<=55`)
 
-Multi-sprite naming rule (recommended):
-- `SPRITE_BASENAME="iotest-$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')-$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"`
-- `SPRITE_NAME="${SPRITE_BASENAME}-${ROLE}"` where `ROLE` is stable (`build`, `stress`, `perf-a`, `perf-b`, `cleanup`).
+Multi-sprite naming rule (recommended, 55-char safe):
+- `ROLE_SLUG="$(printf '%s' "$ROLE" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-*//; s/-*$//' | cut -c1-12)"`
+- `RAW_NAME="${RAW_BASE}-${ROLE_SLUG}"`
+- `NAME_HASH="$(printf '%s' "$RAW_NAME" | sha1sum | cut -c1-8)"`
+- `MAX_BASE_LEN=$((55 - 1 - ${#ROLE_SLUG} - 1 - 8))`
+- `BASE_TRIMMED="$(printf '%s' "$RAW_BASE" | cut -c1-"$MAX_BASE_LEN" | sed 's/-$//')"`
+- `SPRITE_NAME="${BASE_TRIMMED}-${ROLE_SLUG}-${NAME_HASH}"` where `ROLE` is stable (`build`, `stress`, `perf-a`, `perf-b`, `cleanup`).
 
 Operational policy:
 - For a new worktree or task branch, derive a stable base name and reuse it.
