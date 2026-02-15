@@ -13,6 +13,7 @@ OSAGE_BASE_SUBDIR="${OSAGE_BASE_SUBDIR:-home/${USER:-$(whoami)}/micro}"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
+TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
 
 # Workload knobs (small by default for quick iteration)
 SMALLFILE_COUNT="${SMALLFILE_COUNT:-1200}"
@@ -64,6 +65,20 @@ case "$WORKFLOW_PROFILE" in
     exit 1
     ;;
 esac
+
+if [[ -n "$TEST_FILTER" ]]; then
+  IFS=',' read -r -a _requested_tests <<<"$TEST_FILTER"
+  _filtered_tests=()
+  for _candidate in "${TEST_NAMES[@]}"; do
+    for _requested in "${_requested_tests[@]}"; do
+      if [[ "$_candidate" == "$_requested" ]]; then
+        _filtered_tests+=("$_candidate")
+        break
+      fi
+    done
+  done
+  TEST_NAMES=("${_filtered_tests[@]}")
+fi
 
 mkdir -p "$RESULTS_DIR"
 RESULTS_JSON="$RESULTS_DIR/results.jsonl"

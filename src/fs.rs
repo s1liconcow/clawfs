@@ -511,6 +511,126 @@ impl OsageFs {
         Ok(())
     }
 
+    fn rename_entry(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+    ) -> std::result::Result<(), i32> {
+        if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
+            return Err(EINVAL);
+        }
+        let old_name = name.to_string();
+        let new_name = newname.to_string();
+        if parent == newparent && old_name == new_name {
+            return Ok(());
+        }
+
+        if parent == newparent {
+            let mut dir = self.load_inode(parent)?;
+            if !dir.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let child_ino = dir
+                .children()
+                .and_then(|children| children.get(&old_name).copied())
+                .ok_or(ENOENT)?;
+            let mut target = self.load_inode(child_ino)?;
+            if target.is_dir() && self.is_descendant(target.inode, newparent)? {
+                return Err(EINVAL);
+            }
+            if let Some(existing) = dir
+                .children()
+                .and_then(|children| children.get(&new_name).copied())
+            {
+                if flags & RENAME_NOREPLACE_FLAG != 0 {
+                    return Err(EEXIST);
+                }
+                if existing != target.inode {
+                    let mut victim = self.load_inode(existing)?;
+                    if victim.is_dir() {
+                        if !target.is_dir() {
+                            return Err(EISDIR);
+                        }
+                        if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
+                            return Err(ENOTEMPTY);
+                        }
+                        self.remove_from_parent(&mut dir, &new_name)?;
+                        let tombstone = InodeRecord::tombstone(victim.inode);
+                        self.stage_inode(tombstone)?;
+                    } else {
+                        self.unlink_file_entry(&mut dir, &new_name, &mut victim)?;
+                    }
+                }
+            }
+            self.remove_from_parent(&mut dir, &old_name)?;
+            self.update_parent(&mut dir, new_name.clone(), target.inode)?;
+            target.parent = dir.inode;
+            target.name = new_name;
+            target.path = Self::build_child_path(&dir, &target.name);
+            target.update_times();
+            self.stage_inode(target.clone())?;
+            if target.is_dir() {
+                self.refresh_descendant_paths(&target)?;
+            }
+            return Ok(());
+        }
+
+        let mut src_parent = self.load_inode(parent)?;
+        if !src_parent.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let mut dst_parent = self.load_inode(newparent)?;
+        if !dst_parent.is_dir() {
+            return Err(ENOTDIR);
+        }
+        let child_ino = src_parent
+            .children()
+            .and_then(|children| children.get(&old_name).copied())
+            .ok_or(ENOENT)?;
+        let mut target = self.load_inode(child_ino)?;
+        if target.is_dir() && self.is_descendant(target.inode, newparent)? {
+            return Err(EINVAL);
+        }
+        if let Some(existing) = dst_parent
+            .children()
+            .and_then(|children| children.get(&new_name).copied())
+        {
+            if flags & RENAME_NOREPLACE_FLAG != 0 {
+                return Err(EEXIST);
+            }
+            if existing != target.inode {
+                let mut victim = self.load_inode(existing)?;
+                if victim.is_dir() {
+                    if !target.is_dir() {
+                        return Err(EISDIR);
+                    }
+                    if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
+                        return Err(ENOTEMPTY);
+                    }
+                    self.remove_from_parent(&mut dst_parent, &new_name)?;
+                    let tombstone = InodeRecord::tombstone(victim.inode);
+                    self.stage_inode(tombstone)?;
+                } else {
+                    self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
+                }
+            }
+        }
+        self.remove_from_parent(&mut src_parent, &old_name)?;
+        self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
+        target.parent = dst_parent.inode;
+        target.name = new_name;
+        target.path = Self::build_child_path(&dst_parent, &target.name);
+        target.update_times();
+        self.stage_inode(target.clone())?;
+        if target.is_dir() {
+            self.refresh_descendant_paths(&target)?;
+        }
+        Ok(())
+    }
+
     fn refresh_descendant_paths(&self, inode: &InodeRecord) -> std::result::Result<(), i32> {
         if let Some(children) = inode.children() {
             let entries: Vec<(String, u64)> = children
@@ -1090,10 +1210,19 @@ impl OsageFs {
             let snapshot = self
                 .superblock
                 .prepare_dirty_generation()
-                .map_err(|_| EIO)?;
+                .map_err(|err| {
+                    log::error!(
+                        "flush_pending prepare_dirty_generation failed pid={} tid={} scope={} err={err:?}",
+                        pid,
+                        tid,
+                        scope
+                    );
+                    EIO
+                })?;
             let target_generation = snapshot.generation;
             prepared_generation = Some(target_generation);
             let mut segment_entries = Vec::new();
+            let mut segment_data_inodes = HashSet::new();
             let mut records = Vec::new();
             let mut flushed_bytes: u64 = 0;
             let mut inline_files = 0;
@@ -1111,8 +1240,17 @@ impl OsageFs {
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
                         record.size = data_len;
                         if data_len <= self.config.inline_threshold as u64 {
-                            record.storage =
-                                self.encode_inline_storage(data_bytes).map_err(|_| EIO)?;
+                            record.storage = self.encode_inline_storage(data_bytes).map_err(|err| {
+                                log::error!(
+                                    "flush_pending inline encode failed pid={} tid={} scope={} ino={} len={} err={err:?}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    record.inode,
+                                    data_len
+                                );
+                                EIO
+                            })?;
                             inline_files += 1;
                             inline_bytes = inline_bytes.saturating_add(data_len);
                             records.push(record);
@@ -1122,6 +1260,7 @@ impl OsageFs {
                                 path: record.path.clone(),
                                 payload: SegmentPayload::Bytes(data_bytes.clone()),
                             });
+                            segment_data_inodes.insert(record.inode);
                             record.storage = FileStorage::Inline(Vec::new());
                             segment_files += 1;
                             segment_bytes = segment_bytes.saturating_add(data_len);
@@ -1138,6 +1277,7 @@ impl OsageFs {
                             path: record.path.clone(),
                             payload: SegmentPayload::Staged(segments.chunks.clone()),
                         });
+                        segment_data_inodes.insert(record.inode);
                         record.storage = FileStorage::Inline(Vec::new());
                         segment_files += 1;
                         segment_bytes = segment_bytes.saturating_add(data_len);
@@ -1153,23 +1293,49 @@ impl OsageFs {
             let mut segment_id_logged = None;
             let mut segment_write_duration = Duration::from_secs(0);
             if !segment_entries.is_empty() {
-                let segment_id = self.allocate_segment_id().map_err(|_| EIO)?;
+                let segment_id = self.allocate_segment_id().map_err(|err| {
+                    log::error!(
+                        "flush_pending allocate_segment_id failed pid={} tid={} scope={} err={err:?}",
+                        pid,
+                        tid,
+                        scope
+                    );
+                    EIO
+                })?;
                 let seg_start = Instant::now();
                 let pointers = self
                     .segments
                     .write_batch(target_generation, segment_id, segment_entries)
-                    .map_err(|_| EIO)?;
+                    .map_err(|err| {
+                        log::error!(
+                            "flush_pending segment write failed pid={} tid={} scope={} gen={} segment_id={} err={err:?}",
+                            pid,
+                            tid,
+                            scope,
+                            target_generation,
+                            segment_id
+                        );
+                        EIO
+                    })?;
                 pointer_map = pointers.into_iter().collect();
                 segment_id_logged = Some(segment_id);
                 segment_write_duration = seg_start.elapsed();
             }
             let persist_start = Instant::now();
             for record in records.iter_mut() {
-                if record.size > self.config.inline_threshold as u64 {
+                if segment_data_inodes.contains(&record.inode) {
                     if let Some(ptr) = pointer_map.get(&record.inode) {
                         record.storage =
                             FileStorage::Segments(vec![SegmentExtent::new(0, ptr.clone())]);
                     } else {
+                        log::error!(
+                            "flush_pending missing segment pointer pid={} tid={} scope={} ino={} gen={}",
+                            pid,
+                            tid,
+                            scope,
+                            record.inode,
+                            target_generation
+                        );
                         return Err(EIO);
                     }
                 }
@@ -1180,11 +1346,30 @@ impl OsageFs {
                 self.config.shard_size,
                 self.config.imap_delta_batch,
             ))
-            .map_err(|_| EIO)?;
+            .map_err(|err| {
+                log::error!(
+                    "flush_pending metadata persist failed pid={} tid={} scope={} gen={} err={err:?}",
+                    pid,
+                    tid,
+                    scope,
+                    target_generation
+                );
+                EIO
+            })?;
             let metadata_duration = persist_start.elapsed();
             let commit_start = Instant::now();
             if self
                 .block_on(self.superblock.commit_generation(target_generation))
+                .map_err(|err| {
+                    log::error!(
+                        "flush_pending commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                        pid,
+                        tid,
+                        scope,
+                        target_generation
+                    );
+                    err
+                })
                 .is_err()
             {
                 self.superblock.abort_generation(target_generation);
@@ -1220,7 +1405,16 @@ impl OsageFs {
                         .collect::<Vec<_>>()
                 };
                 for inode in clearable_inodes {
-                    journal.clear_entry(inode).map_err(|_| EIO)?;
+                    journal.clear_entry(inode).map_err(|err| {
+                        log::error!(
+                            "flush_pending journal clear failed pid={} tid={} scope={} ino={} err={err:?}",
+                            pid,
+                            tid,
+                            scope,
+                            inode
+                        );
+                        EIO
+                    })?;
                 }
             }
             self.log_perf(
@@ -1929,67 +2123,7 @@ impl OsageFs {
     ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let result = (|| {
-            if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
-                return Err(EINVAL);
-            }
-            let mut src_parent = self.load_inode(parent)?;
-            if !src_parent.is_dir() {
-                return Err(ENOTDIR);
-            }
-            let mut dst_parent = self.load_inode(newparent)?;
-            if !dst_parent.is_dir() {
-                return Err(ENOTDIR);
-            }
-            let old_name = name.to_string();
-            let new_name = newname.to_string();
-            let child_ino = src_parent
-                .children()
-                .and_then(|children| children.get(&old_name).copied())
-                .ok_or(ENOENT)?;
-            if parent == newparent && old_name == new_name {
-                return Ok(());
-            }
-            let mut target = self.load_inode(child_ino)?;
-            if target.is_dir() && self.is_descendant(target.inode, newparent)? {
-                return Err(EINVAL);
-            }
-            if let Some(existing) = dst_parent
-                .children()
-                .and_then(|children| children.get(&new_name).copied())
-            {
-                if flags & RENAME_NOREPLACE_FLAG != 0 {
-                    return Err(EEXIST);
-                }
-                if existing != target.inode {
-                    let mut victim = self.load_inode(existing)?;
-                    if victim.is_dir() {
-                        if !target.is_dir() {
-                            return Err(EISDIR);
-                        }
-                        if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
-                            return Err(ENOTEMPTY);
-                        }
-                        self.remove_from_parent(&mut dst_parent, &new_name)?;
-                        let tombstone = InodeRecord::tombstone(victim.inode);
-                        self.stage_inode(tombstone)?;
-                    } else {
-                        self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
-                    }
-                }
-            }
-            self.remove_from_parent(&mut src_parent, &old_name)?;
-            self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
-            target.parent = dst_parent.inode;
-            target.name = new_name;
-            target.path = Self::build_child_path(&dst_parent, &target.name);
-            target.update_times();
-            self.stage_inode(target.clone())?;
-            if target.is_dir() {
-                self.refresh_descendant_paths(&target)?;
-            }
-            Ok(())
-        })();
+        let result = self.rename_entry(parent, name, newparent, newname, flags);
         self.log_replay(
             "nfs",
             "rename",
@@ -2739,65 +2873,9 @@ impl Filesystem for OsageFs {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
-            if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
-                return Err(EINVAL);
-            }
-            let mut src_parent = self.load_inode(parent)?;
-            if !src_parent.is_dir() {
-                return Err(ENOTDIR);
-            }
-            let mut dst_parent = self.load_inode(newparent)?;
-            if !dst_parent.is_dir() {
-                return Err(ENOTDIR);
-            }
             let old_name = name.to_str().ok_or(EINVAL)?.to_string();
             let new_name = newname.to_str().ok_or(EINVAL)?.to_string();
-            let child_ino = src_parent
-                .children()
-                .and_then(|children| children.get(&old_name).copied())
-                .ok_or(ENOENT)?;
-            if parent == newparent && old_name == new_name {
-                return Ok(());
-            }
-            let mut target = self.load_inode(child_ino)?;
-            if target.is_dir() && self.is_descendant(target.inode, newparent)? {
-                return Err(EINVAL);
-            }
-            if let Some(existing) = dst_parent
-                .children()
-                .and_then(|children| children.get(&new_name).copied())
-            {
-                if flags & RENAME_NOREPLACE_FLAG != 0 {
-                    return Err(EEXIST);
-                }
-                if existing != target.inode {
-                    let mut victim = self.load_inode(existing)?;
-                    if victim.is_dir() {
-                        if !target.is_dir() {
-                            return Err(EISDIR);
-                        }
-                        if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
-                            return Err(ENOTEMPTY);
-                        }
-                        self.remove_from_parent(&mut dst_parent, &new_name)?;
-                        let tombstone = InodeRecord::tombstone(victim.inode);
-                        self.stage_inode(tombstone)?;
-                    } else {
-                        self.unlink_file_entry(&mut dst_parent, &new_name, &mut victim)?;
-                    }
-                }
-            }
-            self.remove_from_parent(&mut src_parent, &old_name)?;
-            self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
-            target.parent = dst_parent.inode;
-            target.name = new_name;
-            target.path = Self::build_child_path(&dst_parent, &target.name);
-            target.update_times();
-            self.stage_inode(target.clone())?;
-            if target.is_dir() {
-                self.refresh_descendant_paths(&target)?;
-            }
-            Ok(())
+            self.rename_entry(parent, &old_name, newparent, &new_name, flags)
         })();
         match res {
             Ok(()) => {
@@ -4057,6 +4135,67 @@ mod tests {
         assert_eq!(opened.inode, file.inode);
         assert_eq!(opened.size, 0);
         assert_eq!(harness.fs.nfs_read(file.inode, 0, 64).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn rename_same_parent_drops_old_name() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "rename_same_parent.bin", 1 << 20);
+
+        let lock = harness
+            .fs
+            .nfs_create(ROOT_INODE, "config.lock", 0, 0)
+            .unwrap();
+        harness
+            .fs
+            .nfs_rename(ROOT_INODE, "config.lock", ROOT_INODE, "config", 0)
+            .unwrap();
+
+        assert!(matches!(
+            harness.fs.nfs_lookup(ROOT_INODE, "config.lock"),
+            Err(code) if code == ENOENT
+        ));
+        let config = harness.fs.nfs_lookup(ROOT_INODE, "config").unwrap();
+        assert_eq!(config.inode, lock.inode);
+
+        let new_lock = harness
+            .fs
+            .nfs_create(ROOT_INODE, "config.lock", 0, 0)
+            .unwrap();
+        assert_ne!(new_lock.inode, lock.inode);
+    }
+
+    #[test]
+    fn metadata_only_flush_preserves_large_file_pointer() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(dir.path(), "meta_only_large.bin", 1 << 20, |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+            cfg.inline_threshold = 4096;
+        });
+
+        let file = harness
+            .fs
+            .nfs_create(ROOT_INODE, "large-meta.dat", 0, 0)
+            .unwrap();
+        let payload = vec![0x5Au8; 64 * 1024];
+        harness.fs.nfs_write(file.inode, 0, &payload).unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let mut record = harness.fs.load_inode(file.inode).unwrap();
+        record.mode = 0o100640;
+        harness.fs.stage_inode(record).unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let stored = harness.fs.load_inode(file.inode).unwrap();
+        assert_eq!(stored.mode & 0o777, 0o640);
+        assert_eq!(
+            harness
+                .fs
+                .nfs_read(file.inode, 0, payload.len() as u32)
+                .unwrap(),
+            payload
+        );
     }
 
     #[test]
