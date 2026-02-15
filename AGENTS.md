@@ -33,6 +33,7 @@ Please continuously update this document with useful things you figure out that 
 - Replay logs now include a startup metadata event (`layer=meta`, `op=fs_config`) with key runtime knobs (`home_prefix`, inline/pending/flush/cache settings, journal/fsync flags, bootstrap user) so replay can align config with capture.
 - `src/state.rs`: `ClientStateManager` handles per-client pools, persisted via JSON. Tests ensure persistence across runs.
 - `src/metadata.rs`: Handles inode caching, writes shard snapshots under `/imaps`, emits delta logs with bloom-filtered filenames, and performs CAS updates on `metadata/superblock.bin`.
+- `src/checkpoint.rs` + `src/bin/osagefs_checkpoint.rs`: checkpoint/restore utility that saves and restores superblock snapshots; use it to roll filesystem state backward/forward by generation without rewriting immutable objects.
 - `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` serves cache hits locally, otherwise issues object-store range reads for the pointer span and asynchronously enqueues full-segment cache fill. Tests verify write/read.
 - `src/segment.rs`: `SegmentManager::write_batch` accepts in-memory bytes or staged chunks; flushing can stream staged payloads directly into immutable segments to reduce extra copy overhead in `flush_pending`.
 - `src/fs.rs`: `OsageFs` FUSE implementation with pending-staging logic, flush thresholds, multi-client tests, etc. Unit tests cover single-client flush, multi-client independence, and pending-byte/interval stress.
@@ -41,6 +42,7 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/cleanup.sh`: unmounts, deletes store dir, and removes the state file to give perf scripts a clean slate.
 - `scripts/stress_e2e.sh`: Light-weight FUSE smoke test that launches the daemon via `run_osagefs.sh`, performs single-file, burst, large-file, offset-write, and chmod checks directly against the mounted filesystem, and tears everything down afterward.
 - `scripts/micro_workflows.sh`: Micro-workflow benchmark harness that runs practical dev/data/AI loops (`dev_smallfile_burst`, `dev_scan_and_status`, `data_csv_etl`, `ai_checkpoint_loop`, optional `dev_incremental_build`) on OsageFS and local disk, then emits `results.jsonl` + `summary.md` with side-by-side timing ratios.
+- `scripts/checkpoint.sh`: offline checkpoint helper (`create`/`restore`) for `metadata/superblock.bin`; aborts when mount/process checks indicate OsageFS is still running unless `FORCE=1`.
 
 ## Testing / Tools
 - `cargo test`: runs unit tests (including new integration-like tests in `fs.rs`, `segment.rs`, `state.rs`).
@@ -52,6 +54,7 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
 - `scripts/run_osagefs.sh` + `scripts/run_nfs_gateway.sh`: set `REPLAY_LOG_PATH=/path/replay.jsonl.gz` to pass `--replay-log` and capture replay traces for FUSE or direct NFS traffic.
 - `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
+- `cargo test checkpoint::tests::checkpoint_restore_round_trip_resets_superblock`: validates checkpoint capture + restore round-trip against persisted superblock state.
 - `src/bin/osagefs_replay.rs` brute-force mode: `--iterations N` replays from fresh-init state N times with deterministic seeds (`--seed`) and optional chaos knobs (`--jitter-us`, `--chaos-sleep-prob`, `--chaos-sleep-max-us`, `--chaos-flush-prob`) to shake out timing-sensitive issues.
 - Mount validation: `scripts/common.sh` now provides `osage_assert_welcome_file` and mount-oriented scripts assert `${MOUNT_PATH}/WELCOME.txt` (or `${NFS_MOUNT_PATH}/WELCOME.txt` for NFS auto-mount) to fail fast when the mount did not come up correctly. Tune wait time with `MOUNT_CHECK_TIMEOUT_SEC` (default `10`).
 - `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount). NFSv4 support is Enterprise-only.
@@ -67,6 +70,8 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/stress_e2e.sh` always runs `scripts/cleanup.sh` on exit, which removes both `LOG_FILE` and `PERF_LOG_PATH`; when you need post-run perf analysis, run an equivalent custom workload (or copy logs elsewhere) before cleanup.
 - `scripts/stress_e2e.sh` now wraps `scripts/cleanup.sh` via a shared `run_cleanup_script()` helper for both initial cleanup and EXIT teardown, matching the common script pattern used by other harnesses.
 - In Sprite VMs, long `apt-get install` runs can sometimes end with `Error: connection closed` / non-zero transport exit even after package `Setting up ...` lines complete; verify required tools explicitly (`fusermount3`, `rg`, `strace`) before retrying full bootstrap.
+- Sprite quirk: some images do not provide `/etc/mtab`, so `fusermount -u` can print `failed to open /etc/mtab`; fall back to `umount -l <mount>` when needed.
+- Offline checkpoint helper quirk: `scripts/checkpoint.sh` process guard matches `osagefs.*--store-path`. If you run it inside a long wrapper command that also includes `osagefs_checkpoint ... --store-path`, run checkpoint steps in separate shell invocations to avoid false-positive self-matches.
 - Concurrent `smallfiles_sync` (`numjobs=8`) can expose create/open races; when reproducing, start with `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` and inspect `/work/osagefs/fio-small*.json` for `open(..., O_CREAT) = -1 EIO`.
 - `scripts/micro_workflows.sh` now normalizes DuckDB result payloads to JSON-safe primitives (including `date`/`datetime`) and validates `duckdb_results.json` by parsing it after write; this prevents false `ok` statuses from partially written artifacts.
 - Update (2026-02-15): `smallfiles_sync` `open(..., O_CREAT) = -1 EIO` under `fsync=1` / `numjobs=8` was traced to unstable FUSE inode generation values in `ReplyEntry`/`ReplyCreate`. Do not use superblock generation there; use a stable node generation constant (`1`) per inode lifetime.
@@ -85,6 +90,9 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/run_osagefs.sh` defaults to `$ROOT/osagefs-perf.jsonl`; set `PERF_LOG_PATH=` to disable tracing when needed.
 - Replay trace capture: `REPLAY_LOG_PATH=/work/osagefs/replay.jsonl.gz ./scripts/run_osagefs.sh` (or `./scripts/run_nfs_gateway.sh`). Inspect with `gzip -dc /work/osagefs/replay.jsonl.gz | tail -n 50`.
 - Direct API replay: `cargo run --release --bin osagefs_replay -- --trace-path /work/osagefs/replay.jsonl.gz --store-path /tmp/osagefs-replay-store --local-cache-path /tmp/osagefs-replay-cache --state-path /tmp/osagefs-replay-state.bin --layer fuse --speed 1.0` (add `--ignore-timing` for max-throughput replay).
+- Create checkpoint: `cargo run --bin osagefs_checkpoint -- create --store-path /tmp/osagefs-store --checkpoint-path /tmp/osagefs-store.cp.bin --note "before experiment"`.
+- Restore checkpoint: `cargo run --bin osagefs_checkpoint -- restore --store-path /tmp/osagefs-store --checkpoint-path /tmp/osagefs-store.cp.bin`.
+- Offline checkpoint helper: `CHECKPOINT_PATH=/tmp/osagefs-store.cp.bin scripts/checkpoint.sh create` and `CHECKPOINT_PATH=/tmp/osagefs-store.cp.bin scripts/checkpoint.sh restore`.
 - Enable perf tracing for other invocations by exporting `PERF_LOG_PATH=/tmp/osagefs-perf.jsonl` (empty string disables logging when scripts default it). Use `--fsync-on-close` to restore immediate durability, `--flush-interval-ms` to adjust opportunistic flush cadence (0 disables timer), and `--disable-cleanup` when cleanup will be handled by an external agent.
 - Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`.
 

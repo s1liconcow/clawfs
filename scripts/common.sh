@@ -44,6 +44,14 @@ osage_ensure_release_binary() {
   fi
 }
 
+osage_ensure_release_checkpoint_binary() {
+  local checkpoint_bin=${1:-"$ROOT_DIR/target/release/osagefs_checkpoint"}
+  if [[ ! -x "$checkpoint_bin" ]]; then
+    echo "Building osagefs_checkpoint --release ..."
+    (cd "$ROOT_DIR" && cargo build --release --bin osagefs_checkpoint)
+  fi
+}
+
 osage_assert_welcome_file() {
   local mount_path=${1:-"$MOUNT_PATH"}
   local timeout_sec=${2:-10}

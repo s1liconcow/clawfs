@@ -139,6 +139,42 @@ into the configured bucket prefix: superblock + metadata JSON live under
 `/segs/`. Keep `--state-path` on local storage so each client maintains its own
 `client_id` and id-pool bookkeeping separate from the shared object store.
 
+### Superblock checkpoints and restore
+
+Because inode shards, deltas, and segments are immutable objects, you can
+checkpoint and restore by saving/restoring only the superblock state.
+
+Create a checkpoint file:
+
+```bash
+cargo run --bin osagefs_checkpoint -- create \
+  --store-path /tmp/osagefs-store \
+  --checkpoint-path /tmp/osagefs-store-checkpoint.bin \
+  --note "before migration"
+```
+
+Restore a checkpoint:
+
+```bash
+cargo run --bin osagefs_checkpoint -- restore \
+  --store-path /tmp/osagefs-store \
+  --checkpoint-path /tmp/osagefs-store-checkpoint.bin
+```
+
+Restore resets `metadata/superblock.bin` to the checkpointed generation and
+allocation counters (`next_inode`, `next_segment`).
+
+Offline helper script (recommended):
+
+```bash
+scripts/checkpoint.sh create
+scripts/checkpoint.sh restore
+```
+
+The helper enforces offline safety by default (no mounted filesystem at
+`$MOUNT_PATH`, no active `osagefs` process for `$STORE_PATH`) unless you set
+`FORCE=1`.
+
 ### Performance logging
 
 Pass `--perf-log /path/to/osagefs-perf.jsonl` to emit structured JSONL timing
