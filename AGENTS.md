@@ -10,6 +10,7 @@ Please continuously update this document with useful things you figure out that 
   - `git worktree remove <task-worktree-path>`
   - `git branch -D <task-branch>`
 - If multiple task branches/worktrees were used for the same change, remove all of them once the merge is complete and verified.
+- Sandbox note: if a sibling worktree lives outside the current writable root, `git worktree remove` may fail with `Permission denied`; rerun that command with escalated permissions, then run `git branch -D <task-branch>`.
 
 ## Project Overview
 - OsageFS: a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
@@ -75,7 +76,7 @@ NOT on the developer machine. Use the `sprite` CLI to run commands remotely.
 ## Requirements
 - `sprite` CLI installed and available on PATH
 - `SPRITES_TOKEN` set in the environment
-- A sprite name to use (default: `iotest`)
+- A sprite name to use (default: `osagefs`)
 
 ## Sprite bootstrap dependencies
 On a fresh sprite, install the tools used by build/stress/debug flows before running tests:
@@ -108,7 +109,7 @@ Sprite names must be `<=55` characters.
 Recommended naming rule (55-char safe):
 - `REPO_SLUG="$(basename "$(git rev-parse --show-toplevel)" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-*//; s/-*$//')"`
 - `BRANCH_SLUG="$(git rev-parse --abbrev-ref HEAD | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-*//; s/-*$//')"`
-- `RAW_BASE="iotest-${REPO_SLUG}-${BRANCH_SLUG}"`
+- `RAW_BASE="${REPO_SLUG}-${BRANCH_SLUG}"`
 - `BASE_HASH="$(printf '%s' "$RAW_BASE" | sha1sum | cut -c1-8)"`
 - `SPRITE_BASENAME="$(printf '%s' "$RAW_BASE" | cut -c1-46 | sed 's/-$//')-${BASE_HASH}"`  (always `<=55`)
 
@@ -123,7 +124,7 @@ Multi-sprite naming rule (recommended, 55-char safe):
 Operational policy:
 - For a new worktree or task branch, derive a stable base name and reuse it.
 - You may allocate multiple sprites for the same task, but each must use a stable role suffix and deterministic name.
-- Keep `iotest` as a shared fallback only when you explicitly need a common long-lived sprite.
+- Keep `osagefs` as a shared fallback only when you explicitly need a common long-lived sprite.
 - After task completion, destroy all task sprites (`sprite destroy --force "$SPRITE_NAME"`), unless you intentionally keep specific ones for checkpoints.
 
 If the deterministic sprite does not exist, create it:
@@ -191,17 +192,17 @@ Use sprite checkpoints to avoid repeated Linux untar/build setup cost.
 
 Recommended loop:
 1) Seed a reusable checkpoint once (cold run):
-- `scripts/sprite_perf_loop.sh --sprite iotest --mode cold --create-checkpoint --comment "linux tree prepared"`
+- `scripts/sprite_perf_loop.sh --sprite $SPRITE_NAME --mode cold --create-checkpoint --comment "linux tree prepared"`
 2) Iterate quickly from that checkpoint (restore + sync + perf reuse):
-- `scripts/sprite_perf_loop.sh --sprite iotest --restore v2 --mode fast`
+- `scripts/sprite_perf_loop.sh --sprite SPRITE_NAME --restore v2 --mode fast`
 3) For one-off perf experiments, use ephemeral sprites that auto-clean on exit:
 - `scripts/sprite_perf_loop.sh --ephemeral --mode fast`
-- Add `--keep-sprite` to preserve the ephemeral sprite, or `--cleanup-stale` to delete other leftover `iotest-perf-*` sprites automatically.
+- Add `--keep-sprite` to preserve the ephemeral sprite, or `--cleanup-stale` to delete other leftover `osagefs-perf-*` sprites automatically.
 
 Direct checkpoint commands:
-- `sprite checkpoint list -s iotest`
-- `sprite checkpoint create -s iotest --comment "note"`
-- `sprite restore -s iotest v2`
+- `sprite checkpoint list -s $SPRITE_NAME`
+- `sprite checkpoint create -s $SPRITE_NAME --comment "note"`
+- `sprite restore -s $SPRITE_NAME v2`
 
 Notes:
 - `--mode fast` adds `--reuse_tree` to `scripts/linux_kernel_perf.sh` so it skips cleanup + extract.
