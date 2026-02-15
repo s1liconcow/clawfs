@@ -415,6 +415,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from datetime import date, datetime
 
 out_dir, dataset, cancer_url, nyc_url, allow_pip = sys.argv[1:]
 allow_pip = allow_pip == "1"
@@ -440,6 +441,15 @@ if not ok:
     sys.exit(0)
 
 import duckdb
+
+def json_safe(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    return value
 con = duckdb.connect(os.path.join(out_dir, "analysis.duckdb"))
 
 if dataset == "cancer":
@@ -505,8 +515,12 @@ else:
     payload = {"dataset": dataset, "passenger_mix": q1, "daily": q2}
 
 out_path = os.path.join(out_dir, "duckdb_results.json")
+payload = json_safe(payload)
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(payload, f, indent=2)
+# Validate the artifact is well-formed JSON; fail fast if partially written/corrupt.
+with open(out_path, "r", encoding="utf-8") as f:
+    json.load(f)
 print(out_path)
 PY
 
@@ -514,7 +528,13 @@ PY
     mark_skip "$(cat "$d/SKIP")"
     return 0
   fi
-  [[ -f "$d/duckdb_results.json" ]]
+  [[ -s "$d/duckdb_results.json" ]]
+  python3 - "$d/duckdb_results.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    json.load(f)
+PY
 }
 
 ai_imagenette_train() {

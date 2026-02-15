@@ -68,6 +68,7 @@ Please continuously update this document with useful things you figure out that 
 - `scripts/stress_e2e.sh` now wraps `scripts/cleanup.sh` via a shared `run_cleanup_script()` helper for both initial cleanup and EXIT teardown, matching the common script pattern used by other harnesses.
 - In Sprite VMs, long `apt-get install` runs can sometimes end with `Error: connection closed` / non-zero transport exit even after package `Setting up ...` lines complete; verify required tools explicitly (`fusermount3`, `rg`, `strace`) before retrying full bootstrap.
 - Concurrent `smallfiles_sync` (`numjobs=8`) can expose create/open races; when reproducing, start with `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` and inspect `/work/osagefs/fio-small*.json` for `open(..., O_CREAT) = -1 EIO`.
+- `scripts/micro_workflows.sh` now normalizes DuckDB result payloads to JSON-safe primitives (including `date`/`datetime`) and validates `duckdb_results.json` by parsing it after write; this prevents false `ok` statuses from partially written artifacts.
 - Update (2026-02-15): `smallfiles_sync` `open(..., O_CREAT) = -1 EIO` under `fsync=1` / `numjobs=8` was traced to unstable FUSE inode generation values in `ReplyEntry`/`ReplyCreate`. Do not use superblock generation there; use a stable node generation constant (`1`) per inode lifetime.
 
 ## Useful Commands
