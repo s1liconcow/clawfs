@@ -228,6 +228,9 @@ FIO note:
 - In sprite runs, `smallfiles_sync` may return `Input/output error` during high-concurrency open/create (`filesetup.c:open(...)`) while larger sequential/random workloads still complete. Keep the workload in the matrix for regression tracking, but do not let that single failure abort summary generation.
 - Regression check for this class of issue: `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` should pass repeatedly with `fsync=1` once FUSE generation is stable.
 - `scripts/micro_workflows.sh` `dev_scan_and_status` can expose transient `.git/config.lock` behavior on OsageFS during `git init/config/status`; the harness now retries and clears stale lock files so the suite can complete while preserving this workflow signal.
+- Git clone lockfile failure root cause: FUSE `rename` had a same-directory stale-entry bug (`config.lock -> config` could leave `config.lock` visible). Fixed by routing FUSE and NFS rename through shared `rename_entry(...)` logic and covered by `rename_same_parent_drops_old_name`.
+- Large-file metadata-only flush root cause: `flush_pending` incorrectly required a new segment pointer for any record with `size > inline_threshold`, even when no payload was pending. Fixed by only requiring pointers for inodes with segment payload in the current flush (`segment_data_inodes`), covered by `metadata_only_flush_preserves_large_file_pointer`.
+- Sprite caveat: in this environment, Rust workloads on the OsageFS mount may intermittently fail with `rust-lld` bus errors during build-script linking; this appears environment/toolchain-related, not a filesystem semantic error. For reliable cross-filesystem micro comparisons, use non-Rust OSS build targets or run Rust comparisons in a sprite without this linker instability.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:
