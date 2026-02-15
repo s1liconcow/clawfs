@@ -2002,6 +2002,7 @@ impl OsageFs {
 
     pub fn nfs_flush(&self) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
+        // NFS flush entrypoint does not identify an inode, so keep global semantics.
         let result = self.flush_pending();
         self.log_replay(
             "nfs",
@@ -2916,7 +2917,6 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
-            let _mutation_guard = self.mutation_lock.lock();
             match self.flush_pending() {
                 Ok(()) => {
                     self.log_replay("fuse", "flush", replay, None, json!({ "ino": ino }));
@@ -2949,7 +2949,6 @@ impl Filesystem for OsageFs {
         reply: ReplyEmpty,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
         match self.flush_pending() {
             Ok(()) => {
                 self.log_replay("fuse", "fsync", replay, None, json!({ "ino": ino }));
@@ -2975,7 +2974,6 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
-            let _mutation_guard = self.mutation_lock.lock();
             match self.flush_pending() {
                 Ok(()) => {
                     self.log_replay("fuse", "release", replay, None, json!({ "ino": ino }));
