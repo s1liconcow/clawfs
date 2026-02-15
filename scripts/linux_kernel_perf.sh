@@ -17,6 +17,7 @@ SKIP_EXTRACT=0
 REUSE_TREE=0
 EXTRA_FLAGS=(--disable-cleanup --disable-journal)
 RUN_CLEANUP="$ROOT_DIR/scripts/cleanup.sh"
+MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 
 usage() {
   cat <<USAGE
@@ -147,6 +148,7 @@ fi
 "${CMD[@]}" &
 OSAGE_PID=$!
 sleep 2
+osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
 
 if [[ $EUID -eq 0 ]]; then
   WORKDIR="$MOUNT_PATH"

@@ -6,8 +6,19 @@ osage_set_defaults
 
 PID_FILE="${PID_FILE:-/tmp/osagefs-stress.pid}"
 OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_osagefs.sh}"
-CLEANUP="$ROOT_DIR/scripts/cleanup.sh"
+CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
+MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REF_DIR=""
+
+run_cleanup_script() {
+  LOG_FILE="$LOG_FILE" \
+  PERF_LOG_PATH="$PERF_LOG_PATH" \
+  MOUNT_PATH="$MOUNT_PATH" \
+  STORE_PATH="$STORE_PATH" \
+  LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
+  STATE_PATH="$STATE_PATH" \
+  "$CLEANUP_SCRIPT"
+}
 
 write_payload() {
   local file=$1 size=$2
@@ -69,13 +80,13 @@ cleanup() {
     fi
     rm -f "$PID_FILE"
   fi
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1
+  run_cleanup_script >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 # Ensure clean slate unless user wants to keep existing mount/store
 if [[ -z "${SKIP_CLEANUP:-}" ]]; then
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$CLEANUP" >/dev/null 2>&1 || true
+  run_cleanup_script >/dev/null 2>&1 || true
 fi
 
 mkdir -p "$ROOT_DIR"
@@ -95,6 +106,8 @@ if [[ -s "$PID_FILE" ]]; then
 else
   echo "Warning: PID file $PID_FILE missing; continue if you started osagefs manually."
 fi
+
+osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
 
 run_workload() {
   local dir=$1

@@ -43,3 +43,23 @@ osage_ensure_release_binary() {
     (cd "$ROOT_DIR" && cargo build --release)
   fi
 }
+
+osage_assert_welcome_file() {
+  local mount_path=${1:-"$MOUNT_PATH"}
+  local timeout_sec=${2:-10}
+  local welcome_path="${mount_path%/}/WELCOME.txt"
+  local start=$SECONDS
+
+  while (( SECONDS - start < timeout_sec )); do
+    if [[ -f "$welcome_path" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "Mount validation failed: expected preset file $welcome_path" >&2
+  if [[ -d "$mount_path" ]]; then
+    ls -la "$mount_path" >&2 || true
+  fi
+  return 1
+}
