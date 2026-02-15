@@ -197,22 +197,8 @@ cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- \
   --listen 0.0.0.0:2049
 ```
 
-If you need a compliant NFSv4 endpoint, add `--protocol v4` and point the
-gateway at a `ganesha.nfsd` binary. This mode exports a real POSIX path, so you
-must supply `--use-existing-mount` and point `--mount-path` at an existing
-mounted directory.
-
-```
-cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- \
-  --mount-path /tmp/osagefs-mnt \
-  --use-existing-mount \
-  --protocol v4 \
-  --ganesha-binary /usr/bin/ganesha.nfsd \
-  --listen 10.0.0.5:2049
-```
-
-Windows clients can then mount via `mount -o anon,nolock,vers=3 \\10.0.0.5\\ X:`
-for the user-mode server, or change `vers=4` when running with ganesha.
+Windows clients can mount via `mount -o anon,nolock,vers=3 \\10.0.0.5\\ X:`.
+NFSv4 support is part of the Enterprise offering.
 
 ### Remote cleanup agents
 

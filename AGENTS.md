@@ -54,7 +54,7 @@ Please continuously update this document with useful things you figure out that 
 - `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
 - `src/bin/osagefs_replay.rs` brute-force mode: `--iterations N` replays from fresh-init state N times with deterministic seeds (`--seed`) and optional chaos knobs (`--jitter-us`, `--chaos-sleep-prob`, `--chaos-sleep-max-us`, `--chaos-flush-prob`) to shake out timing-sensitive issues.
 - Mount validation: `scripts/common.sh` now provides `osage_assert_welcome_file` and mount-oriented scripts assert `${MOUNT_PATH}/WELCOME.txt` (or `${NFS_MOUNT_PATH}/WELCOME.txt` for NFS auto-mount) to fail fast when the mount did not come up correctly. Tune wait time with `MOUNT_CHECK_TIMEOUT_SEC` (default `10`).
-- `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount), or exports an existing path for NFSv4 via `ganesha.nfsd` with `--use-existing-mount`.
+- `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount). NFSv4 support is Enterprise-only.
 - When CLI flags/config defaults change, double-check and update `scripts/` launchers in the same PR so script argument sets stay in sync with binaries.
 
 ## Common Issues / Fixes
@@ -79,7 +79,7 @@ Please continuously update this document with useful things you figure out that 
 - Replay trace capture: `REPLAY_LOG_PATH=/work/osagefs/replay.jsonl.gz ./scripts/run_osagefs.sh` (or `./scripts/run_nfs_gateway.sh`). Inspect with `gzip -dc /work/osagefs/replay.jsonl.gz | tail -n 50`.
 - Direct API replay: `cargo run --release --bin osagefs_replay -- --trace-path /work/osagefs/replay.jsonl.gz --store-path /tmp/osagefs-replay-store --local-cache-path /tmp/osagefs-replay-cache --state-path /tmp/osagefs-replay-state.bin --layer fuse --speed 1.0` (add `--ignore-timing` for max-throughput replay).
 - Enable perf tracing for other invocations by exporting `PERF_LOG_PATH=/tmp/osagefs-perf.jsonl` (empty string disables logging when scripts default it). Use `--fsync-on-close` to restore immediate durability, `--flush-interval-ms` to adjust opportunistic flush cadence (0 disables timer), and `--disable-cleanup` when cleanup will be handled by an external agent.
-- Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`. Add `--protocol v4 --use-existing-mount --mount-path /tmp/osagefs-mnt --ganesha-binary /usr/bin/ganesha.nfsd` for a full NFSv4 server.
+- Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`.
 
 Keep this file updated with future design decisions, scripts, and troubleshooting steps.
 

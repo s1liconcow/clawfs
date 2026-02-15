@@ -32,6 +32,7 @@ use serde_json::json;
 
 const ROOT_ID: fileid3 = ROOT_INODE;
 const DEFAULT_V4_EXPORT: &str = "/osagefs";
+#[allow(dead_code)]
 const DEFAULT_GANESHA_BIN: &str = "ganesha.nfsd";
 const WELCOME_FILENAME: &str = "WELCOME.txt";
 const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
@@ -53,7 +54,7 @@ Enjoy building on OsageFS.\n";
 
 #[derive(Parser, Debug)]
 struct Cli {
-    /// Legacy path used for NFSv4/ganesha exports and as default state-path base.
+    /// Mount path (used for local compatibility and state-path defaults).
     #[arg(long, value_name = "PATH", default_value = "/tmp/osagefs-mnt")]
     mount_path: PathBuf,
 
@@ -65,7 +66,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     local_cache_path: Option<PathBuf>,
 
-    /// Re-export an already mounted path (only valid with --protocol v4).
+    /// Re-export an already mounted path (Enterprise-only protocol modes).
     #[arg(long, default_value_t = false)]
     use_existing_mount: bool,
 
@@ -113,7 +114,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:2049")]
     listen: String,
 
-    /// Export pseudo path (used when generating the NFSv4 Ganesha config).
+    /// Export pseudo path (reserved for Enterprise protocol modes).
     #[arg(long, default_value = DEFAULT_V4_EXPORT)]
     pseudo_path: String,
 
@@ -121,15 +122,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     read_only: bool,
 
-    /// Which backend to run (direct user-mode v3 or ganesha-backed v4).
+    /// Which backend to run (OSS supports v3; v4 is Enterprise-only).
     #[arg(long, value_enum, default_value_t = Protocol::V3)]
     protocol: Protocol,
 
-    /// Optional path to ganesha.nfsd when running with --protocol v4.
+    /// Optional path to ganesha.nfsd (Enterprise-only protocol modes).
     #[arg(long)]
     ganesha_binary: Option<PathBuf>,
 
-    /// Optional custom log path for ganesha.nfsd.
+    /// Optional custom log path for ganesha.nfsd (Enterprise-only protocol modes).
     #[arg(long)]
     ganesha_log: Option<PathBuf>,
 }
@@ -147,7 +148,9 @@ async fn main() -> Result<()> {
 
     match cli.protocol {
         Protocol::V3 => run_user_mode(cli).await,
-        Protocol::V4 => run_ganesha(cli).await,
+        Protocol::V4 => Err(anyhow!(
+            "--protocol v4 is available in OsageFS Enterprise builds only"
+        )),
     }
 }
 
@@ -197,6 +200,7 @@ async fn run_user_mode(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn run_ganesha(cli: Cli) -> Result<()> {
     if !cli.use_existing_mount {
         return Err(anyhow!(
@@ -265,6 +269,7 @@ async fn run_ganesha(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn render_ganesha_config(export: &Path, pseudo: &str, port: u16, read_only: bool) -> String {
     let mut body = String::new();
     body.push_str("NFS_Core_Param {\n");
