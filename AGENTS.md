@@ -24,12 +24,14 @@ Please continuously update this document with useful things you figure out that 
 - `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` uses range reads. Tests verify write/read.
 - `src/fs.rs`: `OsageFs` FUSE implementation with pending-staging logic, flush thresholds, multi-client tests, etc. Unit tests cover single-client flush, multi-client independence, and pending-byte/interval stress.
 - `scripts/linux_kernel_perf.sh`: End-to-end harness that cleans mounts, downloads Linux tarball (if missing), mounts osagefs, and times untar + kernel build. Handles cleanups and dependencies.
+- `scripts/fio_workloads.sh`: Starts OsageFS, runs mixed fio profiles (sequential, random, mixed, small-file sync), and writes per-workload JSON plus `summary.md` under `fio-results-*`.
 - `scripts/cleanup.sh`: unmounts, deletes store dir, and removes the state file to give perf scripts a clean slate.
 - `scripts/stress_e2e.sh`: Light-weight FUSE smoke test that launches the daemon via `run_osagefs.sh`, performs single-file, burst, large-file, offset-write, and chmod checks directly against the mounted filesystem, and tears everything down afterward.
 
 ## Testing / Tools
 - `cargo test`: runs unit tests (including new integration-like tests in `fs.rs`, `segment.rs`, `state.rs`).
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
+- `scripts/fio_workloads.sh`: fio benchmark harness; requires `fio`, `python3`, and FUSE support in the runtime environment (prefer sprite execution for mount tests).
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
 - `osagefs-nfs-gateway/`: stand-alone crate that serves OsageFS directly over NFSv3 (`nfsserve`, no FUSE mount), or exports an existing path for NFSv4 via `ganesha.nfsd` with `--use-existing-mount`.
 - When CLI flags/config defaults change, double-check and update `scripts/` launchers in the same PR so script argument sets stay in sync with binaries.
@@ -38,12 +40,14 @@ Please continuously update this document with useful things you figure out that 
 - FUSE error `allow_other`: ensure `user_allow_other` in `/etc/fuse.conf` when running without sudo.
 - Root-owned leftovers from sudo runs: unmount and `sudo rm -rf` mount/store dirs before re-running.
 - Kernel build dependencies (flex/bison) needed for `make defconfig`.
+- `scripts/fio_workloads.sh` generates timestamped `fio-results-*` directories and does not call `scripts/cleanup.sh` at exit, so logs/perf traces are preserved by default for analysis.
 - Pending bytes threshold + `--flush-interval-ms` ensure `flush_pending()` runs automatically; staged payloads append to `$STORE/segment_stage/stage_*.bin` and only one of those files exists per in-flight flush. Metadata poller + TTLs keep cached attrs fresh, while cleanup leases prevent `/imap_deltas/` and `/segs/` from growing without bound.
 - Troubleshooting policy: reproduce with a failing automated test before fixing. For NFS/data-path issues, first capture logs (`write error`, `load_inode miss`, etc.), then codify the failure as a focused regression test in `src/fs.rs`; only after the test fails should code changes be made. Keep the test to prevent regressions.
 
 ## Useful Commands
 - Clean mount/store/state: `fusermount -u /tmp/osagefs-mnt; sudo rm -rf /tmp/osagefs-mnt /tmp/osagefs-store ~/.osagefs_state.bin`.
 - Run perf test: `LOG_FILE=$HOME/linux_build_timings.log ./scripts/linux_kernel_perf.sh`.
+- Run fio workload sweep: `RESULTS_DIR=/work/osagefs/fio-results LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl ./scripts/fio_workloads.sh`.
 - `scripts/run_osagefs.sh` defaults to `$ROOT/osagefs-perf.jsonl`; set `PERF_LOG_PATH=` to disable tracing when needed.
 - Enable perf tracing for other invocations by exporting `PERF_LOG_PATH=/tmp/osagefs-perf.jsonl` (empty string disables logging when scripts default it). Use `--fsync-on-close` to restore immediate durability, `--flush-interval-ms` to adjust opportunistic flush cadence (0 disables timer), and `--disable-cleanup` when cleanup will be handled by an external agent.
 - Export OsageFS via NFS: `cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- --store-path /tmp/osagefs-store --listen 0.0.0.0:2049`. Add `--protocol v4 --use-existing-mount --mount-path /tmp/osagefs-mnt --ganesha-binary /usr/bin/ganesha.nfsd` for a full NFSv4 server.
@@ -65,6 +69,7 @@ NOT on the developer machine. Use the `sprite` CLI to run commands remotely.
 On a fresh sprite, install the tools used by build/stress/debug flows before running tests:
 - Rust toolchain (`cargo`, `rustc`)
 - `python3`
+- `fio`
 - `fuse3` userspace tools (`fusermount`)
 - `util-linux` (`mount`, `umount`, `findmnt`, `mountpoint`)
 - `coreutils` (`dd`, `truncate`, `stat`, `tail`, `sync`, `timeout`)
@@ -75,7 +80,7 @@ On a fresh sprite, install the tools used by build/stress/debug flows before run
 - `strace` for syscall-level failure triage
 
 Example bootstrap (Debian/Ubuntu sprite):
-- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'apt-get update && apt-get install -y python3 fuse3 util-linux coreutils findutils procps psmisc tar gzip ripgrep strace'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'sudo apt-get update && sudo apt-get install -y python3 fio fuse3 util-linux coreutils findutils procps psmisc tar gzip ripgrep strace'`
 
 ## Hard rules for agents
 - Do not run privileged commands locally.
@@ -121,6 +126,7 @@ If integration tests need mounts/services, they must run inside the sprite.
 Use the repo script that already handles launch, workload, verification, and cleanup:
 
 - `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && ./scripts/stress_e2e.sh'`
+- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && RESULTS_DIR=/work/osagefs/fio-results/compact LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl RUNTIME_SEC=5 SEQ_SIZE=64M RAND_SIZE=64M RAND_NUMJOBS=2 RAND_IODEPTH=8 SMALLFILE_COUNT=200 SMALLFILE_NUMJOBS=4 SMALLFILE_SIZE=8k ./scripts/fio_workloads.sh'`
 
 Useful knobs for repeated runs:
 - `LOG_FILE=/work/osagefs/osagefs.log`
@@ -145,6 +151,9 @@ When iterating on fixes, follow this order:
 1) Reproduce with `./scripts/stress_e2e.sh` in sprite.
 2) Add/adjust a focused regression test in `src/fs.rs` for the failing behavior.
 3) Implement the fix and rerun the same sprite stress command.
+
+FIO note:
+- In sprite runs, `smallfiles_sync` may return `Input/output error` during high-concurrency open/create (`filesetup.c:open(...)`) while larger sequential/random workloads still complete. Keep the workload in the matrix for regression tracking, but do not let that single failure abort summary generation.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:
