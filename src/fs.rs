@@ -22,7 +22,7 @@ use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExten
 use crate::journal::{JournalEntry, JournalManager, JournalPayload};
 use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
-use crate::segment::{SegmentEntry, SegmentManager, StagedChunk};
+use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, StagedChunk};
 use crate::state::ClientStateManager;
 use crate::superblock::SuperblockManager;
 use log::{debug, error, info};
@@ -423,17 +423,10 @@ impl OsageFs {
     fn read_pending_bytes(&self, data: &PendingData) -> Result<Vec<u8>> {
         match data {
             PendingData::Inline(bytes) => Ok(bytes.clone()),
-            PendingData::Staged(segments) => {
-                let mut buffer = Vec::with_capacity(segments.total_len as usize);
-                for chunk in &segments.chunks {
-                    let bytes = self
-                        .segments
-                        .read_staged_chunk(chunk)
-                        .map_err(|err| anyhow!("pending read failed: {err:?}"))?;
-                    buffer.extend_from_slice(&bytes);
-                }
-                Ok(buffer)
-            }
+            PendingData::Staged(segments) => self
+                .segments
+                .read_staged_chunks(&segments.chunks, segments.total_len)
+                .map_err(|err| anyhow!("pending read failed: {err:?}")),
         }
     }
 
@@ -1038,7 +1031,7 @@ impl OsageFs {
                             segment_entries.push(SegmentEntry {
                                 inode: record.inode,
                                 path: record.path.clone(),
-                                data: data_bytes.clone(),
+                                payload: SegmentPayload::Bytes(data_bytes.clone()),
                             });
                             record.storage = FileStorage::Inline(Vec::new());
                             segment_files += 1;
@@ -1048,19 +1041,13 @@ impl OsageFs {
                     }
                     Some(PendingData::Staged(segments)) => {
                         let mut record = pending_entry.record.clone();
-                        let mut data_bytes = Vec::with_capacity(record.size as usize);
-                        for chunk in &segments.chunks {
-                            let chunk_bytes =
-                                self.segments.read_staged_chunk(&chunk).map_err(|_| EIO)?;
-                            data_bytes.extend_from_slice(&chunk_bytes);
-                        }
-                        let data_len = data_bytes.len() as u64;
+                        let data_len = segments.total_len;
                         flushed_bytes = flushed_bytes.saturating_add(data_len);
                         record.size = data_len;
                         segment_entries.push(SegmentEntry {
                             inode: record.inode,
                             path: record.path.clone(),
-                            data: data_bytes,
+                            payload: SegmentPayload::Staged(segments.chunks.clone()),
                         });
                         record.storage = FileStorage::Inline(Vec::new());
                         segment_files += 1;

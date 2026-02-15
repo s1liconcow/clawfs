@@ -22,6 +22,7 @@ Please continuously update this document with useful things you figure out that 
 - `src/state.rs`: `ClientStateManager` handles per-client pools, persisted via JSON. Tests ensure persistence across runs.
 - `src/metadata.rs`: Handles inode caching, writes shard snapshots under `/imaps`, emits delta logs with bloom-filtered filenames, and performs CAS updates on `metadata/superblock.bin`.
 - `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` uses range reads. Tests verify write/read.
+- `src/segment.rs`: `SegmentManager::write_batch` accepts in-memory bytes or staged chunks; flushing can stream staged payloads directly into immutable segments to reduce extra copy overhead in `flush_pending`.
 - `src/fs.rs`: `OsageFs` FUSE implementation with pending-staging logic, flush thresholds, multi-client tests, etc. Unit tests cover single-client flush, multi-client independence, and pending-byte/interval stress.
 - `scripts/linux_kernel_perf.sh`: End-to-end harness that cleans mounts, downloads Linux tarball (if missing), mounts osagefs, and times untar + kernel build. Handles cleanups and dependencies.
 - `scripts/fio_workloads.sh`: Starts OsageFS, runs mixed fio profiles (sequential, random, mixed, small-file sync), and writes per-workload JSON plus `summary.md` under `fio-results-*`.
@@ -30,6 +31,7 @@ Please continuously update this document with useful things you figure out that 
 
 ## Testing / Tools
 - `cargo test`: runs unit tests (including new integration-like tests in `fs.rs`, `segment.rs`, `state.rs`).
+- `OSAGEFS_RUN_PERF=1 cargo test --test perf_local -- --nocapture`: local performance suite includes stage throughput, batched segment throughput, and small-file IOPS checks.
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
 - `scripts/fio_workloads.sh`: fio benchmark harness; requires `fio`, `python3`, and FUSE support in the runtime environment (prefer sprite execution for mount tests).
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
