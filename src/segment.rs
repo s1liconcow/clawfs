@@ -32,7 +32,21 @@ pub struct SegmentPointer {
 pub struct SegmentEntry {
     pub inode: u64,
     pub path: String,
-    pub data: Vec<u8>,
+    pub payload: SegmentPayload,
+}
+
+pub enum SegmentPayload {
+    Bytes(Vec<u8>),
+    Staged(Vec<StagedChunk>),
+}
+
+impl SegmentPayload {
+    fn len(&self) -> u64 {
+        match self {
+            SegmentPayload::Bytes(bytes) => bytes.len() as u64,
+            SegmentPayload::Staged(chunks) => chunks.iter().map(|chunk| chunk.len).sum(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,7 +177,19 @@ impl SegmentManager {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut buffer = Vec::new();
+        let mut estimated_size = 4usize + 8usize;
+        for entry in &entries {
+            let payload_len = usize::try_from(entry.payload.len())
+                .with_context(|| format!("segment payload too large for inode {}", entry.inode))?;
+            let path_len = entry.path.len();
+            estimated_size = estimated_size
+                .saturating_add(8)
+                .saturating_add(8)
+                .saturating_add(path_len)
+                .saturating_add(8)
+                .saturating_add(payload_len);
+        }
+        let mut buffer = Vec::with_capacity(estimated_size);
         buffer.extend_from_slice(b"OSG1");
         buffer.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         let mut pointers = Vec::with_capacity(entries.len());
@@ -172,16 +198,27 @@ impl SegmentManager {
             let path_bytes = entry.path.as_bytes();
             buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
             buffer.extend_from_slice(path_bytes);
-            buffer.extend_from_slice(&(entry.data.len() as u64).to_le_bytes());
+            let data_len = entry.payload.len();
+            buffer.extend_from_slice(&data_len.to_le_bytes());
             let offset = buffer.len() as u64;
-            buffer.extend_from_slice(&entry.data);
+            match entry.payload {
+                SegmentPayload::Bytes(bytes) => buffer.extend_from_slice(&bytes),
+                SegmentPayload::Staged(chunks) => {
+                    let appended = self.append_staged_chunks(&mut buffer, &chunks)?;
+                    anyhow::ensure!(
+                        appended == data_len,
+                        "staged payload length mismatch for inode {}",
+                        entry.inode
+                    );
+                }
+            }
             pointers.push((
                 entry.inode,
                 SegmentPointer {
                     segment_id,
                     generation,
                     offset,
-                    length: entry.data.len() as u64,
+                    length: data_len,
                 },
             ));
         }
@@ -189,9 +226,9 @@ impl SegmentManager {
         let object_path = self.segment_path(generation, segment_id);
         let object_path_clone = object_path.clone();
         let store = self.store.clone();
-        let payload = Bytes::from(buffer.clone());
+        let payload = Bytes::from(buffer);
         if self.cache_limit > 0 {
-            self.write_cache_file(generation, segment_id, &buffer)?;
+            self.write_cache_file(generation, segment_id, payload.as_ref())?;
         }
         self.run_store(
             async move {
@@ -276,6 +313,18 @@ impl SegmentManager {
         let mut buffer = vec![0u8; chunk.len as usize];
         file.read_exact(&mut buffer)
             .with_context(|| format!("reading staged payload {}", chunk.path.display()))?;
+        Ok(buffer)
+    }
+
+    pub fn read_staged_chunks(&self, chunks: &[StagedChunk], total_len: u64) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(total_len as usize);
+        let appended = self.append_staged_chunks(&mut buffer, chunks)?;
+        anyhow::ensure!(
+            appended == total_len,
+            "staged payload length mismatch expected={} actual={}",
+            total_len,
+            appended
+        );
         Ok(buffer)
     }
 
@@ -415,6 +464,39 @@ impl SegmentManager {
         )?;
         Ok(bytes.to_vec())
     }
+
+    fn append_staged_chunks(&self, buffer: &mut Vec<u8>, chunks: &[StagedChunk]) -> Result<u64> {
+        let mut appended = 0u64;
+        let mut open_file: Option<(PathBuf, File)> = None;
+        for chunk in chunks {
+            if chunk.len == 0 {
+                continue;
+            }
+            let needs_open = match open_file.as_ref() {
+                Some((path, _)) => path != &chunk.path,
+                None => true,
+            };
+            if needs_open {
+                let file = File::open(&chunk.path)
+                    .with_context(|| format!("opening staged payload {}", chunk.path.display()))?;
+                open_file = Some((chunk.path.clone(), file));
+            }
+            let (_, file) = open_file.as_mut().expect("staged file must be open");
+            file.seek(SeekFrom::Start(chunk.offset))?;
+            let start = buffer.len();
+            buffer.resize(start + chunk.len as usize, 0);
+            file.read_exact(&mut buffer[start..]).with_context(|| {
+                format!(
+                    "reading staged payload {} @{}+{}",
+                    chunk.path.display(),
+                    chunk.offset,
+                    chunk.len
+                )
+            })?;
+            appended = appended.saturating_add(chunk.len);
+        }
+        Ok(appended)
+    }
 }
 
 impl ActiveStage {
@@ -513,7 +595,7 @@ mod tests {
         let entries = vec![SegmentEntry {
             inode: 42,
             path: "/foo.txt".into(),
-            data: b"hello world".to_vec(),
+            payload: SegmentPayload::Bytes(b"hello world".to_vec()),
         }];
         let pointers = manager.write_batch(7, 1, entries).unwrap();
         assert_eq!(pointers.len(), 1);

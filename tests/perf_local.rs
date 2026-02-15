@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use osagefs::config::{Config, ObjectStoreProvider};
-use osagefs::segment::SegmentManager;
+use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
 
@@ -43,8 +43,7 @@ fn perf_config(root: &PathBuf) -> Config {
 
 #[test]
 fn local_disk_stage_throughput() {
-    if std::env::var("OSAGEFS_RUN_PERF").is_err() {
-        eprintln!("skipping local_disk_stage_throughput; set OSAGEFS_RUN_PERF=1 to enable");
+    if !perf_enabled("local_disk_stage_throughput") {
         return;
     }
     let temp = tempdir().expect("temp dir");
@@ -70,4 +69,102 @@ fn local_disk_stage_throughput() {
         "local disk throughput only {:.2} MiB/s (need >= 10 MiB/s)",
         throughput
     );
+}
+
+#[test]
+fn local_segment_batch_throughput() {
+    if !perf_enabled("local_segment_batch_throughput") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    let config = perf_config(&root);
+    std::fs::create_dir_all(&config.mount_path).unwrap();
+    std::fs::create_dir_all(&config.store_path).unwrap();
+    std::fs::create_dir_all(&config.local_cache_path).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let segments = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
+    let entries_per_batch = 128usize;
+    let entry_size = 256 * 1024usize;
+    let batches = 4usize;
+    let total_bytes = (entries_per_batch * entry_size * batches) as f64;
+    let start = Instant::now();
+    for batch in 0..batches {
+        let mut entries = Vec::with_capacity(entries_per_batch);
+        for i in 0..entries_per_batch {
+            let inode = (batch * entries_per_batch + i + 1) as u64;
+            entries.push(SegmentEntry {
+                inode,
+                path: format!("/bulk_{inode}.bin"),
+                payload: SegmentPayload::Bytes(vec![(inode & 0xff) as u8; entry_size]),
+            });
+        }
+        segments
+            .write_batch(1, (batch + 1) as u64, entries)
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+    let throughput_mib = total_bytes / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    eprintln!(
+        "local_segment_batch_throughput throughput={:.2} MiB/s elapsed={:?}",
+        throughput_mib, elapsed
+    );
+    assert!(
+        throughput_mib >= 80.0,
+        "segment batch throughput only {:.2} MiB/s (need >= 80 MiB/s)",
+        throughput_mib
+    );
+}
+
+#[test]
+fn local_segment_small_file_iops() {
+    if !perf_enabled("local_segment_small_file_iops") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    let config = perf_config(&root);
+    std::fs::create_dir_all(&config.mount_path).unwrap();
+    std::fs::create_dir_all(&config.store_path).unwrap();
+    std::fs::create_dir_all(&config.local_cache_path).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let segments = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
+    let files = 8_000usize;
+    let batch_size = 500usize;
+    let file_size = 1024usize;
+    let mut inode = 1u64;
+    let start = Instant::now();
+    for batch in 0..(files / batch_size) {
+        let mut entries = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            entries.push(SegmentEntry {
+                inode,
+                path: format!("/small_{inode}.txt"),
+                payload: SegmentPayload::Bytes(vec![(inode & 0xff) as u8; file_size]),
+            });
+            inode = inode.saturating_add(1);
+        }
+        segments
+            .write_batch(2, (batch + 1) as u64, entries)
+            .expect("write small batch");
+    }
+    let elapsed = start.elapsed();
+    let iops = files as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "local_segment_small_file_iops files={} iops={:.0} elapsed={:?}",
+        files, iops, elapsed
+    );
+    assert!(
+        iops >= 20_000.0,
+        "small-file iops only {:.0} ops/s (need >= 20000)",
+        iops
+    );
+}
+
+fn perf_enabled(name: &str) -> bool {
+    if std::env::var("OSAGEFS_RUN_PERF").is_ok() {
+        return true;
+    }
+    eprintln!("skipping {name}; set OSAGEFS_RUN_PERF=1 to enable");
+    false
 }

@@ -18,7 +18,7 @@ use osagefs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use osagefs::journal::JournalManager;
 use osagefs::metadata::MetadataStore;
 use osagefs::perf::PerfLogger;
-use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPointer};
+use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
 use osagefs::state::ClientStateManager;
 use osagefs::superblock::{CleanupTaskKind, SuperblockManager};
 use tokio::runtime::Handle;
@@ -487,7 +487,7 @@ async fn perform_segment_compaction(
         entries.push(SegmentEntry {
             inode: record.inode,
             path: record.path.clone(),
-            data: data.clone(),
+            payload: SegmentPayload::Bytes(data.clone()),
         });
     }
     let segments_clone = segments.clone();
