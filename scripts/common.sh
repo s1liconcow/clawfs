@@ -71,3 +71,28 @@ osage_assert_welcome_file() {
   fi
   return 1
 }
+
+osage_assert_mount_accessible() {
+  local mount_path=${1:-"$MOUNT_PATH"}
+  local mounted=1
+
+  if command -v mountpoint >/dev/null 2>&1; then
+    if mountpoint -q "$mount_path"; then
+      mounted=0
+    fi
+  else
+    if mount | grep -F " on $mount_path " >/dev/null 2>&1; then
+      mounted=0
+    fi
+  fi
+
+  if [[ $mounted -eq 0 ]]; then
+    if ! ls "$mount_path" >/dev/null 2>&1; then
+      echo "Mount appears stale or inaccessible at $mount_path" >&2
+      echo "Try: sudo umount -l $mount_path" >&2
+      return 1
+    fi
+  fi
+
+  return 0
+}

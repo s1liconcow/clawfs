@@ -76,6 +76,7 @@ if [[ $REUSE_TREE -eq 0 ]]; then
 else
   mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
 fi
+osage_assert_mount_accessible "$MOUNT_PATH"
 if [[ $DO_CLEANUP -eq 1 ]]; then
   trap cleanup_mounts EXIT
 fi
@@ -99,6 +100,11 @@ osage_require_cmd cpio
 osage_require_path /usr/bin/time
 if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
   osage_require_cmd umount
+fi
+if ps -ef | grep -E "[o]sagefs(.| )*--mount-path[[:space:]]+$MOUNT_PATH" >/dev/null 2>&1; then
+  echo "osagefs already running for mount $MOUNT_PATH" >&2
+  echo "Stop existing daemon first, or use a different MOUNT_PATH." >&2
+  exit 1
 fi
 
 latest_kernel_version() {
@@ -148,6 +154,11 @@ fi
 "${CMD[@]}" &
 OSAGE_PID=$!
 sleep 2
+if ! kill -0 "$OSAGE_PID" >/dev/null 2>&1; then
+  echo "osagefs exited during startup; see log at $ROOT_DIR/osagefs.log" >&2
+  exit 1
+fi
+osage_assert_mount_accessible "$MOUNT_PATH"
 osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
 
 if [[ $EUID -eq 0 ]]; then
