@@ -742,7 +742,6 @@ impl OsageFs {
     ) -> std::result::Result<(), i32> {
         let start = Instant::now();
         record.size = data.len() as u64;
-        record.update_times();
         let inode = record.inode;
         let new_len = data.len() as u64;
         let append_range = ctx.and_then(|context| {
@@ -1778,7 +1777,6 @@ impl OsageFs {
             }
             record.update_times();
             self.stage_file(record.clone(), data, None)?;
-            self.stage_inode(record.clone())?;
             Ok(record)
         })();
         self.log_replay(
@@ -2299,7 +2297,6 @@ impl Filesystem for OsageFs {
             record.ctime = OffsetDateTime::now_utc();
             let attr = Self::record_attr(&record);
             self.stage_file(record.clone(), data, None)?;
-            self.stage_inode(record)?;
             Ok(attr)
         })();
         match res {
@@ -4460,6 +4457,42 @@ mod tests {
                 .unwrap(),
             payload
         );
+    }
+
+    #[test]
+    fn nfs_setattr_preserves_pending_large_payload_before_flush() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "setattr_pending_large.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+                cfg.inline_threshold = 4096;
+            });
+
+        let file = harness
+            .fs
+            .nfs_create(ROOT_INODE, "pending-large.dat", 0, 0)
+            .unwrap();
+        let payload = vec![0xA7u8; 64 * 1024];
+        harness.fs.nfs_write(file.inode, 0, &payload).unwrap();
+
+        harness
+            .fs
+            .nfs_setattr(file.inode, Some(0o100640), None, None, None)
+            .unwrap();
+
+        let before_flush = harness
+            .fs
+            .nfs_read(file.inode, 0, payload.len() as u32)
+            .unwrap();
+        assert_eq!(before_flush, payload);
+
+        harness.fs.flush_pending().unwrap();
+        let after_flush = harness
+            .fs
+            .nfs_read(file.inode, 0, payload.len() as u32)
+            .unwrap();
+        assert_eq!(after_flush, payload);
     }
 
     #[test]
