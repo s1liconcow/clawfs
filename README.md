@@ -7,6 +7,36 @@ and per-generation delta files (`/imap_deltas/d_<gen>_<bloom>.bin`). Each delta
 filename embeds a hex bloom-filter of the inodes it contains so clients can skip
 irrelevant updates just by listing objects.
 
+## Comparison matrix
+
+This matrix is for quick positioning against common alternatives.
+
+| System | Metadata architecture | POSIX / file semantics | Shared multi-writer behavior | Cost + deployment profile |
+|-----------|-----------------------|------------------------|------------------------------|---------------------------|
+| **OsageFS** | Metadata lives in object storage (`/imaps` + `/imap_deltas`) with no external metadata DB | POSIX-ish, with explicit durability/caching knobs and shared-state reconciliation via generations | Designed as a shared filesystem across clients (generation-based metadata + leases) | Self-managed (local, S3, or GCS), infra cost depends on your object store + compute |
+| **JuiceFS** | Requires a separate metadata engine (Redis/MySQL/PostgreSQL/TiKV/etcd/FoundationDB) in addition to object storage [^juicefs-meta] | Strong POSIX target (JuiceFS publishes POSIX compatibility behavior) [^juicefs-posix] | Shared filesystem, but depends on operating and scaling that metadata engine [^juicefs-meta] | Self-managed OSS, but operational footprint includes object store **plus** metadata service |
+| **Object-mount OSS adapters (s3fs/goofys/gcsfuse/Mountpoint)** | Typically map object keys directly to files (native object format / object APIs) [^s3fs-native] [^mountpoint-posix] | Trade POSIX completeness for object-store alignment and/or throughput: not fully POSIX or explicitly POSIX-ish [^gcsfuse-posix] [^goofys-posix] [^mountpoint-posix] | Same-file multi-writer semantics are limited: e.g., no client coordination or explicit warnings against concurrent same-object writers [^s3fs-multi] [^gcsfuse-concurrency] | Lightweight OSS clients; good for read-heavy/object-native workflows |
+| **Amazon EFS / FSx for Lustre** | Managed AWS file services [^efs-overview] [^fsx-overview] | Strong POSIX/NFS semantics (FSx for Lustre explicitly POSIX-compliant) [^fsx-overview] | Shared multi-client file systems by design | AWS-only managed services with recurring charges across storage, throughput/IOPS, requests, backups, and transfer depending on tier/configuration [^efs-pricing] [^fsx-pricing] |
+
+### Why OsageFS in this landscape
+
+1. Unlike JuiceFS, OsageFS does not require a separate metadata database tier.
+2. Unlike most object-mount adapters, OsageFS is built as a shared filesystem first (not just object-key projection).
+3. Unlike EFS/FSx, OsageFS is not tied to a single cloud vendor's managed filesystem SKU and pricing model.
+
+[^juicefs-meta]: JuiceFS metadata docs: https://juicefs.com/docs/community/databases_for_metadata/
+[^juicefs-posix]: JuiceFS POSIX compatibility: https://juicefs.com/docs/community/posix_compatibility/
+[^s3fs-native]: s3fs README ("preserves the native object format for files"): https://github.com/s3fs-fuse/s3fs-fuse
+[^s3fs-multi]: s3fs limitations ("no coordination between multiple clients mounting the same bucket"): https://github.com/s3fs-fuse/s3fs-fuse
+[^goofys-posix]: goofys README ("performance first and POSIX second", non-POSIX limitations): https://github.com/kahing/goofys
+[^mountpoint-posix]: Mountpoint for S3 docs (not full POSIX; limited file operations/locking): https://docs.aws.amazon.com/AmazonS3/latest/userguide/mountpoint.html
+[^gcsfuse-posix]: Cloud Storage FUSE overview ("not POSIX compliant"): https://docs.cloud.google.com/storage/docs/cloud-storage-fuse/overview
+[^gcsfuse-concurrency]: Cloud Storage FUSE overview (recommendation against multiple sources modifying same object): https://docs.cloud.google.com/storage/docs/cloud-storage-fuse/overview
+[^efs-overview]: Amazon EFS overview: https://docs.aws.amazon.com/efs/latest/ug/whatisefs.html
+[^efs-pricing]: Amazon EFS pricing: https://aws.amazon.com/efs/pricing/
+[^fsx-overview]: FSx for Lustre overview: https://docs.aws.amazon.com/fsx/latest/LustreGuide/what-is.html
+[^fsx-pricing]: FSx for Lustre pricing: https://aws.amazon.com/fsx/lustre/pricing/
+
 ## High-level architecture
 
 | Component | Responsibility |

@@ -1,8 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -59,7 +60,8 @@ pub struct SegmentManager {
     stage_dir: PathBuf,
     cache_dir: PathBuf,
     cache_limit: u64,
-    cache_state: Mutex<SegmentCache>,
+    cache_state: Arc<Mutex<SegmentCache>>,
+    cache_fill_inflight: Arc<Mutex<HashSet<(u64, u64)>>>,
     stage_state: Mutex<StageState>,
     log_storage_io: bool,
     segment_compression: bool,
@@ -137,7 +139,8 @@ impl SegmentManager {
             stage_dir,
             cache_dir,
             cache_limit: config.segment_cache_bytes,
-            cache_state: Mutex::new(SegmentCache::default()),
+            cache_state: Arc::new(Mutex::new(SegmentCache::default())),
+            cache_fill_inflight: Arc::new(Mutex::new(HashSet::new())),
             stage_state: Mutex::new(StageState::default()),
             log_storage_io: config.log_storage_io,
             segment_compression: config.segment_compression,
@@ -266,11 +269,17 @@ impl SegmentManager {
         if let Some(bytes) = self.read_from_cache(pointer)? {
             return Ok(bytes);
         }
-        let full = self.fetch_segment(pointer.generation, pointer.segment_id)?;
-        if self.cache_limit > 0 {
-            self.write_cache_file(pointer.generation, pointer.segment_id, &full)?;
-        }
-        self.decode_pointer_from_segment(&full, pointer)
+        let range_end = pointer
+            .offset
+            .checked_add(pointer.length)
+            .context("segment pointer range overflow")?;
+        let entry = self.fetch_segment_range(
+            pointer.generation,
+            pointer.segment_id,
+            pointer.offset..range_end,
+        )?;
+        self.enqueue_cache_fill(pointer.generation, pointer.segment_id);
+        self.decode_pointer_entry(&entry)
     }
 
     fn decode_pointer_from_segment(
@@ -288,6 +297,10 @@ impl SegmentManager {
         let end = start + pointer.length as usize;
         anyhow::ensure!(end <= full.len(), "segment pointer out of bounds");
         let slice = &full[start..end];
+        self.decode_pointer_entry(slice)
+    }
+
+    fn decode_pointer_entry(&self, slice: &[u8]) -> Result<Vec<u8>> {
         anyhow::ensure!(
             slice.len() >= SEGMENT_ENTRY_CODEC_HEADER_LEN,
             "segment entry too small for codec header"
@@ -481,29 +494,21 @@ impl SegmentManager {
     }
 
     fn write_cache_file(&self, generation: u64, segment_id: u64, data: &[u8]) -> Result<()> {
-        if self.cache_limit == 0 {
-            return Ok(());
-        }
-        let path = self.cache_path(generation, segment_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, data)?;
-        let mut cache = self.cache_state.lock();
-        cache.entries.push_back((path.clone(), data.len() as u64));
-        cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
-        self.log_cache(format_args!(
-            "synced local cache path={} bytes={}",
-            path.display(),
-            data.len()
-        ));
-        while cache.total_bytes > self.cache_limit {
-            if let Some((old_path, size)) = cache.entries.pop_front() {
-                cache.total_bytes = cache.total_bytes.saturating_sub(size);
-                let _ = fs::remove_file(old_path);
-            } else {
-                break;
-            }
+        let wrote = Self::write_cache_file_with_state(
+            &self.cache_dir,
+            self.cache_limit,
+            &self.cache_state,
+            generation,
+            segment_id,
+            data,
+        )?;
+        if wrote {
+            let path = self.cache_path(generation, segment_id);
+            self.log_cache(format_args!(
+                "synced local cache path={} bytes={}",
+                path.display(),
+                data.len()
+            ));
         }
         Ok(())
     }
@@ -530,6 +535,117 @@ impl SegmentManager {
             || format!("fetching segment {}", path),
         )?;
         Ok(bytes.to_vec())
+    }
+
+    fn fetch_segment_range(&self, generation: u64, segment_id: u64, range: Range<u64>) -> Result<Vec<u8>> {
+        let path = self.segment_path(generation, segment_id);
+        let store = self.store.clone();
+        let path_for_fetch = path.clone();
+        let bytes = self.run_store(
+            async move { store.get_range(&path_for_fetch, range).await },
+            || format!("range-fetching segment {}", path),
+        )?;
+        Ok(bytes.to_vec())
+    }
+
+    fn enqueue_cache_fill(&self, generation: u64, segment_id: u64) {
+        if self.cache_limit == 0 {
+            return;
+        }
+        if self.cache_path(generation, segment_id).exists() {
+            return;
+        }
+        {
+            let mut inflight = self.cache_fill_inflight.lock();
+            if !inflight.insert((generation, segment_id)) {
+                return;
+            }
+        }
+        let store = self.store.clone();
+        let segment_path = self.segment_path(generation, segment_id);
+        let cache_dir = self.cache_dir.clone();
+        let cache_limit = self.cache_limit;
+        let cache_state = self.cache_state.clone();
+        let inflight = self.cache_fill_inflight.clone();
+        let log_storage_io = self.log_storage_io;
+        self.handle.spawn(async move {
+            let result: Result<()> = async {
+                let fetched = store.get(&segment_path).await?;
+                let data = fetched.bytes().await?;
+                SegmentManager::write_cache_file_with_state(
+                    &cache_dir,
+                    cache_limit,
+                    &cache_state,
+                    generation,
+                    segment_id,
+                    data.as_ref(),
+                )?;
+                if log_storage_io {
+                    info!(
+                        target: "cache",
+                        "synced local cache path={} bytes={}",
+                        SegmentManager::cache_path_for(&cache_dir, generation, segment_id).display(),
+                        data.len()
+                    );
+                } else {
+                    debug!(
+                        target: "cache",
+                        "synced local cache path={} bytes={}",
+                        SegmentManager::cache_path_for(&cache_dir, generation, segment_id).display(),
+                        data.len()
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+            .with_context(|| {
+                format!(
+                    "prefetching segment {} generation={} segment_id={}",
+                    segment_path, generation, segment_id
+                )
+            });
+            if let Err(err) = result {
+                warn!(
+                    "segment cache prefetch failed generation={} segment_id={}: {err:#}",
+                    generation, segment_id
+                );
+            }
+            inflight.lock().remove(&(generation, segment_id));
+        });
+    }
+
+    fn cache_path_for(cache_dir: &Path, generation: u64, segment_id: u64) -> PathBuf {
+        cache_dir.join(format!("s_{generation:020}_{segment_id:020}.bin"))
+    }
+
+    fn write_cache_file_with_state(
+        cache_dir: &Path,
+        cache_limit: u64,
+        cache_state: &Mutex<SegmentCache>,
+        generation: u64,
+        segment_id: u64,
+        data: &[u8],
+    ) -> Result<bool> {
+        if cache_limit == 0 {
+            return Ok(false);
+        }
+        let path = Self::cache_path_for(cache_dir, generation, segment_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, data)?;
+        let mut cache = cache_state.lock();
+        cache.entries.push_back((path.clone(), data.len() as u64));
+        cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
+        while cache.total_bytes > cache_limit {
+            if let Some((old_path, size)) = cache.entries.pop_front() {
+                cache.total_bytes = cache.total_bytes.saturating_sub(size);
+                let _ = fs::remove_file(old_path);
+            } else {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     fn append_staged_chunks(&self, buffer: &mut Vec<u8>, chunks: &[StagedChunk]) -> Result<u64> {
@@ -693,5 +809,36 @@ mod tests {
         let ptr = &pointers[0].1;
         let bytes = manager.read_pointer(ptr).unwrap();
         assert_eq!(bytes, b"hello world");
+    }
+
+    #[test]
+    fn range_read_enqueues_cache_fill() {
+        let dir = tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut config = build_config(dir.path());
+        config.segment_cache_bytes = 4 * 1024 * 1024;
+        let manager = SegmentManager::new(&config, handle).unwrap();
+        let entries = vec![SegmentEntry {
+            inode: 7,
+            path: "/bar.txt".into(),
+            payload: SegmentPayload::Bytes(b"range read data".to_vec()),
+        }];
+        let pointers = manager.write_batch(3, 9, entries).unwrap();
+        let ptr = &pointers[0].1;
+        let bytes = manager.read_pointer(ptr).unwrap();
+        assert_eq!(bytes, b"range read data");
+
+        let cache_path = manager.cache_path(ptr.generation, ptr.segment_id);
+        for _ in 0..20 {
+            if cache_path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "expected cache prefetch to create {}",
+            cache_path.display()
+        );
     }
 }

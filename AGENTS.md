@@ -33,7 +33,7 @@ Please continuously update this document with useful things you figure out that 
 - Replay logs now include a startup metadata event (`layer=meta`, `op=fs_config`) with key runtime knobs (`home_prefix`, inline/pending/flush/cache settings, journal/fsync flags, bootstrap user) so replay can align config with capture.
 - `src/state.rs`: `ClientStateManager` handles per-client pools, persisted via JSON. Tests ensure persistence across runs.
 - `src/metadata.rs`: Handles inode caching, writes shard snapshots under `/imaps`, emits delta logs with bloom-filtered filenames, and performs CAS updates on `metadata/superblock.bin`.
-- `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` uses range reads. Tests verify write/read.
+- `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` serves cache hits locally, otherwise issues object-store range reads for the pointer span and asynchronously enqueues full-segment cache fill. Tests verify write/read.
 - `src/segment.rs`: `SegmentManager::write_batch` accepts in-memory bytes or staged chunks; flushing can stream staged payloads directly into immutable segments to reduce extra copy overhead in `flush_pending`.
 - `src/fs.rs`: `OsageFs` FUSE implementation with pending-staging logic, flush thresholds, multi-client tests, etc. Unit tests cover single-client flush, multi-client independence, and pending-byte/interval stress.
 - `scripts/linux_kernel_perf.sh`: End-to-end harness that cleans mounts, downloads Linux tarball (if missing), mounts osagefs, and times untar + kernel build. Handles cleanups and dependencies.
@@ -70,6 +70,8 @@ Please continuously update this document with useful things you figure out that 
 - Concurrent `smallfiles_sync` (`numjobs=8`) can expose create/open races; when reproducing, start with `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` and inspect `/work/osagefs/fio-small*.json` for `open(..., O_CREAT) = -1 EIO`.
 - `scripts/micro_workflows.sh` now normalizes DuckDB result payloads to JSON-safe primitives (including `date`/`datetime`) and validates `duckdb_results.json` by parsing it after write; this prevents false `ok` statuses from partially written artifacts.
 - Update (2026-02-15): `smallfiles_sync` `open(..., O_CREAT) = -1 EIO` under `fsync=1` / `numjobs=8` was traced to unstable FUSE inode generation values in `ReplyEntry`/`ReplyCreate`. Do not use superblock generation there; use a stable node generation constant (`1`) per inode lifetime.
+- Update (2026-02-16): fsync/close sync amplification fix: for FUSE `fsync` and close-sync paths (`flush`/`release` when `--fsync-on-close` is enabled), flush only the target inode plus pending ancestor directories instead of flushing all pending inodes globally. This preserves inode-level durability semantics while avoiding unrelated writeback storms.
+- Sprite A/B benchmark (2026-02-16): baseline (`HEAD`) vs patched fsync-scope binary on a dev-build-like mixed workload (many object-file appends plus per-round lockfile `fsync`) showed median runtime drop from `6.782s` to `3.153s` across 5 runs (`53.5%` faster), with lower run-to-run variance (`stdev 0.199s -> 0.060s`).
 
 ## Useful Commands
 - Clean mount/store/state: `fusermount -u /tmp/osagefs-mnt; sudo rm -rf /tmp/osagefs-mnt /tmp/osagefs-store ~/.osagefs_state.bin`.
@@ -231,6 +233,7 @@ FIO note:
 - Git clone lockfile failure root cause: FUSE `rename` had a same-directory stale-entry bug (`config.lock -> config` could leave `config.lock` visible). Fixed by routing FUSE and NFS rename through shared `rename_entry(...)` logic and covered by `rename_same_parent_drops_old_name`.
 - Large-file metadata-only flush root cause: `flush_pending` incorrectly required a new segment pointer for any record with `size > inline_threshold`, even when no payload was pending. Fixed by only requiring pointers for inodes with segment payload in the current flush (`segment_data_inodes`), covered by `metadata_only_flush_preserves_large_file_pointer`.
 - Sprite caveat: in this environment, Rust workloads on the OsageFS mount may intermittently fail with `rust-lld` bus errors during build-script linking; this appears environment/toolchain-related, not a filesystem semantic error. For reliable cross-filesystem micro comparisons, use non-Rust OSS build targets or run Rust comparisons in a sprite without this linker instability.
+- Dev-build optimization validated in sprite (2026-02-15): keep source/worktree on OsageFS but place Rust build artifacts on sprite-local disk with a shared target dir, e.g. `CARGO_TARGET_DIR=/tmp/osagefs-rust-target-shared cargo check -q`. In repeated runs this reduced median `cargo check` time from ~23.9s (unique cold target each run) to ~2.6s (shared warm target), ~89% faster, while preserving OsageFS durability semantics for source and metadata paths.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:
