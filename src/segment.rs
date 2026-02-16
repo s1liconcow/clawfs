@@ -537,7 +537,12 @@ impl SegmentManager {
         Ok(bytes.to_vec())
     }
 
-    fn fetch_segment_range(&self, generation: u64, segment_id: u64, range: Range<u64>) -> Result<Vec<u8>> {
+    fn fetch_segment_range(
+        &self,
+        generation: u64,
+        segment_id: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>> {
         let path = self.segment_path(generation, segment_id);
         let store = self.store.clone();
         let path_for_fetch = path.clone();
@@ -774,6 +779,7 @@ mod tests {
             gcs_service_account: None,
             state_path: root.join("state.bin"),
             foreground: false,
+            allow_other: false,
             home_prefix: "/home".into(),
             perf_log: None,
             replay_log: None,
@@ -836,9 +842,6 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!(
-            "expected cache prefetch to create {}",
-            cache_path.display()
-        );
+        panic!("expected cache prefetch to create {}", cache_path.display());
     }
 }

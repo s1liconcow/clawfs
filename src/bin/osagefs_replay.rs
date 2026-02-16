@@ -450,6 +450,7 @@ fn build_config(
         metadata_poll_interval_ms: effective.metadata_poll_interval_ms,
         segment_cache_bytes: effective.segment_cache_bytes,
         foreground: true,
+        allow_other: false,
         log_file: None,
         debug_log: false,
         imap_delta_batch: effective.imap_delta_batch,

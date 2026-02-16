@@ -12,6 +12,7 @@ DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
 DEBUG_LOG="${DEBUG_LOG:-0}"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REPLAY_LOG_PATH="${REPLAY_LOG_PATH:-}"
+ALLOW_OTHER="${ALLOW_OTHER:-0}"
 
 osage_ensure_release_binary "$OSAGE_BIN"
 
@@ -41,6 +42,9 @@ if [[ -n "$PERF_LOG_PATH" ]]; then
 fi
 if [[ -n "$REPLAY_LOG_PATH" ]]; then
   CMD+=(--replay-log "$REPLAY_LOG_PATH")
+fi
+if osage_is_true "$ALLOW_OTHER"; then
+  CMD+=(--allow-other)
 fi
 
 if osage_is_true "$FOREGROUND"; then

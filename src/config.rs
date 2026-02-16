@@ -134,6 +134,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub foreground: bool,
 
+    /// Mount with FUSE allow_other (requires user_allow_other in /etc/fuse.conf).
+    #[arg(long, default_value_t = false)]
+    pub allow_other: bool,
+
     /// Optional path where structured logs should be written (defaults to osagefs.log).
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
@@ -181,6 +185,7 @@ pub struct Config {
     pub metadata_poll_interval_ms: u64,
     pub segment_cache_bytes: u64,
     pub foreground: bool,
+    pub allow_other: bool,
     pub log_file: Option<PathBuf>,
     pub debug_log: bool,
     pub imap_delta_batch: usize,
@@ -239,6 +244,7 @@ impl From<Cli> for Config {
             metadata_poll_interval_ms: cli.metadata_poll_interval_ms,
             segment_cache_bytes: cli.segment_cache_bytes,
             foreground: cli.foreground,
+            allow_other: cli.allow_other,
             log_file,
             debug_log: cli.debug_log,
             imap_delta_batch: cli.imap_delta_batch.max(1),

@@ -155,9 +155,14 @@ fn main() -> Result<()> {
         MountOption::FSName("osagefs".to_string()),
         MountOption::DefaultPermissions,
     ];
-    let allow_other = std::env::var("OSAGEFS_ALLOW_OTHER")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+    let allow_other = if config.allow_other {
+        true
+    } else {
+        // Backward-compatible fallback for existing scripts.
+        std::env::var("OSAGEFS_ALLOW_OTHER")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    };
     if allow_other {
         options.push(MountOption::AllowOther);
     } else {

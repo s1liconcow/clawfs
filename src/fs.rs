@@ -3540,6 +3540,7 @@ mod tests {
             gcs_service_account: None,
             state_path: root.join(state_name),
             foreground: false,
+            allow_other: false,
             home_prefix: "/home".into(),
             perf_log: None,
             replay_log: None,
