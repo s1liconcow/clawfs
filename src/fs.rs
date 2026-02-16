@@ -12,7 +12,9 @@ use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL, O_TRUNC};
+use libc::{
+    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL, O_TRUNC,
+};
 use parking_lot::Mutex;
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
@@ -73,6 +75,22 @@ pub struct OsageFs {
 }
 
 impl OsageFs {
+    fn resize_file_data_for_setattr(
+        data: &mut Vec<u8>,
+        target_size: u64,
+    ) -> std::result::Result<(), i32> {
+        let target_len = usize::try_from(target_size).map_err(|_| EFBIG)?;
+        if target_len <= data.len() {
+            data.truncate(target_len);
+            return Ok(());
+        }
+
+        let additional = target_len - data.len();
+        data.try_reserve_exact(additional).map_err(|_| EFBIG)?;
+        data.resize(target_len, 0);
+        Ok(())
+    }
+
     fn summarize_inode_kind(kind: &InodeKind) -> String {
         match kind {
             InodeKind::Directory { children } => {
@@ -1709,7 +1727,7 @@ impl OsageFs {
                 if record.is_dir() {
                     return Err(EISDIR);
                 }
-                data.resize(target_size as usize, 0);
+                Self::resize_file_data_for_setattr(&mut data, target_size)?;
             }
             record.update_times();
             self.stage_file(record.clone(), data, None)?;
@@ -2209,7 +2227,7 @@ impl Filesystem for OsageFs {
                 if record.is_dir() {
                     return Err(EISDIR);
                 }
-                data.resize(target_size as usize, 0);
+                Self::resize_file_data_for_setattr(&mut data, target_size)?;
             }
             record.update_times();
             let attr = Self::record_attr(&record);
@@ -4110,10 +4128,9 @@ mod tests {
         assert!(!created);
         assert_eq!(opened.inode, file.inode);
 
-        let result =
-            harness
-                .fs
-                .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, libc::O_EXCL);
+        let result = harness
+            .fs
+            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, libc::O_EXCL);
         assert!(matches!(result, Err(code) if code == EEXIST));
     }
 
@@ -4135,7 +4152,32 @@ mod tests {
         assert!(!created);
         assert_eq!(opened.inode, file.inode);
         assert_eq!(opened.size, 0);
-        assert_eq!(harness.fs.nfs_read(file.inode, 0, 64).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            harness.fs.nfs_read(file.inode, 0, 64).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn nfs_setattr_huge_truncate_returns_efbig_and_keeps_fs_alive() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "setattr_huge_truncate.bin", 1 << 20);
+
+        let file = harness.fs.nfs_create(ROOT_INODE, "huge.bin", 0, 0).unwrap();
+        harness.fs.nfs_write(file.inode, 0, b"x").unwrap();
+
+        let result =
+            harness
+                .fs
+                .nfs_setattr(file.inode, None, None, None, Some(999_999_999_999_999));
+        assert!(matches!(result, Err(code) if code == EFBIG));
+
+        let record = harness.fs.load_inode(file.inode).unwrap();
+        assert_eq!(record.size, 1);
+        assert_eq!(
+            harness.fs.nfs_read(file.inode, 0, 1).unwrap(),
+            b"x".to_vec()
+        );
     }
 
     #[test]
@@ -4244,7 +4286,10 @@ mod tests {
             });
         let dir_a = harness.fs.nfs_mkdir(ROOT_INODE, "a", 0, 0).unwrap();
         let dir_b = harness.fs.nfs_mkdir(dir_a.inode, "b", 0, 0).unwrap();
-        let file = harness.fs.nfs_create(dir_b.inode, "target.bin", 0, 0).unwrap();
+        let file = harness
+            .fs
+            .nfs_create(dir_b.inode, "target.bin", 0, 0)
+            .unwrap();
         harness.fs.nfs_write(file.inode, 0, b"payload").unwrap();
 
         harness.fs.flush_pending_for_inode(file.inode).unwrap();

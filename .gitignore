@@ -5,3 +5,9 @@ loopback-bench/target
 *.jsonl
 
 .local/ZeroFS/
+/pjdfstest_nfs/pjdfstest
+/pjdfstest_nfs/Makefile
+/pjdfstest_nfs/config.h
+/pjdfstest_nfs/config.log
+/pjdfstest_nfs/config.status
+/pjdfstest_nfs/autom4te.cache/
