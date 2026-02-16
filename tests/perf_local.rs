@@ -28,6 +28,7 @@ fn perf_config(root: &PathBuf) -> Config {
         object_prefix: String::new(),
         gcs_service_account: None,
         state_path: root.join("state.bin"),
+        allow_other: false,
         perf_log: None,
         replay_log: None,
         disable_journal: true,
