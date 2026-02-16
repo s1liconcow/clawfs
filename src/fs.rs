@@ -1142,19 +1142,22 @@ impl OsageFs {
         self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all")
     }
 
-    #[cfg(test)]
     fn flush_pending_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
         self.flush_pending_selected(
             |guard| {
                 let mut selected = HashMap::new();
-                if let Some(entry) = guard.remove(&ino) {
+                let mut cursor = ino;
+                let mut seen = HashSet::new();
+                while seen.insert(cursor) {
+                    let Some(entry) = guard.remove(&cursor) else {
+                        break;
+                    };
                     let parent = entry.record.parent;
-                    selected.insert(ino, entry);
-                    if parent != ino {
-                        if let Some(parent_entry) = guard.remove(&parent) {
-                            selected.insert(parent, parent_entry);
-                        }
+                    selected.insert(cursor, entry);
+                    if parent == cursor {
+                        break;
                     }
+                    cursor = parent;
                 }
                 selected
             },
@@ -2995,7 +2998,7 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
-            match self.flush_pending() {
+            match self.flush_pending_for_inode(ino) {
                 Ok(()) => {
                     self.log_replay("fuse", "flush", replay, None, json!({ "ino": ino }));
                     reply.ok()
@@ -3027,7 +3030,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEmpty,
     ) {
         let replay = self.replay_start();
-        match self.flush_pending() {
+        match self.flush_pending_for_inode(ino) {
             Ok(()) => {
                 self.log_replay("fuse", "fsync", replay, None, json!({ "ino": ino }));
                 reply.ok()
@@ -3052,7 +3055,7 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         if self.fsync_on_close {
-            match self.flush_pending() {
+            match self.flush_pending_for_inode(ino) {
                 Ok(()) => {
                     self.log_replay("fuse", "release", replay, None, json!({ "ino": ino }));
                     reply.ok()
@@ -4229,6 +4232,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(harness.fs.read_file_bytes(&stored_b).unwrap(), b"bbbb");
+    }
+
+    #[test]
+    fn flush_pending_for_inode_flushes_pending_ancestor_directories() {
+        let dir = tempdir().unwrap();
+        let harness =
+            TestHarness::with_config(dir.path(), "flush_inode_ancestors.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
+        let dir_a = harness.fs.nfs_mkdir(ROOT_INODE, "a", 0, 0).unwrap();
+        let dir_b = harness.fs.nfs_mkdir(dir_a.inode, "b", 0, 0).unwrap();
+        let file = harness.fs.nfs_create(dir_b.inode, "target.bin", 0, 0).unwrap();
+        harness.fs.nfs_write(file.inode, 0, b"payload").unwrap();
+
+        harness.fs.flush_pending_for_inode(file.inode).unwrap();
+
+        let pending = harness.fs.pending_inodes.lock();
+        assert!(
+            !pending.contains_key(&file.inode),
+            "file inode should be flushed"
+        );
+        assert!(
+            !pending.contains_key(&dir_b.inode),
+            "direct parent should be flushed"
+        );
+        assert!(
+            !pending.contains_key(&dir_a.inode),
+            "ancestor directory should be flushed"
+        );
+        assert!(
+            !pending.contains_key(&ROOT_INODE),
+            "root directory should be flushed when pending"
+        );
+        drop(pending);
+
+        let root = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(ROOT_INODE))
+            .unwrap()
+            .unwrap();
+        let a_ino = root.children().unwrap().get("a").copied();
+        assert_eq!(a_ino, Some(dir_a.inode));
     }
 
     #[test]
