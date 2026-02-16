@@ -938,7 +938,10 @@ impl OsageFs {
                         *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
                     }
                 }
-                PendingData::Staged(_) => unreachable!("staged append handled elsewhere"),
+                PendingData::Staged(segments) => {
+                    let chunk = self.segments.stage_payload(data).map_err(|_| EIO)?;
+                    segments.append(chunk);
+                }
             }
             let current_len = slot.len();
             entry.record.size = current_len;
@@ -2536,7 +2539,18 @@ impl Filesystem for OsageFs {
                     "create",
                     replay,
                     None,
-                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": file.inode, "created": created }),
+                    json!({
+                        "parent": parent,
+                        "name": name.to_string_lossy(),
+                        "uid": uid,
+                        "gid": gid,
+                        "ino": file.inode,
+                        "created": created,
+                        "mode": mode,
+                        "umask": umask,
+                        "flags": flags,
+                        "stored_mode": file.mode,
+                    }),
                 );
                 let attr = Self::record_attr(&file);
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
@@ -2548,7 +2562,15 @@ impl Filesystem for OsageFs {
                     "create",
                     replay,
                     Some(code),
-                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid }),
+                    json!({
+                        "parent": parent,
+                        "name": name.to_string_lossy(),
+                        "uid": uid,
+                        "gid": gid,
+                        "mode": mode,
+                        "umask": umask,
+                        "flags": flags,
+                    }),
                 );
                 let detail = format!("parent={} name={}", parent, name.to_string_lossy());
                 self.log_fuse_error("create", &detail, code);
@@ -3937,6 +3959,29 @@ mod tests {
                 .unwrap();
             assert_eq!(record.size, 600);
         }
+    }
+
+    #[test]
+    fn append_file_handles_staged_pending_without_panic() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "append_staged.bin", 1 << 20);
+        let inode = harness.fs.allocate_inode_id().unwrap();
+        let record = make_file(inode, "staged.dat");
+        let initial = vec![0xAB; 5000];
+        harness.fs.stage_file(record.clone(), initial.clone(), None).unwrap();
+
+        let mut stale_view = harness.fs.load_inode(inode).unwrap();
+        stale_view.size = 0;
+        harness.fs.append_file(stale_view, b"xyz").unwrap();
+
+        let pending_len = {
+            let map = harness.fs.pending_inodes.lock();
+            map.get(&inode)
+                .and_then(|entry| entry.data.as_ref())
+                .map(|data| data.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(pending_len, initial.len() as u64 + 3);
     }
 
     #[test]
