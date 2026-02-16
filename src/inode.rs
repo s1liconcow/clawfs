@@ -30,6 +30,8 @@ pub struct InodeRecord {
     pub mtime: OffsetDateTime,
     pub ctime: OffsetDateTime,
     pub link_count: u32,
+    #[serde(default)]
+    pub rdev: u32,
     pub storage: FileStorage,
 }
 
@@ -92,6 +94,7 @@ impl InodeRecord {
             mtime: now,
             ctime: now,
             link_count: 1,
+            rdev: 0,
             storage: FileStorage::Inline(Vec::new()),
         }
     }
@@ -119,6 +122,7 @@ impl InodeRecord {
             mtime: now,
             ctime: now,
             link_count: 1,
+            rdev: 0,
             storage: FileStorage::Inline(Vec::new()),
         }
     }
@@ -148,6 +152,7 @@ impl InodeRecord {
             mtime: now,
             ctime: now,
             link_count: 1,
+            rdev: 0,
             storage: FileStorage::Inline(target),
         }
     }
@@ -168,6 +173,7 @@ impl InodeRecord {
             mtime: now,
             ctime: now,
             link_count: 0,
+            rdev: 0,
             storage: FileStorage::Inline(Vec::new()),
         }
     }

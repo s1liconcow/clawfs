@@ -155,10 +155,16 @@ fn main() -> Result<()> {
         MountOption::FSName("osagefs".to_string()),
         MountOption::DefaultPermissions,
     ];
-    if config.foreground {
-        options.push(MountOption::AllowRoot);
+    let allow_other = std::env::var("OSAGEFS_ALLOW_OTHER")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if allow_other {
+        options.push(MountOption::AllowOther);
     } else {
         options.push(MountOption::AllowRoot);
+    }
+    if config.foreground {
+    } else {
         options.push(MountOption::AutoUnmount);
     }
     info!("Mounting OsageFS at {}", config.mount_path.display());

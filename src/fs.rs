@@ -13,7 +13,9 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{
-    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL, O_TRUNC,
+    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL,
+    O_TRUNC,
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use parking_lot::Mutex;
 use time::OffsetDateTime;
@@ -45,6 +47,7 @@ const ADAPTIVE_PENDING_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const ADAPTIVE_INTERVAL_DEFER_MULTIPLIER: u32 = 5;
 const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
 const ADAPTIVE_MIN_MAX_DEFER_SECS: u64 = 5;
+const NAME_MAX_BYTES: usize = 255;
 
 #[cfg(target_os = "linux")]
 const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
@@ -75,6 +78,45 @@ pub struct OsageFs {
 }
 
 impl OsageFs {
+    fn mode_to_file_type(mode: u32) -> FileType {
+        match mode & S_IFMT {
+            x if x == S_IFDIR => FileType::Directory,
+            x if x == S_IFIFO => FileType::NamedPipe,
+            x if x == S_IFCHR => FileType::CharDevice,
+            x if x == S_IFBLK => FileType::BlockDevice,
+            x if x == S_IFSOCK => FileType::Socket,
+            _ => FileType::RegularFile,
+        }
+    }
+
+    fn apply_umask(mode: u32, umask: u32) -> u32 {
+        let type_bits = mode & S_IFMT;
+        let perm_bits = (mode & 0o7777) & !umask;
+        let inode_type = if type_bits == 0 { S_IFREG } else { type_bits };
+        inode_type | perm_bits
+    }
+
+    fn normalize_node_mode(mode: u32) -> u32 {
+        let type_bits = mode & S_IFMT;
+        let inode_type = if type_bits == 0 { S_IFREG } else { type_bits };
+        inode_type | (mode & 0o7777)
+    }
+
+    fn validate_os_name(name: &OsStr) -> std::result::Result<String, i32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if name.as_bytes().len() > NAME_MAX_BYTES {
+                return Err(ENAMETOOLONG);
+            }
+        }
+        let name = name.to_str().ok_or(EINVAL)?.to_string();
+        if name.len() > NAME_MAX_BYTES {
+            return Err(ENAMETOOLONG);
+        }
+        Ok(name)
+    }
+
     fn resize_file_data_for_setattr(
         data: &mut Vec<u8>,
         target_size: u64,
@@ -267,6 +309,12 @@ impl OsageFs {
     }
 
     fn record_attr(record: &InodeRecord) -> FileAttr {
+        let attr_kind = match record.kind {
+            InodeKind::Directory { .. } => FileType::Directory,
+            InodeKind::Symlink => FileType::Symlink,
+            InodeKind::File => Self::mode_to_file_type(record.mode),
+            InodeKind::Tombstone => FileType::RegularFile,
+        };
         FileAttr {
             ino: record.inode,
             size: record.size,
@@ -275,12 +323,7 @@ impl OsageFs {
             mtime: to_system_time(record.mtime),
             ctime: to_system_time(record.ctime),
             crtime: to_system_time(record.ctime),
-            kind: match record.kind {
-                InodeKind::Directory { .. } => FileType::Directory,
-                InodeKind::File => FileType::RegularFile,
-                InodeKind::Symlink => FileType::Symlink,
-                InodeKind::Tombstone => FileType::RegularFile,
-            },
+            kind: attr_kind,
             perm: (record.mode & 0o7777) as u16,
             nlink: if record.is_dir() {
                 2 + record.children().map(|c| c.len() as u32).unwrap_or(0)
@@ -289,7 +332,7 @@ impl OsageFs {
             },
             uid: record.uid,
             gid: record.gid,
-            rdev: 0,
+            rdev: record.rdev,
             flags: 0,
             blksize: 4096,
         }
@@ -1728,9 +1771,11 @@ impl OsageFs {
                     return Err(EISDIR);
                 }
                 Self::resize_file_data_for_setattr(&mut data, target_size)?;
+                record.size = data.len() as u64;
             }
             record.update_times();
             self.stage_file(record.clone(), data, None)?;
+            self.stage_inode(record.clone())?;
             Ok(record)
         })();
         self.log_replay(
@@ -1841,6 +1886,8 @@ impl OsageFs {
         name: &str,
         uid: u32,
         gid: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
     ) -> std::result::Result<(InodeRecord, bool), i32> {
         let mut parent_inode = match self.load_inode(parent) {
@@ -1888,6 +1935,7 @@ impl OsageFs {
         };
         let path = Self::build_child_path(&parent_inode, name);
         let mut file = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, gid);
+        file.mode = Self::apply_umask(S_IFREG | (mode & 0o7777), umask);
         file.update_times();
         if let Err(code) = self.stage_inode(file.clone()) {
             self.log_fuse_error(
@@ -2199,8 +2247,8 @@ impl Filesystem for OsageFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -2228,10 +2276,27 @@ impl Filesystem for OsageFs {
                     return Err(EISDIR);
                 }
                 Self::resize_file_data_for_setattr(&mut data, target_size)?;
+                record.size = data.len() as u64;
+                if mtime.is_none() {
+                    record.mtime = OffsetDateTime::now_utc();
+                }
             }
-            record.update_times();
+            if let Some(next_atime) = atime {
+                record.atime = match next_atime {
+                    TimeOrNow::SpecificTime(ts) => from_system_time(ts),
+                    TimeOrNow::Now => OffsetDateTime::now_utc(),
+                };
+            }
+            if let Some(next_mtime) = mtime {
+                record.mtime = match next_mtime {
+                    TimeOrNow::SpecificTime(ts) => from_system_time(ts),
+                    TimeOrNow::Now => OffsetDateTime::now_utc(),
+                };
+            }
+            record.ctime = OffsetDateTime::now_utc();
             let attr = Self::record_attr(&record);
-            self.stage_file(record, data, None)?;
+            self.stage_file(record.clone(), data, None)?;
+            self.stage_inode(record)?;
             Ok(attr)
         })();
         match res {
@@ -2260,20 +2325,21 @@ impl Filesystem for OsageFs {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let replay = self.replay_start();
-        let name_str = match name.to_str() {
-            Some(n) => n,
-            None => {
+        let name_owned = match Self::validate_os_name(name) {
+            Ok(n) => n,
+            Err(code) => {
                 self.log_replay(
                     "fuse",
                     "lookup",
                     replay,
-                    Some(EINVAL),
+                    Some(code),
                     json!({ "parent": parent, "name": name.to_string_lossy() }),
                 );
-                reply.error(EINVAL);
+                reply.error(code);
                 return;
             }
         };
+        let name_str = name_owned.as_str();
         let response = (|| {
             let parent_inode = self.load_inode(parent)?;
             let child = parent_inode
@@ -2389,8 +2455,8 @@ impl Filesystem for OsageFs {
         req: &Request<'_>,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let replay = self.replay_start();
@@ -2402,7 +2468,7 @@ impl Filesystem for OsageFs {
             if !parent_inode.is_dir() {
                 return Err(ENOTDIR);
             }
-            let name = name.to_str().ok_or(EINVAL)?.to_string();
+            let name = Self::validate_os_name(name)?;
             if parent_inode
                 .children()
                 .map(|children| children.contains_key(&name))
@@ -2414,6 +2480,7 @@ impl Filesystem for OsageFs {
             let path = Self::build_child_path(&parent_inode, &name);
             let mut dir =
                 InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
+            dir.mode = Self::apply_umask(S_IFDIR | (mode & 0o7777), umask);
             dir.update_times();
             self.stage_inode(dir.clone())?;
             self.update_parent(&mut parent_inode, name, inode_id)?;
@@ -2449,8 +2516,8 @@ impl Filesystem for OsageFs {
         req: &Request<'_>,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
@@ -2459,8 +2526,8 @@ impl Filesystem for OsageFs {
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
-            let name = name.to_str().ok_or(EINVAL)?.to_string();
-            self.fuse_create_file(parent, &name, uid, gid, flags)
+            let name = Self::validate_os_name(name)?;
+            self.fuse_create_file(parent, &name, uid, gid, mode, umask, flags)
         })();
         match res {
             Ok((file, created)) => {
@@ -2490,6 +2557,70 @@ impl Filesystem for OsageFs {
         }
     }
 
+    fn mknod(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let replay = self.replay_start();
+        let _mutation_guard = self.mutation_lock.lock();
+        let uid = req.uid();
+        let gid = req.gid();
+        let res = (|| {
+            let mut parent_inode = self.load_inode(parent)?;
+            if !parent_inode.is_dir() {
+                return Err(ENOTDIR);
+            }
+            let name = Self::validate_os_name(name)?;
+            if parent_inode
+                .children()
+                .map(|children| children.contains_key(&name))
+                .unwrap_or(false)
+            {
+                return Err(EEXIST);
+            }
+
+            let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
+            let path = Self::build_child_path(&parent_inode, &name);
+            let mut node = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
+            node.mode = Self::normalize_node_mode(mode);
+            node.rdev = rdev;
+            node.update_times();
+            self.stage_inode(node.clone())?;
+            self.update_parent(&mut parent_inode, name, inode_id)?;
+            Ok(node)
+        })();
+
+        match res {
+            Ok(node) => {
+                self.log_replay(
+                    "fuse",
+                    "mknod",
+                    replay,
+                    None,
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "mode": mode, "rdev": rdev, "ino": node.inode }),
+                );
+                let attr = Self::record_attr(&node);
+                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+            }
+            Err(code) => {
+                self.log_replay(
+                    "fuse",
+                    "mknod",
+                    replay,
+                    Some(code),
+                    json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "mode": mode, "rdev": rdev }),
+                );
+                reply.error(code);
+            }
+        }
+    }
+
     fn symlink(
         &mut self,
         req: &Request<'_>,
@@ -2508,7 +2639,7 @@ impl Filesystem for OsageFs {
             if !parent_inode.is_dir() {
                 return Err(ENOTDIR);
             }
-            let name = name.to_str().ok_or(EINVAL)?.to_string();
+            let name = Self::validate_os_name(name)?;
             if parent_inode
                 .children()
                 .map(|children| children.contains_key(&name))
@@ -2550,16 +2681,36 @@ impl Filesystem for OsageFs {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let replay = self.replay_start();
-        match self.load_inode(ino) {
+        let res = (|| {
+            let mut record = self.load_inode(ino)?;
+            if flags & O_TRUNC != 0 && !record.is_dir() && record.size > 0 {
+                record.update_times();
+                self.stage_file(record.clone(), Vec::new(), None)?;
+            }
+            Ok(())
+        })();
+        match res {
             Ok(_) => {
-                self.log_replay("fuse", "open", replay, None, json!({ "ino": ino }));
+                self.log_replay(
+                    "fuse",
+                    "open",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "flags": flags }),
+                );
                 // FUSE open reply flags are FOPEN_* bits, not O_* request flags.
                 reply.opened(0, 0)
             }
             Err(code) => {
-                self.log_replay("fuse", "open", replay, Some(code), json!({ "ino": ino }));
+                self.log_replay(
+                    "fuse",
+                    "open",
+                    replay,
+                    Some(code),
+                    json!({ "ino": ino, "flags": flags }),
+                );
                 let detail = format!("ino={}", ino);
                 self.log_fuse_error("open", &detail, code);
                 reply.error(code);
@@ -2795,7 +2946,8 @@ impl Filesystem for OsageFs {
             if !parent_inode.is_dir() {
                 return Err(ENOTDIR);
             }
-            let name_str = name.to_str().ok_or(EINVAL)?;
+            let name = Self::validate_os_name(name)?;
+            let name_str = name.as_str();
             let child_ino = parent_inode
                 .children()
                 .and_then(|children| children.get(name_str).copied())
@@ -2841,7 +2993,8 @@ impl Filesystem for OsageFs {
             if !parent_inode.is_dir() {
                 return Err(ENOTDIR);
             }
-            let name_str = name.to_str().ok_or(EINVAL)?;
+            let name = Self::validate_os_name(name)?;
+            let name_str = name.as_str();
             let child_ino = parent_inode
                 .children()
                 .and_then(|children| children.get(name_str).copied())
@@ -2895,8 +3048,8 @@ impl Filesystem for OsageFs {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let res = (|| {
-            let old_name = name.to_str().ok_or(EINVAL)?.to_string();
-            let new_name = newname.to_str().ok_or(EINVAL)?.to_string();
+            let old_name = Self::validate_os_name(name)?;
+            let new_name = Self::validate_os_name(newname)?;
             self.rename_entry(parent, &old_name, newparent, &new_name, flags)
         })();
         match res {
@@ -2954,7 +3107,7 @@ impl Filesystem for OsageFs {
             if !parent_inode.is_dir() {
                 return Err(ENOTDIR);
             }
-            let name = newname.to_str().ok_or(EINVAL)?.to_string();
+            let name = Self::validate_os_name(newname)?;
             if parent_inode
                 .children()
                 .map(|children| children.contains_key(&name))
@@ -3100,7 +3253,7 @@ impl Filesystem for OsageFs {
 fn file_type(record: &InodeRecord) -> FileType {
     match record.kind {
         InodeKind::Directory { .. } => FileType::Directory,
-        InodeKind::File => FileType::RegularFile,
+        InodeKind::File => OsageFs::mode_to_file_type(record.mode),
         InodeKind::Symlink => FileType::Symlink,
         InodeKind::Tombstone => FileType::RegularFile,
     }
@@ -3127,6 +3280,28 @@ fn to_system_time(ts: OffsetDateTime) -> SystemTime {
             + Duration::from_nanos(nanos as u64)
     } else {
         SystemTime::UNIX_EPOCH
+    }
+}
+
+fn from_system_time(ts: SystemTime) -> OffsetDateTime {
+    match ts.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs() as i64;
+            let nanos = duration.subsec_nanos();
+            OffsetDateTime::from_unix_timestamp(secs)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+                .replace_nanosecond(nanos)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        }
+        Err(err) => {
+            let duration = err.duration();
+            let secs = duration.as_secs() as i64;
+            let nanos = duration.subsec_nanos();
+            OffsetDateTime::from_unix_timestamp(-secs)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+                .replace_nanosecond(nanos)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        }
     }
 }
 
@@ -4123,14 +4298,14 @@ mod tests {
 
         let (opened, created) = harness
             .fs
-            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, 0)
+            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, 0o644, 0, 0)
             .unwrap();
         assert!(!created);
         assert_eq!(opened.inode, file.inode);
 
         let result = harness
             .fs
-            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, libc::O_EXCL);
+            .fuse_create_file(ROOT_INODE, "existing.dat", 0, 0, 0o644, 0, libc::O_EXCL);
         assert!(matches!(result, Err(code) if code == EEXIST));
     }
 
@@ -4147,7 +4322,7 @@ mod tests {
 
         let (opened, created) = harness
             .fs
-            .fuse_create_file(ROOT_INODE, "truncate.dat", 0, 0, libc::O_TRUNC)
+            .fuse_create_file(ROOT_INODE, "truncate.dat", 0, 0, 0o644, 0, libc::O_TRUNC)
             .unwrap();
         assert!(!created);
         assert_eq!(opened.inode, file.inode);
