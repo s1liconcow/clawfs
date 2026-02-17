@@ -168,6 +168,7 @@ fn main() -> Result<()> {
     } else {
         options.push(MountOption::AllowRoot);
     }
+    log_boot_config(&config, allow_other);
     if config.foreground {
     } else {
         options.push(MountOption::AutoUnmount);
@@ -180,6 +181,51 @@ fn main() -> Result<()> {
         metadata.shutdown().await.ok();
     });
     Ok(())
+}
+
+fn log_boot_config(config: &Config, allow_other: bool) {
+    info!(
+        target: "startup",
+        "fs_boot_config {}",
+        json!({
+            "mode": "fuse",
+            "mount_path": config.mount_path.display().to_string(),
+            "store_path": config.store_path.display().to_string(),
+            "local_cache_path": config.local_cache_path.display().to_string(),
+            "state_path": config.state_path.display().to_string(),
+            "object_provider": format!("{:?}", config.object_provider).to_lowercase(),
+            "bucket": config.bucket.as_deref(),
+            "region": config.region.as_deref(),
+            "endpoint": config.endpoint.as_deref(),
+            "object_prefix": &config.object_prefix,
+            "gcs_service_account": config
+                .gcs_service_account
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            "home_prefix": &config.home_prefix,
+            "inline_threshold": config.inline_threshold,
+            "inline_compression": config.inline_compression,
+            "inline_encryption_enabled": config.inline_encryption_key.is_some(),
+            "segment_compression": config.segment_compression,
+            "segment_encryption_enabled": config.segment_encryption_key.is_some(),
+            "pending_bytes": config.pending_bytes,
+            "fsync_on_close": config.fsync_on_close,
+            "flush_interval_ms": config.flush_interval_ms,
+            "disable_journal": config.disable_journal,
+            "disable_cleanup": config.disable_cleanup,
+            "lookup_cache_ttl_ms": config.lookup_cache_ttl_ms,
+            "dir_cache_ttl_ms": config.dir_cache_ttl_ms,
+            "metadata_poll_interval_ms": config.metadata_poll_interval_ms,
+            "segment_cache_bytes": config.segment_cache_bytes,
+            "imap_delta_batch": config.imap_delta_batch,
+            "allow_other_effective": allow_other,
+            "foreground": config.foreground,
+            "perf_log": config.perf_log.as_ref().map(|p| p.display().to_string()),
+            "replay_log": config.replay_log.as_ref().map(|p| p.display().to_string()),
+            "log_file": config.log_file.as_ref().map(|p| p.display().to_string()),
+            "debug_log": config.debug_log,
+        })
+    );
 }
 
 fn ensure_root(

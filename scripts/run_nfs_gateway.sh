@@ -13,6 +13,7 @@ LISTEN="${LISTEN:-0.0.0.0:2049}"
 PROTOCOL="${PROTOCOL:-v3}"
 USE_EXISTING_MOUNT="${USE_EXISTING_MOUNT:-0}"
 DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
+ENABLE_JOURNAL="${ENABLE_JOURNAL:-0}"
 DEBUG_LOG="${DEBUG_LOG:-0}"
 FOREGROUND="${FOREGROUND:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -86,7 +87,13 @@ CMD=(
 if is_true "$USE_EXISTING_MOUNT"; then
   CMD+=(--use-existing-mount)
 fi
-if is_true "$DISABLE_JOURNAL"; then
+if is_true "$DISABLE_JOURNAL" && is_true "$ENABLE_JOURNAL"; then
+  echo "Conflicting settings: DISABLE_JOURNAL=1 and ENABLE_JOURNAL=1" >&2
+  exit 1
+fi
+if is_true "$ENABLE_JOURNAL"; then
+  CMD+=(--enable-journal)
+elif is_true "$DISABLE_JOURNAL"; then
   CMD+=(--disable-journal)
 fi
 if [[ -n "$GANESHA_BINARY" ]]; then

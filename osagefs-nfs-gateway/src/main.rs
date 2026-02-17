@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use tokio_util::sync::CancellationToken;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
@@ -103,8 +103,12 @@ struct Cli {
     state_path: Option<PathBuf>,
 
     /// Disable close-time journal in direct mode (higher throughput, lower crash durability).
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue, conflicts_with = "enable_journal")]
     disable_journal: bool,
+
+    /// Enable close-time journal in direct mode (safer crash durability).
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue, conflicts_with = "disable_journal")]
+    enable_journal: bool,
 
     /// Optional compressed replay log path (.jsonl.gz) for operation-level tracing.
     #[arg(long, value_name = "PATH")]
@@ -785,7 +789,11 @@ fn build_config(cli: &Cli) -> Config {
         state_path,
         perf_log: None,
         replay_log: cli.replay_log.clone(),
-        disable_journal: cli.disable_journal,
+        disable_journal: if cli.enable_journal {
+            false
+        } else {
+            cli.disable_journal
+        },
         fsync_on_close: false,
         flush_interval_ms: 30_000,
         disable_cleanup: true,
@@ -797,7 +805,7 @@ fn build_config(cli: &Cli) -> Config {
         foreground: true,
         log_file: None,
         debug_log: false,
-        imap_delta_batch: 256,
+        imap_delta_batch: 512,
         allow_other: false,
     }
 }
