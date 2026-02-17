@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{deserialize_flex, write_flexbuffer};
+use crate::codec::{deserialize_flex, write_flexbuffer_unsynced};
 use crate::inode::InodeRecord;
 use crate::segment::StagedChunk;
 
@@ -50,7 +50,23 @@ impl JournalManager {
             record: entry.record.clone(),
             payload: entry.payload.clone(),
         };
-        write_flexbuffer(&path, &stored)
+        write_flexbuffer_unsynced(&path, &stored)
+    }
+
+    pub fn sync_entries(&self, inodes: &[u64]) -> Result<()> {
+        for inode in inodes {
+            let path = self.entry_path(*inode);
+            if !path.exists() {
+                continue;
+            }
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .with_context(|| format!("opening journal entry {}", path.display()))?;
+            file.sync_data()
+                .with_context(|| format!("syncing journal entry {}", path.display()))?;
+        }
+        self.sync_dir()
     }
 
     pub fn clear_entry(&self, inode: u64) -> Result<()> {
@@ -90,5 +106,14 @@ impl JournalManager {
 
     fn entry_path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("inode_{inode:020}.bin"))
+    }
+
+    fn sync_dir(&self) -> Result<()> {
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .open(&self.dir)
+            .with_context(|| format!("opening journal dir {}", self.dir.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("syncing journal dir {}", self.dir.display()))
     }
 }

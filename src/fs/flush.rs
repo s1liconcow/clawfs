@@ -28,7 +28,58 @@ impl OsageFs {
         )
     }
 
-    pub(crate) fn flush_pending_selected<F>(&self, selector: F, scope: &str) -> std::result::Result<(), i32>
+    pub(crate) fn sync_local_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
+        let (inodes, staged_chunks) = {
+            let pending = self.pending_inodes.lock();
+            let mut cursor = ino;
+            let mut seen = HashSet::new();
+            let mut inodes = Vec::new();
+            let mut staged_chunks = Vec::new();
+            while seen.insert(cursor) {
+                let Some(entry) = pending.get(&cursor) else {
+                    break;
+                };
+                inodes.push(cursor);
+                if let Some(PendingData::Staged(segments)) = &entry.data {
+                    staged_chunks.extend(segments.chunks.iter().cloned());
+                }
+                let parent = entry.record.parent;
+                if parent == cursor {
+                    break;
+                }
+                cursor = parent;
+            }
+            (inodes, staged_chunks)
+        };
+
+        if !staged_chunks.is_empty() {
+            self.segments
+                .sync_staged_chunks(&staged_chunks)
+                .map_err(|err| {
+                    error!(
+                        "sync_local_for_inode failed to sync staged chunks ino={} err={err:?}",
+                        ino
+                    );
+                    EIO
+                })?;
+        }
+        if let Some(journal) = &self.journal {
+            journal.sync_entries(&inodes).map_err(|err| {
+                error!(
+                    "sync_local_for_inode failed to sync journal ino={} err={err:?}",
+                    ino
+                );
+                EIO
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_pending_selected<F>(
+        &self,
+        selector: F,
+        scope: &str,
+    ) -> std::result::Result<(), i32>
     where
         F: FnOnce(&mut HashMap<u64, PendingEntry>) -> HashMap<u64, PendingEntry>,
     {
@@ -486,5 +537,4 @@ impl OsageFs {
             op, pid, tid, detail, code
         );
     }
-
 }

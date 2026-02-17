@@ -13,6 +13,14 @@ use tempfile::NamedTempFile;
 use crate::inode::{FileStorage, InlinePayload, InlinePayloadCodec};
 
 pub fn write_flexbuffer<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_flexbuffer_internal(path, value, true)
+}
+
+pub fn write_flexbuffer_unsynced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_flexbuffer_internal(path, value, false)
+}
+
+fn write_flexbuffer_internal<T: Serialize>(path: &Path, value: &T, sync_file: bool) -> Result<()> {
     let parent: PathBuf = path
         .parent()
         .map(|p| p.to_path_buf())
@@ -22,7 +30,9 @@ pub fn write_flexbuffer<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(&parent)
         .with_context(|| format!("creating temp file in {}", parent.display()))?;
     tmp.write_all(&data)?;
-    tmp.as_file().sync_all()?;
+    if sync_file {
+        tmp.as_file().sync_all()?;
+    }
     tmp.persist(path)
         .map(|_| ())
         .with_context(|| format!("persisting temp file to {}", path.display()))
