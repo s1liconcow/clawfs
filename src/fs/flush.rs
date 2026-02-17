@@ -455,49 +455,11 @@ impl OsageFs {
 
     pub(crate) fn pending_flush_limit_for_write(&self, is_append: bool, write_len: usize) -> u64 {
         let base = self.config.pending_bytes;
-        if self.journal.is_none() {
-            return base;
-        }
         if !is_append || (write_len as u64) < ADAPTIVE_LARGE_WRITE_MIN_BYTES {
             return base;
         }
         let by_write_size = (write_len as u64).saturating_mul(8);
         self.adaptive_pending_limit().max(by_write_size).max(base)
-    }
-
-    pub(crate) fn should_defer_interval_flush(&self, elapsed: Duration) -> bool {
-        if self.journal.is_none() {
-            return false;
-        }
-        let Some(interval) = self.flush_interval else {
-            return false;
-        };
-        let max_defer = interval
-            .checked_mul(ADAPTIVE_INTERVAL_DEFER_MULTIPLIER)
-            .unwrap_or(Duration::MAX);
-        let bounded_max_defer = max_defer.max(Duration::from_secs(ADAPTIVE_MIN_MAX_DEFER_SECS));
-        if elapsed >= bounded_max_defer {
-            return false;
-        }
-        let pending_total = *self.pending_bytes.lock();
-        if pending_total == 0 {
-            return false;
-        }
-        let adaptive_limit = self.adaptive_pending_limit();
-        if pending_total >= adaptive_limit {
-            return false;
-        }
-        let pending = self.pending_inodes.lock();
-        if pending.len() != 1 {
-            return false;
-        }
-        let Some(entry) = pending.values().next() else {
-            return false;
-        };
-        let Some(PendingData::Staged(staged)) = &entry.data else {
-            return false;
-        };
-        staged.total_len > self.config.inline_threshold as u64
     }
 
     pub(crate) fn flush_if_interval_elapsed(&self) -> std::result::Result<(), i32> {
@@ -509,15 +471,6 @@ impl OsageFs {
             guard.elapsed()
         };
         if elapsed < interval {
-            return Ok(());
-        }
-        if self.should_defer_interval_flush(elapsed) {
-            debug!(
-                "deferring interval flush elapsed={:?} pending_total={} adaptive_limit={}",
-                elapsed,
-                *self.pending_bytes.lock(),
-                self.adaptive_pending_limit()
-            );
             return Ok(());
         }
         debug!("flush_interval {:?} elapsed, triggering flush", interval);

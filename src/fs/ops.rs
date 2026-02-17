@@ -317,13 +317,7 @@ impl OsageFs {
         if record.is_dir() {
             return Err(EISDIR);
         }
-        let data = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        let offset = offset as usize;
-        if offset >= data.len() {
-            return Ok(Vec::new());
-        }
-        let end = std::cmp::min(offset + size as usize, data.len());
-        Ok(data[offset..end].to_vec())
+        self.read_file_range(&record, offset, size).map_err(|_| EIO)
     }
 
     pub(crate) fn op_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {

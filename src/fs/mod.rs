@@ -44,9 +44,7 @@ const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
 const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
 const ADAPTIVE_PENDING_MULTIPLIER: u64 = 16;
 const ADAPTIVE_PENDING_MAX_BYTES: u64 = 128 * 1024 * 1024;
-const ADAPTIVE_INTERVAL_DEFER_MULTIPLIER: u32 = 5;
 const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
-const ADAPTIVE_MIN_MAX_DEFER_SECS: u64 = 5;
 const NAME_MAX_BYTES: usize = 255;
 
 #[cfg(target_os = "linux")]

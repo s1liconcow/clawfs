@@ -106,8 +106,8 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub fsync_on_close: bool,
 
-    /// Milliseconds between automatic background flushes (0 disables).
-    #[arg(long, default_value_t = 1000)]
+    /// Max milliseconds dirty data is allowed to stay pending before auto-flush (0 disables).
+    #[arg(long, default_value_t = 5000)]
     pub flush_interval_ms: u64,
 
     /// Disable local background cleanup (leases, compaction) on this client.

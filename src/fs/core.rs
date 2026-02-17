@@ -312,38 +312,84 @@ impl OsageFs {
     }
 
     pub(crate) fn read_file_bytes(&self, record: &InodeRecord) -> Result<Vec<u8>> {
+        self.read_file_range_inner(record, 0, record.size)
+    }
+
+    pub(crate) fn read_file_range(
+        &self,
+        record: &InodeRecord,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>> {
+        if size == 0 || offset >= record.size {
+            return Ok(Vec::new());
+        }
+        let range_start = offset;
+        let range_end = range_start.saturating_add(size as u64).min(record.size);
+        if range_end <= range_start {
+            return Ok(Vec::new());
+        }
+        self.read_file_range_inner(record, range_start, range_end)
+    }
+
+    fn read_file_range_inner(
+        &self,
+        record: &InodeRecord,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Vec<u8>> {
+        if range_end <= range_start {
+            return Ok(Vec::new());
+        }
         if let Some(entry) = self.pending_inodes.lock().get(&record.inode) {
             if let Some(data) = &entry.data {
-                return self.read_pending_bytes(data);
+                return self.slice_pending_bytes(data, range_start, range_end);
             }
         }
         if let Some(entry) = self.mutating_inodes.lock().get(&record.inode) {
             if let Some(data) = &entry.data {
-                return self.read_pending_bytes(data);
+                return self.slice_pending_bytes(data, range_start, range_end);
             }
         }
         if let Some(entry) = self.flushing_inodes.lock().get(&record.inode) {
             if let Some(data) = &entry.data {
-                return self.read_pending_bytes(data);
+                return self.slice_pending_bytes(data, range_start, range_end);
             }
         }
         match &record.storage {
             FileStorage::Inline(_) | FileStorage::InlineEncoded(_) => {
-                self.decode_inline_storage(&record.storage)
+                let bytes = self.decode_inline_storage(&record.storage)?;
+                Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
             }
-            FileStorage::LegacySegment(ptr) => self.segments.read_pointer(ptr),
+            FileStorage::LegacySegment(ptr) => {
+                let bytes = self.segments.read_pointer(ptr)?;
+                Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
+            }
             FileStorage::Segments(extents) => {
-                let mut buffer = vec![0u8; record.size as usize];
+                let out_len = (range_end - range_start) as usize;
+                let mut buffer = vec![0u8; out_len];
                 let mut ordered = extents.to_vec();
                 ordered.sort_by_key(|ext| ext.logical_offset);
                 for extent in ordered {
-                    let start = extent.logical_offset as usize;
+                    let extent_start = extent.logical_offset;
                     let bytes = self.segments.read_pointer(&extent.pointer)?;
-                    let end = start + bytes.len();
-                    if end > buffer.len() {
-                        buffer.resize(end, 0);
+                    let extent_end = extent_start.saturating_add(bytes.len() as u64);
+                    if extent_end <= range_start {
+                        continue;
                     }
-                    buffer[start..end].copy_from_slice(&bytes);
+                    if extent_start >= range_end {
+                        break;
+                    }
+                    let overlap_start = extent_start.max(range_start);
+                    let overlap_end = extent_end.min(range_end);
+                    if overlap_end <= overlap_start {
+                        continue;
+                    }
+                    let src_start = (overlap_start - extent_start) as usize;
+                    let src_end = (overlap_end - extent_start) as usize;
+                    let dst_start = (overlap_start - range_start) as usize;
+                    let dst_end = (overlap_end - range_start) as usize;
+                    buffer[dst_start..dst_end].copy_from_slice(&bytes[src_start..src_end]);
                 }
                 Ok(buffer)
             }
@@ -438,6 +484,28 @@ impl OsageFs {
                 .read_staged_chunks(&segments.chunks, segments.total_len)
                 .map_err(|err| anyhow!("pending read failed: {err:?}")),
         }
+    }
+
+    fn slice_pending_bytes(
+        &self,
+        data: &PendingData,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.read_pending_bytes(data)?;
+        Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
+    }
+
+    fn slice_bytes_in_range(bytes: Vec<u8>, range_start: u64, range_end: u64) -> Vec<u8> {
+        let len = bytes.len() as u64;
+        if range_start >= len {
+            return Vec::new();
+        }
+        let end = range_end.min(len);
+        if end <= range_start {
+            return Vec::new();
+        }
+        bytes[range_start as usize..end as usize].to_vec()
     }
 
     pub(crate) fn release_pending_data(&self, data: PendingData) {

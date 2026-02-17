@@ -399,7 +399,7 @@
         let harness =
             TestHarness::with_config(dir.path(), "adaptive_perf.bin", 1024 * 1024, |cfg| {
                 cfg.disable_journal = false;
-                cfg.flush_interval_ms = 1;
+                cfg.flush_interval_ms = 5000;
             });
         let inode = stage_named_file(&harness, "adaptive-throughput.dat", Vec::new());
         let chunk_size = 512 * 1024;
@@ -570,6 +570,40 @@
         assert!(
             pending_total > harness.fs.config.pending_bytes,
             "expected adaptive pending to exceed base threshold, got {} vs {}",
+            pending_total,
+            harness.fs.config.pending_bytes
+        );
+        let record = harness.fs.load_inode(inode).unwrap();
+        let staged = harness.fs.read_file_bytes(&record).unwrap();
+        assert_eq!(staged.len(), chunk.len() * 6);
+        harness.fs.flush_pending().unwrap();
+    }
+
+    #[test]
+    fn adaptive_large_append_keeps_data_pending_without_journal() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(
+            dir.path(),
+            "adaptive_pending_no_journal.bin",
+            1024 * 1024,
+            |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            },
+        );
+        let inode = stage_named_file(&harness, "stream.bin", Vec::new());
+        let chunk = vec![0xAB; 512 * 1024];
+        for i in 0..6 {
+            let record = harness.fs.load_inode(inode).unwrap();
+            harness
+                .fs
+                .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
+                .unwrap();
+        }
+        let pending_total = *harness.fs.pending_bytes.lock();
+        assert!(
+            pending_total > harness.fs.config.pending_bytes,
+            "expected adaptive pending to exceed base threshold without journal, got {} vs {}",
             pending_total,
             harness.fs.config.pending_bytes
         );
