@@ -107,9 +107,9 @@ if [[ -f "$NFS_LOG_FILE" ]]; then
   rm -f "$NFS_LOG_FILE"
 fi
 
-if [[ -f "$PERF_LOG_PATH" ]]; then
-  echo "Removing perf log $PERF_LOG_PATH ..."
-  rm -f "$PERF_LOG_PATH"
-fi
+#if [[ -f "$PERF_LOG_PATH" ]]; then
+#  echo "Removing perf log $PERF_LOG_PATH ..."
+#  rm -f "$PERF_LOG_PATH"
+#fi
 
 echo "Cleanup complete."

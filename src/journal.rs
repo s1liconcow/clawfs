@@ -52,6 +52,16 @@ struct StoredJournalEntry {
     payload: JournalPayload,
 }
 
+/// Borrow-friendly serialization struct — avoids cloning the InodeRecord
+/// and JournalPayload on every `persist_entry` call.  The flexbuffer wire
+/// format is identical to [`StoredJournalEntry`].
+#[derive(Serialize)]
+struct StoredJournalEntryRef<'a> {
+    version: u32,
+    record: &'a InodeRecord,
+    payload: &'a JournalPayload,
+}
+
 // ── WAL state held under the lock ─────────────────────────────────────────
 
 struct WalState {
@@ -89,10 +99,10 @@ impl JournalManager {
 
     /// Append `entry` to the WAL without fsync.  Fast path: one buffered write.
     pub fn persist_entry(&self, entry: &JournalEntry) -> Result<()> {
-        let stored = StoredJournalEntry {
+        let stored = StoredJournalEntryRef {
             version: JOURNAL_VERSION,
-            record: entry.record.clone(),
-            payload: entry.payload.clone(),
+            record: &entry.record,
+            payload: &entry.payload,
         };
         let data = serialize_flex(&stored)?;
         let len = data.len() as u32;

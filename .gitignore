@@ -6,3 +6,5 @@ loopback-bench/target
 
 .local/ZeroFS/
 pjdfstest_nfs
+micro-results-*
+pjdfstest_*

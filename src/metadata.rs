@@ -9,7 +9,9 @@ use log::debug;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{deserialize_flex, write_flexbuffer, write_flexbuffer_unsynced};
+use crate::codec::{
+    deserialize_flex, serialize_flex, write_flexbuffer, write_preserialized_unsynced,
+};
 use crate::inode::{FileStorage, InodeRecord, InodeShard};
 use crate::superblock::Superblock;
 
@@ -33,6 +35,25 @@ struct StoredShard {
     version: u32,
     generation: u64,
     entries: Vec<(u64, InodeRecord)>,
+}
+
+/// Borrow-friendly serialization struct for shards — avoids cloning every
+/// InodeRecord just to serialize the shard snapshot to disk.  The flexbuffer
+/// wire format is identical to [`StoredShard`] so deserialization is unchanged.
+#[derive(Serialize)]
+struct StoredShardRef<'a> {
+    version: u32,
+    generation: u64,
+    entries: Vec<(u64, &'a InodeRecord)>,
+}
+
+/// Borrow-friendly serialization struct for deltas — avoids the
+/// `records.to_vec()` clone that the owned [`StoredDelta`] required.
+#[derive(Serialize)]
+struct StoredDeltaRef<'a> {
+    version: u32,
+    generation: u64,
+    records: &'a [InodeRecord],
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -229,13 +250,15 @@ impl MetadataStore {
         if records.is_empty() {
             return Ok(());
         }
-        let mut touched = HashMap::new();
+
+        // Phase 1: update in-memory caches + shards under lock, collecting
+        // only the set of touched shard IDs (NOT full shard clones).
+        let mut touched_shard_ids = Vec::new();
         {
             let mut cache = self.cache.lock();
             let mut shards = self.shards.lock();
             let mut neg = self.negative_cache.lock();
             for record in records {
-                // Writing this inode makes any cached ENOENT stale.
                 neg.remove(&record.inode);
                 cache.insert(record.inode, CacheEntry::new(record.clone()));
                 let shard_id = record.shard_index(shard_size);
@@ -245,15 +268,53 @@ impl MetadataStore {
                 });
                 entry.shard.upsert(record.clone());
                 entry.generation = generation;
-                touched.insert(shard_id, entry.shard.clone());
+                if !touched_shard_ids.contains(&shard_id) {
+                    touched_shard_ids.push(shard_id);
+                }
             }
         }
-        for (_, shard) in touched {
-            self.write_shard(generation, &shard)?;
+
+        // Phase 2: serialize touched shards from references (single lock
+        // acquisition, no record clones, no redundant re-insert).
+        let shard_writes: Vec<(PathBuf, Vec<u8>, u64, usize)> = {
+            let shards = self.shards.lock();
+            touched_shard_ids
+                .iter()
+                .filter_map(|&shard_id| {
+                    let entry = shards.get(&shard_id)?;
+                    let stored = StoredShardRef {
+                        version: METADATA_FORMAT_VERSION,
+                        generation,
+                        entries: entry
+                            .shard
+                            .inodes
+                            .iter()
+                            .map(|(ino, rec)| (*ino, rec))
+                            .collect(),
+                    };
+                    let data = serialize_flex(&stored).ok()?;
+                    let count = entry.shard.inodes.len();
+                    let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
+                    Some((self.imap_dir.join(filename), data, shard_id, count))
+                })
+                .collect()
+        };
+
+        for (path, data, shard_id, count) in shard_writes {
+            write_preserialized_unsynced(&path, &self.imap_dir, &data)?;
+            self.log_backing(format_args!(
+                "synced backing file path={} type=imap shard={} generation={} entries={}",
+                path.display(),
+                shard_id,
+                generation,
+                count
+            ));
         }
+
+        // Phase 3: write deltas using borrowed references (no to_vec clone).
         let chunk = delta_batch.max(1);
         for chunk_records in records.chunks(chunk) {
-            self.write_delta(generation, chunk_records)?;
+            self.write_delta_ref(generation, chunk_records)?;
         }
         Ok(())
     }
@@ -275,54 +336,56 @@ impl MetadataStore {
         self.cache.lock().remove(&inode);
         self.negative_cache.lock().remove(&inode);
         let shard_id = shard_for_inode(inode, shard_size);
-        let mut shards = self.shards.lock();
-        if let Some(entry) = shards.get_mut(&shard_id) {
-            entry.shard.inodes.remove(&inode);
-            entry.generation = generation;
-            let shard_clone = entry.shard.clone();
-            drop(shards);
-            self.write_shard(generation, &shard_clone)?;
-        } else {
-            drop(shards);
+        {
+            let mut shards = self.shards.lock();
+            if let Some(entry) = shards.get_mut(&shard_id) {
+                entry.shard.inodes.remove(&inode);
+                entry.generation = generation;
+            }
         }
+        self.write_shard_ref(generation, shard_id)?;
         let tombstone = InodeRecord::tombstone(inode);
-        self.write_delta(generation, &[tombstone])
+        self.write_delta_ref(generation, &[tombstone])
     }
 
-    fn write_shard(&self, generation: u64, shard: &InodeShard) -> Result<()> {
-        let filename = format!("i_{generation:020}_{:08x}.bin", shard.shard_id);
+    /// Serialize a shard directly from the in-memory `self.shards` map using
+    /// borrowed references, avoiding the full `InodeShard::clone()` +
+    /// per-record clone that the legacy [`write_shard`] path required.
+    fn write_shard_ref(&self, generation: u64, shard_id: u64) -> Result<()> {
+        let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
         let path = self.imap_dir.join(filename);
-        let entries = shard
-            .inodes
-            .iter()
-            .map(|(ino, record)| (*ino, record.clone()))
-            .collect();
-        let stored = StoredShard {
-            version: METADATA_FORMAT_VERSION,
-            generation,
-            entries,
-        };
-        self.shards.lock().insert(
-            shard.shard_id,
-            ShardEntry {
-                shard: shard.clone(),
+        let (data, count) = {
+            let shards = self.shards.lock();
+            let entry = match shards.get(&shard_id) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+            let stored = StoredShardRef {
+                version: METADATA_FORMAT_VERSION,
                 generation,
-            },
-        );
-        // Unsynced write: the parent directory is fsynced once by
-        // sync_metadata_writes() before the superblock CAS commits.
-        write_flexbuffer_unsynced(&path, &stored)?;
+                entries: entry
+                    .shard
+                    .inodes
+                    .iter()
+                    .map(|(ino, rec)| (*ino, rec))
+                    .collect(),
+            };
+            (serialize_flex(&stored)?, entry.shard.inodes.len())
+        };
+        write_preserialized_unsynced(&path, &self.imap_dir, &data)?;
         self.log_backing(format_args!(
             "synced backing file path={} type=imap shard={} generation={} entries={}",
             path.display(),
-            shard.shard_id,
+            shard_id,
             generation,
-            shard.inodes.len()
+            count
         ));
         Ok(())
     }
 
-    fn write_delta(&self, generation: u64, records: &[InodeRecord]) -> Result<()> {
+    /// Write a delta log using borrowed record references, avoiding the
+    /// `records.to_vec()` clone that [`write_delta`] performed.
+    fn write_delta_ref(&self, generation: u64, records: &[InodeRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -331,18 +394,17 @@ impl MetadataStore {
             .fold(0u128, |mask, record| mask | bloom_mask(record.inode));
         let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
         let path = self.delta_dir.join(filename);
-        let file = StoredDelta {
+        let stored = StoredDeltaRef {
             version: METADATA_FORMAT_VERSION,
             generation,
-            records: records.to_vec(),
+            records,
         };
+        let data = serialize_flex(&stored)?;
         {
             let mut guard = self.last_delta_generation.lock();
             *guard = (*guard).max(generation);
         }
-        // Unsynced write: the parent directory is fsynced once by
-        // sync_metadata_writes() before the superblock CAS commits.
-        write_flexbuffer_unsynced(&path, &file)?;
+        write_preserialized_unsynced(&path, &self.delta_dir, &data)?;
         self.log_backing(format_args!(
             "synced backing file path={} type=delta generation={} records={}",
             path.display(),
