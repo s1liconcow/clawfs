@@ -1,7 +1,11 @@
 use super::*;
 
 impl OsageFs {
-    pub(crate) fn op_lookup(&self, parent: u64, name: &str) -> std::result::Result<InodeRecord, i32> {
+    pub(crate) fn op_lookup(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> std::result::Result<InodeRecord, i32> {
         let parent_inode = self.load_inode(parent)?;
         let child = parent_inode
             .children()
@@ -296,7 +300,8 @@ impl OsageFs {
         }
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let record = InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
+        let record =
+            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
         self.stage_inode(record.clone())?;
         self.update_parent(&mut parent_inode, name, inode_id)?;
         Ok(record)
@@ -462,6 +467,7 @@ impl OsageFs {
     }
 
     pub(crate) fn op_flush_inode(&self, ino: u64) -> std::result::Result<(), i32> {
+        self.sync_local_for_inode(ino)?;
         self.flush_pending_for_inode(ino)
     }
 }

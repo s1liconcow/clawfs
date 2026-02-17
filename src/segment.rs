@@ -223,7 +223,8 @@ impl SegmentManager {
         buffer.extend_from_slice(&(entry_count as u64).to_le_bytes());
         let mut pointers = Vec::with_capacity(entry_count);
         if use_parallel {
-            let encoded_entries = self.encode_entries_parallel(entries, &codec_config, entry_count)?;
+            let encoded_entries =
+                self.encode_entries_parallel(entries, &codec_config, entry_count)?;
             for encoded_entry in encoded_entries {
                 buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
                 let path_bytes = encoded_entry.path.as_bytes();
@@ -232,7 +233,8 @@ impl SegmentManager {
                 let offset = buffer.len() as u64;
                 buffer.push(codec_to_u8(encoded_entry.encoded.codec));
                 buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
-                buffer.extend_from_slice(&(encoded_entry.encoded.payload.len() as u64).to_le_bytes());
+                buffer
+                    .extend_from_slice(&(encoded_entry.encoded.payload.len() as u64).to_le_bytes());
                 buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
                 buffer.extend_from_slice(&encoded_entry.encoded.payload);
                 pointers.push((
@@ -241,7 +243,8 @@ impl SegmentManager {
                         segment_id,
                         generation,
                         offset,
-                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded_entry.encoded.payload.len())
+                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
+                            + encoded_entry.encoded.payload.len())
                             as u64,
                     },
                 ));
@@ -344,30 +347,33 @@ impl SegmentManager {
         for chunk in chunks {
             let codec_config = codec_config.clone();
             let stage_dir = self.stage_dir.clone();
-            handles.push(std::thread::spawn(move || -> Result<Vec<EncodedSegmentEntry>> {
-                let mut out = Vec::with_capacity(chunk.len());
-                for entry in chunk {
-                    let plain_bytes = match entry.payload {
-                        SegmentPayload::Bytes(bytes) => bytes,
-                        SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
-                        SegmentPayload::Staged(chunks) => {
-                            let total_len = chunks.iter().map(|chunk| chunk.len).sum();
-                            read_staged_chunks_from_disk(&stage_dir, &chunks, total_len)?
-                        }
-                    };
-                    let plain_len = plain_bytes.len() as u64;
-                    let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
-                        format!("segment payload encoding failed for inode {}", entry.inode)
-                    })?;
-                    out.push(EncodedSegmentEntry {
-                        inode: entry.inode,
-                        path: entry.path,
-                        plain_len,
-                        encoded,
-                    });
-                }
-                Ok(out)
-            }));
+            handles.push(std::thread::spawn(
+                move || -> Result<Vec<EncodedSegmentEntry>> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for entry in chunk {
+                        let plain_bytes = match entry.payload {
+                            SegmentPayload::Bytes(bytes) => bytes,
+                            SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
+                            SegmentPayload::Staged(chunks) => {
+                                let total_len = chunks.iter().map(|chunk| chunk.len).sum();
+                                read_staged_chunks_from_disk(&stage_dir, &chunks, total_len)?
+                            }
+                        };
+                        let plain_len = plain_bytes.len() as u64;
+                        let encoded =
+                            encode_bytes(&plain_bytes, &codec_config).with_context(|| {
+                                format!("segment payload encoding failed for inode {}", entry.inode)
+                            })?;
+                        out.push(EncodedSegmentEntry {
+                            inode: entry.inode,
+                            path: entry.path,
+                            plain_len,
+                            encoded,
+                        });
+                    }
+                    Ok(out)
+                },
+            ));
         }
 
         let mut out = Vec::with_capacity(entry_count);
@@ -526,6 +532,22 @@ impl SegmentManager {
         Ok(buffer)
     }
 
+    pub fn sync_staged_chunks(&self, chunks: &[StagedChunk]) -> Result<()> {
+        let mut synced = HashSet::new();
+        for chunk in chunks {
+            if !synced.insert(chunk.path.clone()) {
+                continue;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&chunk.path)
+                .with_context(|| format!("opening staged payload {}", chunk.path.display()))?;
+            file.sync_data()
+                .with_context(|| format!("syncing staged payload {}", chunk.path.display()))?;
+        }
+        self.sync_stage_dir()
+    }
+
     pub fn release_staged_chunk(&self, chunk: &StagedChunk) -> Result<()> {
         let mut state = self.stage_state.lock();
         if let Some(count) = state.ref_counts.get_mut(&chunk.path) {
@@ -544,6 +566,15 @@ impl SegmentManager {
             }
         }
         Ok(())
+    }
+
+    fn sync_stage_dir(&self) -> Result<()> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .open(&self.stage_dir)
+            .with_context(|| format!("opening stage dir {}", self.stage_dir.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("syncing stage dir {}", self.stage_dir.display()))
     }
 
     pub fn prefetch_segment(&self, pointer: &SegmentPointer) -> Result<()> {
