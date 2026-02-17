@@ -9,9 +9,10 @@ use clap::{ArgAction, Parser, ValueEnum};
 use tokio_util::sync::CancellationToken;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, set_gid3, set_mode3,
-    set_size3, set_uid3, specdata3, writeverf3, NFS3_WRITEVERFSIZE,
+    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, set_atime, set_gid3,
+    set_mode3, set_mtime, set_size3, set_uid3, specdata3, writeverf3, NFS3_WRITEVERFSIZE,
 };
+use time::OffsetDateTime;
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use osagefs::config::{Config, ObjectStoreProvider};
@@ -456,9 +457,19 @@ impl NFSFileSystem for OsageDirectFs {
             set_size3::size(v) => Some(v),
             set_size3::Void => None,
         };
+        let atime = match setattr.atime {
+            set_atime::DONT_CHANGE => None,
+            set_atime::SET_TO_SERVER_TIME => Some(OffsetDateTime::now_utc()),
+            set_atime::SET_TO_CLIENT_TIME(t) => Some(nfstime3_to_odt(t)),
+        };
+        let mtime = match setattr.mtime {
+            set_mtime::DONT_CHANGE => None,
+            set_mtime::SET_TO_SERVER_TIME => Some(OffsetDateTime::now_utc()),
+            set_mtime::SET_TO_CLIENT_TIME(t) => Some(nfstime3_to_odt(t)),
+        };
 
         let inode = self
-            .call(move |fs| fs.nfs_setattr(id, mode, uid, gid, size))
+            .call(move |fs| fs.nfs_setattr(id, mode, uid, gid, size, atime, mtime))
             .await?;
         Ok(inode_to_fattr(&inode))
     }
@@ -516,7 +527,7 @@ impl NFSFileSystem for OsageDirectFs {
             set_size3::Void => None,
         };
         let inode = self
-            .call(move |fs| fs.nfs_setattr(inode.inode, mode, Some(uid), Some(gid), size))
+            .call(move |fs| fs.nfs_setattr(inode.inode, mode, Some(uid), Some(gid), size, None, None))
             .await?;
         Ok((inode.inode, inode_to_fattr(&inode)))
     }
@@ -553,7 +564,7 @@ impl NFSFileSystem for OsageDirectFs {
             .await?;
         if let set_mode3::mode(mode) = attrs.mode {
             let inode = self
-                .call(move |fs| fs.nfs_setattr(inode.inode, Some(mode), Some(uid), Some(gid), None))
+                .call(move |fs| fs.nfs_setattr(inode.inode, Some(mode), Some(uid), Some(gid), None, None, None))
                 .await?;
             return Ok((inode.inode, inode_to_fattr(&inode)));
         }
@@ -969,6 +980,13 @@ fn inode_to_fattr(inode: &InodeRecord) -> fattr3 {
         mtime: to_nfstime(inode.mtime.unix_timestamp(), inode.mtime.nanosecond()),
         ctime: to_nfstime(inode.ctime.unix_timestamp(), inode.ctime.nanosecond()),
     }
+}
+
+fn nfstime3_to_odt(t: nfstime3) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp_nanos(
+        (t.seconds as i128) * 1_000_000_000 + t.nseconds as i128,
+    )
+    .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
 fn to_nfstime(secs: i64, nanos: u32) -> nfstime3 {

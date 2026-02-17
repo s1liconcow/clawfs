@@ -761,6 +761,8 @@ fn replay_event(fs: &OsageFs, event: &ReplayEvent, mapper: &mut InodeMapper) -> 
                 d_u32(details, "uid"),
                 d_u32(details, "gid"),
                 d_u64(details, "size"),
+                None,
+                None,
             )
             .err()
         }

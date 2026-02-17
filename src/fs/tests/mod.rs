@@ -1007,7 +1007,7 @@
         let result =
             harness
                 .fs
-                .nfs_setattr(file.inode, None, None, None, Some(999_999_999_999_999));
+                .nfs_setattr(file.inode, None, None, None, Some(999_999_999_999_999), None, None);
         assert!(matches!(result, Err(code) if code == EFBIG));
 
         let record = harness.fs.load_inode(file.inode).unwrap();
@@ -1098,7 +1098,7 @@
 
         harness
             .fs
-            .nfs_setattr(file.inode, Some(0o100640), None, None, None)
+            .nfs_setattr(file.inode, Some(0o100640), None, None, None, None, None)
             .unwrap();
 
         let before_flush = harness
@@ -1113,6 +1113,26 @@
             .nfs_read(file.inode, 0, payload.len() as u32)
             .unwrap();
         assert_eq!(after_flush, payload);
+    }
+
+    #[test]
+    fn nfs_setattr_applies_explicit_atime_and_mtime() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "nfs_setattr_timestamps.bin", 1 << 20);
+
+        let file = harness.fs.nfs_create(ROOT_INODE, "ts_test.txt", 0, 0).unwrap();
+
+        // Set explicit atime=1900000000 and mtime=1950000000 (values from utimensat/05.t).
+        let atime = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        let mtime = OffsetDateTime::from_unix_timestamp(1_950_000_000).unwrap();
+        harness
+            .fs
+            .nfs_setattr(file.inode, None, None, None, None, Some(atime), Some(mtime))
+            .unwrap();
+
+        let record = harness.fs.load_inode(file.inode).unwrap();
+        assert_eq!(record.atime.unix_timestamp(), 1_900_000_000, "atime must be set to the supplied value");
+        assert_eq!(record.mtime.unix_timestamp(), 1_950_000_000, "mtime must be set to the supplied value");
     }
 
     #[test]

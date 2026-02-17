@@ -47,10 +47,12 @@ impl OsageFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
+        atime: Option<OffsetDateTime>,
+        mtime: Option<OffsetDateTime>,
     ) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let result = self.op_nfs_setattr(ino, mode, uid, gid, size);
+        let result = self.op_nfs_setattr(ino, mode, uid, gid, size, atime, mtime);
         self.log_replay(
             "nfs",
             "setattr",

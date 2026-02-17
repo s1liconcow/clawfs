@@ -61,6 +61,8 @@ impl OsageFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
+        atime: Option<OffsetDateTime>,
+        mtime: Option<OffsetDateTime>,
     ) -> std::result::Result<InodeRecord, i32> {
         let mut record = self.load_inode(ino)?;
         if let Some(new_mode) = mode {
@@ -80,7 +82,15 @@ impl OsageFs {
             Self::resize_file_data_for_setattr(&mut data, target_size)?;
             record.size = data.len() as u64;
         }
-        record.update_times();
+        record.ctime = OffsetDateTime::now_utc();
+        if let Some(ts) = atime {
+            record.atime = ts;
+        }
+        if let Some(ts) = mtime {
+            record.mtime = ts;
+        } else if size.is_some() {
+            record.mtime = record.ctime;
+        }
         self.stage_file(record.clone(), data, None)?;
         Ok(record)
     }
