@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
-use crate::codec::{InlineCodecConfig, decode_bytes, encode_bytes};
+use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::InlinePayloadCodec;
 
@@ -43,6 +43,7 @@ pub struct SegmentEntry {
 
 pub enum SegmentPayload {
     Bytes(Vec<u8>),
+    SharedBytes(Arc<Vec<u8>>),
     Staged(Vec<StagedChunk>),
 }
 
@@ -66,6 +67,13 @@ pub struct SegmentManager {
     log_storage_io: bool,
     segment_compression: bool,
     segment_encryption_key: Option<String>,
+}
+
+struct EncodedSegmentEntry {
+    inode: u64,
+    path: String,
+    plain_len: u64,
+    encoded: EncodedBytes,
 }
 
 #[derive(Default)]
@@ -187,55 +195,91 @@ impl SegmentManager {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
+        let entry_count = entries.len();
         let mut estimated_size = 4usize + 8usize;
-        let mut encoded_entries: Vec<(u64, String, u64, crate::codec::EncodedBytes)> =
-            Vec::with_capacity(entries.len());
-        let codec_config = self.segment_codec_config();
-        for entry in entries {
-            let plain_bytes = match entry.payload {
-                SegmentPayload::Bytes(bytes) => bytes,
-                SegmentPayload::Staged(chunks) => {
-                    let total_len = chunks.iter().map(|chunk| chunk.len).sum();
-                    self.read_staged_chunks(&chunks, total_len)?
-                }
-            };
-            let plain_len = plain_bytes.len() as u64;
-            let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
-                format!("segment payload encoding failed for inode {}", entry.inode)
-            })?;
-            let path_len = entry.path.len();
+        for entry in &entries {
             estimated_size = estimated_size
                 .saturating_add(8)
                 .saturating_add(8)
-                .saturating_add(path_len)
-                .saturating_add(SEGMENT_ENTRY_CODEC_HEADER_LEN)
-                .saturating_add(encoded.payload.len());
-            encoded_entries.push((entry.inode, entry.path, plain_len, encoded));
+                .saturating_add(entry.path.len())
+                .saturating_add(SEGMENT_ENTRY_CODEC_HEADER_LEN);
+            match &entry.payload {
+                SegmentPayload::Bytes(bytes) => {
+                    estimated_size = estimated_size.saturating_add(bytes.len());
+                }
+                SegmentPayload::SharedBytes(bytes) => {
+                    estimated_size = estimated_size.saturating_add(bytes.len());
+                }
+                SegmentPayload::Staged(chunks) => {
+                    let total_len: usize = chunks.iter().map(|chunk| chunk.len as usize).sum();
+                    estimated_size = estimated_size.saturating_add(total_len);
+                }
+            }
         }
+        let codec_config = self.segment_codec_config();
+        let use_parallel = self.should_parallel_encode(entry_count, estimated_size);
         let mut buffer = Vec::with_capacity(estimated_size);
         buffer.extend_from_slice(SEGMENT_MAGIC_V2);
-        buffer.extend_from_slice(&(encoded_entries.len() as u64).to_le_bytes());
-        let mut pointers = Vec::with_capacity(encoded_entries.len());
-        for (inode, path, plain_len, encoded) in encoded_entries {
-            buffer.extend_from_slice(&inode.to_le_bytes());
-            let path_bytes = path.as_bytes();
-            buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
-            buffer.extend_from_slice(path_bytes);
-            let offset = buffer.len() as u64;
-            buffer.push(codec_to_u8(encoded.codec));
-            buffer.extend_from_slice(&plain_len.to_le_bytes());
-            buffer.extend_from_slice(&(encoded.payload.len() as u64).to_le_bytes());
-            buffer.extend_from_slice(&encoded.nonce.unwrap_or([0u8; 12]));
-            buffer.extend_from_slice(&encoded.payload);
-            pointers.push((
-                inode,
-                SegmentPointer {
-                    segment_id,
-                    generation,
-                    offset,
-                    length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded.payload.len()) as u64,
-                },
-            ));
+        buffer.extend_from_slice(&(entry_count as u64).to_le_bytes());
+        let mut pointers = Vec::with_capacity(entry_count);
+        if use_parallel {
+            let encoded_entries = self.encode_entries_parallel(entries, &codec_config, entry_count)?;
+            for encoded_entry in encoded_entries {
+                buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
+                let path_bytes = encoded_entry.path.as_bytes();
+                buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+                buffer.extend_from_slice(path_bytes);
+                let offset = buffer.len() as u64;
+                buffer.push(codec_to_u8(encoded_entry.encoded.codec));
+                buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
+                buffer.extend_from_slice(&(encoded_entry.encoded.payload.len() as u64).to_le_bytes());
+                buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
+                buffer.extend_from_slice(&encoded_entry.encoded.payload);
+                pointers.push((
+                    encoded_entry.inode,
+                    SegmentPointer {
+                        segment_id,
+                        generation,
+                        offset,
+                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded_entry.encoded.payload.len())
+                            as u64,
+                    },
+                ));
+            }
+        } else {
+            for entry in entries {
+                let plain_bytes = match entry.payload {
+                    SegmentPayload::Bytes(bytes) => bytes,
+                    SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
+                    SegmentPayload::Staged(chunks) => {
+                        let total_len = chunks.iter().map(|chunk| chunk.len).sum();
+                        self.read_staged_chunks(&chunks, total_len)?
+                    }
+                };
+                let plain_len = plain_bytes.len() as u64;
+                let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
+                    format!("segment payload encoding failed for inode {}", entry.inode)
+                })?;
+                buffer.extend_from_slice(&entry.inode.to_le_bytes());
+                let path_bytes = entry.path.as_bytes();
+                buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+                buffer.extend_from_slice(path_bytes);
+                let offset = buffer.len() as u64;
+                buffer.push(codec_to_u8(encoded.codec));
+                buffer.extend_from_slice(&plain_len.to_le_bytes());
+                buffer.extend_from_slice(&(encoded.payload.len() as u64).to_le_bytes());
+                buffer.extend_from_slice(&encoded.nonce.unwrap_or([0u8; 12]));
+                buffer.extend_from_slice(&encoded.payload);
+                pointers.push((
+                    entry.inode,
+                    SegmentPointer {
+                        segment_id,
+                        generation,
+                        offset,
+                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded.payload.len()) as u64,
+                    },
+                ));
+            }
         }
         let total_bytes = buffer.len();
         let object_path = self.segment_path(generation, segment_id);
@@ -263,6 +307,77 @@ impl SegmentManager {
             total_bytes
         ));
         Ok(pointers)
+    }
+
+    fn should_parallel_encode(&self, entry_count: usize, estimated_size: usize) -> bool {
+        let max_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let approx_input_bytes = estimated_size.saturating_sub(12);
+        max_workers > 1 && entry_count >= 64 && approx_input_bytes >= 2 * 1024 * 1024
+    }
+
+    fn encode_entries_parallel(
+        &self,
+        entries: Vec<SegmentEntry>,
+        codec_config: &InlineCodecConfig,
+        entry_count: usize,
+    ) -> Result<Vec<EncodedSegmentEntry>> {
+        let max_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let workers = max_workers.min(entry_count);
+        let chunk_size = entry_count.div_ceil(workers);
+        let mut chunks: Vec<Vec<SegmentEntry>> = Vec::with_capacity(workers);
+        let mut iter = entries.into_iter();
+        loop {
+            let chunk: Vec<SegmentEntry> = iter.by_ref().take(chunk_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(chunk);
+        }
+
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let codec_config = codec_config.clone();
+            let stage_dir = self.stage_dir.clone();
+            handles.push(std::thread::spawn(move || -> Result<Vec<EncodedSegmentEntry>> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for entry in chunk {
+                    let plain_bytes = match entry.payload {
+                        SegmentPayload::Bytes(bytes) => bytes,
+                        SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
+                        SegmentPayload::Staged(chunks) => {
+                            let total_len = chunks.iter().map(|chunk| chunk.len).sum();
+                            read_staged_chunks_from_disk(&stage_dir, &chunks, total_len)?
+                        }
+                    };
+                    let plain_len = plain_bytes.len() as u64;
+                    let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
+                        format!("segment payload encoding failed for inode {}", entry.inode)
+                    })?;
+                    out.push(EncodedSegmentEntry {
+                        inode: entry.inode,
+                        path: entry.path,
+                        plain_len,
+                        encoded,
+                    });
+                }
+                Ok(out)
+            }));
+        }
+
+        let mut out = Vec::with_capacity(entry_count);
+        for handle in handles {
+            let chunk_entries = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("segment encode worker panicked"))??;
+            out.extend(chunk_entries);
+        }
+        Ok(out)
     }
 
     pub fn read_pointer(&self, pointer: &SegmentPointer) -> Result<Vec<u8>> {
@@ -702,7 +817,6 @@ impl ActiveStage {
 
     fn append(&mut self, data: &[u8]) -> Result<u64> {
         let offset = self.len;
-        self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
         self.len += data.len() as u64;
         Ok(offset)
@@ -715,8 +829,7 @@ impl ActiveStage {
 
     fn reset(&mut self) -> Result<()> {
         self.file.set_len(0)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
+        self.file.seek(SeekFrom::Start(0))?;
         self.len = 0;
         Ok(())
     }
@@ -729,6 +842,55 @@ fn segment_prefix(user_prefix: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn read_staged_chunks_from_disk(
+    stage_dir: &Path,
+    chunks: &[StagedChunk],
+    total_len: u64,
+) -> Result<Vec<u8>> {
+    let mut buffer = Vec::with_capacity(total_len as usize);
+    let mut open_file: Option<(PathBuf, File)> = None;
+    let mut appended = 0u64;
+    for chunk in chunks {
+        if chunk.len == 0 {
+            continue;
+        }
+        let needs_open = match open_file.as_ref() {
+            Some((path, _)) => path != &chunk.path,
+            None => true,
+        };
+        if needs_open {
+            let resolved_path = if chunk.path.is_absolute() || chunk.path.starts_with(stage_dir) {
+                chunk.path.clone()
+            } else {
+                stage_dir.join(&chunk.path)
+            };
+            let file = File::open(&resolved_path)
+                .with_context(|| format!("opening staged payload {}", resolved_path.display()))?;
+            open_file = Some((resolved_path, file));
+        }
+        let (path, file) = open_file.as_mut().expect("staged file must be open");
+        file.seek(SeekFrom::Start(chunk.offset))?;
+        let start = buffer.len();
+        buffer.resize(start + chunk.len as usize, 0);
+        file.read_exact(&mut buffer[start..]).with_context(|| {
+            format!(
+                "reading staged payload {} @{}+{}",
+                path.display(),
+                chunk.offset,
+                chunk.len
+            )
+        })?;
+        appended = appended.saturating_add(chunk.len);
+    }
+    anyhow::ensure!(
+        appended == total_len,
+        "staged payload length mismatch expected={} actual={}",
+        total_len,
+        appended
+    );
+    Ok(buffer)
 }
 
 fn codec_to_u8(codec: InlinePayloadCodec) -> u8 {

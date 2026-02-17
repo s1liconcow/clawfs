@@ -100,13 +100,13 @@ pub fn encode_bytes(data: &[u8], config: &InlineCodecConfig) -> Result<EncodedBy
         });
     }
 
-    let mut working = data.to_vec();
+    let mut compressed_payload: Option<Vec<u8>> = None;
     let mut compressed = false;
     if config.compression {
         let candidate = compress_prepend_size(data);
         if candidate.len() < data.len() {
             compressed = true;
-            working = candidate;
+            compressed_payload = Some(candidate);
         }
     }
 
@@ -114,7 +114,7 @@ pub fn encode_bytes(data: &[u8], config: &InlineCodecConfig) -> Result<EncodedBy
         return Ok(if compressed {
             EncodedBytes {
                 codec: InlinePayloadCodec::Lz4,
-                payload: working,
+                payload: compressed_payload.expect("compressed payload should exist"),
                 original_len: Some(data.len() as u64),
                 nonce: None,
             }
@@ -132,8 +132,9 @@ pub fn encode_bytes(data: &[u8], config: &InlineCodecConfig) -> Result<EncodedBy
     OsRng.fill_bytes(&mut nonce);
     let key = key_from_passphrase(passphrase);
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+    let plain = compressed_payload.as_deref().unwrap_or(data);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), working.as_ref())
+        .encrypt(Nonce::from_slice(&nonce), plain)
         .map_err(|_| anyhow::anyhow!("payload encryption failed"))?;
     let codec = if compressed {
         InlinePayloadCodec::Lz4ChaCha20Poly1305
