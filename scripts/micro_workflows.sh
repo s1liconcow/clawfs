@@ -5,7 +5,12 @@ source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
 PID_FILE="${PID_FILE:-/tmp/osagefs-micro.pid}"
-OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_osagefs.sh}"
+TRANSPORT="${TRANSPORT:-fuse}" # fuse|nfs
+if [[ "$TRANSPORT" == "nfs" ]]; then
+  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_nfs_gateway.sh}"
+else
+  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_osagefs.sh}"
+fi
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/micro-results-$(date +%Y%m%d-%H%M%S)}"
 LOCAL_BASE="${LOCAL_BASE:-/tmp/osagefs-micro-local}"
@@ -14,6 +19,11 @@ MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
 TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
+
+# NFS transport knobs
+NFS_LISTEN="${NFS_LISTEN:-0.0.0.0:2049}"
+NFS_MOUNT_PATH="${NFS_MOUNT_PATH:-$MOUNT_PATH}"
+NFS_LOG_FILE="${NFS_LOG_FILE:-$ROOT_DIR/osagefs-nfs-gateway.log}"
 
 # Workload knobs (default to moderate intensity for clearer perf signal)
 SMALLFILE_COUNT="${SMALLFILE_COUNT:-5000}"
@@ -102,6 +112,20 @@ run_cleanup_script() {
   if [[ "$cleanup_perf_log" != "1" ]]; then
     perf_log_arg=""
   fi
+  local nfs_pid_arg=""
+  local nfs_log_arg=""
+  if [[ "$TRANSPORT" == "nfs" ]]; then
+    nfs_pid_arg="$PID_FILE"
+    nfs_log_arg="$NFS_LOG_FILE"
+    # When NFS mount path differs from MOUNT_PATH, unmount it first.
+    if [[ "$NFS_MOUNT_PATH" != "$MOUNT_PATH" ]] && mountpoint -q "$NFS_MOUNT_PATH" 2>/dev/null; then
+      umount "$NFS_MOUNT_PATH" 2>/dev/null \
+        || sudo umount -l "$NFS_MOUNT_PATH" 2>/dev/null \
+        || true
+    fi
+  fi
+  NFS_GATEWAY_PID_FILE="$nfs_pid_arg" \
+  NFS_LOG_FILE="$nfs_log_arg" \
   LOG_FILE="$LOG_FILE" \
   PERF_LOG_PATH="$perf_log_arg" \
   MOUNT_PATH="$MOUNT_PATH" \
@@ -121,6 +145,12 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
+  fi
+  # Unmount NFS before general cleanup when mount paths differ.
+  if [[ "$TRANSPORT" == "nfs" && "$NFS_MOUNT_PATH" != "$MOUNT_PATH" ]]; then
+    umount "$NFS_MOUNT_PATH" 2>/dev/null \
+      || sudo umount -l "$NFS_MOUNT_PATH" 2>/dev/null \
+      || true
   fi
   run_cleanup_script 0 >/dev/null 2>&1 || true
 }
@@ -174,7 +204,16 @@ require_tools() {
 
   # Only required when mounting OsageFS.
   if [[ "$MODE" == "both" || "$MODE" == "osage" ]]; then
-    ensure_cmd fusermount3 fuse3 || { echo "Missing dependency: fusermount3/fuse3" >&2; exit 1; }
+    if [[ "$TRANSPORT" == "nfs" ]]; then
+      # NFS transport needs mount.nfs (nfs-common on Debian/Ubuntu).
+      if ! command -v mount.nfs >/dev/null 2>&1 \
+         && ! [[ -x /sbin/mount.nfs ]] \
+         && ! [[ -x /usr/sbin/mount.nfs ]]; then
+        ensure_cmd mount.nfs nfs-common || { echo "Missing dependency: mount.nfs/nfs-common" >&2; exit 1; }
+      fi
+    else
+      ensure_cmd fusermount3 fuse3 || { echo "Missing dependency: fusermount3/fuse3" >&2; exit 1; }
+    fi
   fi
 }
 
@@ -182,10 +221,19 @@ start_osage_if_needed() {
   [[ "$MODE" == "local" ]] && return
 
   run_cleanup_script >/dev/null 2>&1 || true
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" \
-    MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
-    STATE_PATH="$STATE_PATH" "$OSAGE_RUNNER"
-  osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+  if [[ "$TRANSPORT" == "nfs" ]]; then
+    LOG_FILE="$NFS_LOG_FILE" PID_FILE="$PID_FILE" \
+      MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
+      STATE_PATH="$STATE_PATH" LISTEN="$NFS_LISTEN" NFS_MOUNT_PATH="$NFS_MOUNT_PATH" \
+      AUTO_MOUNT_NFS=1 FOREGROUND=0 SKIP_BUILD=0 \
+      MOUNT_CHECK_TIMEOUT_SEC="$MOUNT_CHECK_TIMEOUT_SEC" \
+      "$OSAGE_RUNNER"
+  else
+    LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" \
+      MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
+      STATE_PATH="$STATE_PATH" "$OSAGE_RUNNER"
+    osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+  fi
 }
 
 emit_result() {
@@ -916,8 +964,13 @@ main() {
 
   start_osage_if_needed
 
+  local effective_mount="$MOUNT_PATH"
+  if [[ "$TRANSPORT" == "nfs" ]]; then
+    effective_mount="$NFS_MOUNT_PATH"
+  fi
+
   if [[ "$MODE" == "both" || "$MODE" == "osage" ]]; then
-    run_suite_for_fs "osagefs" "$MOUNT_PATH/$OSAGE_BASE_SUBDIR"
+    run_suite_for_fs "osagefs" "$effective_mount/$OSAGE_BASE_SUBDIR"
   fi
 
   if [[ "$MODE" == "both" || "$MODE" == "local" ]]; then

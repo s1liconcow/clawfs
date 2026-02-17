@@ -774,7 +774,6 @@ fn build_config(cli: &Cli) -> Config {
         shard_size: 2048,
         inode_batch: 1280,
         segment_batch: 2560,
-        // Match ZeroFS-style aggressive writeback batching defaults for throughput.
         pending_bytes: 1024 * 1024 * 1024,
         home_prefix: "/home".to_string(),
         object_provider: cli.object_provider,
@@ -799,6 +798,7 @@ fn build_config(cli: &Cli) -> Config {
         log_file: None,
         debug_log: false,
         imap_delta_batch: 256,
+        allow_other: false,
     }
 }
 
