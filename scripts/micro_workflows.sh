@@ -97,8 +97,13 @@ CASE_SKIP_REASON=""
 RUN_FAILURES=0
 
 run_cleanup_script() {
+  local cleanup_perf_log="${1:-1}"
+  local perf_log_arg="$PERF_LOG_PATH"
+  if [[ "$cleanup_perf_log" != "1" ]]; then
+    perf_log_arg=""
+  fi
   LOG_FILE="$LOG_FILE" \
-  PERF_LOG_PATH="$PERF_LOG_PATH" \
+  PERF_LOG_PATH="$perf_log_arg" \
   MOUNT_PATH="$MOUNT_PATH" \
   STORE_PATH="$STORE_PATH" \
   LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
@@ -117,7 +122,7 @@ cleanup() {
     fi
     rm -f "$PID_FILE"
   fi
-  run_cleanup_script >/dev/null 2>&1 || true
+  run_cleanup_script 0 >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT
