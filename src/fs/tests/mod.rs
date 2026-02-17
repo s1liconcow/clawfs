@@ -360,6 +360,54 @@
     }
 
     #[test]
+    fn read_file_range_for_segment_storage_returns_expected_window() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "range_segments.bin", 64 * 1024 * 1024);
+        let inode = stage_named_file(&harness, "range.dat", Vec::new());
+
+        let first = vec![0x11; 4096];
+        let second = vec![0x22; 4096];
+        let record = harness.fs.load_inode(inode).unwrap();
+        harness.fs.write_large_segments(record, 0, &first).unwrap();
+        let record = harness.fs.load_inode(inode).unwrap();
+        harness
+            .fs
+            .write_large_segments(record, 8192, &second)
+            .unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let stored = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(inode))
+            .unwrap()
+            .unwrap();
+        let actual = harness.fs.read_file_range(&stored, 2048, 8192).unwrap();
+        let mut expected = Vec::with_capacity(8192);
+        expected.extend_from_slice(&first[2048..]);
+        expected.extend_from_slice(&vec![0u8; 4096]);
+        expected.extend_from_slice(&second[..2048]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn op_read_returns_only_requested_window_for_large_segment_file() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "op_read_range.bin", 64 * 1024 * 1024);
+        let inode = stage_named_file(&harness, "checkpoint.bin", Vec::new());
+        let payload = vec![0x5A; 64 * 1024];
+        let record = harness.fs.load_inode(inode).unwrap();
+        harness
+            .fs
+            .write_large_segments(record, 0, &payload)
+            .unwrap();
+        harness.fs.flush_pending().unwrap();
+
+        let read = harness.fs.op_read(inode, 32 * 1024, 4096).unwrap();
+        assert_eq!(read.len(), 4096);
+        assert_eq!(read, vec![0x5A; 4096]);
+    }
+
+    #[test]
     fn write_path_meets_perf_target() {
         let dir = tempdir().unwrap();
         let harness =
