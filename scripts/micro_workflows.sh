@@ -15,14 +15,24 @@ MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
 TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
 
-# Workload knobs (small by default for quick iteration)
-SMALLFILE_COUNT="${SMALLFILE_COUNT:-1200}"
-SMALLFILE_SIZE="${SMALLFILE_SIZE:-1024}"
+# Workload knobs (default to moderate intensity for clearer perf signal)
+SMALLFILE_COUNT="${SMALLFILE_COUNT:-5000}"
+SMALLFILE_SIZE="${SMALLFILE_SIZE:-2048}"
+DEV_SCAN_EDIT_FILES="${DEV_SCAN_EDIT_FILES:-3000}"
+DEV_SCAN_RG_PASSES="${DEV_SCAN_RG_PASSES:-80}"
+DEV_SCAN_STATUS_PASSES="${DEV_SCAN_STATUS_PASSES:-300}"
+DEV_SCAN_TREE_COPIES="${DEV_SCAN_TREE_COPIES:-8}"
+DEV_SCAN_MUTATION_ROUNDS="${DEV_SCAN_MUTATION_ROUNDS:-60}"
 CHECKPOINT_MB="${CHECKPOINT_MB:-128}"
 CHECKPOINT_ITERS="${CHECKPOINT_ITERS:-3}"
-ETL_ROWS="${ETL_ROWS:-150000}"
-ETL_COLS="${ETL_COLS:-8}"
+ETL_ROWS="${ETL_ROWS:-500000}"
+ETL_COLS="${ETL_COLS:-10}"
+ETL_PASSES="${ETL_PASSES:-3}"
 BUILD_MODE="${BUILD_MODE:-check}" # check|none
+DEV_BUILD_TARGET_DIR="${DEV_BUILD_TARGET_DIR:-}" # optional override for cargo target dir
+DEV_BUILD_CARGO_JOBS="${DEV_BUILD_CARGO_JOBS:-}" # optional override for cargo parallelism
+DEV_BUILD_INCREMENTAL="${DEV_BUILD_INCREMENTAL:-}" # optional override for CARGO_INCREMENTAL
+DEV_BUILD_SPRITE_WORKAROUND="${DEV_BUILD_SPRITE_WORKAROUND:-1}" # set 0 to disable auto sprite workaround
 ALLOW_PIP_INSTALL="${ALLOW_PIP_INSTALL:-1}"
 ALLOW_SYSTEM_INSTALL="${ALLOW_SYSTEM_INSTALL:-1}"
 
@@ -272,12 +282,16 @@ dev_scan_and_status() {
   rm -rf "$d"
   mkdir -p "$d"
 
-  # Keep this copy small enough for fast loops.
   rsync -a --delete \
     --exclude .git \
     --exclude target \
     --exclude fio-results-* \
     "$ROOT_DIR/src" "$ROOT_DIR/scripts" "$ROOT_DIR/Cargo.toml" "$ROOT_DIR/Cargo.lock" "$d/"
+
+  local copy_idx
+  for copy_idx in $(seq 1 "$DEV_SCAN_TREE_COPIES"); do
+    cp -a "$d/src" "$d/src_copy_${copy_idx}"
+  done
 
   (
     cd "$d"
@@ -304,24 +318,40 @@ dev_scan_and_status() {
       sleep 0.1
     done
 
-    rg "fn |pub struct|impl " src scripts >/dev/null
+    local pass
+    for pass in $(seq 1 "$DEV_SCAN_RG_PASSES"); do
+      rg "fn |pub struct|impl " src scripts src_copy_* >/dev/null
+    done
 
-    python3 - <<'PY'
+    python3 - "$DEV_SCAN_EDIT_FILES" <<'PY'
+import sys
 from pathlib import Path
+target_edits = int(sys.argv[1])
 count = 0
-for p in Path("src").rglob("*.rs"):
+for p in Path(".").rglob("*.rs"):
+    if ".git" in p.parts or "target" in p.parts:
+        continue
     txt = p.read_text(encoding="utf-8")
     p.write_text(txt + "\n// micro workflow edit\n", encoding="utf-8")
     count += 1
-    if count >= 120:
+    if count >= target_edits:
         break
 PY
 
     # Status is metadata heavy and representative of inner-loop developer ops.
-    for _ in 1 2 3 4 5; do
-      rm -f .git/config.lock .git/index.lock
-      git status --porcelain >/dev/null && break
-      sleep 0.1
+    for pass in $(seq 1 "$DEV_SCAN_STATUS_PASSES"); do
+      for _ in 1 2 3 4 5; do
+        rm -f .git/config.lock .git/index.lock
+        git status --porcelain >/dev/null && break
+        sleep 0.1
+      done
+    done
+
+    # Repeated index churn better approximates active dev loops than status alone.
+    for pass in $(seq 1 "$DEV_SCAN_MUTATION_ROUNDS"); do
+      git add -A
+      git diff --cached --name-only >/dev/null
+      git reset -q
     done
   )
 }
@@ -332,7 +362,7 @@ data_csv_etl() {
   rm -rf "$d"
   mkdir -p "$d"
 
-  python3 - "$d" "$ETL_ROWS" "$ETL_COLS" <<'PY'
+  python3 - "$d" "$ETL_ROWS" "$ETL_COLS" "$ETL_PASSES" <<'PY'
 import csv
 import os
 import random
@@ -342,6 +372,7 @@ from collections import defaultdict
 root = sys.argv[1]
 rows = int(sys.argv[2])
 cols = int(sys.argv[3])
+passes = int(sys.argv[4])
 random.seed(42)
 in_csv = os.path.join(root, "input.csv")
 out_dir = os.path.join(root, "partitions")
@@ -356,23 +387,26 @@ with open(in_csv, "w", newline="", encoding="utf-8") as f:
         vals = [bucket] + [random.randint(0, 1000) for _ in range(cols)]
         w.writerow(vals)
 
-agg = defaultdict(int)
-with open(in_csv, "r", newline="", encoding="utf-8") as f:
-    r = csv.DictReader(f)
-    for row in r:
-        b = int(row["bucket"])
-        agg[b] += int(row["c0"])
+for p in range(passes):
+    agg = defaultdict(int)
+    with open(in_csv, "r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            b = int(row["bucket"])
+            agg[b] += int(row["c0"])
+            if p > 0:
+                agg[b] += int(row["c1"]) % 7
 
-for b in range(16):
-    part = os.path.join(out_dir, f"bucket={b:02d}.csv")
-    with open(part, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["bucket", "sum_c0"])
-        w.writerow([b, agg[b]])
+    for b in range(16):
+        part = os.path.join(out_dir, f"pass={p:02d}_bucket={b:02d}.csv")
+        with open(part, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["bucket", "sum_c0"])
+            w.writerow([b, agg[b]])
 PY
 
-  [[ -f "$d/partitions/bucket=00.csv" ]]
-  [[ -f "$d/partitions/bucket=15.csv" ]]
+  [[ -f "$d/partitions/pass=00_bucket=00.csv" ]]
+  [[ -f "$d/partitions/pass=$(printf '%02d' $((ETL_PASSES - 1)))_bucket=15.csv" ]]
 }
 
 ai_checkpoint_loop() {
@@ -748,9 +782,44 @@ optional_build_probe() {
   mkdir -p "$d"
   rsync -a --delete --exclude target --exclude .git "$ROOT_DIR/" "$d/"
 
+  local target_dir="$DEV_BUILD_TARGET_DIR"
+  local jobs="$DEV_BUILD_CARGO_JOBS"
+  local incremental="$DEV_BUILD_INCREMENTAL"
+  if [[ -z "$target_dir" && "$fs_type" == "osagefs" && "$DEV_BUILD_SPRITE_WORKAROUND" == "1" && -d "/.sprite" ]]; then
+    # Sprite VMs can intermittently SIGBUS when Rust artifacts are emitted on the FUSE mount.
+    target_dir="/tmp/osagefs-rust-target-shared"
+  fi
+  if [[ -z "$jobs" && "$target_dir" == /tmp/* ]]; then
+    jobs=1
+  fi
+  if [[ -z "$incremental" && "$target_dir" == /tmp/* ]]; then
+    incremental=0
+  fi
+
   local start_ns end_ns elapsed
   start_ns=$(date +%s%N)
-  (cd "$d" && cargo check -q)
+  if ! (
+    cd "$d" &&
+    if [[ -n "$target_dir" ]]; then export CARGO_TARGET_DIR="$target_dir"; fi &&
+    if [[ -n "$jobs" ]]; then export CARGO_BUILD_JOBS="$jobs"; fi &&
+    if [[ -n "$incremental" ]]; then export CARGO_INCREMENTAL="$incremental"; fi &&
+    cargo check -q
+  ); then
+    end_ns=$(date +%s%N)
+    elapsed=$(python3 - "$start_ns" "$end_ns" <<'PY'
+import sys
+start_ns, end_ns = map(int, sys.argv[1:])
+print(f"{(end_ns - start_ns)/1e9:.6f}")
+PY
+)
+    local detail="cargo check failed"
+    if [[ -n "$target_dir" ]]; then
+      detail="$detail (target_dir=$target_dir)"
+    fi
+    emit_result "$fs_type" "dev_incremental_build" "$elapsed" "fail" "$detail"
+    printf '[%s] %-24s FAIL %ss\n' "$fs_type" "dev_incremental_build" "$elapsed" >&2
+    return 1
+  fi
   end_ns=$(date +%s%N)
   elapsed=$(python3 - "$start_ns" "$end_ns" <<'PY'
 import sys
@@ -758,7 +827,11 @@ start_ns, end_ns = map(int, sys.argv[1:])
 print(f"{(end_ns - start_ns)/1e9:.6f}")
 PY
 )
-  emit_result "$fs_type" "dev_incremental_build" "$elapsed" "ok" "cargo check"
+  local detail="cargo check"
+  if [[ -n "$target_dir" ]]; then
+    detail="$detail (target_dir=$target_dir)"
+  fi
+  emit_result "$fs_type" "dev_incremental_build" "$elapsed" "ok" "$detail"
   printf '[%s] %-24s ok  %ss\n' "$fs_type" "dev_incremental_build" "$elapsed"
 }
 
