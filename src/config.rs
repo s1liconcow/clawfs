@@ -147,7 +147,7 @@ pub struct Cli {
     pub debug_log: bool,
 
     /// Number of inode records to pack into each metadata delta file (higher reduces API calls).
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 512)]
     pub imap_delta_batch: usize,
 }
 

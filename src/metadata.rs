@@ -9,9 +9,14 @@ use log::debug;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{deserialize_flex, write_flexbuffer};
+use crate::codec::{deserialize_flex, write_flexbuffer, write_flexbuffer_unsynced};
 use crate::inode::{FileStorage, InodeRecord, InodeShard};
 use crate::superblock::Superblock;
+
+/// How long an ENOENT result is served from the negative cache before we
+/// re-check the backing store.  Short enough that new files created by the
+/// same or another client become visible promptly.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_millis(1_500);
 
 const SUPERBLOCK_FILE: &str = "superblock.bin";
 const METADATA_FORMAT_VERSION: u32 = 1;
@@ -57,6 +62,9 @@ pub struct MetadataStore {
     shards: Mutex<HashMap<u64, ShardEntry>>,
     last_delta_generation: Mutex<u64>,
     log_storage_io: bool,
+    /// Short-lived cache of inode numbers known not to exist.  Avoids
+    /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
+    negative_cache: Mutex<HashMap<u64, Instant>>,
 }
 
 impl MetadataStore {
@@ -81,6 +89,7 @@ impl MetadataStore {
             shards: Mutex::new(HashMap::new()),
             last_delta_generation: Mutex::new(0),
             log_storage_io,
+            negative_cache: Mutex::new(HashMap::new()),
         };
         store.load_latest_imaps()?;
         Ok(store)
@@ -158,18 +167,41 @@ impl MetadataStore {
         dir_ttl: Duration,
     ) -> Result<Option<InodeRecord>> {
         let ttl = |rec: &InodeRecord| if rec.is_dir() { dir_ttl } else { file_ttl };
+
+        // Fast path: positive cache hit.
         if let Some(entry) = self.cache.lock().get(&inode).cloned() {
             let allowed = ttl(&entry.record);
             if allowed.is_zero() || entry.refreshed.elapsed() <= allowed {
                 return Ok(Some(entry.record));
             }
         }
+
+        // Negative cache: skip shard load if we recently confirmed ENOENT.
+        {
+            let neg = self.negative_cache.lock();
+            if let Some(&expires) = neg.get(&inode) {
+                if Instant::now() < expires {
+                    return Ok(None);
+                }
+            }
+        }
+
         self.reload_shard_for_inode(inode)?;
-        Ok(self
+
+        let result = self
             .cache
             .lock()
             .get(&inode)
-            .map(|entry| entry.record.clone()))
+            .map(|entry| entry.record.clone());
+
+        // Populate the negative cache on confirmed ENOENT.
+        if result.is_none() {
+            self.negative_cache
+                .lock()
+                .insert(inode, Instant::now() + NEGATIVE_CACHE_TTL);
+        }
+
+        Ok(result)
     }
 
     pub async fn get_inode(&self, inode: u64) -> Result<Option<InodeRecord>> {
@@ -201,7 +233,10 @@ impl MetadataStore {
         {
             let mut cache = self.cache.lock();
             let mut shards = self.shards.lock();
+            let mut neg = self.negative_cache.lock();
             for record in records {
+                // Writing this inode makes any cached ENOENT stale.
+                neg.remove(&record.inode);
                 cache.insert(record.inode, CacheEntry::new(record.clone()));
                 let shard_id = record.shard_index(shard_size);
                 let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
@@ -223,8 +258,22 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Ensure all shard and delta files written during this flush cycle are
+    /// durable on disk.  Must be called after `persist_inodes_batch` and
+    /// before `commit_generation` so that the superblock CAS only advances
+    /// once all referenced metadata objects are safely written.
+    ///
+    /// Two directory-level fsyncs replace the per-file fsyncs that the old
+    /// `write_flexbuffer` (synced) variant issued for every shard and delta.
+    pub async fn sync_metadata_writes(&self) -> Result<()> {
+        sync_dir_path(&self.imap_dir)?;
+        sync_dir_path(&self.delta_dir)?;
+        Ok(())
+    }
+
     pub async fn remove_inode(&self, inode: u64, generation: u64, shard_size: u64) -> Result<()> {
         self.cache.lock().remove(&inode);
+        self.negative_cache.lock().remove(&inode);
         let shard_id = shard_for_inode(inode, shard_size);
         let mut shards = self.shards.lock();
         if let Some(entry) = shards.get_mut(&shard_id) {
@@ -260,7 +309,9 @@ impl MetadataStore {
                 generation,
             },
         );
-        write_flexbuffer(&path, &stored)?;
+        // Unsynced write: the parent directory is fsynced once by
+        // sync_metadata_writes() before the superblock CAS commits.
+        write_flexbuffer_unsynced(&path, &stored)?;
         self.log_backing(format_args!(
             "synced backing file path={} type=imap shard={} generation={} entries={}",
             path.display(),
@@ -289,7 +340,9 @@ impl MetadataStore {
             let mut guard = self.last_delta_generation.lock();
             *guard = (*guard).max(generation);
         }
-        write_flexbuffer(&path, &file)?;
+        // Unsynced write: the parent directory is fsynced once by
+        // sync_metadata_writes() before the superblock CAS commits.
+        write_flexbuffer_unsynced(&path, &file)?;
         self.log_backing(format_args!(
             "synced backing file path={} type=delta generation={} records={}",
             path.display(),
@@ -583,4 +636,16 @@ impl CacheEntry {
             refreshed: Instant::now(),
         }
     }
+}
+
+/// Open `dir` and call `sync_all()` on it, ensuring all previously written
+/// files within the directory are durable before the superblock advances.
+fn sync_dir_path(dir: &Path) -> Result<()> {
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir)
+        .with_context(|| format!("opening dir for sync {}", dir.display()))?;
+    handle
+        .sync_all()
+        .with_context(|| format!("syncing dir {}", dir.display()))
 }

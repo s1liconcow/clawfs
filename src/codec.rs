@@ -100,6 +100,17 @@ fn decode_inline_payload(payload: &InlinePayload, encryption_key: Option<&str>) 
     )
 }
 
+/// Minimum payload size above which we run a compressibility probe before
+/// attempting full LZ4 compression.  Payloads at or below this threshold are
+/// always compressed directly (cheap enough that the probe adds no value).
+const COMPRESSION_PROBE_THRESHOLD: usize = 256 * 1024; // 256 KiB
+/// Number of bytes sampled from the beginning of large payloads to estimate
+/// compressibility before committing to a full compression pass.
+const COMPRESSION_PROBE_LEN: usize = 64 * 1024; // 64 KiB
+/// If the probe compresses to more than this fraction of its original size the
+/// data is likely incompressible and we skip the full compression attempt.
+const COMPRESSION_PROBE_MIN_RATIO: f64 = 0.90;
+
 pub fn encode_bytes(data: &[u8], config: &InlineCodecConfig) -> Result<EncodedBytes> {
     if data.is_empty() && config.encryption_key.is_none() {
         return Ok(EncodedBytes {
@@ -113,10 +124,23 @@ pub fn encode_bytes(data: &[u8], config: &InlineCodecConfig) -> Result<EncodedBy
     let mut compressed_payload: Option<Vec<u8>> = None;
     let mut compressed = false;
     if config.compression {
-        let candidate = compress_prepend_size(data);
-        if candidate.len() < data.len() {
-            compressed = true;
-            compressed_payload = Some(candidate);
+        // For large payloads, probe the first COMPRESSION_PROBE_LEN bytes to
+        // decide whether full compression is worth attempting.  Binary/random
+        // data (ML checkpoints, encrypted archives) shows near-zero savings
+        // while still paying the full compression CPU + allocation cost.
+        let should_try = if data.len() > COMPRESSION_PROBE_THRESHOLD {
+            let probe_len = COMPRESSION_PROBE_LEN.min(data.len());
+            let probe = compress_prepend_size(&data[..probe_len]);
+            (probe.len() as f64) < (probe_len as f64) * COMPRESSION_PROBE_MIN_RATIO
+        } else {
+            true
+        };
+        if should_try {
+            let candidate = compress_prepend_size(data);
+            if candidate.len() < data.len() {
+                compressed = true;
+                compressed_payload = Some(candidate);
+            }
         }
     }
 

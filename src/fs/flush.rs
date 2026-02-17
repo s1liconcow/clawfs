@@ -273,6 +273,21 @@ impl OsageFs {
                 );
                 EIO
             })?;
+            // Flush all shard/delta writes to disk with a single directory
+            // fsync on each metadata subdirectory before advancing the
+            // superblock.  This replaces per-file fsyncs inside write_shard /
+            // write_delta, reducing O(N) fsyncs to O(2) per flush cycle.
+            self.block_on(self.metadata.sync_metadata_writes())
+                .map_err(|err| {
+                    log::error!(
+                        "flush_pending sync_metadata_writes failed pid={} tid={} scope={} gen={} err={err:?}",
+                        pid,
+                        tid,
+                        scope,
+                        target_generation
+                    );
+                    EIO
+                })?;
             let metadata_duration = persist_start.elapsed();
             let commit_start = Instant::now();
             if self

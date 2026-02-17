@@ -1,9 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use osagefs::config::{Config, ObjectStoreProvider};
+use osagefs::inode::{FileStorage, InodeKind, InodeRecord};
+use osagefs::journal::{JournalEntry, JournalManager, JournalPayload};
+use osagefs::metadata::MetadataStore;
 use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload};
+use osagefs::superblock::SuperblockManager;
 use tempfile::tempdir;
+use time::OffsetDateTime;
 use tokio::runtime::Runtime;
 
 fn perf_config(root: &PathBuf) -> Config {
@@ -45,6 +51,206 @@ fn perf_config(root: &PathBuf) -> Config {
         imap_delta_batch: 16,
         log_storage_io: false,
     }
+}
+
+fn make_file_record(inode: u64, parent: u64, data: Vec<u8>) -> InodeRecord {
+    InodeRecord {
+        inode,
+        parent,
+        name: format!("f{inode}"),
+        path: format!("/f{inode}"),
+        kind: InodeKind::File,
+        size: data.len() as u64,
+        mode: 0o100644,
+        uid: 1000,
+        gid: 1000,
+        atime: OffsetDateTime::now_utc(),
+        mtime: OffsetDateTime::now_utc(),
+        ctime: OffsetDateTime::now_utc(),
+        link_count: 1,
+        rdev: 0,
+        storage: FileStorage::Inline(data),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUJ: small-file burst flush (dev_smallfile_burst)
+//
+// Measures how long it takes to persist a batch of N inline inodes through
+// MetadataStore + superblock CAS — the full metadata flush path that runs
+// once per flush cycle during a 5 000-file burst.
+// Before opt #1 (deferred dir fsync): O(N_shards + N_deltas) individual
+// fsyncs.  After: 2 directory fsyncs total.
+// ---------------------------------------------------------------------------
+#[test]
+fn flush_metadata_batch_latency() {
+    if !perf_enabled("flush_metadata_batch_latency") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("store")).unwrap();
+
+    // Use realistic production defaults: shard_size=2048, delta_batch=64
+    let shard_size = 2048u64;
+    let delta_batch = 64usize;
+    let n_inodes = 5_000usize;
+
+    let runtime = Runtime::new().unwrap();
+    let metadata = Arc::new(
+        runtime
+            .block_on(MetadataStore::open(root.join("store"), shard_size, false))
+            .unwrap(),
+    );
+    let superblock = Arc::new(
+        runtime
+            .block_on(SuperblockManager::load_or_init(metadata.clone(), shard_size))
+            .unwrap(),
+    );
+
+    let records: Vec<InodeRecord> = (2..=(n_inodes as u64 + 1))
+        .map(|ino| make_file_record(ino, 1, vec![0x42u8; 512]))
+        .collect();
+
+    let start = Instant::now();
+
+    let snapshot = superblock.prepare_dirty_generation().unwrap();
+    let generation = snapshot.generation;
+    runtime
+        .block_on(metadata.persist_inodes_batch(&records, generation, shard_size, delta_batch))
+        .unwrap();
+    runtime
+        .block_on(metadata.sync_metadata_writes())
+        .unwrap();
+    runtime
+        .block_on(superblock.commit_generation(generation))
+        .unwrap();
+
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    eprintln!(
+        "flush_metadata_batch_latency n={} delta_batch={} elapsed={:.1}ms",
+        n_inodes, delta_batch, ms
+    );
+
+    // With deferred dir-fsync this should complete in well under 500 ms on any
+    // reasonable disk.  We set a generous bound so CI doesn't flap.
+    assert!(
+        ms < 5_000.0,
+        "metadata batch flush took {:.1}ms — should be < 5000ms",
+        ms
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CUJ: checkpoint write + fsync (ai_checkpoint_loop)
+//
+// Measures end-to-end latency of staging 128 MiB of data and flushing it as
+// a single segment, including the cache write.
+// Before opt #2 (async cache): write_batch writes 128 MiB to cache AND store
+// synchronously.  After: cache write is async/background.
+// Before opt #3 (compression sampling): LZ4 is attempted on all 128 MiB.
+// After: incompressible data detected from a small probe and skipped.
+// ---------------------------------------------------------------------------
+#[test]
+fn large_segment_staged_flush_latency() {
+    if !perf_enabled("large_segment_staged_flush_latency") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    let mut config = perf_config(&root);
+    // Enable a realistic segment cache so the cache write path is exercised.
+    config.segment_cache_bytes = 512 * 1024 * 1024;
+    std::fs::create_dir_all(&config.store_path).unwrap();
+    std::fs::create_dir_all(&config.local_cache_path).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let segments = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
+
+    let checkpoint_mb = 128usize;
+    let data_size = checkpoint_mb * 1024 * 1024;
+    // Use pseudo-random-looking bytes (incompressible) to simulate an ML checkpoint.
+    let payload: Vec<u8> = (0..data_size)
+        .map(|i: usize| {
+            i.wrapping_mul(6364136223846793005_usize)
+                .wrapping_add(1442695040888963407_usize)
+                .wrapping_shr(56) as u8
+        })
+        .collect();
+
+    // Stage the payload (simulates FUSE writes landing in the staging area)
+    let chunk = segments.stage_payload(&payload).unwrap();
+
+    let start = Instant::now();
+    segments
+        .write_batch(
+            1,
+            1,
+            vec![SegmentEntry {
+                inode: 42,
+                path: "/checkpoint.bin".into(),
+                payload: SegmentPayload::Staged(vec![chunk]),
+            }],
+        )
+        .unwrap();
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    let throughput = data_size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    eprintln!(
+        "large_segment_staged_flush_latency size={}MiB elapsed={:.1}ms throughput={:.1}MiB/s",
+        checkpoint_mb, ms, throughput
+    );
+
+    // After async cache + compression-skip the flush should be essentially
+    // one local-FS write at disk speed (200+ MiB/s).  Set a generous floor.
+    assert!(
+        throughput >= 50.0,
+        "large staged flush only {:.1} MiB/s (need >= 50 MiB/s)",
+        throughput
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CUJ: journal write throughput (dev_smallfile_burst, dev_incremental_build)
+//
+// Measures how fast persist_entry runs for N inline-payload entries.
+// Before opt #4 (WAL): each call creates a NamedTempFile + rename.
+// After: each call appends to a single buffered WAL file.
+// ---------------------------------------------------------------------------
+#[test]
+fn journal_write_throughput() {
+    if !perf_enabled("journal_write_throughput") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let n = 5_000usize;
+    let journal = JournalManager::new(temp.path()).unwrap();
+    let inline_data = vec![0x42u8; 512];
+
+    let start = Instant::now();
+    for i in 0..n {
+        let inode = (i + 2) as u64;
+        let record = make_file_record(inode, 1, inline_data.clone());
+        let entry = JournalEntry {
+            record,
+            payload: JournalPayload::Inline(inline_data.clone()),
+        };
+        journal.persist_entry(&entry).unwrap();
+    }
+    let elapsed = start.elapsed();
+    let iops = n as f64 / elapsed.as_secs_f64();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    eprintln!(
+        "journal_write_throughput n={} elapsed={:.1}ms iops={:.0}",
+        n, ms, iops
+    );
+
+    // After WAL the journal should sustain well above 10 000 entries/s.
+    assert!(
+        iops >= 5_000.0,
+        "journal write iops only {:.0} (need >= 5000)",
+        iops
+    );
 }
 
 #[test]

@@ -289,9 +289,6 @@ impl SegmentManager {
         let object_path_clone = object_path.clone();
         let store = self.store.clone();
         let payload = Bytes::from(buffer);
-        if self.cache_limit > 0 {
-            self.write_cache_file(generation, segment_id, payload.as_ref())?;
-        }
         self.run_store(
             async move {
                 store
@@ -301,6 +298,13 @@ impl SegmentManager {
             },
             || format!("writing segment {}", object_path),
         )?;
+        // Populate the local cache asynchronously after the object-store write
+        // succeeds.  Moving the cache write off the flush critical path removes
+        // a synchronous double-write of the full segment buffer (e.g. 128 MiB
+        // for a checkpoint) that was previously blocking the fsync return.
+        if self.cache_limit > 0 {
+            self.enqueue_cache_fill(generation, segment_id);
+        }
         self.log_backing(format_args!(
             "synced backing file path={} type=segment generation={} segment_id={} entries={} bytes={}",
             object_path.to_string(),
