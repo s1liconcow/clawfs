@@ -468,10 +468,9 @@ fn run_iteration(
 ) -> Result<IterationStats> {
     let runtime = Runtime::new()?;
     let handle = runtime.handle().clone();
-    let metadata = Arc::new(runtime.block_on(MetadataStore::open(
-        &config.store_path,
-        config.shard_size,
-        config.log_storage_io,
+    let metadata = Arc::new(runtime.block_on(MetadataStore::new(
+        config,
+        handle.clone(),
     ))?);
     let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
         metadata.clone(),

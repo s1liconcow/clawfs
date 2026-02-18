@@ -29,10 +29,9 @@
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let metadata = Arc::new(
                 runtime
-                    .block_on(MetadataStore::open(
-                        &config.store_path,
-                        config.shard_size,
-                        config.log_storage_io,
+                    .block_on(MetadataStore::new(
+                        &config,
+                        runtime.handle().clone(),
                     ))
                     .unwrap(),
             );

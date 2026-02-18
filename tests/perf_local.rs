@@ -96,10 +96,15 @@ fn flush_metadata_batch_latency() {
     let delta_batch = 64usize;
     let n_inodes = 5_000usize;
 
+    let mut config = perf_config(&root);
+
+    config.shard_size = 2048;
+    config.imap_delta_batch = 64;
+
     let runtime = Runtime::new().unwrap();
     let metadata = Arc::new(
         runtime
-            .block_on(MetadataStore::open(root.join("store"), shard_size, false))
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
             .unwrap(),
     );
     let superblock = Arc::new(

@@ -313,7 +313,7 @@ impl OsageDirectFs {
 
         let handle = tokio::runtime::Handle::current();
         let metadata = Arc::new(
-            MetadataStore::open(&config.store_path, config.shard_size, config.log_storage_io).await?,
+            MetadataStore::new(&config, handle.clone()).await?,
         );
         let superblock = Arc::new(
             SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?,

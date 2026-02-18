@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config_from_env()?; // mount_path, store_path, state_path, etc.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
-        let metadata = Arc::new(MetadataStore::open(&config.store_path, config.shard_size).await?);
+        let metadata = Arc::new(MetadataStore::new(&config, runtime.handle().clone()).await?);
         let superblock = Arc::new(SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?);
         let segments = Arc::new(SegmentManager::new(&config, runtime.handle().clone())?);
         run_cleanup_loop(metadata, superblock, segments, client_id_from_env()).await

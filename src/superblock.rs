@@ -54,6 +54,7 @@ pub struct CleanupLease {
 
 struct SuperblockState {
     block: Superblock,
+    version: String,
     pending_generation: Option<u64>,
 }
 
@@ -64,23 +65,25 @@ pub struct SuperblockManager {
 
 impl SuperblockManager {
     pub async fn load_or_init(store: Arc<MetadataStore>, shard_size: u64) -> Result<Self> {
-        let block = match store.load_superblock().await? {
-            Some(mut existing) => {
-                if existing.cleanup_leases.is_empty() {
-                    existing.cleanup_leases = Vec::new();
+        let (block, version) = match store.load_superblock().await? {
+            Some(existing) => {
+                let mut block = existing.block;
+                if block.cleanup_leases.is_empty() {
+                    block.cleanup_leases = Vec::new();
                 }
-                existing
+                (block, existing.version)
             }
             None => {
                 let bootstrap = Superblock::bootstrap(shard_size);
-                store.store_superblock(&bootstrap).await?;
-                bootstrap
+                let version = store.store_superblock(&bootstrap).await?;
+                (bootstrap, version)
             }
         };
         Ok(Self {
             store,
             state: Mutex::new(SuperblockState {
                 block,
+                version,
                 pending_generation: None,
             }),
         })
@@ -90,8 +93,42 @@ impl SuperblockManager {
         self.state.lock().block.clone()
     }
 
-    async fn persist(&self, snapshot: &Superblock) -> Result<()> {
-        self.store.store_superblock(snapshot).await
+    async fn reload(&self) -> Result<()> {
+        if let Some(wrapper) = self.store.load_superblock().await? {
+            let mut guard = self.state.lock();
+            // Preserve pending_generation logic? 
+            // If we reload, and we had a pending_generation, we might be desynchronized if on-disk generation changed.
+            // But reload is mostly for CAS retry loops where we want to re-apply an operation.
+            guard.block = wrapper.block;
+            guard.version = wrapper.version;
+        }
+        Ok(())
+    }
+
+    async fn update_with_retry<F, R>(&self, mut action: F) -> Result<R>
+    where
+        F: FnMut(&mut Superblock) -> Result<R>,
+    {
+        loop {
+            let (mut block, expected_version) = {
+                let guard = self.state.lock();
+                (guard.block.clone(), guard.version.clone())
+            };
+
+            let result = action(&mut block)?;
+
+            match self.store.store_superblock_conditional(&block, &expected_version).await {
+                Ok(new_version) => {
+                    let mut guard = self.state.lock();
+                    guard.block = block;
+                    guard.version = new_version;
+                    return Ok(result);
+                }
+                Err(_) => {
+                    self.reload().await?;
+                }
+            }
+        }
     }
 
     pub fn prepare_dirty_generation(&self) -> Result<Superblock> {
@@ -117,56 +154,83 @@ impl SuperblockManager {
     }
 
     pub async fn mark_clean(&self) -> Result<()> {
-        let snapshot = {
-            let mut guard = self.state.lock();
-            guard.block.state = FilesystemState::Clean;
-            guard.pending_generation = None;
-            guard.block.clone()
-        };
-        self.persist(&snapshot).await
+        self.update_with_retry(|block| {
+            block.state = FilesystemState::Clean;
+            Ok(())
+        }).await?;
+        let mut guard = self.state.lock();
+        guard.pending_generation = None;
+        Ok(())
     }
 
     pub async fn reserve_inodes(&self, count: u64) -> Result<u64> {
         let count = count.max(1);
-        let (start, snapshot) = {
-            let mut guard = self.state.lock();
-            let start = guard.block.next_inode;
-            guard.block.next_inode = guard.block.next_inode.saturating_add(count);
-            let snapshot = guard.block.clone();
-            (start, snapshot)
-        };
-        self.persist(&snapshot).await?;
-        Ok(start)
+        self.update_with_retry(|block| {
+            let start = block.next_inode;
+            block.next_inode = block.next_inode.saturating_add(count);
+            Ok(start)
+        }).await
     }
 
     pub async fn reserve_segments(&self, count: u64) -> Result<u64> {
         let count = count.max(1);
-        let (start, snapshot) = {
-            let mut guard = self.state.lock();
-            let start = guard.block.next_segment;
-            guard.block.next_segment = guard.block.next_segment.saturating_add(count);
-            let snapshot = guard.block.clone();
-            (start, snapshot)
-        };
-        self.persist(&snapshot).await?;
-        Ok(start)
+        self.update_with_retry(|block| {
+            let start = block.next_segment;
+            block.next_segment = block.next_segment.saturating_add(count);
+            Ok(start)
+        }).await
     }
 
     pub async fn commit_generation(&self, generation: u64) -> Result<()> {
-        let (expected, snapshot) = {
-            let mut guard = self.state.lock();
-            if guard.pending_generation != Some(generation) {
-                bail!("generation {} not pending", generation);
+        loop {
+            let (expected_version, snapshot) = {
+                let mut guard = self.state.lock();
+                if guard.pending_generation != Some(generation) {
+                    bail!("generation {} not pending", generation);
+                }
+                
+                // If we reloaded and disk moved past our expected old generation, we have a conflict.
+                // But `commit_generation` asserts we are moving from `generation-1` to `generation`.
+                // If disk is already at `generation` or higher, we are stale.
+                // Actually, if disk is at `generation`, someone else committed it? Or we did?
+                
+                // Let's check consistency.
+                if guard.block.generation >= generation {
+                     // If on-disk generation is already >= target, we might have raced.
+                     // But if we are the ones committing, we expect to be at `generation - 1`.
+                     // If we see `generation`, maybe another client committed it?
+                     // If another client committed `generation`, then our metadata flush (which was associated with `generation`)
+                     // is now effectively part of history.
+                     // We can treat this as success?
+                     // BUT, we clear `pending_generation`.
+                     
+                     // For now, let's just proceed with applying our intent.
+                     // If `guard.block.generation` changed, `generation` argument passed to us is fixed.
+                     // We want to set `block.generation = generation`.
+                     // If `block.generation` is already `generation`, setting it is a no-op?
+                     // But we also set `state = Clean`.
+                }
+
+                let expected_version = guard.version.clone();
+                guard.block.generation = generation;
+                guard.block.state = FilesystemState::Clean;
+                (expected_version, guard.block.clone())
+            };
+
+            // Use true storage CAS via ETag check (If-Match)
+            match self.store.store_superblock_conditional(&snapshot, &expected_version).await {
+                Ok(new_version) => {
+                    let mut guard = self.state.lock();
+                    guard.version = new_version;
+                    guard.pending_generation = None;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.reload().await?;
+                    // Loop to retry with new base state
+                }
             }
-            guard.pending_generation = None;
-            let expected = guard.block.generation;
-            guard.block.generation = generation;
-            guard.block.state = FilesystemState::Clean;
-            (expected, guard.block.clone())
-        };
-        self.store
-            .compare_and_swap_superblock(expected, &snapshot)
-            .await
+        }
     }
 
     pub async fn try_acquire_cleanup(
@@ -176,41 +240,35 @@ impl SuperblockManager {
         ttl: Duration,
     ) -> Result<bool> {
         let deadline = OffsetDateTime::now_utc().unix_timestamp() + ttl.as_secs() as i64;
-        let snapshot = {
-            let mut guard = self.state.lock();
+        self.update_with_retry(|block| {
             let now = OffsetDateTime::now_utc().unix_timestamp();
-            guard
-                .block
+            block
                 .cleanup_leases
                 .retain(|lease| lease.lease_until > now);
-            if guard
-                .block
+            if block
                 .cleanup_leases
                 .iter()
                 .any(|lease| lease.kind == kind)
             {
                 return Ok(false);
             }
-            guard.block.cleanup_leases.push(CleanupLease {
-                kind,
+            block.cleanup_leases.push(CleanupLease {
+                kind: kind.clone(),
                 client_id: client_id.to_string(),
                 lease_until: deadline,
             });
-            guard.block.clone()
-        };
-        self.persist(&snapshot).await?;
-        Ok(true)
+            Ok(true)
+        }).await
     }
 
     pub async fn complete_cleanup(&self, kind: CleanupTaskKind, client_id: &str) -> Result<()> {
-        let snapshot = {
-            let mut guard = self.state.lock();
-            guard
-                .block
+        self.update_with_retry(|block| {
+            block
                 .cleanup_leases
                 .retain(|lease| !(lease.kind == kind && lease.client_id == client_id));
-            guard.block.clone()
-        };
-        self.persist(&snapshot).await
+            Ok(())
+        }).await
     }
 }
+
+

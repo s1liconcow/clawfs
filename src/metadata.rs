@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use log::debug;
+use bytes::Bytes;
+use futures::StreamExt;
+use log::{debug, info};
+use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 
-use crate::codec::{
-    deserialize_flex, serialize_flex, write_flexbuffer, write_preserialized_unsynced,
-};
+use crate::codec::{deserialize_flex, serialize_flex};
+use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{FileStorage, InodeRecord, InodeShard};
 use crate::superblock::Superblock;
 
@@ -62,6 +68,12 @@ struct StoredSuperblock {
     block: Superblock,
 }
 
+#[derive(Debug, Clone)]
+pub struct VersionedSuperblock {
+    pub block: Superblock,
+    pub version: String,
+}
+
 #[derive(Clone)]
 struct CacheEntry {
     record: InodeRecord,
@@ -75,9 +87,8 @@ struct ShardEntry {
 }
 
 pub struct MetadataStore {
-    imap_dir: PathBuf,
-    delta_dir: PathBuf,
-    superblock_path: PathBuf,
+    store: Arc<dyn ObjectStore>,
+    root_prefix: String,
     shard_size: u64,
     cache: Mutex<HashMap<u64, CacheEntry>>,
     shards: Mutex<HashMap<u64, ShardEntry>>,
@@ -86,39 +97,31 @@ pub struct MetadataStore {
     /// Short-lived cache of inode numbers known not to exist.  Avoids
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
     negative_cache: Mutex<HashMap<u64, Instant>>,
+    handle: Handle,
 }
 
 impl MetadataStore {
-    pub async fn open<P: AsRef<Path>>(
-        store_root: P,
-        shard_size: u64,
-        log_storage_io: bool,
-    ) -> Result<Self> {
-        let metadata_root = store_root.as_ref().join("metadata");
-        let imap_dir = metadata_root.join("imaps");
-        let delta_dir = metadata_root.join("imap_deltas");
-        fs::create_dir_all(&imap_dir)
-            .with_context(|| format!("creating imap dir {}", imap_dir.display()))?;
-        fs::create_dir_all(&delta_dir)
-            .with_context(|| format!("creating delta dir {}", delta_dir.display()))?;
+    pub async fn new(config: &Config, handle: Handle) -> Result<Self> {
+        let (store, prefix) = create_object_store(config)?;
+
         let store = Self {
-            imap_dir: imap_dir.clone(),
-            delta_dir: delta_dir.clone(),
-            superblock_path: metadata_root.join(SUPERBLOCK_FILE),
-            shard_size,
+            store,
+            root_prefix: prefix,
+            shard_size: config.shard_size,
             cache: Mutex::new(HashMap::new()),
             shards: Mutex::new(HashMap::new()),
             last_delta_generation: Mutex::new(0),
-            log_storage_io,
+            log_storage_io: config.log_storage_io,
             negative_cache: Mutex::new(HashMap::new()),
+            handle,
         };
-        store.load_latest_imaps()?;
+        store.load_latest_imaps().await?;
         Ok(store)
     }
 
     fn log_backing(&self, args: fmt::Arguments<'_>) {
         if self.log_storage_io {
-            log::info!(target: "backing", "{}", args);
+            info!(target: "backing", "{}", args);
         } else {
             debug!(target: "backing", "{}", args);
         }
@@ -128,34 +131,118 @@ impl MetadataStore {
         Ok(())
     }
 
-    pub async fn load_superblock(&self) -> Result<Option<Superblock>> {
-        if !self.superblock_path.exists() {
-            return Ok(None);
+    fn superblock_path(&self) -> ObjectPath {
+        let base = self.root_prefix.trim_matches('/');
+        if base.is_empty() {
+            ObjectPath::from(format!("metadata/{}", SUPERBLOCK_FILE))
+        } else {
+            ObjectPath::from(format!("{}/metadata/{}", base, SUPERBLOCK_FILE))
         }
-        let bytes = fs::read(&self.superblock_path)
-            .with_context(|| format!("reading superblock {}", self.superblock_path.display()))?;
-        let stored: StoredSuperblock = deserialize_flex(&bytes)?;
-        anyhow::ensure!(
-            stored.version == METADATA_FORMAT_VERSION,
-            "unsupported superblock format version {}",
-            stored.version
-        );
-        let block = stored.block;
-        Ok(Some(block))
     }
 
-    pub async fn store_superblock(&self, sb: &Superblock) -> Result<()> {
+    fn imap_prefix(&self) -> ObjectPath {
+        let base = self.root_prefix.trim_matches('/');
+        if base.is_empty() {
+            ObjectPath::from("metadata/imaps")
+        } else {
+            ObjectPath::from(format!("{}/metadata/imaps", base))
+        }
+    }
+
+    fn delta_prefix(&self) -> ObjectPath {
+        let base = self.root_prefix.trim_matches('/');
+        if base.is_empty() {
+            ObjectPath::from("metadata/imap_deltas")
+        } else {
+            ObjectPath::from(format!("{}/metadata/imap_deltas", base))
+        }
+    }
+
+    pub async fn load_superblock(&self) -> Result<Option<VersionedSuperblock>> {
+        let path = self.superblock_path();
+        let result = self.store.get(&path).await;
+        match result {
+            Ok(get_result) => {
+                let version = get_result.meta.e_tag.clone().unwrap_or_else(|| {
+                    get_result.meta.last_modified.timestamp_nanos_opt().unwrap_or(0).to_string()
+                });
+                let bytes = get_result.bytes().await?;
+                let stored: StoredSuperblock = deserialize_flex(&bytes)?;
+                anyhow::ensure!(
+                    stored.version == METADATA_FORMAT_VERSION,
+                    "unsupported superblock format version {}",
+                    stored.version
+                );
+                Ok(Some(VersionedSuperblock {
+                    block: stored.block,
+                    version,
+                }))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("reading superblock {}", path))),
+        }
+    }
+
+    pub async fn store_superblock(&self, sb: &Superblock) -> Result<String> {
         let stored = StoredSuperblock {
             version: METADATA_FORMAT_VERSION,
             block: sb.clone(),
         };
-        write_flexbuffer(&self.superblock_path, &stored)?;
+        let bytes = serialize_flex(&stored)?;
+        let path = self.superblock_path();
+        let put_result = self.store
+            .put(&path, PutPayload::from_bytes(Bytes::from(bytes)))
+            .await?;
         self.log_backing(format_args!(
             "synced backing file path={} type=superblock generation={}",
-            self.superblock_path.display(),
-            sb.generation
+            path, sb.generation
         ));
-        Ok(())
+        Ok(put_result.e_tag.unwrap_or_default())
+    }
+
+    pub async fn store_superblock_conditional(
+        &self,
+        sb: &Superblock,
+        expected_version: &str,
+    ) -> Result<String> {
+        let stored = StoredSuperblock {
+            version: METADATA_FORMAT_VERSION,
+            block: sb.clone(),
+        };
+        let bytes = serialize_flex(&stored)?;
+        let path = self.superblock_path();
+
+        let opts = object_store::PutOptions {
+            mode: object_store::PutMode::Update(object_store::UpdateVersion {
+                e_tag: Some(expected_version.to_string()),
+                version: None,
+            }),
+            ..Default::default()
+        };
+
+        let result = self
+            .store
+            .put_opts(&path, PutPayload::from_bytes(Bytes::from(bytes)), opts)
+            .await;
+
+        match result {
+            Ok(put_result) => {
+                self.log_backing(format_args!(
+                    "synced backing file path={} type=superblock generation={} (conditional if-match={})",
+                    path, sb.generation, expected_version
+                ));
+                Ok(put_result.e_tag.unwrap_or_default())
+            }
+            Err(object_store::Error::NotImplemented) => {
+                // Fallback for stores that don't support conditional put (like LocalFileSystem)
+                // Note: This loses atomicity guarantees in concurrent environments.
+                self.store_superblock(sb).await
+            }
+            Err(e) => Err(anyhow::Error::from(e).context(format!(
+                "conditional put failed for superblock at version {}",
+                expected_version
+            ))),
+        }
     }
 
     pub async fn compare_and_swap_superblock(
@@ -165,20 +252,48 @@ impl MetadataStore {
     ) -> Result<()> {
         let current = self.load_superblock().await?;
         if let Some(existing) = current {
-            if existing.generation != expected_generation {
+            if existing.block.generation != expected_generation {
                 return Err(anyhow!(
                     "superblock generation mismatch: expected {}, found {}",
                     expected_generation,
-                    existing.generation
+                    existing.block.generation
                 ));
             }
+            self.store_superblock_conditional(sb, &existing.version).await?;
         } else if expected_generation != 0 {
             return Err(anyhow!(
                 "superblock missing while expecting generation {}",
                 expected_generation
             ));
+        } else {
+            // Bootstrap: first write. 
+            let stored = StoredSuperblock {
+                version: METADATA_FORMAT_VERSION,
+                block: sb.clone(),
+            };
+            let bytes = serialize_flex(&stored)?;
+            let payload = Bytes::from(bytes);
+            let path = self.superblock_path();
+            
+            let opts = object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            };
+            let result = self.store
+                .put_opts(&path, PutPayload::from_bytes(payload.clone()), opts)
+                .await;
+
+            match result {
+                Ok(_) => {}
+                Err(object_store::Error::NotImplemented) => {
+                    self.store
+                        .put(&path, PutPayload::from_bytes(payload))
+                        .await?;
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("initial superblock bootstrap failed")),
+            }
         }
-        self.store_superblock(sb).await
+        Ok(())
     }
 
     pub async fn get_inode_with_ttl(
@@ -207,7 +322,7 @@ impl MetadataStore {
             }
         }
 
-        self.reload_shard_for_inode(inode)?;
+        self.reload_shard_for_inode(inode).await?;
 
         let result = self
             .cache
@@ -251,8 +366,7 @@ impl MetadataStore {
             return Ok(());
         }
 
-        // Phase 1: update in-memory caches + shards under lock, collecting
-        // only the set of touched shard IDs (NOT full shard clones).
+        // Phase 1: update in-memory caches + shards under lock
         let mut touched_shard_ids = Vec::new();
         {
             let mut cache = self.cache.lock();
@@ -274,10 +388,10 @@ impl MetadataStore {
             }
         }
 
-        // Phase 2: serialize touched shards from references (single lock
-        // acquisition, no record clones, no redundant re-insert).
-        let shard_writes: Vec<(PathBuf, Vec<u8>, u64, usize)> = {
+        // Phase 2: serialize touched shards
+        let shard_writes: Vec<(ObjectPath, Vec<u8>, u64, usize)> = {
             let shards = self.shards.lock();
+            let base_path = self.imap_prefix();
             touched_shard_ids
                 .iter()
                 .filter_map(|&shard_id| {
@@ -295,40 +409,33 @@ impl MetadataStore {
                     let data = serialize_flex(&stored).ok()?;
                     let count = entry.shard.inodes.len();
                     let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
-                    Some((self.imap_dir.join(filename), data, shard_id, count))
+                    let path = base_path.child(filename.as_str());
+                    Some((path, data, shard_id, count))
                 })
                 .collect()
         };
 
         for (path, data, shard_id, count) in shard_writes {
-            write_preserialized_unsynced(&path, &self.imap_dir, &data)?;
+            self.store
+                .put(&path, PutPayload::from_bytes(Bytes::from(data)))
+                .await?;
             self.log_backing(format_args!(
                 "synced backing file path={} type=imap shard={} generation={} entries={}",
-                path.display(),
-                shard_id,
-                generation,
-                count
+                path, shard_id, generation, count
             ));
         }
 
-        // Phase 3: write deltas using borrowed references (no to_vec clone).
+        // Phase 3: write deltas
         let chunk = delta_batch.max(1);
         for chunk_records in records.chunks(chunk) {
-            self.write_delta_ref(generation, chunk_records)?;
+            self.write_delta_ref(generation, chunk_records).await?;
         }
         Ok(())
     }
 
-    /// Ensure all shard and delta files written during this flush cycle are
-    /// durable on disk.  Must be called after `persist_inodes_batch` and
-    /// before `commit_generation` so that the superblock CAS only advances
-    /// once all referenced metadata objects are safely written.
-    ///
-    /// Two directory-level fsyncs replace the per-file fsyncs that the old
-    /// `write_flexbuffer` (synced) variant issued for every shard and delta.
     pub async fn sync_metadata_writes(&self) -> Result<()> {
-        sync_dir_path(&self.imap_dir)?;
-        sync_dir_path(&self.delta_dir)?;
+        // Object store writes (put) are atomic and durable upon success.
+        // No directory fsync needed.
         Ok(())
     }
 
@@ -343,17 +450,14 @@ impl MetadataStore {
                 entry.generation = generation;
             }
         }
-        self.write_shard_ref(generation, shard_id)?;
+        self.write_shard_ref(generation, shard_id).await?;
         let tombstone = InodeRecord::tombstone(inode);
-        self.write_delta_ref(generation, &[tombstone])
+        self.write_delta_ref(generation, &[tombstone]).await
     }
 
-    /// Serialize a shard directly from the in-memory `self.shards` map using
-    /// borrowed references, avoiding the full `InodeShard::clone()` +
-    /// per-record clone that the legacy [`write_shard`] path required.
-    fn write_shard_ref(&self, generation: u64, shard_id: u64) -> Result<()> {
+    async fn write_shard_ref(&self, generation: u64, shard_id: u64) -> Result<()> {
         let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
-        let path = self.imap_dir.join(filename);
+        let path = self.imap_prefix().child(filename.as_str());
         let (data, count) = {
             let shards = self.shards.lock();
             let entry = match shards.get(&shard_id) {
@@ -372,20 +476,17 @@ impl MetadataStore {
             };
             (serialize_flex(&stored)?, entry.shard.inodes.len())
         };
-        write_preserialized_unsynced(&path, &self.imap_dir, &data)?;
+        self.store
+            .put(&path, PutPayload::from_bytes(Bytes::from(data)))
+            .await?;
         self.log_backing(format_args!(
             "synced backing file path={} type=imap shard={} generation={} entries={}",
-            path.display(),
-            shard_id,
-            generation,
-            count
+            path, shard_id, generation, count
         ));
         Ok(())
     }
 
-    /// Write a delta log using borrowed record references, avoiding the
-    /// `records.to_vec()` clone that [`write_delta`] performed.
-    fn write_delta_ref(&self, generation: u64, records: &[InodeRecord]) -> Result<()> {
+    async fn write_delta_ref(&self, generation: u64, records: &[InodeRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -393,7 +494,7 @@ impl MetadataStore {
             .iter()
             .fold(0u128, |mask, record| mask | bloom_mask(record.inode));
         let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-        let path = self.delta_dir.join(filename);
+        let path = self.delta_prefix().child(filename.as_str());
         let stored = StoredDeltaRef {
             version: METADATA_FORMAT_VERSION,
             generation,
@@ -404,48 +505,48 @@ impl MetadataStore {
             let mut guard = self.last_delta_generation.lock();
             *guard = (*guard).max(generation);
         }
-        write_preserialized_unsynced(&path, &self.delta_dir, &data)?;
+        self.store
+            .put(&path, PutPayload::from_bytes(Bytes::from(data)))
+            .await?;
         self.log_backing(format_args!(
             "synced backing file path={} type=delta generation={} records={}",
-            path.display(),
+            path,
             generation,
             records.len()
         ));
         Ok(())
     }
 
-    fn load_latest_imaps(&self) -> Result<()> {
-        let mut latest: HashMap<u64, (u64, PathBuf)> = HashMap::new();
-        if !self.imap_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.imap_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = match name.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
+    async fn load_latest_imaps(&self) -> Result<()> {
+        let mut latest: HashMap<u64, (u64, ObjectPath)> = HashMap::new();
+        let prefix = self.imap_prefix();
+        
+        // Ensure prefix exists (optional check or just list)
+        // Note: list(Some(prefix)) works even if prefix is "virtual" directory
+        
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            let meta = item?;
+            let name = meta.location.filename().unwrap_or_default();
             if let Some((generation, shard_id)) = parse_imap_filename(name) {
                 latest
                     .entry(shard_id)
                     .and_modify(|current| {
                         if generation > current.0 {
-                            *current = (generation, entry.path());
+                            *current = (generation, meta.location.clone());
                         }
                     })
-                    .or_insert((generation, entry.path()));
+                    .or_insert((generation, meta.location));
             }
         }
+
         let mut cache = self.cache.lock();
         let mut shard_map = self.shards.lock();
         let mut max_generation = 0;
+        
+        // Parallel fetch could be better here, but keep it simple for now
         for (shard_id, (_, path)) in latest {
-            let bytes =
-                fs::read(&path).with_context(|| format!("reading shard {}", path.display()))?;
+            let bytes = self.store.get(&path).await?.bytes().await?;
             let stored: StoredShard = deserialize_flex(&bytes)?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
@@ -473,93 +574,93 @@ impl MetadataStore {
     }
 
     pub fn apply_external_deltas(&self) -> Result<Vec<InodeRecord>> {
-        let mut newest = *self.last_delta_generation.lock();
-        let mut files = Vec::new();
-        if !self.delta_dir.exists() {
-            return Ok(Vec::new());
-        }
-        for entry in fs::read_dir(&self.delta_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name_os = entry.file_name();
-            let name = match name_os.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-            if let Some(generation) = parse_delta_filename(name) {
-                if generation > newest {
-                    files.push((generation, entry.path()));
+        // This needs to be async or blocking. Since we are in a non-async method 
+        // that's often called from blocking context (or we need to change signature),
+        // we use the handle to block.
+        // However, `spawn_metadata_poller` calls this inside `spawn_blocking`.
+        // So we can use `self.handle.block_on`.
+        
+        self.handle.block_on(async {
+            let mut newest = *self.last_delta_generation.lock();
+            let mut files = Vec::new();
+            let prefix = self.delta_prefix();
+            
+            let mut stream = self.store.list(Some(&prefix));
+            while let Some(item) = stream.next().await {
+                let meta = item?;
+                let name = meta.location.filename().unwrap_or_default();
+                if let Some(generation) = parse_delta_filename(name) {
+                    if generation > newest {
+                        files.push((generation, meta.location));
+                    }
                 }
             }
-        }
-        files.sort_by_key(|(generation, _)| *generation);
-        let mut updated_records = Vec::new();
-        for (generation, path) in files {
-            let bytes =
-                fs::read(&path).with_context(|| format!("reading delta {}", path.display()))?;
-            let stored: StoredDelta = deserialize_flex(&bytes)?;
-            anyhow::ensure!(
-                stored.version == METADATA_FORMAT_VERSION,
-                "unsupported delta version {}",
-                stored.version
-            );
-            for record in stored.records {
-                if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                    self.cache.lock().remove(&record.inode);
-                } else {
-                    self.cache
-                        .lock()
-                        .insert(record.inode, CacheEntry::new(record.clone()));
-                    updated_records.push(record.clone());
+            
+            files.sort_by_key(|(generation, _)| *generation);
+            let mut updated_records = Vec::new();
+            for (generation, path) in files {
+                let bytes = self.store.get(&path).await?.bytes().await?;
+                let stored: StoredDelta = deserialize_flex(&bytes)?;
+                anyhow::ensure!(
+                    stored.version == METADATA_FORMAT_VERSION,
+                    "unsupported delta version {}",
+                    stored.version
+                );
+                for record in stored.records {
+                    if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
+                        self.cache.lock().remove(&record.inode);
+                    } else {
+                        self.cache
+                            .lock()
+                            .insert(record.inode, CacheEntry::new(record.clone()));
+                        updated_records.push(record.clone());
+                    }
                 }
+                newest = newest.max(generation);
             }
-            newest = newest.max(generation);
-        }
-        *self.last_delta_generation.lock() = newest;
-        Ok(updated_records)
+            *self.last_delta_generation.lock() = newest;
+            Ok(updated_records)
+        })
     }
 
     pub fn delta_file_count(&self) -> Result<usize> {
-        if !self.delta_dir.exists() {
-            return Ok(0);
-        }
-        let mut count = 0;
-        for entry in fs::read_dir(&self.delta_dir)? {
-            if entry?.file_type()?.is_file() {
+        self.handle.block_on(async {
+            let prefix = self.delta_prefix();
+            let mut count = 0;
+            let mut stream = self.store.list(Some(&prefix));
+            while let Some(item) = stream.next().await {
+                let _ = item?;
                 count += 1;
             }
-        }
-        Ok(count)
+            Ok(count)
+        })
     }
 
     pub fn prune_deltas(&self, keep: usize) -> Result<usize> {
-        if !self.delta_dir.exists() {
-            return Ok(0);
-        }
-        let mut files: Vec<(u64, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&self.delta_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
+        self.handle.block_on(async {
+            let prefix = self.delta_prefix();
+            let mut files: Vec<(u64, ObjectPath)> = Vec::new();
+            
+            let mut stream = self.store.list(Some(&prefix));
+            while let Some(item) = stream.next().await {
+                let meta = item?;
+                let name = meta.location.filename().unwrap_or_default();
+                if let Some(generation) = parse_delta_filename(name) {
+                    files.push((generation, meta.location));
+                }
             }
-            if let Some(generation) = entry.file_name().to_str().and_then(parse_delta_filename) {
-                files.push((generation, entry.path()));
-            }
-        }
-        files.sort_by_key(|(generation, _)| *generation);
-        let mut removed = 0;
-        if files.len() > keep {
-            let excess = files.len() - keep;
-            for (_, path) in files.into_iter().take(excess) {
-                if path.exists() {
-                    fs::remove_file(&path)?;
+            
+            files.sort_by_key(|(generation, _)| *generation);
+            let mut removed = 0;
+            if files.len() > keep {
+                let excess = files.len() - keep;
+                for (_, path) in files.into_iter().take(excess) {
+                    self.store.delete(&path).await?;
                     removed += 1;
                 }
             }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     pub fn segment_candidates(&self, max: usize) -> Result<Vec<InodeRecord>> {
@@ -588,38 +689,31 @@ impl MetadataStore {
         Ok(candidates)
     }
 
-    fn reload_shard_for_inode(&self, inode: u64) -> Result<()> {
+    async fn reload_shard_for_inode(&self, inode: u64) -> Result<()> {
         let shard_id = shard_for_inode(inode, self.shard_size);
-        self.reload_shard(shard_id)
+        self.reload_shard(shard_id).await
     }
 
-    fn reload_shard(&self, shard_id: u64) -> Result<()> {
-        let mut newest_path: Option<(u64, PathBuf)> = None;
-        if !self.imap_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.imap_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name_os = entry.file_name();
-            let name = match name_os.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
+    async fn reload_shard(&self, shard_id: u64) -> Result<()> {
+        let mut newest_path: Option<(u64, ObjectPath)> = None;
+        let prefix = self.imap_prefix();
+        
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            let meta = item?;
+            let name = meta.location.filename().unwrap_or_default();
             if let Some((generation, shard)) = parse_imap_filename(name) {
                 if shard == shard_id {
                     newest_path = match newest_path {
                         Some((existing_gen, _)) if existing_gen >= generation => newest_path,
-                        _ => Some((generation, entry.path())),
+                        _ => Some((generation, meta.location)),
                     };
                 }
             }
         }
+
         if let Some((generation, path)) = newest_path {
-            let bytes =
-                fs::read(&path).with_context(|| format!("reading shard {}", path.display()))?;
+            let bytes = self.store.get(&path).await?.bytes().await?;
             let stored: StoredShard = deserialize_flex(&bytes)?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
@@ -700,14 +794,53 @@ impl CacheEntry {
     }
 }
 
-/// Open `dir` and call `sync_all()` on it, ensuring all previously written
-/// files within the directory are durable before the superblock advances.
-fn sync_dir_path(dir: &Path) -> Result<()> {
-    let handle = std::fs::OpenOptions::new()
-        .read(true)
-        .open(dir)
-        .with_context(|| format!("opening dir for sync {}", dir.display()))?;
-    handle
-        .sync_all()
-        .with_context(|| format!("syncing dir {}", dir.display()))
+fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
+    match config.object_provider {
+        ObjectStoreProvider::Local => {
+            std::fs::create_dir_all(&config.store_path)
+                .with_context(|| format!("creating store root {}", config.store_path.display()))?;
+            let store = Arc::new(LocalFileSystem::new_with_prefix(config.store_path.clone())?)
+                as Arc<dyn ObjectStore>;
+            Ok((store, normalize_prefix(&config.object_prefix)))
+        }
+        ObjectStoreProvider::Aws => {
+            let bucket = config
+                .bucket
+                .clone()
+                .context("--bucket is required for AWS provider")?;
+            let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
+            let region = config
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
+            builder = builder.with_region(&region);
+            if let Some(endpoint) = &config.endpoint {
+                builder = builder.with_endpoint(endpoint);
+            }
+            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
+            Ok((store, normalize_prefix(&config.object_prefix)))
+        }
+        ObjectStoreProvider::Gcs => {
+            let bucket = config
+                .bucket
+                .clone()
+                .context("--bucket is required for GCS provider")?;
+            let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&bucket);
+            if let Some(sa_path) = &config.gcs_service_account {
+                let creds = sa_path.to_string_lossy().into_owned();
+                builder = builder.with_service_account_path(creds);
+            }
+            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
+            Ok((store, normalize_prefix(&config.object_prefix)))
+        }
+    }
+}
+
+fn normalize_prefix(user_prefix: &str) -> String {
+    let trimmed = user_prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
