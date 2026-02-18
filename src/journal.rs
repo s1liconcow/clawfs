@@ -99,10 +99,17 @@ impl JournalManager {
 
     /// Append `entry` to the WAL without fsync.  Fast path: one buffered write.
     pub fn persist_entry(&self, entry: &JournalEntry) -> Result<()> {
+        self.persist_record(&entry.record, &entry.payload)
+    }
+
+    /// Append a record + payload to the WAL without fsync.  Borrows both
+    /// arguments so callers can avoid constructing an intermediate
+    /// `JournalEntry` (and the associated clone).
+    pub fn persist_record(&self, record: &InodeRecord, payload: &JournalPayload) -> Result<()> {
         let stored = StoredJournalEntryRef {
             version: JOURNAL_VERSION,
-            record: &entry.record,
-            payload: &entry.payload,
+            record,
+            payload,
         };
         let data = serialize_flex(&stored)?;
         let len = data.len() as u32;

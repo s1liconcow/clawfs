@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
+use lru::LruCache;
+
 use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::InlinePayloadCodec;
@@ -54,6 +56,9 @@ pub struct StagedChunk {
     pub len: u64,
 }
 
+/// Default in-memory decoded-extent cache budget (256 MiB).
+const DECODED_CACHE_DEFAULT_BYTES: u64 = 256 * 1024 * 1024;
+
 pub struct SegmentManager {
     store: Arc<dyn ObjectStore>,
     handle: Handle,
@@ -67,6 +72,11 @@ pub struct SegmentManager {
     log_storage_io: bool,
     segment_compression: bool,
     segment_encryption_key: Option<String>,
+    /// In-memory LRU cache of decoded segment payloads.  Keyed by
+    /// `(generation, segment_id, offset, length)`, stores the decoded bytes
+    /// wrapped in `Arc` so that callers can slice without copying the full
+    /// extent on every FUSE read.
+    decoded_cache: Mutex<DecodedExtentCache>,
 }
 
 struct EncodedSegmentEntry {
@@ -80,6 +90,48 @@ struct EncodedSegmentEntry {
 struct SegmentCache {
     total_bytes: u64,
     entries: VecDeque<(PathBuf, u64)>,
+}
+
+/// In-memory LRU cache of decoded segment payloads.  Avoids redundant
+/// decompression when the same extent is read repeatedly (e.g. sequential
+/// FUSE reads of a large file stored as one segment extent).
+struct DecodedExtentCache {
+    lru: LruCache<(u64, u64, u64, u64), Arc<Vec<u8>>>,
+    total_bytes: u64,
+    budget: u64,
+}
+
+impl DecodedExtentCache {
+    fn new(budget: u64) -> Self {
+        Self {
+            // unbounded cap — we evict based on byte budget instead
+            lru: LruCache::unbounded(),
+            total_bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, key: &(u64, u64, u64, u64)) -> Option<Arc<Vec<u8>>> {
+        self.lru.get(key).cloned()
+    }
+
+    fn put(&mut self, key: (u64, u64, u64, u64), value: Arc<Vec<u8>>) {
+        let entry_bytes = value.len() as u64;
+        // Don't cache entries larger than half the budget.
+        if entry_bytes > self.budget / 2 {
+            return;
+        }
+        self.total_bytes += entry_bytes;
+        self.lru.put(key, value);
+        // Evict LRU entries until within budget.
+        while self.total_bytes > self.budget {
+            if let Some((_k, evicted)) = self.lru.pop_lru() {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.len() as u64);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -140,6 +192,11 @@ impl SegmentManager {
         let cache_dir = config.local_cache_path.join("segment_cache");
         fs::create_dir_all(&stage_dir)?;
         fs::create_dir_all(&cache_dir)?;
+        let decoded_budget = if config.segment_cache_bytes > 0 {
+            config.segment_cache_bytes
+        } else {
+            DECODED_CACHE_DEFAULT_BYTES
+        };
         Ok(Self {
             store,
             handle,
@@ -153,6 +210,7 @@ impl SegmentManager {
             log_storage_io: config.log_storage_io,
             segment_compression: config.segment_compression,
             segment_encryption_key: config.segment_encryption_key.clone(),
+            decoded_cache: Mutex::new(DecodedExtentCache::new(decoded_budget)),
         })
     }
 
@@ -391,20 +449,46 @@ impl SegmentManager {
     }
 
     pub fn read_pointer(&self, pointer: &SegmentPointer) -> Result<Vec<u8>> {
-        if let Some(bytes) = self.read_from_cache(pointer)? {
-            return Ok(bytes);
-        }
-        let range_end = pointer
-            .offset
-            .checked_add(pointer.length)
-            .context("segment pointer range overflow")?;
-        let entry = self.fetch_segment_range(
+        let arc = self.read_pointer_arc(pointer)?;
+        Ok(Arc::unwrap_or_clone(arc))
+    }
+
+    /// Read and decode a segment extent, returning an `Arc` so callers can
+    /// slice the decoded bytes without copying the full extent.  Results are
+    /// kept in an in-memory LRU cache keyed by pointer coordinates.
+    pub fn read_pointer_arc(&self, pointer: &SegmentPointer) -> Result<Arc<Vec<u8>>> {
+        let key = (
             pointer.generation,
             pointer.segment_id,
-            pointer.offset..range_end,
-        )?;
-        self.enqueue_cache_fill(pointer.generation, pointer.segment_id);
-        self.decode_pointer_entry(&entry)
+            pointer.offset,
+            pointer.length,
+        );
+
+        // Fast path: decoded LRU cache hit.
+        if let Some(cached) = self.decoded_cache.lock().get(&key) {
+            return Ok(cached);
+        }
+
+        // Slow path: on-disk cache or object store fetch + decode.
+        let decoded = if let Some(bytes) = self.read_from_cache(pointer)? {
+            bytes
+        } else {
+            let range_end = pointer
+                .offset
+                .checked_add(pointer.length)
+                .context("segment pointer range overflow")?;
+            let entry = self.fetch_segment_range(
+                pointer.generation,
+                pointer.segment_id,
+                pointer.offset..range_end,
+            )?;
+            self.enqueue_cache_fill(pointer.generation, pointer.segment_id);
+            self.decode_pointer_entry(&entry)?
+        };
+
+        let arc = Arc::new(decoded);
+        self.decoded_cache.lock().put(key, arc.clone());
+        Ok(arc)
     }
 
     fn decode_pointer_from_segment(

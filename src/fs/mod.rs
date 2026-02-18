@@ -27,7 +27,7 @@ use crate::codec::{
 };
 use crate::config::Config;
 use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExtent};
-use crate::journal::{JournalEntry, JournalManager, JournalPayload};
+use crate::journal::{JournalManager, JournalPayload};
 use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
 use crate::replay::ReplayLogger;

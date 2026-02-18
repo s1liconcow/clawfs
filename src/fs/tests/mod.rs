@@ -189,7 +189,7 @@
         let mut root = harness.fs.load_inode(ROOT_INODE).unwrap();
         harness
             .fs
-            .update_parent(&mut root, name.to_string(), inode)
+            .update_parent_ref(&mut root, name.to_string(), inode)
             .unwrap();
         inode
     }
@@ -713,7 +713,7 @@
         harness.fs.stage_inode(record.clone()).unwrap();
         harness
             .fs
-            .update_parent(&mut root, "link".to_string(), inode)
+            .update_parent_ref(&mut root, "link".to_string(), inode)
             .unwrap();
         harness.fs.flush_pending().unwrap();
 
@@ -741,7 +741,7 @@
         let mut root = harness.fs.load_inode(ROOT_INODE).unwrap();
         harness
             .fs
-            .update_parent(&mut root, primary_name.to_string(), inode)
+            .update_parent_ref(&mut root, primary_name.to_string(), inode)
             .unwrap();
         harness.fs.flush_pending().unwrap();
 
@@ -752,7 +752,7 @@
         harness.fs.stage_inode(stored_file.clone()).unwrap();
         harness
             .fs
-            .update_parent(&mut root, secondary_name.to_string(), inode)
+            .update_parent_ref(&mut root, secondary_name.to_string(), inode)
             .unwrap();
         harness.fs.flush_pending().unwrap();
 

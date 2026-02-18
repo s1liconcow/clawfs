@@ -90,17 +90,22 @@ impl OsageFs {
                 pending
             }
         };
-        let journal_payload = if self.journal.is_some() {
-            Some(self.snapshot_journal_payload(&pending_data))
-        } else {
-            None
-        };
+        // Journal first — borrows record, no clone needed.
+        if let Some(journal) = &self.journal {
+            let journal_payload = self.snapshot_journal_payload(&pending_data);
+            journal
+                .persist_record(&record, &journal_payload)
+                .map_err(|_| EIO)?;
+        }
+        // Save fields needed after move.
+        let path = record.path.clone();
+        // Move record into pending map — zero clones.
         {
             let mut map = self.pending_inodes.lock();
             map.insert(
                 inode,
                 PendingEntry {
-                    record: record.clone(),
+                    record,
                     data: Some(pending_data),
                 },
             );
@@ -117,14 +122,6 @@ impl OsageFs {
         let pending_total = *total;
         let should_flush = pending_total >= self.config.pending_bytes;
         drop(total);
-        if let (Some(journal), Some(journal_payload)) = (&self.journal, journal_payload) {
-            let journal_entry = JournalEntry {
-                record: record.clone(),
-                payload: journal_payload,
-            };
-            journal.persist_entry(&journal_entry).map_err(|_| EIO)?;
-        }
-        let path = record.path.clone();
         self.log_perf(
             "stage_file",
             start.elapsed(),
@@ -140,7 +137,7 @@ impl OsageFs {
         let tid = format!("{:?}", thread::current().id());
         debug!(
             "stage_file pid={} tid={} inode={} path={} bytes={} pending={} flush_triggered={}",
-            pid, tid, inode, record.path, new_len, pending_total, should_flush
+            pid, tid, inode, path, new_len, pending_total, should_flush
         );
         if should_flush {
             self.flush_pending()?;
@@ -228,14 +225,12 @@ impl OsageFs {
         let pending_total = *total;
         let should_flush = pending_total >= self.config.pending_bytes;
         drop(total);
-        if let (Some(journal), Some(payload)) = (&self.journal, journal_payload) {
-            let entry = JournalEntry {
-                record: record.clone(),
-                payload,
-            };
-            journal.persist_entry(&entry).map_err(|_| EIO)?;
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal
+                .persist_record(&record, payload)
+                .map_err(|_| EIO)?;
         }
-        let path = record.path.clone();
+        let path = &record.path;
         self.log_perf(
             "stage_file",
             start.elapsed(),
@@ -408,14 +403,12 @@ impl OsageFs {
         let pending_limit = self.pending_flush_limit_for_write(offset == prev_len, data.len());
         let should_flush = pending_total >= pending_limit;
         drop(total);
-        if let (Some(journal), Some(payload)) = (&self.journal, journal_payload) {
-            let journal_entry = JournalEntry {
-                record: record.clone(),
-                payload,
-            };
-            journal.persist_entry(&journal_entry).map_err(|_| EIO)?;
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal
+                .persist_record(&record, payload)
+                .map_err(|_| EIO)?;
         }
-        let path = record.path.clone();
+        let path = &record.path;
         self.log_perf(
             "stage_segments",
             start.elapsed(),

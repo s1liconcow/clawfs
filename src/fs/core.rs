@@ -362,8 +362,8 @@ impl OsageFs {
                 Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
             }
             FileStorage::LegacySegment(ptr) => {
-                let bytes = self.segments.read_pointer(ptr)?;
-                Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
+                let bytes = self.segments.read_pointer_arc(ptr)?;
+                Ok(Self::slice_arc_in_range(&bytes, range_start, range_end))
             }
             FileStorage::Segments(extents) => {
                 let out_len = (range_end - range_start) as usize;
@@ -372,7 +372,7 @@ impl OsageFs {
                 ordered.sort_by_key(|ext| ext.logical_offset);
                 for extent in ordered {
                     let extent_start = extent.logical_offset;
-                    let bytes = self.segments.read_pointer(&extent.pointer)?;
+                    let bytes = self.segments.read_pointer_arc(&extent.pointer)?;
                     let extent_end = extent_start.saturating_add(bytes.len() as u64);
                     if extent_end <= range_start {
                         continue;
@@ -413,6 +413,16 @@ impl OsageFs {
 
     pub(crate) fn stage_inode(&self, record: InodeRecord) -> std::result::Result<(), i32> {
         let inode = record.inode;
+        let kind_summary = Self::summarize_inode_kind(&record.kind);
+
+        // Journal first — borrows record, avoids clone.
+        if let Some(journal) = &self.journal {
+            journal
+                .persist_record(&record, &JournalPayload::None)
+                .map_err(|_| EIO)?;
+        }
+
+        // Move record into pending map — zero clones.
         let mut map = self.pending_inodes.lock();
         match map.entry(inode) {
             Entry::Occupied(mut occupied) => {
@@ -426,24 +436,17 @@ impl OsageFs {
                         }
                     }
                 }
-                occupied.get_mut().record = record.clone();
+                occupied.get_mut().record = record;
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(PendingEntry {
-                    record: record.clone(),
+                    record,
                     data: None,
                 });
             }
         }
         drop(map);
-        let kind_summary = Self::summarize_inode_kind(&record.kind);
-        if let Some(journal) = &self.journal {
-            let entry = JournalEntry {
-                record,
-                payload: JournalPayload::None,
-            };
-            journal.persist_entry(&entry).map_err(|_| EIO)?;
-        }
+
         debug!(
             "stage_inode inode={} kind={} metadata-staged",
             inode, kind_summary
@@ -496,6 +499,18 @@ impl OsageFs {
         Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
     }
 
+    fn slice_arc_in_range(bytes: &[u8], range_start: u64, range_end: u64) -> Vec<u8> {
+        let len = bytes.len() as u64;
+        if range_start >= len {
+            return Vec::new();
+        }
+        let end = range_end.min(len);
+        if end <= range_start {
+            return Vec::new();
+        }
+        bytes[range_start as usize..end as usize].to_vec()
+    }
+
     fn slice_bytes_in_range(bytes: Vec<u8>, range_start: u64, range_end: u64) -> Vec<u8> {
         let len = bytes.len() as u64;
         if range_start >= len {
@@ -521,7 +536,23 @@ impl OsageFs {
         }
     }
 
-    pub(crate) fn update_parent(
+    /// Owned variant — moves parent into pending map without cloning.
+    /// Use this on the hot path (create, mkdir, mknod, symlink, link, unlink).
+    pub(crate) fn update_parent_move(
+        &self,
+        mut parent: InodeRecord,
+        name: String,
+        child: u64,
+    ) -> std::result::Result<(), i32> {
+        let entries = parent.children_mut().ok_or(ENOTDIR)?;
+        entries.insert(name, child);
+        parent.update_times();
+        self.stage_inode(parent)
+    }
+
+    /// Borrowed variant — clones parent into pending map.
+    /// Use this in rename where the caller continues to use `parent` afterward.
+    pub(crate) fn update_parent_ref(
         &self,
         parent: &mut InodeRecord,
         name: String,
@@ -533,7 +564,20 @@ impl OsageFs {
         self.stage_inode(parent.clone())
     }
 
-    pub(crate) fn remove_from_parent(
+    /// Owned variant — moves parent into pending map without cloning.
+    pub(crate) fn remove_from_parent_move(
+        &self,
+        mut parent: InodeRecord,
+        name: &str,
+    ) -> std::result::Result<(), i32> {
+        let entries = parent.children_mut().ok_or(ENOTDIR)?;
+        entries.remove(name);
+        parent.update_times();
+        self.stage_inode(parent)
+    }
+
+    /// Borrowed variant — clones parent into pending map.
+    pub(crate) fn remove_from_parent_ref(
         &self,
         parent: &mut InodeRecord,
         name: &str,
@@ -550,7 +594,7 @@ impl OsageFs {
         name: &str,
         record: &mut InodeRecord,
     ) -> std::result::Result<(), i32> {
-        self.remove_from_parent(parent, name)?;
+        self.remove_from_parent_ref(parent, name)?;
         if record.link_count > 1 {
             record.dec_links();
             record.update_times();
@@ -609,7 +653,7 @@ impl OsageFs {
                         if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
                             return Err(ENOTEMPTY);
                         }
-                        self.remove_from_parent(&mut dir, &new_name)?;
+                        self.remove_from_parent_ref(&mut dir, &new_name)?;
                         let tombstone = InodeRecord::tombstone(victim.inode);
                         self.stage_inode(tombstone)?;
                     } else {
@@ -617,8 +661,8 @@ impl OsageFs {
                     }
                 }
             }
-            self.remove_from_parent(&mut dir, &old_name)?;
-            self.update_parent(&mut dir, new_name.clone(), target.inode)?;
+            self.remove_from_parent_ref(&mut dir, &old_name)?;
+            self.update_parent_ref(&mut dir, new_name.clone(), target.inode)?;
             target.parent = dir.inode;
             target.name = new_name;
             target.path = Self::build_child_path(&dir, &target.name);
@@ -662,7 +706,7 @@ impl OsageFs {
                     if victim.children().map(|c| !c.is_empty()).unwrap_or(false) {
                         return Err(ENOTEMPTY);
                     }
-                    self.remove_from_parent(&mut dst_parent, &new_name)?;
+                    self.remove_from_parent_ref(&mut dst_parent, &new_name)?;
                     let tombstone = InodeRecord::tombstone(victim.inode);
                     self.stage_inode(tombstone)?;
                 } else {
@@ -670,8 +714,8 @@ impl OsageFs {
                 }
             }
         }
-        self.remove_from_parent(&mut src_parent, &old_name)?;
-        self.update_parent(&mut dst_parent, new_name.clone(), target.inode)?;
+        self.remove_from_parent_ref(&mut src_parent, &old_name)?;
+        self.update_parent_ref(&mut dst_parent, new_name.clone(), target.inode)?;
         target.parent = dst_parent.inode;
         target.name = new_name;
         target.path = Self::build_child_path(&dst_parent, &target.name);

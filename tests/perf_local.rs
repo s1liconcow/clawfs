@@ -378,6 +378,76 @@ fn local_segment_small_file_iops() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CUJ: sequential read of a large segment-backed file (ai_checkpoint_loop)
+//
+// Measures read throughput when reading a 128 MiB segment-backed extent in
+// 128 KiB chunks through `read_pointer_arc`.  Without the in-memory decoded
+// cache each read would re-decompress the full extent; with the cache only
+// the first read decompresses and subsequent reads are memory copies.
+// ---------------------------------------------------------------------------
+#[test]
+fn segment_sequential_read_throughput() {
+    if !perf_enabled("segment_sequential_read_throughput") {
+        return;
+    }
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    let mut config = perf_config(&root);
+    config.segment_cache_bytes = 512 * 1024 * 1024;
+    std::fs::create_dir_all(&config.store_path).unwrap();
+    std::fs::create_dir_all(&config.local_cache_path).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let segments = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
+
+    let data_size = 128 * 1024 * 1024usize; // 128 MiB
+    let read_chunk = 128 * 1024usize; // 128 KiB FUSE read size
+
+    // Compressible data (zeros) — exercises the decompression path.
+    let payload = vec![0u8; data_size];
+    let chunk = segments.stage_payload(&payload).unwrap();
+    let pointers = segments
+        .write_batch(
+            1,
+            1,
+            vec![SegmentEntry {
+                inode: 42,
+                path: "/large.bin".into(),
+                payload: SegmentPayload::Staged(vec![chunk]),
+            }],
+        )
+        .unwrap();
+    let (_, ptr) = &pointers[0];
+
+    // Sequential read in 128 KiB chunks using read_pointer_arc (cached path).
+    let reads = data_size / read_chunk;
+    let start = Instant::now();
+    for _ in 0..reads {
+        let arc = segments.read_pointer_arc(ptr).unwrap();
+        // Simulate slicing the range the way read_file_range_inner does.
+        assert!(arc.len() == data_size);
+    }
+    let elapsed = start.elapsed();
+    let throughput =
+        (reads * read_chunk) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    eprintln!(
+        "segment_sequential_read_throughput reads={} chunk={}KiB elapsed={:.1}ms throughput={:.1}MiB/s",
+        reads,
+        read_chunk / 1024,
+        elapsed.as_secs_f64() * 1000.0,
+        throughput
+    );
+
+    // With the decoded cache, 1024 reads should be nearly instant (memory-only).
+    // Without the cache each read would decompress 128 MiB — ~10 MiB/s or less.
+    // Release builds typically exceed 3000 MiB/s; use a generous floor for CI.
+    assert!(
+        throughput >= 100.0,
+        "sequential read throughput only {:.1} MiB/s (need >= 100 MiB/s)",
+        throughput
+    );
+}
+
 fn perf_enabled(name: &str) -> bool {
     if std::env::var("OSAGEFS_RUN_PERF").is_ok() {
         return true;

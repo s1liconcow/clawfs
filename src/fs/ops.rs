@@ -151,7 +151,7 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -168,7 +168,7 @@ impl OsageFs {
         let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
         file.update_times();
         self.stage_inode(file.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
+        self.update_parent_move(parent_inode, name, inode_id)?;
         Ok(file)
     }
 
@@ -182,7 +182,7 @@ impl OsageFs {
         umask: u32,
         flags: i32,
     ) -> std::result::Result<(InodeRecord, bool), i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -210,7 +210,7 @@ impl OsageFs {
         file.mode = Self::apply_umask(S_IFREG | (mode & 0o7777), umask);
         file.update_times();
         self.stage_inode(file.clone())?;
-        self.update_parent(&mut parent_inode, name.to_string(), inode_id)?;
+        self.update_parent_move(parent_inode, name.to_string(), inode_id)?;
         Ok((file, true))
     }
 
@@ -221,7 +221,7 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -238,7 +238,7 @@ impl OsageFs {
         let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
         dir.update_times();
         self.stage_inode(dir.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
+        self.update_parent_move(parent_inode, name, inode_id)?;
         Ok(dir)
     }
 
@@ -266,7 +266,7 @@ impl OsageFs {
         mode: u32,
         rdev: u32,
     ) -> std::result::Result<InodeRecord, i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -284,7 +284,7 @@ impl OsageFs {
         node.rdev = rdev;
         node.update_times();
         self.stage_inode(node.clone())?;
-        self.update_parent(&mut parent_inode, name.to_string(), inode_id)?;
+        self.update_parent_move(parent_inode, name.to_string(), inode_id)?;
         Ok(node)
     }
 
@@ -296,7 +296,7 @@ impl OsageFs {
         uid: u32,
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -313,7 +313,7 @@ impl OsageFs {
         let record =
             InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
         self.stage_inode(record.clone())?;
-        self.update_parent(&mut parent_inode, name, inode_id)?;
+        self.update_parent_move(parent_inode, name, inode_id)?;
         Ok(record)
     }
 
@@ -406,7 +406,7 @@ impl OsageFs {
     }
 
     pub(crate) fn op_remove_dir(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
-        let mut parent_inode = self.load_inode(parent)?;
+        let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -423,7 +423,7 @@ impl OsageFs {
         }
         let tombstone = InodeRecord::tombstone(child_ino);
         self.stage_inode(tombstone)?;
-        self.remove_from_parent(&mut parent_inode, name)?;
+        self.remove_from_parent_move(parent_inode, name)?;
         Ok(())
     }
 
@@ -448,7 +448,7 @@ impl OsageFs {
         if file.is_dir() {
             return Err(EPERM);
         }
-        let mut parent_inode = self.load_inode(newparent)?;
+        let parent_inode = self.load_inode(newparent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
         }
@@ -462,7 +462,7 @@ impl OsageFs {
         file.inc_links();
         file.update_times();
         self.stage_inode(file.clone())?;
-        self.update_parent(&mut parent_inode, newname.to_string(), file.inode)?;
+        self.update_parent_move(parent_inode, newname.to_string(), file.inode)?;
         Ok(file)
     }
 
