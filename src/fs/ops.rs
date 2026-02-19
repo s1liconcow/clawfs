@@ -1,5 +1,9 @@
 use super::*;
 
+const S_ISVTX: u32 = 0o1000;
+const S_ISGID: u32 = 0o2000;
+const S_ISUID: u32 = 0o4000;
+
 impl OsageFs {
     pub(crate) fn op_lookup(
         &self,
@@ -95,9 +99,34 @@ impl OsageFs {
         Ok(record)
     }
 
+    /// Enforce sticky-bit restriction: if parent dir has the sticky bit set,
+    /// only root, the directory owner, or the file owner may remove/rename the child.
+    fn check_sticky(caller_uid: u32, parent: &InodeRecord, child: &InodeRecord) -> std::result::Result<(), i32> {
+        if parent.mode & S_ISVTX != 0
+            && caller_uid != 0
+            && caller_uid != parent.uid
+            && caller_uid != child.uid
+        {
+            return Err(EPERM);
+        }
+        Ok(())
+    }
+
+    /// Resolve effective GID for a new entry: inherit parent GID when parent has SGID.
+    fn effective_gid(parent: &InodeRecord, caller_gid: u32) -> u32 {
+        if parent.mode & S_ISGID != 0 {
+            parent.gid
+        } else {
+            caller_gid
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_fuse_setattr(
         &self,
         ino: u64,
+        caller_uid: u32,
+        _caller_gid: u32,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -106,15 +135,68 @@ impl OsageFs {
         mtime: Option<TimeOrNow>,
     ) -> std::result::Result<FileAttr, i32> {
         let mut record = self.load_inode(ino)?;
+
+        // chmod permission: only owner or root may change mode bits.
+        //
+        // Exception: allow a mode change that *only* clears SUID/SGID (rwx bits
+        // unchanged) from any caller.  When a non-privileged user writes to a
+        // setuid/setgid file, the kernel calls file_remove_privs() which sends a
+        // FUSE setattr with req.uid() = writer's uid and the new mode = old mode
+        // with SUID/SGID stripped.  We must honour this or the write() syscall
+        // itself fails with EPERM (file_remove_privs returns the setattr error).
+        let is_priv_strip_only = mode.map_or(false, |m| {
+            let old = record.mode & 0o7777;
+            let new = m & 0o7777;
+            (old & 0o0777) == (new & 0o0777)              // rwx bits unchanged
+                && (old & (S_ISUID | S_ISGID)) != 0       // old had SUID/SGID
+                && (new & (S_ISUID | S_ISGID)) == 0       // new has neither
+        });
+        if mode.is_some() && !is_priv_strip_only && caller_uid != 0 && record.uid != caller_uid {
+            return Err(EPERM);
+        }
+
+        // chown permission checks (POSIX / Linux semantics):
+        //   - uid change: root only (non-root cannot reassign uid).
+        //   - gid change: root always; owner may change to any group they belong to.
+        //     FUSE does not expose supplementary groups, so we allow the owner to
+        //     change the gid freely (permissive but necessary given the API limit).
+        if let Some(new_uid) = uid {
+            if caller_uid != 0 && new_uid != record.uid {
+                return Err(EPERM);
+            }
+        }
+        if let Some(new_gid) = gid {
+            if caller_uid != 0 && record.uid != caller_uid {
+                // Non-owner cannot change the gid.
+                return Err(EPERM);
+            }
+            let _ = new_gid; // owner-can-change-gid is allowed (supplementary groups not checkable)
+        }
+
+        // Apply mode change.
         if let Some(new_mode) = mode {
             record.mode = (record.mode & !0o7777) | (new_mode & 0o7777);
         }
+
+        // Apply ownership change.
+        let ownership_changed = uid.is_some() || gid.is_some();
         if let Some(new_uid) = uid {
             record.uid = new_uid;
         }
         if let Some(new_gid) = gid {
             record.gid = new_gid;
         }
+
+        // Linux: when a non-privileged user changes ownership, strip SUID/SGID bits.
+        // (For directories, Linux does not strip SGID; we mirror that behaviour.)
+        if ownership_changed && caller_uid != 0 {
+            if record.is_dir() {
+                record.mode &= !(S_ISUID);
+            } else {
+                record.mode &= !(S_ISUID | S_ISGID);
+            }
+        }
+
         let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
         if let Some(target_size) = size {
             if record.is_dir() {
@@ -163,9 +245,10 @@ impl OsageFs {
         {
             return Err(EEXIST);
         }
+        let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, gid);
+        let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, effective_gid);
         file.update_times();
         self.stage_inode(file.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
@@ -204,9 +287,10 @@ impl OsageFs {
             }
             return Ok((existing, false));
         }
+        let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, name);
-        let mut file = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, gid);
+        let mut file = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
         file.mode = Self::apply_umask(S_IFREG | (mode & 0o7777), umask);
         file.update_times();
         self.stage_inode(file.clone())?;
@@ -233,9 +317,10 @@ impl OsageFs {
         {
             return Err(EEXIST);
         }
+        let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, gid);
+        let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, effective_gid);
         dir.update_times();
         self.stage_inode(dir.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
@@ -251,8 +336,16 @@ impl OsageFs {
         mode: u32,
         umask: u32,
     ) -> std::result::Result<InodeRecord, i32> {
+        let parent_inode = self.load_inode(parent)?;
+        // Determine whether SGID should propagate to the new directory.
+        let propagate_sgid = parent_inode.mode & S_ISGID != 0;
         let mut dir = self.op_mkdir(parent, name, uid, gid)?;
-        dir.mode = Self::apply_umask(S_IFDIR | (mode & 0o7777), umask);
+        let mut applied_mode = Self::apply_umask(S_IFDIR | (mode & 0o7777), umask);
+        // SGID propagates to subdirectories.
+        if propagate_sgid {
+            applied_mode |= S_ISGID;
+        }
+        dir.mode = applied_mode;
         self.stage_inode(dir.clone())?;
         Ok(dir)
     }
@@ -277,9 +370,10 @@ impl OsageFs {
         {
             return Err(EEXIST);
         }
+        let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, name);
-        let mut node = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, gid);
+        let mut node = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
         node.mode = Self::normalize_node_mode(mode);
         node.rdev = rdev;
         node.update_times();
@@ -308,10 +402,11 @@ impl OsageFs {
         {
             return Err(EEXIST);
         }
+        let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
         let record =
-            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, gid, target);
+            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, effective_gid, target);
         self.stage_inode(record.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
         Ok(record)
@@ -389,7 +484,12 @@ impl OsageFs {
         Ok(())
     }
 
-    pub(crate) fn op_remove_file(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+    pub(crate) fn op_remove_file(
+        &self,
+        parent: u64,
+        name: &str,
+        caller_uid: u32,
+    ) -> std::result::Result<(), i32> {
         let mut parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
@@ -402,10 +502,16 @@ impl OsageFs {
         if child.is_dir() {
             return Err(EISDIR);
         }
+        Self::check_sticky(caller_uid, &parent_inode, &child)?;
         self.unlink_file_entry(&mut parent_inode, name, &mut child)
     }
 
-    pub(crate) fn op_remove_dir(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+    pub(crate) fn op_remove_dir(
+        &self,
+        parent: u64,
+        name: &str,
+        caller_uid: u32,
+    ) -> std::result::Result<(), i32> {
         let parent_inode = self.load_inode(parent)?;
         if !parent_inode.is_dir() {
             return Err(ENOTDIR);
@@ -421,6 +527,7 @@ impl OsageFs {
         if child.children().map(|c| !c.is_empty()).unwrap_or(false) {
             return Err(ENOTEMPTY);
         }
+        Self::check_sticky(caller_uid, &parent_inode, &child)?;
         let tombstone = InodeRecord::tombstone(child_ino);
         self.stage_inode(tombstone)?;
         self.remove_from_parent_move(parent_inode, name)?;
@@ -434,7 +541,30 @@ impl OsageFs {
         newparent: u64,
         newname: &str,
         flags: u32,
+        caller_uid: u32,
     ) -> std::result::Result<(), i32> {
+        // Sticky-bit check on source parent: ensure caller may remove `name` from it.
+        let parent_inode = self.load_inode(parent)?;
+        let child_ino = parent_inode
+            .children()
+            .and_then(|ch| ch.get(name).copied())
+            .ok_or(ENOENT)?;
+        let child_inode = self.load_inode(child_ino)?;
+        Self::check_sticky(caller_uid, &parent_inode, &child_inode)?;
+
+        // Sticky-bit check on destination parent: ensure caller may overwrite `newname`
+        // if it already exists there.
+        if newparent != parent || newname != name {
+            let newparent_inode = self.load_inode(newparent)?;
+            if let Some(dst_ino) = newparent_inode
+                .children()
+                .and_then(|ch| ch.get(newname).copied())
+            {
+                let dst_inode = self.load_inode(dst_ino)?;
+                Self::check_sticky(caller_uid, &newparent_inode, &dst_inode)?;
+            }
+        }
+
         self.rename_entry(parent, name, newparent, newname, flags)
     }
 

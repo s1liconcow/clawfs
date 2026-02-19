@@ -1028,7 +1028,7 @@
             .unwrap();
         harness
             .fs
-            .nfs_rename(ROOT_INODE, "config.lock", ROOT_INODE, "config", 0)
+            .nfs_rename(ROOT_INODE, "config.lock", ROOT_INODE, "config", 0, 0)
             .unwrap();
 
         assert!(matches!(
@@ -1295,4 +1295,294 @@
             writer.join().unwrap();
             reader.join().unwrap();
         });
+    }
+
+    // ===== Permission / POSIX semantics tests =====
+
+    /// Helper: create a directory under parent with a given uid/gid, then set its mode bits.
+    fn make_dir_with_mode(fs: &OsageFs, parent: u64, name: &str, uid: u32, gid: u32, mode_bits: u32) -> InodeRecord {
+        let dir = fs.op_mkdir(parent, name, uid, gid).unwrap();
+        // op_fuse_setattr with caller_uid=0 (root) so it always succeeds
+        fs.op_fuse_setattr(dir.inode, 0, 0, Some(mode_bits), None, None, None, None, None).unwrap();
+        fs.load_inode(dir.inode).unwrap()
+    }
+
+    #[test]
+    fn chmod_by_owner_succeeds() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chmod_owner.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Owner (uid=1000) can chmod
+        let result = fs.op_fuse_setattr(file.inode, 1000, 1000, Some(0o644), None, None, None, None, None);
+        assert!(result.is_ok());
+        let updated = fs.load_inode(file.inode).unwrap();
+        assert_eq!(updated.mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn chmod_by_non_owner_returns_eperm() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chmod_noown.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Non-owner (uid=1001) cannot chmod
+        let result = fs.op_fuse_setattr(file.inode, 1001, 1001, Some(0o644), None, None, None, None, None);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn chmod_by_root_always_succeeds() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chmod_root.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Root (uid=0) can always chmod
+        let result = fs.op_fuse_setattr(file.inode, 0, 0, Some(0o600), None, None, None, None, None);
+        assert!(result.is_ok());
+        let updated = fs.load_inode(file.inode).unwrap();
+        assert_eq!(updated.mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn chown_uid_by_non_root_returns_eperm() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chown_uid.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Even the file owner cannot change uid (Linux rule: uid change is root-only)
+        let result = fs.op_fuse_setattr(file.inode, 1000, 1000, None, Some(1001), None, None, None, None);
+        assert_eq!(result.unwrap_err(), EPERM);
+        // Non-owner also cannot change uid
+        let result = fs.op_fuse_setattr(file.inode, 1001, 1001, None, Some(1002), None, None, None, None);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn chown_uid_by_root_succeeds() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chown_uid_root.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Root can change uid
+        let result = fs.op_fuse_setattr(file.inode, 0, 0, None, Some(2000), None, None, None, None);
+        assert!(result.is_ok());
+        let updated = fs.load_inode(file.inode).unwrap();
+        assert_eq!(updated.uid, 2000);
+    }
+
+    #[test]
+    fn chown_gid_by_owner_succeeds() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chown_gid_own.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Owner (uid=1000) can change gid
+        let result = fs.op_fuse_setattr(file.inode, 1000, 1000, None, None, Some(2000), None, None, None);
+        assert!(result.is_ok());
+        let updated = fs.load_inode(file.inode).unwrap();
+        assert_eq!(updated.gid, 2000);
+    }
+
+    #[test]
+    fn chown_gid_by_non_owner_returns_eperm() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chown_gid_noown.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let file = fs.op_create(ROOT_INODE, "test.txt", 1000, 1000).unwrap();
+        // Non-owner cannot change gid
+        let result = fs.op_fuse_setattr(file.inode, 1001, 1001, None, None, Some(2000), None, None, None);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn chown_clears_suid_sgid_for_non_root_owner_change() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chown_suid.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // Root creates file, sets SUID+SGID, then gives it to uid=1000
+        let file = fs.op_create(ROOT_INODE, "setuid.bin", 0, 0).unwrap();
+        fs.op_fuse_setattr(file.inode, 0, 0, Some(0o6755), None, None, None, None, None).unwrap();
+        fs.op_fuse_setattr(file.inode, 0, 0, None, Some(1000), Some(1000), None, None, None).unwrap();
+        // Root chown should NOT clear SUID/SGID (root exemption)
+        let after_root = fs.load_inode(file.inode).unwrap();
+        assert_eq!(after_root.mode & 0o6000, 0o6000, "root chown preserves SUID/SGID");
+
+        // Re-set SUID+SGID (file is now owned by uid=1000, so owner can chmod)
+        fs.op_fuse_setattr(file.inode, 1000, 1000, Some(0o6755), None, None, None, None, None).unwrap();
+        let before = fs.load_inode(file.inode).unwrap();
+        assert_eq!(before.mode & 0o6000, 0o6000);
+
+        // Owner (uid=1000) changes gid -> SUID+SGID must be cleared on files
+        fs.op_fuse_setattr(file.inode, 1000, 1000, None, None, Some(2000), None, None, None).unwrap();
+        let after = fs.load_inode(file.inode).unwrap();
+        assert_eq!(after.mode & 0o6000, 0, "non-root chown strips SUID+SGID from files");
+    }
+
+    #[test]
+    fn sticky_bit_blocks_unlink_by_third_party() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_unlink.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // Sticky dir owned by uid=1000; file in it owned by uid=1001
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _file = fs.op_create(sticky_dir.inode, "victim.txt", 1001, 1001).unwrap();
+        // uid=1002 is neither dir owner nor file owner
+        let result = fs.op_remove_file(sticky_dir.inode, "victim.txt", 1002);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn sticky_bit_allows_unlink_by_file_owner() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_file_own.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _file = fs.op_create(sticky_dir.inode, "myfile.txt", 1001, 1001).unwrap();
+        // File owner (uid=1001) can remove even without owning the directory
+        let result = fs.op_remove_file(sticky_dir.inode, "myfile.txt", 1001);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sticky_bit_allows_unlink_by_dir_owner() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_dir_own.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _file = fs.op_create(sticky_dir.inode, "theirfile.txt", 1001, 1001).unwrap();
+        // Directory owner (uid=1000) can remove anyone's file
+        let result = fs.op_remove_file(sticky_dir.inode, "theirfile.txt", 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sticky_bit_blocks_rmdir_by_third_party() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_rmdir.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _sub = fs.op_mkdir(sticky_dir.inode, "subdir", 1001, 1001).unwrap();
+        // Third party (uid=1002) cannot rmdir a subdirectory they don't own
+        let result = fs.op_remove_dir(sticky_dir.inode, "subdir", 1002);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn sticky_bit_blocks_rename_by_third_party() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_rename.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _file = fs.op_create(sticky_dir.inode, "victim.txt", 1001, 1001).unwrap();
+        let other_dir = fs.op_mkdir(ROOT_INODE, "otherdir", 0, 0).unwrap();
+        // uid=1002: not dir owner, not file owner → cannot rename out of sticky dir
+        let result = fs.op_rename(sticky_dir.inode, "victim.txt", other_dir.inode, "moved.txt", 0, 1002);
+        assert_eq!(result.unwrap_err(), EPERM);
+    }
+
+    #[test]
+    fn sticky_bit_allows_rename_by_file_owner() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sticky_ren_fown.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let sticky_dir = make_dir_with_mode(fs, ROOT_INODE, "stickydir", 1000, 1000, 0o1777);
+        let _file = fs.op_create(sticky_dir.inode, "myfile.txt", 1001, 1001).unwrap();
+        let other_dir = fs.op_mkdir(ROOT_INODE, "otherdir", 0, 0).unwrap();
+        // File owner (uid=1001) can rename their own file
+        let result = fs.op_rename(sticky_dir.inode, "myfile.txt", other_dir.inode, "moved.txt", 0, 1001);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sgid_dir_new_file_inherits_parent_gid() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sgid_gid.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // SGID dir owned by gid=5000
+        let sgid_dir = make_dir_with_mode(fs, ROOT_INODE, "sgiddir", 1000, 5000, 0o2755);
+        assert_ne!(sgid_dir.mode & 0o2000, 0, "SGID bit should be set on dir");
+        // Caller with gid=9999 creates a file in the SGID dir
+        let file = fs.op_create(sgid_dir.inode, "newfile.txt", 2000, 9999).unwrap();
+        // File should inherit gid=5000 from the directory, not caller's gid=9999
+        assert_eq!(file.gid, 5000, "file gid should be inherited from SGID parent");
+    }
+
+    #[test]
+    fn sgid_dir_new_subdir_inherits_gid_and_sgid_bit() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sgid_subdir.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // SGID dir owned by gid=5000
+        let sgid_dir = make_dir_with_mode(fs, ROOT_INODE, "sgiddir", 1000, 5000, 0o2755);
+        // Create subdirectory via op_mkdir_fuse (which propagates SGID bit to new subdirs)
+        let subdir = fs.op_mkdir_fuse(sgid_dir.inode, "sub", 2000, 9999, 0o755, 0o022).unwrap();
+        assert_eq!(subdir.gid, 5000, "subdir gid should be inherited from SGID parent");
+        assert_ne!(subdir.mode & 0o2000, 0, "SGID bit should propagate to new subdirectories");
+    }
+
+    // chmod/12.t: writing to a SUID/SGID file by a non-owner clears those bits.
+    // The kernel sends a FUSE setattr (req.uid = writer) stripping SUID/SGID; we
+    // must allow it or the write() syscall itself fails.
+    #[test]
+    fn write_by_non_owner_clears_suid_bit() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "suid_clear.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // Root creates a file with SUID set
+        let f = fs.op_create(ROOT_INODE, "suidfile", 0, 0).unwrap();
+        fs.op_fuse_setattr(f.inode, 0, 0, Some(0o4777), None, None, None, None, None).unwrap();
+        let file = fs.load_inode(f.inode).unwrap();
+        assert_ne!(file.mode & 0o4000, 0, "SUID should be set initially");
+        // Kernel strips SUID on behalf of writer uid=65534: setattr with new mode=0777
+        let attr = fs
+            .op_fuse_setattr(f.inode, 65534, 65534, Some(0o0777), None, None, None, None, None)
+            .expect("priv-strip setattr should succeed even from non-owner");
+        assert_eq!(attr.perm & 0o4000, 0, "SUID should be cleared");
+        assert_eq!(attr.perm & 0o0777, 0o0777, "rwx bits should be unchanged");
+    }
+
+    #[test]
+    fn write_by_non_owner_clears_sgid_bit() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "sgid_clear.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        let f = fs.op_create(ROOT_INODE, "sgidfile", 0, 0).unwrap();
+        fs.op_fuse_setattr(f.inode, 0, 0, Some(0o2777), None, None, None, None, None).unwrap();
+        let file = fs.load_inode(f.inode).unwrap();
+        assert_ne!(file.mode & 0o2000, 0, "SGID should be set initially");
+        let attr = fs
+            .op_fuse_setattr(f.inode, 65534, 65534, Some(0o0777), None, None, None, None, None)
+            .expect("priv-strip setattr should succeed even from non-owner");
+        assert_eq!(attr.perm & 0o2000, 0, "SGID should be cleared");
+        assert_eq!(attr.perm & 0o0777, 0o0777, "rwx bits should be unchanged");
+    }
+
+    #[test]
+    fn chmod_by_non_owner_non_strip_still_fails() {
+        // Arbitrary mode change (not just stripping SUID/SGID) by non-owner → EPERM
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "chmod_eperm2.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // Root creates file with SUID, gives to uid=0
+        let f = fs.op_create(ROOT_INODE, "file", 0, 0).unwrap();
+        fs.op_fuse_setattr(f.inode, 0, 0, Some(0o4755), None, None, None, None, None).unwrap();
+        // non-owner tries to change rwx bits as well → must still be EPERM
+        let err = fs
+            .op_fuse_setattr(f.inode, 65534, 65534, Some(0o0644), None, None, None, None, None)
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM, "non-owner rwx change should be EPERM");
+    }
+
+    #[test]
+    fn non_sgid_dir_file_uses_caller_gid() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::new(dir.path(), "no_sgid.bin", 8 * 1024 * 1024);
+        let fs = &harness.fs;
+        // Normal dir (no SGID), owned by gid=5000
+        let normal_dir = make_dir_with_mode(fs, ROOT_INODE, "normaldir", 1000, 5000, 0o755);
+        assert_eq!(normal_dir.mode & 0o2000, 0, "SGID bit should NOT be set");
+        // Caller with gid=9999 creates file; should get caller's gid, not parent's
+        let file = fs.op_create(normal_dir.inode, "newfile.txt", 2000, 9999).unwrap();
+        assert_eq!(file.gid, 9999, "without SGID parent, file keeps caller gid");
     }

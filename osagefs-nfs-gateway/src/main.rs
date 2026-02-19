@@ -582,9 +582,9 @@ impl NFSFileSystem for OsageDirectFs {
         let lookup_name = name.clone();
         let child = self.call(move |fs| fs.nfs_lookup(dirid, &lookup_name)).await?;
         if child.is_dir() {
-            self.call(move |fs| fs.nfs_remove_dir(dirid, &name)).await?;
+            self.call(move |fs| fs.nfs_remove_dir(dirid, &name, 0)).await?;
         } else {
-            self.call(move |fs| fs.nfs_remove_file(dirid, &name)).await?;
+            self.call(move |fs| fs.nfs_remove_file(dirid, &name, 0)).await?;
         }
         Ok(())
     }
@@ -600,7 +600,7 @@ impl NFSFileSystem for OsageDirectFs {
         self.ensure_writable()?;
         let from_name = filename_to_name(from_filename)?;
         let to_name = filename_to_name(to_filename)?;
-        self.call(move |fs| fs.nfs_rename(from_dirid, &from_name, to_dirid, &to_name, 0))
+        self.call(move |fs| fs.nfs_rename(from_dirid, &from_name, to_dirid, &to_name, 0, 0))
             .await?;
         Ok(())
     }
