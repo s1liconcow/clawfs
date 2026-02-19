@@ -272,3 +272,10 @@ If tests fail, capture logs from the sprite:
 - `sprite exec -s "$SPRITE_NAME" -- bash -lc 'dmesg | tail -200 || true'`
 - `sprite exec -s "$SPRITE_NAME" -- bash -lc 'journalctl -n 200 --no-pager || true'`
 - `sprite exec -s "$SPRITE_NAME" -- bash -lc 'ls -la /tmp/osagefs-it || true'`
+
+- Update (2026-02-19): write-path contention hardening: `append_file` no longer panics when a pending entry disappears during concurrent mutation (returns `EIO`), and mutation handoff for `stage_file`/`write_large_segments` now avoids cloning payload bytes while still preserving inode visibility via `mutating_inodes` handoff under lock.
+- Update (2026-02-19): synchronous threshold-triggered write-path flushes are now deferred to the interval/explicit flush path (non-blocking write syscall path), reducing foreground write latency spikes under heavy append/segment traffic.
+- Update (2026-02-19): pending-byte threshold and interval flush triggers now schedule `flush_pending()` on a background worker (`trigger_async_flush`) with coalescing (`flush_scheduled`) so foreground writes still trigger flush promptly without blocking syscall latency.
+- Update (2026-02-19): pending inline/staged buffers now use `Arc`-backed storage (`PendingData::Inline(Arc<Vec<u8>>`, `PendingSegments.chunks: Arc<Vec<StagedChunk>>`) so rollback/hand-off paths can clone handles without deep-copying payload bytes.
+- Update (2026-02-19): `append_file` now atomically moves the inode from `pending_inodes` to `mutating_inodes` up front, performs read/stage work on local state, and only re-locks maps for final commit/rollback; non-I/O races no longer surface as `EIO`.
+- Update (2026-02-19): pending/mutating/flushing inode tables now use `DashMap` instead of `Mutex<HashMap<...>>` for concurrent access; flush selection snapshots keys then removes entries explicitly before selector/commit to preserve rollback behavior.

@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 impl OsageFs {
     pub(crate) fn mode_to_file_type(mode: u32) -> FileType {
@@ -105,17 +106,18 @@ impl OsageFs {
             segments,
             handle,
             client_state,
-            pending_inodes: Mutex::new(HashMap::new()),
-            mutating_inodes: Mutex::new(HashMap::new()),
-            flushing_inodes: Mutex::new(HashMap::new()),
-            pending_bytes: Mutex::new(0),
+            pending_inodes: Arc::new(DashMap::new()),
+            mutating_inodes: Arc::new(DashMap::new()),
+            flushing_inodes: Arc::new(DashMap::new()),
+            pending_bytes: Arc::new(Mutex::new(0)),
             perf,
             replay,
             fsync_on_close,
             flush_interval,
-            last_flush: Mutex::new(Instant::now()),
-            flush_lock: Mutex::new(()),
-            mutation_lock: Mutex::new(()),
+            last_flush: Arc::new(Mutex::new(Instant::now())),
+            flush_lock: Arc::new(Mutex::new(())),
+            mutation_lock: Arc::new(Mutex::new(())),
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
             lookup_cache_ttl,
             dir_cache_ttl,
             journal,
@@ -136,7 +138,7 @@ impl OsageFs {
             let record = entry.record;
             let data_opt = match entry.payload {
                 JournalPayload::None => None,
-                JournalPayload::Inline(bytes) => Some(PendingData::Inline(bytes)),
+                JournalPayload::Inline(bytes) => Some(PendingData::Inline(Arc::new(bytes))),
                 JournalPayload::StageFile(chunk) => {
                     if chunk.path.exists() {
                         Some(PendingData::Staged(PendingSegments::from_chunk(chunk)))
@@ -167,25 +169,22 @@ impl OsageFs {
                     } else {
                         let total = present.iter().map(|c| c.len).sum();
                         Some(PendingData::Staged(PendingSegments {
-                            chunks: present,
+                            chunks: Arc::new(present),
                             total_len: total,
                         }))
                     }
                 }
             };
             let data_len = data_opt.as_ref().map(|d| d.len()).unwrap_or(0);
-            {
-                let mut map = self.pending_inodes.lock();
-                if let Some(old) = map.insert(
-                    inode,
-                    PendingEntry {
-                        record,
-                        data: data_opt,
-                    },
-                ) {
-                    if let Some(old_data) = old.data {
-                        self.release_pending_data(old_data);
-                    }
+            if let Some(old) = self.pending_inodes.insert(
+                inode,
+                PendingEntry {
+                    record,
+                    data: data_opt,
+                },
+            ) {
+                if let Some(old_data) = old.data {
+                    self.release_pending_data(old_data);
                 }
             }
             if data_len > 0 {
@@ -262,19 +261,19 @@ impl OsageFs {
     }
 
     pub(crate) fn load_inode(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
-        if let Some(entry) = self.pending_inodes.lock().get(&ino) {
+        if let Some(entry) = self.pending_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
                 return Err(ENOENT);
             }
             return Ok(entry.record.clone());
         }
-        if let Some(entry) = self.mutating_inodes.lock().get(&ino) {
+        if let Some(entry) = self.mutating_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
                 return Err(ENOENT);
             }
             return Ok(entry.record.clone());
         }
-        if let Some(entry) = self.flushing_inodes.lock().get(&ino) {
+        if let Some(entry) = self.flushing_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
                 return Err(ENOENT);
             }
@@ -291,9 +290,9 @@ impl OsageFs {
                 error!(
                     "load_inode metadata error ino={} pending={} mutating={} flushing={} err={:#}",
                     ino,
-                    self.pending_inodes.lock().contains_key(&ino),
-                    self.mutating_inodes.lock().contains_key(&ino),
-                    self.flushing_inodes.lock().contains_key(&ino),
+                    self.pending_inodes.contains_key(&ino),
+                    self.mutating_inodes.contains_key(&ino),
+                    self.flushing_inodes.contains_key(&ino),
                     err
                 );
                 return Err(EIO);
@@ -303,9 +302,9 @@ impl OsageFs {
             debug!(
                 "load_inode miss ino={} pending={} mutating={} flushing={}",
                 ino,
-                self.pending_inodes.lock().contains_key(&ino),
-                self.mutating_inodes.lock().contains_key(&ino),
-                self.flushing_inodes.lock().contains_key(&ino)
+                self.pending_inodes.contains_key(&ino),
+                self.mutating_inodes.contains_key(&ino),
+                self.flushing_inodes.contains_key(&ino)
             );
             ENOENT
         })
@@ -341,17 +340,17 @@ impl OsageFs {
         if range_end <= range_start {
             return Ok(Vec::new());
         }
-        if let Some(entry) = self.pending_inodes.lock().get(&record.inode) {
+        if let Some(entry) = self.pending_inodes.get(&record.inode) {
             if let Some(data) = &entry.data {
                 return self.slice_pending_bytes(data, range_start, range_end);
             }
         }
-        if let Some(entry) = self.mutating_inodes.lock().get(&record.inode) {
+        if let Some(entry) = self.mutating_inodes.get(&record.inode) {
             if let Some(data) = &entry.data {
                 return self.slice_pending_bytes(data, range_start, range_end);
             }
         }
-        if let Some(entry) = self.flushing_inodes.lock().get(&record.inode) {
+        if let Some(entry) = self.flushing_inodes.get(&record.inode) {
             if let Some(data) = &entry.data {
                 return self.slice_pending_bytes(data, range_start, range_end);
             }
@@ -423,29 +422,22 @@ impl OsageFs {
         }
 
         // Move record into pending map — zero clones.
-        let mut map = self.pending_inodes.lock();
-        match map.entry(inode) {
-            Entry::Occupied(mut occupied) => {
-                if matches!(record.kind, InodeKind::Tombstone) {
-                    if let Some(data) = occupied.get_mut().data.take() {
-                        let len = data.len();
-                        self.release_pending_data(data);
-                        if len > 0 {
-                            let mut total = self.pending_bytes.lock();
-                            *total = total.saturating_sub(len);
-                        }
+        if let Some(mut occupied) = self.pending_inodes.get_mut(&inode) {
+            if matches!(record.kind, InodeKind::Tombstone) {
+                if let Some(data) = occupied.data.take() {
+                    let len = data.len();
+                    self.release_pending_data(data);
+                    if len > 0 {
+                        let mut total = self.pending_bytes.lock();
+                        *total = total.saturating_sub(len);
                     }
                 }
-                occupied.get_mut().record = record;
             }
-            Entry::Vacant(vacant) => {
-                vacant.insert(PendingEntry {
-                    record,
-                    data: None,
-                });
-            }
+            occupied.record = record;
+        } else {
+            self.pending_inodes
+                .insert(inode, PendingEntry { record, data: None });
         }
-        drop(map);
 
         debug!(
             "stage_inode inode={} kind={} metadata-staged",
@@ -456,11 +448,7 @@ impl OsageFs {
     }
 
     pub(crate) fn drop_pending_entry(&self, inode: u64) {
-        let entry = {
-            let mut map = self.pending_inodes.lock();
-            map.remove(&inode)
-        };
-        if let Some(entry) = entry {
+        if let Some((_, entry)) = self.pending_inodes.remove(&inode) {
             if let Some(data) = entry.data {
                 let len = data.len();
                 self.release_pending_data(data);
@@ -474,14 +462,16 @@ impl OsageFs {
 
     pub(crate) fn snapshot_journal_payload(&self, data: &PendingData) -> JournalPayload {
         match data {
-            PendingData::Inline(bytes) => JournalPayload::Inline(bytes.clone()),
-            PendingData::Staged(segments) => JournalPayload::StageChunks(segments.chunks.clone()),
+            PendingData::Inline(bytes) => JournalPayload::Inline(bytes.as_ref().clone()),
+            PendingData::Staged(segments) => {
+                JournalPayload::StageChunks(segments.chunks.as_ref().clone())
+            }
         }
     }
 
     pub(crate) fn read_pending_bytes(&self, data: &PendingData) -> Result<Vec<u8>> {
         match data {
-            PendingData::Inline(bytes) => Ok(bytes.clone()),
+            PendingData::Inline(bytes) => Ok(bytes.as_ref().clone()),
             PendingData::Staged(segments) => self
                 .segments
                 .read_staged_chunks(&segments.chunks, segments.total_len)
@@ -525,7 +515,7 @@ impl OsageFs {
 
     pub(crate) fn release_pending_data(&self, data: PendingData) {
         if let PendingData::Staged(segments) = data {
-            for chunk in segments.chunks {
+            for chunk in segments.chunks.iter() {
                 if let Err(err) = self.segments.release_staged_chunk(&chunk) {
                     log::warn!(
                         "failed to release staged payload {}: {err:?}",
@@ -727,7 +717,10 @@ impl OsageFs {
         Ok(())
     }
 
-    pub(crate) fn refresh_descendant_paths(&self, inode: &InodeRecord) -> std::result::Result<(), i32> {
+    pub(crate) fn refresh_descendant_paths(
+        &self,
+        inode: &InodeRecord,
+    ) -> std::result::Result<(), i32> {
         if let Some(children) = inode.children() {
             let entries: Vec<(String, u64)> = children
                 .iter()
@@ -748,7 +741,11 @@ impl OsageFs {
         Ok(())
     }
 
-    pub(crate) fn is_descendant(&self, ancestor: u64, mut candidate: u64) -> std::result::Result<bool, i32> {
+    pub(crate) fn is_descendant(
+        &self,
+        ancestor: u64,
+        mut candidate: u64,
+    ) -> std::result::Result<bool, i32> {
         if ancestor == candidate {
             return Ok(true);
         }
@@ -768,5 +765,4 @@ impl OsageFs {
         }
         Ok(false)
     }
-
 }

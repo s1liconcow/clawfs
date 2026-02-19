@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl OsageFs {
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
@@ -30,7 +31,7 @@ impl OsageFs {
 
     pub(crate) fn sync_local_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
         let (inodes, staged_chunks) = {
-            let pending = self.pending_inodes.lock();
+            let pending = &self.pending_inodes;
             let mut cursor = ino;
             let mut seen = HashSet::new();
             let mut inodes = Vec::new();
@@ -91,12 +92,25 @@ impl OsageFs {
         let result = (|| {
             let start = Instant::now();
             let pending = {
-                let mut guard = self.pending_inodes.lock();
+                let mut guard = HashMap::new();
+                let keys: Vec<u64> = self
+                    .pending_inodes
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .collect();
+                for inode in keys {
+                    if let Some((_, entry)) = self.pending_inodes.remove(&inode) {
+                        guard.insert(inode, entry);
+                    }
+                }
                 if guard.is_empty() {
                     self.touch_last_flush();
                     return Ok(());
                 }
                 let drained = selector(&mut guard);
+                for (inode, entry) in guard {
+                    self.pending_inodes.insert(inode, entry);
+                }
                 if drained.is_empty() {
                     self.touch_last_flush();
                     return Ok(());
@@ -107,9 +121,8 @@ impl OsageFs {
                 if has_staged {
                     self.segments.rotate_stage_file();
                 }
-                let mut flushing = self.flushing_inodes.lock();
                 for (inode, entry) in drained.iter() {
-                    flushing.insert(*inode, entry.clone());
+                    self.flushing_inodes.insert(*inode, entry.clone());
                 }
                 drained
             };
@@ -175,7 +188,7 @@ impl OsageFs {
                             segment_entries.push(SegmentEntry {
                                 inode: record.inode,
                                 path: record.path.clone(),
-                                payload: SegmentPayload::Bytes(data_bytes.clone()),
+                                payload: SegmentPayload::Bytes(data_bytes.as_ref().clone()),
                             });
                             segment_data_inodes.insert(record.inode);
                             record.storage = FileStorage::Inline(Vec::new());
@@ -192,7 +205,7 @@ impl OsageFs {
                         segment_entries.push(SegmentEntry {
                             inode: record.inode,
                             path: record.path.clone(),
-                            payload: SegmentPayload::Staged(segments.chunks.clone()),
+                            payload: SegmentPayload::Staged(segments.chunks.as_ref().clone()),
                         });
                         segment_data_inodes.insert(record.inode);
                         record.storage = FileStorage::Inline(Vec::new());
@@ -317,11 +330,8 @@ impl OsageFs {
             let flushed_entries = drained_pending
                 .take()
                 .expect("drained pending map must exist until flush commit");
-            {
-                let mut flushing = self.flushing_inodes.lock();
-                for inode in flushed_entries.keys() {
-                    flushing.remove(inode);
-                }
+            for inode in flushed_entries.keys() {
+                self.flushing_inodes.remove(inode);
             }
             for pending_entry in flushed_entries.into_values() {
                 if let Some(data) = pending_entry.data {
@@ -329,13 +339,10 @@ impl OsageFs {
                 }
             }
             if let Some(journal) = &self.journal {
-                let clearable_inodes = {
-                    let guard = self.pending_inodes.lock();
-                    flushed_inodes
-                        .into_iter()
-                        .filter(|inode| !guard.contains_key(inode))
-                        .collect::<Vec<_>>()
-                };
+                let clearable_inodes = flushed_inodes
+                    .into_iter()
+                    .filter(|inode| !self.pending_inodes.contains_key(inode))
+                    .collect::<Vec<_>>();
                 for inode in clearable_inodes {
                     journal.clear_entry(inode).map_err(|err| {
                         log::error!(
@@ -403,26 +410,19 @@ impl OsageFs {
     pub(crate) fn restore_pending_after_failed_flush(&self, restored: HashMap<u64, PendingEntry>) {
         let mut dropped_bytes = 0u64;
         let restored_inodes: Vec<u64> = restored.keys().copied().collect();
-        let mut map = self.pending_inodes.lock();
         for (inode, entry) in restored {
-            match map.entry(inode) {
-                Entry::Vacant(vacant) => {
-                    vacant.insert(entry);
+            if self.pending_inodes.contains_key(&inode) {
+                if let Some(data) = entry.data {
+                    dropped_bytes = dropped_bytes.saturating_add(data.len());
+                    self.release_pending_data(data);
                 }
-                Entry::Occupied(_) => {
-                    if let Some(data) = entry.data {
-                        dropped_bytes = dropped_bytes.saturating_add(data.len());
-                        self.release_pending_data(data);
-                    }
-                }
+            } else {
+                self.pending_inodes.insert(inode, entry);
             }
         }
-        drop(map);
-        let mut flushing = self.flushing_inodes.lock();
         for inode in restored_inodes {
-            flushing.remove(&inode);
+            self.flushing_inodes.remove(&inode);
         }
-        drop(flushing);
         if dropped_bytes > 0 {
             let mut total = self.pending_bytes.lock();
             *total = total.saturating_sub(dropped_bytes);
@@ -477,6 +477,22 @@ impl OsageFs {
         self.adaptive_pending_limit().max(by_write_size).max(base)
     }
 
+    pub(crate) fn trigger_async_flush(&self) {
+        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let fs = self.clone();
+        self.handle.spawn_blocking(move || {
+            if let Err(code) = fs.flush_pending() {
+                error!("background flush_pending failed errno={}", code);
+            }
+            fs.flush_scheduled.store(false, Ordering::Release);
+            if !fs.pending_inodes.is_empty() {
+                fs.trigger_async_flush();
+            }
+        });
+    }
+
     pub(crate) fn flush_if_interval_elapsed(&self) -> std::result::Result<(), i32> {
         let Some(interval) = self.flush_interval else {
             return Ok(());
@@ -488,8 +504,11 @@ impl OsageFs {
         if elapsed < interval {
             return Ok(());
         }
-        debug!("flush_interval {:?} elapsed, triggering flush", interval);
-        self.flush_pending()?;
+        debug!(
+            "flush_interval {:?} elapsed, scheduling background flush",
+            interval
+        );
+        self.trigger_async_flush();
         Ok(())
     }
 

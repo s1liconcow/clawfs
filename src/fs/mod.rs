@@ -1,9 +1,12 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet};
+
+use dashmap::DashMap;
 use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -14,8 +17,7 @@ use fuser::{
 };
 use libc::{
     EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL,
-    O_TRUNC,
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+    O_TRUNC, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use parking_lot::Mutex;
 use time::OffsetDateTime;
@@ -52,6 +54,21 @@ const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
 #[cfg(not(target_os = "linux"))]
 const RENAME_NOREPLACE_FLAG: u32 = 0;
 
+trait DashMapLockExt {
+    fn lock(&self) -> &Self;
+}
+
+impl<K, V, S> DashMapLockExt for DashMap<K, V, S>
+where
+    K: Eq + std::hash::Hash,
+    S: std::hash::BuildHasher + Clone,
+{
+    fn lock(&self) -> &Self {
+        self
+    }
+}
+
+#[derive(Clone)]
 pub struct OsageFs {
     config: Config,
     metadata: Arc<MetadataStore>,
@@ -59,28 +76,29 @@ pub struct OsageFs {
     segments: Arc<SegmentManager>,
     handle: Handle,
     client_state: Arc<ClientStateManager>,
-    pending_inodes: Mutex<HashMap<u64, PendingEntry>>,
-    mutating_inodes: Mutex<HashMap<u64, PendingEntry>>,
-    flushing_inodes: Mutex<HashMap<u64, PendingEntry>>,
-    pending_bytes: Mutex<u64>,
+    pending_inodes: Arc<DashMap<u64, PendingEntry>>,
+    mutating_inodes: Arc<DashMap<u64, PendingEntry>>,
+    flushing_inodes: Arc<DashMap<u64, PendingEntry>>,
+    pending_bytes: Arc<Mutex<u64>>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
-    last_flush: Mutex<Instant>,
-    flush_lock: Mutex<()>,
-    mutation_lock: Mutex<()>,
+    last_flush: Arc<Mutex<Instant>>,
+    flush_lock: Arc<Mutex<()>>,
+    mutation_lock: Arc<Mutex<()>>,
+    flush_scheduled: Arc<AtomicBool>,
     lookup_cache_ttl: Duration,
     dir_cache_ttl: Duration,
     journal: Option<Arc<JournalManager>>,
 }
 
 mod core;
-mod write_path;
 mod flush;
-mod nfs;
 mod fuse;
+mod nfs;
 mod ops;
+mod write_path;
 
 fn file_type(record: &InodeRecord) -> FileType {
     match record.kind {
@@ -151,20 +169,20 @@ pub(crate) struct StageWriteContext {
 
 #[derive(Clone)]
 pub(crate) enum PendingData {
-    Inline(Vec<u8>),
+    Inline(Arc<Vec<u8>>),
     Staged(PendingSegments),
 }
 
 #[derive(Clone)]
 pub(crate) struct PendingSegments {
-    chunks: Vec<StagedChunk>,
+    chunks: Arc<Vec<StagedChunk>>,
     total_len: u64,
 }
 
 impl PendingSegments {
     fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: Arc::new(Vec::new()),
             total_len: 0,
         }
     }
@@ -180,7 +198,7 @@ impl PendingSegments {
             return;
         }
         self.total_len = self.total_len.saturating_add(chunk.len);
-        self.chunks.push(chunk);
+        Arc::make_mut(&mut self.chunks).push(chunk);
     }
 
     fn ensure_offset(&mut self, manager: &SegmentManager, target: u64) -> Result<()> {
@@ -212,8 +230,9 @@ impl PendingSegments {
         let write_end = offset.saturating_add(chunk.len);
         let mut cursor = 0u64;
         let mut pending_chunk = Some(chunk);
-        let mut result = Vec::with_capacity(self.chunks.len() + 1);
-        for existing in self.chunks.drain(..) {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let mut result = Vec::with_capacity(chunks.len() + 1);
+        for existing in chunks.drain(..) {
             let chunk_len = existing.len;
             let chunk_start = cursor;
             let chunk_end = chunk_start + chunk_len;
@@ -256,7 +275,7 @@ impl PendingSegments {
         if let Some(new_chunk) = pending_chunk.take() {
             result.push(new_chunk);
         }
-        self.chunks = result;
+        self.chunks = Arc::new(result);
         self.total_len = self.total_len.max(write_end);
         Ok(())
     }

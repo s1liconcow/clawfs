@@ -18,19 +18,18 @@ impl OsageFs {
                 None
             }
         });
-        let prev_entry = {
-            let mut map = self.pending_inodes.lock();
-            let entry = map.remove(&inode);
-            let mut mutating = self.mutating_inodes.lock();
-            mutating.insert(
-                inode,
-                entry.clone().unwrap_or(PendingEntry {
-                    record: record.clone(),
-                    data: None,
-                }),
-            );
-            entry
-        };
+        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
+        let mutating_entry = prev_entry
+            .as_ref()
+            .map(|entry| PendingEntry {
+                record: entry.record.clone(),
+                data: None,
+            })
+            .unwrap_or(PendingEntry {
+                record: record.clone(),
+                data: None,
+            });
+        self.mutating_inodes.insert(inode, mutating_entry);
         let original_entry = prev_entry.clone();
         let mut prev_data = prev_entry.and_then(|entry| entry.data);
         let prev_len = prev_data.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -39,15 +38,15 @@ impl OsageFs {
             if let Some(old) = prev_data.take() {
                 self.release_pending_data(old);
             }
-            PendingData::Inline(data)
+            PendingData::Inline(Arc::new(data))
         } else {
             let mut segments = match prev_data.take() {
                 Some(PendingData::Staged(segs)) => segs,
                 Some(PendingData::Inline(bytes)) => {
-                    let chunk = match self.segments.stage_payload(&bytes) {
+                    let chunk = match self.segments.stage_payload(bytes.as_ref()) {
                         Ok(chunk) => chunk,
                         Err(_) => {
-                            self.restore_mutation_on_error(inode, original_entry);
+                            self.restore_mutation_on_error(inode, original_entry.clone());
                             return Err(EIO);
                         }
                     };
@@ -59,7 +58,7 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(&data) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry);
+                        self.restore_mutation_on_error(inode, original_entry.clone());
                         return Err(EIO);
                     }
                 };
@@ -69,7 +68,7 @@ impl OsageFs {
                     let chunk = match self.segments.stage_payload(&data[range]) {
                         Ok(chunk) => chunk,
                         Err(_) => {
-                            self.restore_mutation_on_error(inode, original_entry);
+                            self.restore_mutation_on_error(inode, original_entry.clone());
                             return Err(EIO);
                         }
                     };
@@ -80,7 +79,7 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(&data) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry);
+                        self.restore_mutation_on_error(inode, original_entry.clone());
                         return Err(EIO);
                     }
                 };
@@ -100,17 +99,14 @@ impl OsageFs {
         // Save fields needed after move.
         let path = record.path.clone();
         // Move record into pending map — zero clones.
-        {
-            let mut map = self.pending_inodes.lock();
-            map.insert(
-                inode,
-                PendingEntry {
-                    record,
-                    data: Some(pending_data),
-                },
-            );
-        }
-        self.mutating_inodes.lock().remove(&inode);
+        self.pending_inodes.insert(
+            inode,
+            PendingEntry {
+                record,
+                data: Some(pending_data),
+            },
+        );
+        self.mutating_inodes.remove(&inode);
 
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
@@ -140,14 +136,17 @@ impl OsageFs {
             pid, tid, inode, path, new_len, pending_total, should_flush
         );
         if should_flush {
-            self.flush_pending()?;
-        } else {
-            self.flush_if_interval_elapsed()?;
+            self.trigger_async_flush();
         }
+        self.flush_if_interval_elapsed()?;
         Ok(())
     }
 
-    pub(crate) fn append_file(&self, mut record: InodeRecord, data: &[u8]) -> std::result::Result<(), i32> {
+    pub(crate) fn append_file(
+        &self,
+        mut record: InodeRecord,
+        data: &[u8],
+    ) -> std::result::Result<(), i32> {
         if data.is_empty() {
             return Ok(());
         }
@@ -155,66 +154,91 @@ impl OsageFs {
         let inode = record.inode;
         record.update_times();
         let current_size = record.size;
-        let new_len = current_size.saturating_add(data.len() as u64);
+        let target_len = current_size.saturating_add(data.len() as u64);
         let inline_cap = self.config.inline_threshold as u64;
-        if new_len > inline_cap {
+        if target_len > inline_cap {
             return self.write_large_segments(record, current_size, data);
         }
-        let mut needs_existing = false;
-        {
-            let mut map = self.pending_inodes.lock();
-            let entry = map.entry(inode).or_insert_with(|| PendingEntry {
+
+        let previous_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
+        let mutating_entry = previous_entry
+            .as_ref()
+            .map(|entry| PendingEntry {
+                record: entry.record.clone(),
+                data: None,
+            })
+            .unwrap_or(PendingEntry {
                 record: record.clone(),
                 data: None,
             });
-            if entry.data.is_none() {
-                entry.data = Some(PendingData::Inline(Vec::new()));
-                needs_existing = record.size > 0;
+        self.mutating_inodes.insert(inode, mutating_entry);
+        let original_entry = previous_entry.clone();
+
+        let mut working_entry = previous_entry.unwrap_or(PendingEntry {
+            record: record.clone(),
+            data: None,
+        });
+        working_entry.record = record.clone();
+
+        if working_entry.data.is_none() {
+            if record.size > 0 {
+                let existing = self.read_file_bytes(&record).map_err(|_| {
+                    self.restore_mutation_on_error(inode, original_entry.clone());
+                    EIO
+                })?;
+                working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
+            } else {
+                working_entry.data = Some(PendingData::Inline(Arc::new(Vec::new())));
             }
         }
-        if needs_existing {
-            let existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
-            let mut map = self.pending_inodes.lock();
-            if let Some(entry) = map.get_mut(&inode) {
-                entry.data = Some(PendingData::Inline(existing));
-            }
-        }
+
         let appended = data.len() as u64;
-        let (prev_len, new_len, journal_payload) = {
-            let mut map = self.pending_inodes.lock();
-            let entry = map.get_mut(&inode).expect("pending entry must exist");
-            entry.record = record.clone();
-            let slot = entry
-                .data
-                .as_mut()
-                .expect("pending data must exist before append");
-            let prev_len = slot.len();
-            match slot {
-                PendingData::Inline(buf) => {
-                    if buf.len() as u64 != record.size {
-                        buf.resize(record.size as usize, 0);
-                    }
-                    buf.extend_from_slice(data);
-                    if buf.len() as u64 > inline_cap {
-                        let bytes = std::mem::take(buf);
-                        let chunk = self.segments.stage_payload(&bytes).map_err(|_| EIO)?;
-                        *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
-                    }
+        let slot = working_entry
+            .data
+            .get_or_insert_with(|| PendingData::Inline(Arc::new(Vec::new())));
+        let prev_len = slot.len();
+        match slot {
+            PendingData::Inline(buf) => {
+                let buf = Arc::make_mut(buf);
+                if buf.len() as u64 != record.size {
+                    buf.resize(record.size as usize, 0);
                 }
-                PendingData::Staged(segments) => {
-                    let chunk = self.segments.stage_payload(data).map_err(|_| EIO)?;
-                    segments.append(chunk);
+                buf.extend_from_slice(data);
+                if buf.len() as u64 > inline_cap {
+                    let bytes = std::mem::take(buf);
+                    let chunk = self.segments.stage_payload(&bytes).map_err(|_| {
+                        self.restore_mutation_on_error(inode, original_entry.clone());
+                        EIO
+                    })?;
+                    *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
                 }
             }
-            let current_len = slot.len();
-            entry.record.size = current_len;
-            record.size = current_len;
-            let payload = self
-                .journal
-                .as_ref()
-                .map(|_| self.snapshot_journal_payload(slot));
-            (prev_len, current_len, payload)
-        };
+            PendingData::Staged(segments) => {
+                let chunk = self.segments.stage_payload(data).map_err(|_| {
+                    self.restore_mutation_on_error(inode, original_entry.clone());
+                    EIO
+                })?;
+                segments.append(chunk);
+            }
+        }
+        let new_len = slot.len();
+        working_entry.record.size = new_len;
+        record.size = new_len;
+
+        let journal_payload = self
+            .journal
+            .as_ref()
+            .map(|_| self.snapshot_journal_payload(slot));
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            if journal.persist_record(&record, payload).is_err() {
+                self.restore_mutation_on_error(inode, original_entry.clone());
+                return Err(EIO);
+            }
+        }
+
+        self.pending_inodes.insert(inode, working_entry);
+        self.mutating_inodes.remove(&inode);
+
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
         if delta >= 0 {
@@ -225,11 +249,7 @@ impl OsageFs {
         let pending_total = *total;
         let should_flush = pending_total >= self.config.pending_bytes;
         drop(total);
-        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
-            journal
-                .persist_record(&record, payload)
-                .map_err(|_| EIO)?;
-        }
+
         let path = &record.path;
         self.log_perf(
             "stage_file",
@@ -250,10 +270,9 @@ impl OsageFs {
             pid, tid, inode, record.path, appended, new_len, pending_total, should_flush
         );
         if should_flush {
-            self.flush_pending()?;
-        } else {
-            self.flush_if_interval_elapsed()?;
+            self.trigger_async_flush();
         }
+        self.flush_if_interval_elapsed()?;
         Ok(())
     }
 
@@ -269,19 +288,18 @@ impl OsageFs {
         let start = Instant::now();
         let inode = record.inode;
         record.update_times();
-        let prev_entry = {
-            let mut map = self.pending_inodes.lock();
-            let entry = map.remove(&inode);
-            let mut mutating = self.mutating_inodes.lock();
-            mutating.insert(
-                inode,
-                entry.clone().unwrap_or(PendingEntry {
-                    record: record.clone(),
-                    data: None,
-                }),
-            );
-            entry
-        };
+        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
+        let mutating_entry = prev_entry
+            .as_ref()
+            .map(|entry| PendingEntry {
+                record: entry.record.clone(),
+                data: None,
+            })
+            .unwrap_or(PendingEntry {
+                record: record.clone(),
+                data: None,
+            });
+        self.mutating_inodes.insert(inode, mutating_entry);
         let original_entry = prev_entry.clone();
         let mut entry = prev_entry.unwrap_or(PendingEntry {
             record: record.clone(),
@@ -298,14 +316,14 @@ impl OsageFs {
                         &format!("ino={} stage=read_existing", inode),
                         EIO,
                     );
-                    self.restore_mutation_on_error(inode, original_entry);
+                    self.restore_mutation_on_error(inode, original_entry.clone());
                     return Err(EIO);
                 }
             };
             if existing.is_empty() {
                 data_state = Some(PendingData::Staged(PendingSegments::new()));
             } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
-                data_state = Some(PendingData::Inline(existing));
+                data_state = Some(PendingData::Inline(Arc::new(existing)));
             } else {
                 let chunk = match self.segments.stage_payload(&existing) {
                     Ok(chunk) => chunk,
@@ -315,7 +333,7 @@ impl OsageFs {
                             &format!("ino={} stage=stage_existing_inline", inode),
                             EIO,
                         );
-                        self.restore_mutation_on_error(inode, original_entry);
+                        self.restore_mutation_on_error(inode, original_entry.clone());
                         return Err(EIO);
                     }
                 };
@@ -325,10 +343,10 @@ impl OsageFs {
         let mut segments = match data_state {
             Some(PendingData::Staged(segs)) => segs,
             Some(PendingData::Inline(bytes)) => {
-                let chunk = match self.segments.stage_payload(&bytes) {
+                let chunk = match self.segments.stage_payload(bytes.as_ref()) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry);
+                        self.restore_mutation_on_error(inode, original_entry.clone());
                         return Err(EIO);
                     }
                 };
@@ -344,7 +362,7 @@ impl OsageFs {
                 &format!("ino={} stage=ensure_offset offset={}", inode, offset),
                 EIO,
             );
-            self.restore_mutation_on_error(inode, original_entry);
+            self.restore_mutation_on_error(inode, original_entry.clone());
             return Err(EIO);
         }
         let staged_chunk = match self.segments.stage_payload(data) {
@@ -356,7 +374,7 @@ impl OsageFs {
                     &format!("ino={} stage=stage_new_payload len={}", inode, data.len()),
                     EIO,
                 );
-                self.restore_mutation_on_error(inode, original_entry);
+                self.restore_mutation_on_error(inode, original_entry.clone());
                 return Err(EIO);
             }
         };
@@ -372,7 +390,7 @@ impl OsageFs {
                 ),
                 EIO,
             );
-            self.restore_mutation_on_error(inode, original_entry);
+            self.restore_mutation_on_error(inode, original_entry.clone());
             return Err(EIO);
         }
         let new_len = segments.total_len;
@@ -387,11 +405,8 @@ impl OsageFs {
         } else {
             None
         };
-        {
-            let mut map = self.pending_inodes.lock();
-            map.insert(inode, entry);
-        }
-        self.mutating_inodes.lock().remove(&inode);
+        self.pending_inodes.insert(inode, entry);
+        self.mutating_inodes.remove(&inode);
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
         if delta >= 0 {
@@ -404,9 +419,7 @@ impl OsageFs {
         let should_flush = pending_total >= pending_limit;
         drop(total);
         if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
-            journal
-                .persist_record(&record, payload)
-                .map_err(|_| EIO)?;
+            journal.persist_record(&record, payload).map_err(|_| EIO)?;
         }
         let path = &record.path;
         self.log_perf(
@@ -439,26 +452,21 @@ impl OsageFs {
             should_flush
         );
         if should_flush {
-            self.flush_pending()?;
-        } else {
-            self.flush_if_interval_elapsed()?;
+            self.trigger_async_flush();
         }
+        self.flush_if_interval_elapsed()?;
         Ok(())
     }
 
     pub(crate) fn restore_mutation_on_error(&self, inode: u64, original: Option<PendingEntry>) {
-        {
-            let mut map = self.pending_inodes.lock();
-            match original {
-                Some(entry) => {
-                    map.insert(inode, entry);
-                }
-                None => {
-                    map.remove(&inode);
-                }
+        match original {
+            Some(entry) => {
+                self.pending_inodes.insert(inode, entry);
+            }
+            None => {
+                self.pending_inodes.remove(&inode);
             }
         }
-        self.mutating_inodes.lock().remove(&inode);
+        self.mutating_inodes.remove(&inode);
     }
-
 }
