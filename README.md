@@ -1,5 +1,7 @@
 # OsageFS
 
+> **POSIX compliance**: OsageFS passes the [pjdfstest](https://github.com/pjd/pjdfstest) POSIX filesystem test suite.
+
 OsageFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
 and payloads in a log-structured layout over an object store. Metadata now lives
 directly inside the bucket as immutable inode-map shards (`/imaps/i_<gen>_<shard>`)
