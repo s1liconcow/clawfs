@@ -1,38 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3:*)",
-      "Bash(OSAGEFS_RUN_PERF=1 cargo test:*)",
-      "Bash(cargo build:*)",
-      "Bash(cargo test:*)",
-      "Bash(git stash:*)",
-      "Bash(git checkout:*)",
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(sprite --help:*)",
-      "Bash(sprite list:*)",
-      "Bash(git worktree:*)",
-      "Bash(sprite create:*)",
-      "Bash(tar:*)",
-      "Bash(sprite exec:*)",
-      "Bash(then)",
-      "Bash(break)",
-      "Bash(fi:*)",
-      "Bash(done)",
-      "Bash(bash -n /home/david/projects/osagefs/osagefs/scripts/micro_workflows.sh)",
-      "Bash(sudo tee:*)",
-      "Bash(sudo chmod:*)",
-      "Bash(sudo visudo:*)",
-      "Bash(find:*)",
-      "Bash(grep:*)",
-      "Bash(for:*)",
-      "Bash(do echo \"=== Run $i ===\")",
-      "Bash(cargo metadata:*)",
-      "Bash(do OSAGEFS_RUN_PERF=1 cargo test --release --test perf_local flush_metadata_phase_breakdown -- --nocapture)",
-      "Bash(OSAGEFS_RUN_PERF=1 RUST_LOG=debug cargo test:*)",
-      "Bash(ls:*)",
-      "Bash(cargo check:*)",
-      "Bash(./scripts/run_pjdfstest.sh:*)"
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)"
     ]
   }
 }
