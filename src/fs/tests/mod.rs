@@ -531,7 +531,7 @@
             inodes.push(inode);
         }
         harness.fs.flush_pending().unwrap();
-        assert!(harness.fs.pending_inodes.lock().is_empty());
+        assert!(harness.fs.pending_inodes.is_empty());
         assert_eq!(*harness.fs.pending_bytes.lock(), 0);
         for inode in inodes {
             let record = harness
@@ -556,13 +556,12 @@
         stale_view.size = 0;
         harness.fs.append_file(stale_view, b"xyz").unwrap();
 
-        let pending_len = {
-            let map = harness.fs.pending_inodes.lock();
-            map.get(&inode)
-                .and_then(|entry| entry.data.as_ref())
-                .map(|data| data.len())
-                .unwrap_or(0)
-        };
+        let pending_len = harness
+            .fs
+            .pending_inodes
+            .get(&inode)
+            .map(|entry| entry.data.as_ref().map(|d| d.len()).unwrap_or(0))
+            .unwrap_or(0);
         assert_eq!(pending_len, initial.len() as u64 + 3);
     }
 
@@ -1150,7 +1149,7 @@
         harness.fs.flush_pending_for_inode(file_a.inode).unwrap();
 
         assert!(
-            harness.fs.pending_inodes.lock().contains_key(&file_b.inode),
+            harness.fs.pending_inodes.contains_key(&file_b.inode),
             "expected unrelated inode to remain pending"
         );
         let stored_a = harness
@@ -1187,7 +1186,7 @@
 
         harness.fs.flush_pending_for_inode(file.inode).unwrap();
 
-        let pending = harness.fs.pending_inodes.lock();
+        let pending = &harness.fs.pending_inodes;
         assert!(
             !pending.contains_key(&file.inode),
             "file inode should be flushed"
@@ -1204,7 +1203,6 @@
             !pending.contains_key(&ROOT_INODE),
             "root directory should be flushed when pending"
         );
-        drop(pending);
 
         let root = harness
             .runtime
