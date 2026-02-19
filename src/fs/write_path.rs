@@ -18,18 +18,21 @@ impl OsageFs {
                 None
             }
         });
-        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let mutating_entry = prev_entry
-            .as_ref()
-            .map(|entry| PendingEntry {
-                record: entry.record.clone(),
+        // Insert a placeholder into mutating_inodes BEFORE removing from pending_inodes
+        // so that load_inode always sees the inode in at least one map.
+        let mutating_placeholder = self
+            .pending_inodes
+            .get(&inode)
+            .map(|e| PendingEntry {
+                record: e.record.clone(),
                 data: None,
             })
-            .unwrap_or(PendingEntry {
+            .unwrap_or_else(|| PendingEntry {
                 record: record.clone(),
                 data: None,
             });
-        self.mutating_inodes.insert(inode, mutating_entry);
+        self.mutating_inodes.insert(inode, mutating_placeholder);
+        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
         let original_entry = prev_entry.clone();
         let mut prev_data = prev_entry.and_then(|entry| entry.data);
         let prev_len = prev_data.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -160,18 +163,20 @@ impl OsageFs {
             return self.write_large_segments(record, current_size, data);
         }
 
-        let previous_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let mutating_entry = previous_entry
-            .as_ref()
-            .map(|entry| PendingEntry {
-                record: entry.record.clone(),
+        // Insert placeholder into mutating_inodes BEFORE removing from pending_inodes.
+        let mutating_placeholder = self
+            .pending_inodes
+            .get(&inode)
+            .map(|e| PendingEntry {
+                record: e.record.clone(),
                 data: None,
             })
-            .unwrap_or(PendingEntry {
+            .unwrap_or_else(|| PendingEntry {
                 record: record.clone(),
                 data: None,
             });
-        self.mutating_inodes.insert(inode, mutating_entry);
+        self.mutating_inodes.insert(inode, mutating_placeholder);
+        let previous_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
         let original_entry = previous_entry.clone();
 
         let mut working_entry = previous_entry.unwrap_or(PendingEntry {
@@ -288,18 +293,20 @@ impl OsageFs {
         let start = Instant::now();
         let inode = record.inode;
         record.update_times();
-        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let mutating_entry = prev_entry
-            .as_ref()
-            .map(|entry| PendingEntry {
-                record: entry.record.clone(),
+        // Insert placeholder into mutating_inodes BEFORE removing from pending_inodes.
+        let mutating_placeholder = self
+            .pending_inodes
+            .get(&inode)
+            .map(|e| PendingEntry {
+                record: e.record.clone(),
                 data: None,
             })
-            .unwrap_or(PendingEntry {
+            .unwrap_or_else(|| PendingEntry {
                 record: record.clone(),
                 data: None,
             });
-        self.mutating_inodes.insert(inode, mutating_entry);
+        self.mutating_inodes.insert(inode, mutating_placeholder);
+        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
         let original_entry = prev_entry.clone();
         let mut entry = prev_entry.unwrap_or(PendingEntry {
             record: record.clone(),

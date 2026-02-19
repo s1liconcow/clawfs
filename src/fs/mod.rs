@@ -54,20 +54,6 @@ const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
 #[cfg(not(target_os = "linux"))]
 const RENAME_NOREPLACE_FLAG: u32 = 0;
 
-trait DashMapLockExt {
-    fn lock(&self) -> &Self;
-}
-
-impl<K, V, S> DashMapLockExt for DashMap<K, V, S>
-where
-    K: Eq + std::hash::Hash,
-    S: std::hash::BuildHasher + Clone,
-{
-    fn lock(&self) -> &Self {
-        self
-    }
-}
-
 #[derive(Clone)]
 pub struct OsageFs {
     config: Config,

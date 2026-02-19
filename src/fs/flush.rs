@@ -99,6 +99,11 @@ impl OsageFs {
                     .map(|entry| *entry.key())
                     .collect();
                 for inode in keys {
+                    // Insert into flushing_inodes BEFORE removing from pending_inodes so
+                    // load_inode always finds the inode in at least one map.
+                    if let Some(e) = self.pending_inodes.get(&inode) {
+                        self.flushing_inodes.insert(inode, e.value().clone());
+                    }
                     if let Some((_, entry)) = self.pending_inodes.remove(&inode) {
                         guard.insert(inode, entry);
                     }
@@ -108,8 +113,11 @@ impl OsageFs {
                     return Ok(());
                 }
                 let drained = selector(&mut guard);
+                // Reinsert non-selected into pending BEFORE removing from flushing so
+                // there is no gap where load_inode cannot find the inode.
                 for (inode, entry) in guard {
                     self.pending_inodes.insert(inode, entry);
+                    self.flushing_inodes.remove(&inode);
                 }
                 if drained.is_empty() {
                     self.touch_last_flush();
@@ -409,18 +417,21 @@ impl OsageFs {
 
     pub(crate) fn restore_pending_after_failed_flush(&self, restored: HashMap<u64, PendingEntry>) {
         let mut dropped_bytes = 0u64;
-        let restored_inodes: Vec<u64> = restored.keys().copied().collect();
         for (inode, entry) in restored {
-            if self.pending_inodes.contains_key(&inode) {
-                if let Some(data) = entry.data {
-                    dropped_bytes = dropped_bytes.saturating_add(data.len());
-                    self.release_pending_data(data);
+            // Use the entry API for an atomic check-and-insert so a concurrent write
+            // that arrived after the flush started is not overwritten.
+            // Insert into pending BEFORE removing from flushing to keep the inode visible.
+            match self.pending_inodes.entry(inode) {
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    vac.insert(entry);
                 }
-            } else {
-                self.pending_inodes.insert(inode, entry);
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    if let Some(data) = entry.data {
+                        dropped_bytes = dropped_bytes.saturating_add(data.len());
+                        self.release_pending_data(data);
+                    }
+                }
             }
-        }
-        for inode in restored_inodes {
             self.flushing_inodes.remove(&inode);
         }
         if dropped_bytes > 0 {
