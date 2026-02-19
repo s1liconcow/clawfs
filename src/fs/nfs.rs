@@ -175,10 +175,10 @@ impl OsageFs {
         result
     }
 
-    pub fn nfs_remove_file(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+    pub fn nfs_remove_file(&self, parent: u64, name: &str, caller_uid: u32) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let result = self.op_remove_file(parent, name);
+        let result = self.op_remove_file(parent, name, caller_uid);
         self.log_replay(
             "nfs",
             "unlink",
@@ -189,10 +189,10 @@ impl OsageFs {
         result
     }
 
-    pub fn nfs_remove_dir(&self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+    pub fn nfs_remove_dir(&self, parent: u64, name: &str, caller_uid: u32) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let result = self.op_remove_dir(parent, name);
+        let result = self.op_remove_dir(parent, name, caller_uid);
         self.log_replay(
             "nfs",
             "rmdir",
@@ -210,10 +210,11 @@ impl OsageFs {
         newparent: u64,
         newname: &str,
         flags: u32,
+        caller_uid: u32,
     ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let result = self.op_rename(parent, name, newparent, newname, flags);
+        let result = self.op_rename(parent, name, newparent, newname, flags, caller_uid);
         self.log_replay(
             "nfs",
             "rename",

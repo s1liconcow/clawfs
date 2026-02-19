@@ -50,7 +50,7 @@ impl Filesystem for OsageFs {
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -68,7 +68,7 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let res = self.op_fuse_setattr(ino, mode, uid, gid, size, atime, mtime);
+        let res = self.op_fuse_setattr(ino, req.uid(), req.gid(), mode, uid, gid, size, atime, mtime);
         match res {
             Ok(attr) => {
                 self.log_replay(
@@ -520,12 +520,13 @@ impl Filesystem for OsageFs {
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
+        let caller_uid = req.uid();
         let res = (|| {
             let name = Self::validate_os_name(name)?;
-            self.op_remove_file(parent, &name)
+            self.op_remove_file(parent, &name, caller_uid)
         })();
         match res {
             Ok(()) => {
@@ -553,12 +554,13 @@ impl Filesystem for OsageFs {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
+        let caller_uid = req.uid();
         let res = (|| {
             let name = Self::validate_os_name(name)?;
-            self.op_remove_dir(parent, &name)
+            self.op_remove_dir(parent, &name, caller_uid)
         })();
         match res {
             Ok(()) => {
@@ -586,7 +588,7 @@ impl Filesystem for OsageFs {
 
     fn rename(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -596,10 +598,11 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
+        let caller_uid = req.uid();
         let res = (|| {
             let old_name = Self::validate_os_name(name)?;
             let new_name = Self::validate_os_name(newname)?;
-            self.op_rename(parent, &old_name, newparent, &new_name, flags)
+            self.op_rename(parent, &old_name, newparent, &new_name, flags, caller_uid)
         })();
         match res {
             Ok(()) => {

@@ -855,14 +855,14 @@ fn replay_event(fs: &OsageFs, event: &ReplayEvent, mapper: &mut InodeMapper) -> 
             else {
                 return ReplayOutcome::Skipped;
             };
-            fs.nfs_remove_file(mapper.map(parent), &name).err()
+            fs.nfs_remove_file(mapper.map(parent), &name, 0).err()
         }
         "rmdir" => {
             let (Some(parent), Some(name)) = (d_u64(details, "parent"), d_str(details, "name"))
             else {
                 return ReplayOutcome::Skipped;
             };
-            fs.nfs_remove_dir(mapper.map(parent), &name).err()
+            fs.nfs_remove_dir(mapper.map(parent), &name, 0).err()
         }
         "rename" => {
             let (Some(parent), Some(name), Some(newparent), Some(newname)) = (
@@ -880,6 +880,7 @@ fn replay_event(fs: &OsageFs, event: &ReplayEvent, mapper: &mut InodeMapper) -> 
                 mapper.map(newparent),
                 &newname,
                 flags,
+                0,
             )
             .err()
         }
