@@ -92,24 +92,25 @@ if [[ -f "$STATE_PATH" ]]; then
   rm -f "$STATE_PATH"
 fi
 
-if [[ -d "$MOUNT_PATH" ]]; then
-  echo "Removing mount dir $MOUNT_PATH ..."
-  rm -rf "$MOUNT_PATH"
-fi
 
-if [[ -f "$LOG_FILE" ]]; then
-  echo "Removing log file $LOG_FILE ..."
-  rm -f "$LOG_FILE"
-fi
 
 if [[ -f "$NFS_LOG_FILE" ]]; then
   echo "Removing NFS log files $NFS_LOG_FILE ..."
   rm -f "$NFS_LOG_FILE"
 fi
 
+if [[ -d "$MOUNT_PATH" ]]; then
+  echo "Removing mount dir $MOUNT_PATH ..."
+  rm -rf "$MOUNT_PATH"
+fi
+
 #if [[ -f "$PERF_LOG_PATH" ]]; then
 #  echo "Removing perf log $PERF_LOG_PATH ..."
 #  rm -f "$PERF_LOG_PATH"
+#fi
+#if [[ -f "$LOG_FILE" ]]; then
+#  echo "Removing log file $LOG_FILE ..."
+#  rm -f "$LOG_FILE"
 #fi
 
 echo "Cleanup complete."

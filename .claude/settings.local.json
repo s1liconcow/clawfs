@@ -4,7 +4,10 @@
       "Bash(*)",
       "Read(*)",
       "Write(*)",
-      "Edit(*)"
+      "Edit(*)",
+      "Bash(sudo rm:*)",
+      "Bash(cargo clean:*)",
+      "Bash(OSAGEFS_RUN_PERF=1 cargo test:*)"
     ]
   }
 }

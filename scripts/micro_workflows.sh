@@ -19,6 +19,7 @@ MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
 TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
+PERF_LOG="${PERF_LOG:-1}"
 
 # NFS transport knobs
 NFS_LISTEN="${NFS_LISTEN:-0.0.0.0:2049}"
