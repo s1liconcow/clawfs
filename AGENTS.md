@@ -5,10 +5,7 @@ Please continuously update this document with useful things you figure out that 
 
 ## Post-Merge Hygiene
 - After merging a task branch into `master`, automatically clean up temporary git worktrees and local task branches from that effort.
-- Standard cleanup sequence:
-  - `git worktree list`
-  - `git worktree remove <task-worktree-path>`
-  - `git branch -D <task-branch>`
+- Standard cleanup sequence: `git worktree list`, `git worktree remove <task-worktree-path>`, `git branch -D <task-branch>`.
 - If multiple task branches/worktrees were used for the same change, remove all of them once the merge is complete and verified.
 - Sandbox note: if a sibling worktree lives outside the current writable root, `git worktree remove` may fail with `Permission denied`; rerun that command with escalated permissions, then run `git branch -D <task-branch>`.
 
@@ -19,7 +16,6 @@ Please continuously update this document with useful things you figure out that 
 - Payload transforms: inline metadata payloads and immutable segment payloads can be compressed/encrypted. `--inline-compression` and `--segment-compression` default to `true` and only keep compressed bytes when smaller; `--inline-encryption-key <passphrase>` and `--segment-encryption-key <passphrase>` enable ChaCha20Poly1305 encryption (compression runs first when beneficial).
 - Pending writes are buffered per inode; `flush_pending()` writes a single immutable segment, emits a delta log, rewrites touched shards, and bumps the superblock generation once. Each large write appends to a staging segment file under `$STORE/segment_stage` so data survives until the next flush. When a flush finishes we drop that file and open a fresh staging file for the next batch. Flush triggers: explicit `flush`/`fsync`/`release`, interval timer, or when staged bytes exceed `pending_bytes`.
 - Adaptive large-write flush policy: append-heavy large writes can use a higher pending-byte watermark (capped) to reduce write amplification. `flush_interval_ms` is treated as the hard max dirty-data wait time for interval flushing (no extra adaptive defer window).
-- Metadata/list caches follow NFS-like TTLs: `--lookup-cache-ttl-ms` for attrs and `--dir-cache-ttl-ms` for directory entries. A background poller (`--metadata-poll-interval-ms`) lists `/imap_deltas/`, applies newer generations, and kicks off segment prefetches for affected inodes. Immutable segments are cached under `$STORE/segment_cache` up to `--segment-cache-bytes`.
 - Metadata/list caches follow NFS-like TTLs: `--lookup-cache-ttl-ms` for attrs and `--dir-cache-ttl-ms` for directory entries. A background poller (`--metadata-poll-interval-ms`) lists `/imap_deltas/`, applies newer generations, and kicks off segment prefetches for affected inodes. Immutable segments are cached under `$STORE/segment_cache` up to `--segment-cache-bytes`. Metadata flushes batch up to `--imap-delta-batch` inodes per delta object and rewrite each shard snapshot only once per flush to limit backing-store API calls.
 - Cleanup is coordinated via short leases recorded in the superblock. Clients opportunistically take `DeltaCompaction` leases (prune older `/imap_deltas/`) and `SegmentCompaction` leases (merge older segments and update inode pointers) so maintenance work is shared across mounts.
 - Use `--disable-cleanup` when a client is far from the bucket; run a regional cleanup agent (see `docs/CLEANUP_AGENT.md`) to pick up the leases without incurring cross-region traffic.
@@ -34,8 +30,7 @@ Please continuously update this document with useful things you figure out that 
 - `src/state.rs`: `ClientStateManager` handles per-client pools, persisted via JSON. Tests ensure persistence across runs.
 - `src/metadata.rs`: Handles inode caching, writes shard snapshots under `/imaps`, emits delta logs with bloom-filtered filenames, and performs CAS updates on `metadata/superblock.bin`.
 - `src/checkpoint.rs` + `src/bin/osagefs_checkpoint.rs`: checkpoint/restore utility that saves and restores superblock snapshots; use it to roll filesystem state backward/forward by generation without rewriting immutable objects.
-- `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries into immutable segments; `read_pointer` serves cache hits locally, otherwise issues object-store range reads for the pointer span and asynchronously enqueues full-segment cache fill. Tests verify write/read.
-- `src/segment.rs`: `SegmentManager::write_batch` accepts in-memory bytes or staged chunks; flushing can stream staged payloads directly into immutable segments to reduce extra copy overhead in `flush_pending`.
+- `src/segment.rs`: `SegmentManager::write_batch` serializes `[inode,path,data]` entries (in-memory or staged chunks) into immutable segments; `flush_pending` can stream staged payloads directly to avoid extra copies. `read_pointer` serves cache hits locally, otherwise issues object-store range reads and asynchronously enqueues full-segment cache fill. Tests cover write/read paths.
 - `src/fs/`: split filesystem module. `mod.rs` holds shared types/constants, `core.rs` handles inode/path primitives, `write_path.rs` handles staging/appends/segment writes, `flush.rs` handles flush/journal/replay timing, `ops.rs` provides shared transport-agnostic `op_*` methods, `fuse.rs` contains FUSE adapter wiring, and `nfs.rs` contains NFS adapter wiring.
 - `scripts/linux_kernel_perf.sh`: End-to-end harness that cleans mounts, downloads Linux tarball (if missing), mounts osagefs, and times untar + kernel build. Handles cleanups and dependencies.
 - `scripts/fio_workloads.sh`: Starts OsageFS, runs mixed fio profiles (sequential, random, mixed, small-file sync), and writes per-workload JSON plus `summary.md` under `fio-results-*`.
@@ -71,7 +66,7 @@ Please continuously update this document with useful things you figure out that 
 - Pending bytes threshold + `--flush-interval-ms` ensure `flush_pending()` runs automatically; staged payloads append to `$STORE/segment_stage/stage_*.bin` and only one of those files exists per in-flight flush. Metadata poller + TTLs keep cached attrs fresh, while cleanup leases prevent `/imap_deltas/` and `/segs/` from growing without bound.
 - Troubleshooting policy: reproduce with a failing automated test before fixing. For NFS/data-path issues, first capture logs (`write error`, `load_inode miss`, etc.), then codify the failure as a focused regression test in `src/fs/tests/mod.rs`; only after the test fails should code changes be made. Keep the test to prevent regressions.
 - `scripts/stress_e2e.sh` always runs `scripts/cleanup.sh` on exit, which removes both `LOG_FILE` and `PERF_LOG_PATH`; when you need post-run perf analysis, run an equivalent custom workload (or copy logs elsewhere) before cleanup.
-- Update (2026-02-17): `scripts/micro_workflows.sh` now preserves `PERF_LOG_PATH` on EXIT cleanup; pre-run cleanup still resets it before launching a fresh OsageFS run.
+- Update (2026-02-20): `scripts/micro_workflows.sh` preserves caller-provided `PERF_LOG_PATH` on EXIT cleanup and perf logging is now opt-in; pass `PERF_LOG_PATH=/path/to/osagefs-perf.jsonl` explicitly when you want traces.
 - `scripts/stress_e2e.sh` now wraps `scripts/cleanup.sh` via a shared `run_cleanup_script()` helper for both initial cleanup and EXIT teardown, matching the common script pattern used by other harnesses.
 - In Sprite VMs, long `apt-get install` runs can sometimes end with `Error: connection closed` / non-zero transport exit even after package `Setting up ...` lines complete; verify required tools explicitly (`fusermount3`, `rg`, `strace`) before retrying full bootstrap.
 - Sprite quirk: some images do not provide `/etc/mtab`, so `fusermount -u` can print `failed to open /etc/mtab`; fall back to `umount -l <mount>` when needed.
@@ -96,9 +91,7 @@ Please continuously update this document with useful things you figure out that 
 - Update (2026-02-16): OsageFS now has a proper CLI flag `--allow-other` (wired through `Config.allow_other`). `scripts/run_osagefs.sh` maps `ALLOW_OTHER=1` to `--allow-other`; `OSAGEFS_ALLOW_OTHER=1` remains as a backward-compatible fallback.
 - Update (2026-02-16): Long-name behavior should return `ENAMETOOLONG` (not `ENOENT`/success). Enforce component length checks (`NAME_MAX=255`) in FUSE path operations and lookup to satisfy `*/02.t` length tests.
 - Update (2026-02-16): `mknod` callback parameter order in `fuser` is `(mode, umask, rdev)`. Mixing `umask`/`rdev` silently compiles (both `u32`) but breaks `major/minor` assertions (`mknod/11.t`).
-- Sprite A/B benchmark (2026-02-16): baseline (`HEAD`) vs patched fsync-scope binary on a dev-build-like mixed workload (many object-file appends plus per-round lockfile `fsync`) showed median runtime drop from `6.782s` to `3.153s` across 5 runs (`53.5%` faster), with lower run-to-run variance (`stdev 0.199s -> 0.060s`).
-- Update (2026-02-16): local segment-path optimization pass: `encode_bytes` no longer clones payloads before deciding compression/encryption, `SegmentManager::write_batch` now encodes/appends in a single pass (no intermediate encoded-entry vector), and staged file `reset()` avoids unnecessary `sync_data`. On `OSAGEFS_RUN_PERF=1 cargo test --test perf_local -- --nocapture`, small-file IOPS improved from `163876` (baseline sample) to ~`199176` median across 5 runs (~`21.5%`), while batch throughput stayed in the same band with ~`279.18 MiB/s` median across 5 runs (single low outlier at `244.56 MiB/s`).
-- Update (2026-02-16): bounded worker-shard encode path added for large segment flushes in `SegmentManager::write_batch` (uses up to 8 workers only when batch is large; small batches keep one-pass serialization). Validation: isolated `local_segment_small_file_iops` stayed around ~`200k` ops/s across 5 runs (`198061`-`208039`), and isolated `local_segment_batch_throughput` jumped from prior ~`279 MiB/s` median to a new ~`1162 MiB/s` median across 5 runs (`667`-`1542 MiB/s`, high variance but consistently above old band).
+- Performance summary (2026-02-16): fsync-scope and segment-write-path optimizations materially improved dev-loop latency and local `perf_local` throughput; keep current flush-scope and segment serialization behavior unless a targeted regression test/perf run indicates otherwise.
 - Update (2026-02-16): `io_uring` local segment write experiment was removed after `perf_local` did not show consistent wins versus the standard write path; keep default object-store/local write flow until a better async write design is ready.
 
 ## Useful Commands
@@ -221,9 +214,6 @@ Useful knobs for repeated runs:
 - `LOCAL_CACHE_PATH=/tmp/osagefs-cache`
 - `STATE_PATH=$HOME/.osagefs/state/client_state.bin`
 
-Example with explicit paths:
-- `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl ./scripts/stress_e2e.sh'`
-
 ## Sprite FUSE Troubleshooting
 If stress fails with `Input/output error` (for example during `cp` in the attribute test), collect these immediately:
 - `sprite exec -s "$SPRITE_NAME" -- bash -lc 'tail -n 200 /work/osagefs/osagefs.log || true'`
@@ -263,9 +253,7 @@ FIO note:
 - `scripts/micro_workflows.sh` `dev_scan_and_status` can expose transient `.git/config.lock` behavior on OsageFS during `git init/config/status`; the harness now retries and clears stale lock files so the suite can complete while preserving this workflow signal.
 - Git clone lockfile failure root cause: FUSE `rename` had a same-directory stale-entry bug (`config.lock -> config` could leave `config.lock` visible). Fixed by routing FUSE and NFS rename through shared `rename_entry(...)` logic and covered by `rename_same_parent_drops_old_name`.
 - Large-file metadata-only flush root cause: `flush_pending` incorrectly required a new segment pointer for any record with `size > inline_threshold`, even when no payload was pending. Fixed by only requiring pointers for inodes with segment payload in the current flush (`segment_data_inodes`), covered by `metadata_only_flush_preserves_large_file_pointer`.
-- Sprite caveat: in this environment, Rust workloads on the OsageFS mount may intermittently fail with `rust-lld` bus errors during build-script linking; this appears environment/toolchain-related, not a filesystem semantic error. For reliable cross-filesystem micro comparisons, use non-Rust OSS build targets or run Rust comparisons in a sprite without this linker instability.
-- Dev-build optimization validated in sprite (2026-02-15): keep source/worktree on OsageFS but place Rust build artifacts on sprite-local disk with a shared target dir, e.g. `CARGO_TARGET_DIR=/tmp/osagefs-rust-target-shared cargo check -q`. In repeated runs this reduced median `cargo check` time from ~23.9s (unique cold target each run) to ~2.6s (shared warm target), ~89% faster, while preserving OsageFS durability semantics for source and metadata paths.
-- Update (2026-02-17): `scripts/micro_workflows.sh` now applies that sprite workaround automatically for `dev_incremental_build` on OsageFS mounts (`DEV_BUILD_SPRITE_WORKAROUND=1` -> `CARGO_TARGET_DIR=/tmp/osagefs-rust-target-shared`, `CARGO_BUILD_JOBS=1`, `CARGO_INCREMENTAL=0` unless overridden). Also fixed build result reporting: `dev_incremental_build` now records `fail` and non-zero exit when `cargo check` fails instead of incorrectly emitting `ok`.
+- FUSE mmap caveat (Rust builds): linking can SIGBUS on OsageFS FUSE mounts because `rustc` memory-maps `.rmeta` files. Keep sources on OsageFS but direct build artifacts to local disk (`CARGO_TARGET_DIR=/tmp/osagefs-rust-target-shared`). `scripts/micro_workflows.sh` does this automatically for OsageFS `dev_incremental_build` when `DEV_BUILD_SPRITE_WORKAROUND=1` (default), including conservative `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` unless overridden; it also correctly records `fail` on `cargo check` errors.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:

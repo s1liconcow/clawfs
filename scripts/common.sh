@@ -12,7 +12,7 @@ osage_set_defaults() {
   LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-$HOME/.osagefs/cache}"
   STATE_PATH="${STATE_PATH:-$HOME/.osagefs/state/client_state.bin}"
   LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs.log}"
-  PERF_LOG_PATH="${PERF_LOG_PATH:-$ROOT_DIR/osagefs-perf.jsonl}"
+  PERF_LOG_PATH="${PERF_LOG_PATH:-}"
 }
 
 osage_is_true() {

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
+set -x
 set -eEuo pipefail
+
+PERF_LOG_PATH_FROM_ENV="${PERF_LOG_PATH-}"
+PERF_LOG_PATH_WAS_SET=0
+if [[ "${PERF_LOG_PATH+x}" == "x" ]]; then
+  PERF_LOG_PATH_WAS_SET=1
+fi
 
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
@@ -19,7 +26,6 @@ MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
 TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
-PERF_LOG="${PERF_LOG:-1}"
 
 # NFS transport knobs
 NFS_LISTEN="${NFS_LISTEN:-0.0.0.0:2049}"
@@ -839,8 +845,9 @@ optional_build_probe() {
   local target_dir="$DEV_BUILD_TARGET_DIR"
   local jobs="$DEV_BUILD_CARGO_JOBS"
   local incremental="$DEV_BUILD_INCREMENTAL"
-  if [[ -z "$target_dir" && "$fs_type" == "osagefs" && "$DEV_BUILD_SPRITE_WORKAROUND" == "1" && -d "/.sprite" ]]; then
-    # Sprite VMs can intermittently SIGBUS when Rust artifacts are emitted on the FUSE mount.
+  if [[ -z "$target_dir" && "$fs_type" == "osagefs" && "$DEV_BUILD_SPRITE_WORKAROUND" == "1" ]]; then
+    # rustc mmap's .rmeta files; FUSE mmap semantics are broken and cause SIGBUS.
+    # Redirect build artifacts off the FUSE mount regardless of environment.
     target_dir="/tmp/osagefs-rust-target-shared"
   fi
   if [[ -z "$jobs" && "$target_dir" == /tmp/* ]]; then
