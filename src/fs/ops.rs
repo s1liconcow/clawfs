@@ -78,25 +78,33 @@ impl OsageFs {
         if let Some(new_gid) = gid {
             record.gid = new_gid;
         }
-        let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        if let Some(target_size) = size {
-            if record.is_dir() {
-                return Err(EISDIR);
-            }
-            Self::resize_file_data_for_setattr(&mut data, target_size)?;
-            record.size = data.len() as u64;
-        }
         record.ctime = OffsetDateTime::now_utc();
         if let Some(ts) = atime {
             record.atime = ts;
         }
         if let Some(ts) = mtime {
             record.mtime = ts;
-        } else if size.is_some() {
-            record.mtime = record.ctime;
         }
-        self.stage_file(record.clone(), data, None)?;
-        Ok(record)
+
+        if let Some(target_size) = size {
+            // Size change: must read and restage file data.
+            if record.is_dir() {
+                return Err(EISDIR);
+            }
+            if mtime.is_none() {
+                record.mtime = record.ctime;
+            }
+            let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            Self::resize_file_data_for_setattr(&mut data, target_size)?;
+            record.size = data.len() as u64;
+            self.stage_file(record.clone(), data, None)?;
+            Ok(record)
+        } else {
+            // Metadata-only: preserve file data via stage_inode (avoids the
+            // read_file_bytes race with concurrent flush for large files).
+            self.stage_inode(record.clone())?;
+            Ok(record)
+        }
     }
 
     /// Enforce sticky-bit restriction: if parent dir has the sticky bit set,
@@ -197,17 +205,6 @@ impl OsageFs {
             }
         }
 
-        let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        if let Some(target_size) = size {
-            if record.is_dir() {
-                return Err(EISDIR);
-            }
-            Self::resize_file_data_for_setattr(&mut data, target_size)?;
-            record.size = data.len() as u64;
-            if mtime.is_none() {
-                record.mtime = OffsetDateTime::now_utc();
-            }
-        }
         if let Some(next_atime) = atime {
             record.atime = match next_atime {
                 TimeOrNow::SpecificTime(ts) => from_system_time(ts),
@@ -221,9 +218,38 @@ impl OsageFs {
             };
         }
         record.ctime = OffsetDateTime::now_utc();
-        let attr = Self::record_attr(&record);
-        self.stage_file(record, data, None)?;
-        Ok(attr)
+
+        if let Some(target_size) = size {
+            // Size change: must read and restage file data to truncate/extend.
+            if record.is_dir() {
+                return Err(EISDIR);
+            }
+            let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
+            Self::resize_file_data_for_setattr(&mut data, target_size)?;
+            record.size = data.len() as u64;
+            if mtime.is_none() {
+                record.mtime = OffsetDateTime::now_utc();
+            }
+            let attr = Self::record_attr(&record);
+            self.stage_file(record, data, None)?;
+            Ok(attr)
+        } else {
+            // Metadata-only change (mode/uid/gid/timestamps, no size change).
+            // Do NOT call read_file_bytes + stage_file here: for large files
+            // the record loaded from flushing_inodes carries a stale
+            // Inline([]) storage placeholder.  If the concurrent flush
+            // completes between load_inode and read_file_bytes, the staged
+            // chunks are gone and read_file_bytes falls back to that stale
+            // placeholder, returning empty bytes.  stage_file would then
+            // persist an empty file, corrupting the content.
+            // stage_inode updates the record in-place when the inode is
+            // already in pending_inodes (preserving the data field), and
+            // creates a metadata-only pending entry otherwise (handled in
+            // flush_pending_selected via stale-storage detection).
+            let attr = Self::record_attr(&record);
+            self.stage_inode(record)?;
+            Ok(attr)
+        }
     }
 
     pub(crate) fn op_create(

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -x
 set -eEuo pipefail
 
 PERF_LOG_PATH_FROM_ENV="${PERF_LOG_PATH-}"
@@ -49,7 +48,7 @@ BUILD_MODE="${BUILD_MODE:-check}" # check|none
 DEV_BUILD_TARGET_DIR="${DEV_BUILD_TARGET_DIR:-}" # optional override for cargo target dir
 DEV_BUILD_CARGO_JOBS="${DEV_BUILD_CARGO_JOBS:-}" # optional override for cargo parallelism
 DEV_BUILD_INCREMENTAL="${DEV_BUILD_INCREMENTAL:-}" # optional override for CARGO_INCREMENTAL
-DEV_BUILD_SPRITE_WORKAROUND="${DEV_BUILD_SPRITE_WORKAROUND:-1}" # set 0 to disable auto sprite workaround
+DEV_BUILD_SPRITE_WORKAROUND="${DEV_BUILD_SPRITE_WORKAROUND:-1}" 
 ALLOW_PIP_INSTALL="${ALLOW_PIP_INSTALL:-1}"
 ALLOW_SYSTEM_INSTALL="${ALLOW_SYSTEM_INSTALL:-1}"
 

@@ -1584,3 +1584,169 @@
         let file = fs.op_create(normal_dir.inode, "newfile.txt", 2000, 9999).unwrap();
         assert_eq!(file.gid, 9999, "without SGID parent, file keeps caller gid");
     }
+
+    // Regression: metadata-only setattr (chmod) on a large file that is still
+    // in pending_inodes must NOT call read_file_bytes + stage_file (which could
+    // corrupt content by reading a stale Inline([]) placeholder).
+    // After the fix, op_fuse_setattr uses stage_inode for size=None, preserving
+    // the staged data in-place.
+    #[test]
+    fn fuse_setattr_chmod_on_large_pending_file_preserves_content() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(
+            dir.path(),
+            "fuse_chmod_pending_large.bin",
+            1 << 20,
+            |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+                cfg.inline_threshold = 512;
+            },
+        );
+        let fs = &harness.fs;
+
+        // Write a file larger than inline_threshold so it enters staged storage.
+        let payload = vec![0xABu8; 8 * 1024];
+        let file = fs.nfs_create(ROOT_INODE, "large.bin", 1000, 1000).unwrap();
+        fs.nfs_write(file.inode, 0, &payload).unwrap();
+
+        // File is now in pending_inodes.  Perform a metadata-only chmod.
+        // Before the fix this called read_file_bytes on the pending record,
+        // which could return empty bytes and then stage_file would corrupt the
+        // file; after the fix it calls stage_inode (data preserved in-place).
+        fs.op_fuse_setattr(
+            file.inode,
+            1000,
+            1000,
+            Some(0o100640),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("chmod on pending large file should succeed");
+
+        // Content must survive the chmod.
+        let before_flush = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+        assert_eq!(before_flush, payload, "content corrupted by chmod before flush");
+
+        fs.flush_pending().unwrap();
+
+        let after_flush = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+        assert_eq!(after_flush, payload, "content corrupted by chmod after flush");
+
+        let stored = fs.load_inode(file.inode).unwrap();
+        assert_eq!(stored.mode & 0o777, 0o640, "chmod mode not persisted");
+        assert_eq!(stored.size, payload.len() as u64, "size must not change");
+    }
+
+    // Regression: metadata-only setattr on a large file that has already been
+    // flushed (inode lives in the metadata store with correct Segments storage)
+    // must persist both the correct storage pointer AND the metadata change.
+    #[test]
+    fn fuse_setattr_chmod_after_flush_preserves_large_file_content() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(
+            dir.path(),
+            "fuse_chmod_after_flush_large.bin",
+            1 << 20,
+            |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+                cfg.inline_threshold = 512;
+            },
+        );
+        let fs = &harness.fs;
+
+        let payload = vec![0xCDu8; 8 * 1024];
+        let file = fs.nfs_create(ROOT_INODE, "flushed.bin", 1000, 1000).unwrap();
+        fs.nfs_write(file.inode, 0, &payload).unwrap();
+        fs.flush_pending().unwrap();
+
+        // Inode is now only in the metadata store.  chmod creates a metadata-only
+        // pending entry (stage_inode).  A second flush must merge it with the
+        // correct Segments pointer from the metadata store.
+        fs.op_fuse_setattr(
+            file.inode,
+            1000,
+            1000,
+            Some(0o100600),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("chmod after flush should succeed");
+
+        fs.flush_pending().unwrap();
+
+        let after = fs.load_inode(file.inode).unwrap();
+        assert_eq!(after.mode & 0o777, 0o600, "chmod mode not persisted after second flush");
+        assert_eq!(after.size, payload.len() as u64, "size must not change");
+
+        let content = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+        assert_eq!(content, payload, "content corrupted after chmod + second flush");
+    }
+
+    // Regression: if a metadata-only pending entry (data=None) carries a stale
+    // Inline([]) storage placeholder (the hallmark of a setattr that raced with
+    // a concurrent flush), flush_pending_selected must reload the authoritative
+    // record from the metadata store and merge the pending metadata changes
+    // rather than persisting the stale Inline([]) pointer.
+    #[test]
+    fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
+        let dir = tempdir().unwrap();
+        let harness = TestHarness::with_config(
+            dir.path(),
+            "flush_stale_setattr.bin",
+            1 << 20,
+            |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+                cfg.inline_threshold = 512;
+            },
+        );
+        let fs = &harness.fs;
+
+        // Write and flush a large file so the metadata store has its correct
+        // Segments(extents) storage pointer.
+        let payload = vec![0xEFu8; 8 * 1024];
+        let file = fs.nfs_create(ROOT_INODE, "race.bin", 1000, 1000).unwrap();
+        fs.nfs_write(file.inode, 0, &payload).unwrap();
+        fs.flush_pending().unwrap();
+
+        // Simulate the race: load the flushed record, corrupt its storage field
+        // to Inline([]) (the stale placeholder written by flush before the
+        // segment pointer is known), change its mode, and inject it as a
+        // metadata-only pending entry — exactly what stage_inode produces when
+        // called from setattr on a record loaded from flushing_inodes just
+        // before the concurrent flush completes.
+        let mut stale_record = fs.load_inode(file.inode).unwrap();
+        stale_record.storage = FileStorage::Inline(Vec::new()); // stale placeholder
+        stale_record.mode = (stale_record.mode & !0o7777) | 0o100604;
+
+        fs.pending_inodes.insert(
+            file.inode,
+            PendingEntry {
+                record: stale_record,
+                data: None,
+            },
+        );
+
+        // flush_pending_selected must detect the stale Inline([]) storage,
+        // reload from metadata store, and persist the merged record.
+        fs.flush_pending().unwrap();
+
+        let after = fs.load_inode(file.inode).unwrap();
+        assert_eq!(after.mode & 0o777, 0o604, "metadata change from stale entry not applied");
+        assert_eq!(after.size, payload.len() as u64, "size must be preserved");
+
+        // Most importantly: content must still be readable (storage pointer intact).
+        let content = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+        assert_eq!(
+            content, payload,
+            "stale Inline([]) storage overwrote correct Segments pointer — data lost"
+        );
+    }

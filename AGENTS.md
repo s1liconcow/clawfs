@@ -3,6 +3,9 @@
 ## Living Document
 Please continuously update this document with useful things you figure out that will make future workflows smoother and increase iteration speed.  
 
+## Increase Iteration Speed and Token Efficiency
+If a new tool (or modifying an existing) can help with your work, propose building it.  If you're creating a shell or python command longer than a few lines, consider making a reusable tool instead.
+
 ## Post-Merge Hygiene
 - After merging a task branch into `master`, automatically clean up temporary git worktrees and local task branches from that effort.
 - Standard cleanup sequence: `git worktree list`, `git worktree remove <task-worktree-path>`, `git branch -D <task-branch>`.
@@ -246,14 +249,6 @@ Direct checkpoint commands:
 Notes:
 - `--mode fast` adds `--reuse_tree` to `scripts/linux_kernel_perf.sh` so it skips cleanup + extract.
 - Keep tarball + extracted kernel tree in the checkpoint you restore from, then only sync code deltas each run.
-
-FIO note:
-- In sprite runs, `smallfiles_sync` may return `Input/output error` during high-concurrency open/create (`filesetup.c:open(...)`) while larger sequential/random workloads still complete. Keep the workload in the matrix for regression tracking, but do not let that single failure abort summary generation.
-- Regression check for this class of issue: `WORKLOADS=smallfiles_sync FAST_REPRO=1 SMALLFILE_NUMJOBS=8` should pass repeatedly with `fsync=1` once FUSE generation is stable.
-- `scripts/micro_workflows.sh` `dev_scan_and_status` can expose transient `.git/config.lock` behavior on OsageFS during `git init/config/status`; the harness now retries and clears stale lock files so the suite can complete while preserving this workflow signal.
-- Git clone lockfile failure root cause: FUSE `rename` had a same-directory stale-entry bug (`config.lock -> config` could leave `config.lock` visible). Fixed by routing FUSE and NFS rename through shared `rename_entry(...)` logic and covered by `rename_same_parent_drops_old_name`.
-- Large-file metadata-only flush root cause: `flush_pending` incorrectly required a new segment pointer for any record with `size > inline_threshold`, even when no payload was pending. Fixed by only requiring pointers for inodes with segment payload in the current flush (`segment_data_inodes`), covered by `metadata_only_flush_preserves_large_file_pointer`.
-- FUSE mmap caveat (Rust builds): linking can SIGBUS on OsageFS FUSE mounts because `rustc` memory-maps `.rmeta` files. Keep sources on OsageFS but direct build artifacts to local disk (`CARGO_TARGET_DIR=/tmp/osagefs-rust-target-shared`). `scripts/micro_workflows.sh` does this automatically for OsageFS `dev_incremental_build` when `DEV_BUILD_SPRITE_WORKAROUND=1` (default), including conservative `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` unless overridden; it also correctly records `fail` on `cargo check` errors.
 
 ## Artifact capture
 If tests fail, capture logs from the sprite:

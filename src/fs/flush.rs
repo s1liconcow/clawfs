@@ -223,7 +223,65 @@ impl OsageFs {
                     }
                     None => {
                         metadata_only += 1;
-                        records.push(pending_entry.record.clone());
+                        let mut record = pending_entry.record.clone();
+                        // A metadata-only pending entry (data=None) whose record carries
+                        // stale Inline([]) storage for a non-empty file was produced by a
+                        // setattr that raced with a concurrent flush: load_inode returned
+                        // the flushing record (storage placeholder = Inline([])) just
+                        // before the prior flush committed and removed it from
+                        // flushing_inodes.  flush_lock serializes flushes, so that prior
+                        // flush has committed by the time we get here.  Reload the
+                        // authoritative record from the metadata store (which has the
+                        // correct Segments(extents) pointer) and merge our pending
+                        // metadata changes on top.
+                        if record.size > 0
+                            && matches!(
+                                record.storage,
+                                FileStorage::Inline(ref v) if v.is_empty()
+                            )
+                        {
+                            match self.block_on(self.metadata.get_inode(record.inode)) {
+                                Ok(Some(fresh)) => {
+                                    let merged_mode = record.mode;
+                                    let merged_uid = record.uid;
+                                    let merged_gid = record.gid;
+                                    let merged_ctime = record.ctime;
+                                    let merged_atime = record.atime;
+                                    let merged_mtime = record.mtime;
+                                    record = fresh;
+                                    record.mode = merged_mode;
+                                    record.uid = merged_uid;
+                                    record.gid = merged_gid;
+                                    record.ctime = merged_ctime;
+                                    record.atime = merged_atime;
+                                    record.mtime = merged_mtime;
+                                }
+                                Ok(None) => {
+                                    // The prior data flush may not have committed yet
+                                    // (very unlikely given flush_lock, but possible on
+                                    // flush failure + recovery).  Skip this record to
+                                    // avoid persisting a zero-storage record; the next
+                                    // flush of the data entry will carry our metadata
+                                    // changes if they were merged there.
+                                    log::warn!(
+                                        "flush: metadata-only entry ino={} has stale \
+                                         Inline([]) storage but inode absent from metadata \
+                                         store; skipping to prevent data pointer loss",
+                                        record.inode
+                                    );
+                                    metadata_only -= 1;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "flush: metadata-only entry ino={} storage reload \
+                                         failed: {err:?}; using stale storage as fallback",
+                                        record.inode
+                                    );
+                                }
+                            }
+                        }
+                        records.push(record);
                     }
                 }
             }
