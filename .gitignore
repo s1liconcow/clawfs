@@ -8,3 +8,4 @@ loopback-bench/target
 pjdfstest_nfs
 micro-results-*
 pjdfstest_*
+fio-results-*

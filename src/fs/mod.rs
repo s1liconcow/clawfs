@@ -62,9 +62,7 @@ pub struct OsageFs {
     segments: Arc<SegmentManager>,
     handle: Handle,
     client_state: Arc<ClientStateManager>,
-    pending_inodes: Arc<DashMap<u64, PendingEntry>>,
-    mutating_inodes: Arc<DashMap<u64, PendingEntry>>,
-    flushing_inodes: Arc<DashMap<u64, PendingEntry>>,
+    active_inodes: Arc<DashMap<u64, Arc<Mutex<ActiveInode>>>>,
     pending_bytes: Arc<Mutex<u64>>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
@@ -147,6 +145,12 @@ pub(crate) struct PendingEntry {
     data: Option<PendingData>,
 }
 
+#[derive(Default)]
+pub(crate) struct ActiveInode {
+    pub pending: Option<PendingEntry>,
+    pub flushing: Option<PendingEntry>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StageWriteContext {
     prev_size: u64,
@@ -161,13 +165,23 @@ pub(crate) enum PendingData {
 
 #[derive(Clone)]
 pub(crate) struct PendingSegments {
+    /// Committed segment extents from the last flush that back regions of the
+    /// file not yet overwritten by staged chunks.  These are carried forward
+    /// from the previous committed storage and merged with new staged chunks at
+    /// flush time, avoiding a full file read on partial overwrites.
+    pub(crate) base_extents: Arc<Vec<SegmentExtent>>,
+    /// Staged chunks representing new or modified data, each with an explicit
+    /// logical file offset.
     chunks: Arc<Vec<StagedChunk>>,
+    /// Total logical file size.  May exceed the sum of `chunks` lengths when
+    /// `base_extents` are present.
     total_len: u64,
 }
 
 impl PendingSegments {
     fn new() -> Self {
         Self {
+            base_extents: Arc::new(Vec::new()),
             chunks: Arc::new(Vec::new()),
             total_len: 0,
         }
@@ -179,28 +193,42 @@ impl PendingSegments {
         segments
     }
 
+    /// Create pending segments backed by existing committed extents, without
+    /// reading any segment data.  Used by `write_large_segments` to avoid
+    /// materialising a large file just to apply a partial write on top of it.
+    pub(crate) fn from_committed_extents(extents: Vec<SegmentExtent>, total_len: u64) -> Self {
+        Self {
+            base_extents: Arc::new(extents),
+            chunks: Arc::new(Vec::new()),
+            total_len,
+        }
+    }
+
+    /// Sum of bytes in staged chunks only (excludes base_extents).  Used for
+    /// `pending_bytes` accounting: only newly-staged data contributes to the
+    /// in-flight dirty-byte watermark.
+    pub(crate) fn staged_bytes(&self) -> u64 {
+        self.chunks.iter().map(|c| c.len).sum()
+    }
+
     fn append(&mut self, chunk: StagedChunk) {
         if chunk.len == 0 {
             return;
         }
+        let mut chunk = chunk;
+        // An appended chunk always starts at the current logical end.
+        chunk.logical_offset = self.total_len;
         self.total_len = self.total_len.saturating_add(chunk.len);
         Arc::make_mut(&mut self.chunks).push(chunk);
     }
 
-    fn ensure_offset(&mut self, manager: &SegmentManager, target: u64) -> Result<()> {
+    fn ensure_offset(&mut self, target: u64) -> Result<()> {
         if target <= self.total_len {
             return Ok(());
         }
-        let gap = target - self.total_len;
-        if gap == 0 {
-            return Ok(());
-        }
-        let gap_len = usize::try_from(gap).map_err(|_| anyhow!("gap too large"))?;
-        let zeros = vec![0u8; gap_len];
-        let chunk = manager
-            .stage_payload(&zeros)
-            .map_err(|_| anyhow!("stage gap"))?;
-        self.append(chunk);
+        // Preserve sparse-hole semantics by extending logical length without
+        // materializing a staged zero chunk for the gap.
+        self.total_len = target;
         Ok(())
     }
 
@@ -213,15 +241,15 @@ impl PendingSegments {
         if chunk.len == 0 {
             return Ok(());
         }
+        let mut chunk = chunk;
+        chunk.logical_offset = offset;
         let write_end = offset.saturating_add(chunk.len);
-        let mut cursor = 0u64;
         let mut pending_chunk = Some(chunk);
         let chunks = Arc::make_mut(&mut self.chunks);
         let mut result = Vec::with_capacity(chunks.len() + 1);
         for existing in chunks.drain(..) {
-            let chunk_len = existing.len;
-            let chunk_start = cursor;
-            let chunk_end = chunk_start + chunk_len;
+            let chunk_start = existing.logical_offset;
+            let chunk_end = chunk_start.saturating_add(existing.len);
             if chunk_end <= offset || chunk_start >= write_end {
                 if chunk_start >= write_end {
                     if let Some(new_chunk) = pending_chunk.take() {
@@ -256,7 +284,6 @@ impl PendingSegments {
                     .release_staged_chunk(&existing)
                     .map_err(|_| anyhow!("release chunk"))?;
             }
-            cursor = chunk_end;
         }
         if let Some(new_chunk) = pending_chunk.take() {
             result.push(new_chunk);

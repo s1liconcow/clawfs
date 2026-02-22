@@ -96,7 +96,7 @@ impl SuperblockManager {
     async fn reload(&self) -> Result<()> {
         if let Some(wrapper) = self.store.load_superblock().await? {
             let mut guard = self.state.lock();
-            // Preserve pending_generation logic? 
+            // Preserve pending_generation logic?
             // If we reload, and we had a pending_generation, we might be desynchronized if on-disk generation changed.
             // But reload is mostly for CAS retry loops where we want to re-apply an operation.
             guard.block = wrapper.block;
@@ -117,7 +117,11 @@ impl SuperblockManager {
 
             let result = action(&mut block)?;
 
-            match self.store.store_superblock_conditional(&block, &expected_version).await {
+            match self
+                .store
+                .store_superblock_conditional(&block, &expected_version)
+                .await
+            {
                 Ok(new_version) => {
                     let mut guard = self.state.lock();
                     guard.block = block;
@@ -157,7 +161,8 @@ impl SuperblockManager {
         self.update_with_retry(|block| {
             block.state = FilesystemState::Clean;
             Ok(())
-        }).await?;
+        })
+        .await?;
         let mut guard = self.state.lock();
         guard.pending_generation = None;
         Ok(())
@@ -169,7 +174,8 @@ impl SuperblockManager {
             let start = block.next_inode;
             block.next_inode = block.next_inode.saturating_add(count);
             Ok(start)
-        }).await
+        })
+        .await
     }
 
     pub async fn reserve_segments(&self, count: u64) -> Result<u64> {
@@ -178,7 +184,8 @@ impl SuperblockManager {
             let start = block.next_segment;
             block.next_segment = block.next_segment.saturating_add(count);
             Ok(start)
-        }).await
+        })
+        .await
     }
 
     pub async fn commit_generation(&self, generation: u64) -> Result<()> {
@@ -188,28 +195,7 @@ impl SuperblockManager {
                 if guard.pending_generation != Some(generation) {
                     bail!("generation {} not pending", generation);
                 }
-                
-                // If we reloaded and disk moved past our expected old generation, we have a conflict.
-                // But `commit_generation` asserts we are moving from `generation-1` to `generation`.
-                // If disk is already at `generation` or higher, we are stale.
-                // Actually, if disk is at `generation`, someone else committed it? Or we did?
-                
-                // Let's check consistency.
-                if guard.block.generation >= generation {
-                     // If on-disk generation is already >= target, we might have raced.
-                     // But if we are the ones committing, we expect to be at `generation - 1`.
-                     // If we see `generation`, maybe another client committed it?
-                     // If another client committed `generation`, then our metadata flush (which was associated with `generation`)
-                     // is now effectively part of history.
-                     // We can treat this as success?
-                     // BUT, we clear `pending_generation`.
-                     
-                     // For now, let's just proceed with applying our intent.
-                     // If `guard.block.generation` changed, `generation` argument passed to us is fixed.
-                     // We want to set `block.generation = generation`.
-                     // If `block.generation` is already `generation`, setting it is a no-op?
-                     // But we also set `state = Clean`.
-                }
+
 
                 let expected_version = guard.version.clone();
                 guard.block.generation = generation;
@@ -218,7 +204,11 @@ impl SuperblockManager {
             };
 
             // Use true storage CAS via ETag check (If-Match)
-            match self.store.store_superblock_conditional(&snapshot, &expected_version).await {
+            match self
+                .store
+                .store_superblock_conditional(&snapshot, &expected_version)
+                .await
+            {
                 Ok(new_version) => {
                     let mut guard = self.state.lock();
                     guard.version = new_version;
@@ -242,14 +232,8 @@ impl SuperblockManager {
         let deadline = OffsetDateTime::now_utc().unix_timestamp() + ttl.as_secs() as i64;
         self.update_with_retry(|block| {
             let now = OffsetDateTime::now_utc().unix_timestamp();
-            block
-                .cleanup_leases
-                .retain(|lease| lease.lease_until > now);
-            if block
-                .cleanup_leases
-                .iter()
-                .any(|lease| lease.kind == kind)
-            {
+            block.cleanup_leases.retain(|lease| lease.lease_until > now);
+            if block.cleanup_leases.iter().any(|lease| lease.kind == kind) {
                 return Ok(false);
             }
             block.cleanup_leases.push(CleanupLease {
@@ -258,7 +242,8 @@ impl SuperblockManager {
                 lease_until: deadline,
             });
             Ok(true)
-        }).await
+        })
+        .await
     }
 
     pub async fn complete_cleanup(&self, kind: CleanupTaskKind, client_id: &str) -> Result<()> {
@@ -267,8 +252,7 @@ impl SuperblockManager {
                 .cleanup_leases
                 .retain(|lease| !(lease.kind == kind && lease.client_id == client_id));
             Ok(())
-        }).await
+        })
+        .await
     }
 }
-
-

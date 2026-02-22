@@ -60,13 +60,7 @@ async fn main() -> Result<()> {
             note,
         } => {
             let config = build_config(store_path, shard_size, log_storage_io);
-            let saved = create_checkpoint(
-                &config,
-                handle,
-                &checkpoint_path,
-                note,
-            )
-            .await?;
+            let saved = create_checkpoint(&config, handle, &checkpoint_path, note).await?;
             println!(
                 "checkpoint saved path={} generation={} next_inode={} next_segment={}",
                 saved.checkpoint_path, saved.generation, saved.next_inode, saved.next_segment
@@ -79,9 +73,7 @@ async fn main() -> Result<()> {
             log_storage_io,
         } => {
             let config = build_config(store_path, shard_size, log_storage_io);
-            let restored =
-                restore_checkpoint(&config, handle, &checkpoint_path)
-                    .await?;
+            let restored = restore_checkpoint(&config, handle, &checkpoint_path).await?;
             println!(
                 "checkpoint restored path={} generation={} next_inode={} next_segment={}",
                 restored.checkpoint_path,

@@ -131,10 +131,7 @@ impl JournalManager {
         let mut state = self.state.lock();
         if let Some(writer) = state.writer.as_mut() {
             writer.flush().context("flushing WAL buffer")?;
-            writer
-                .get_ref()
-                .sync_data()
-                .context("fdatasync WAL file")?;
+            writer.get_ref().sync_data().context("fdatasync WAL file")?;
         }
         self.sync_dir()
     }
@@ -268,7 +265,8 @@ impl JournalManager {
                 .into_inner()
                 .map_err(|_| anyhow::anyhow!("WAL BufWriter flush error during truncate"))?;
             file.set_len(0).context("truncating WAL")?;
-            file.seek(SeekFrom::Start(0)).context("seeking WAL to start")?;
+            file.seek(SeekFrom::Start(0))
+                .context("seeking WAL to start")?;
             // Re-open for future appends.
             state.writer = Some(BufWriter::with_capacity(WAL_BUF_BYTES, file));
         } else if self.wal_path.exists() {

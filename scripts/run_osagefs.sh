@@ -36,6 +36,7 @@ CMD=(
   --log-file "$LOG_FILE"
   --segment-compression "$SEGMENT_COMPRESSION"
   --inline-compression "$INLINE_COMPRESSION"
+  --log-storage-io
   --foreground
 )
 

@@ -91,6 +91,14 @@ impl OsageFs {
             if record.is_dir() {
                 return Err(EISDIR);
             }
+            if target_size > record.size && record.size == 0 {
+                // Sparse growth on an empty file: represent the hole via size +
+                // empty segment extents instead of allocating target_size zeros.
+                record.size = target_size;
+                record.storage = FileStorage::Segments(Vec::new());
+                self.stage_inode(record.clone())?;
+                return Ok(record);
+            }
             if mtime.is_none() {
                 record.mtime = record.ctime;
             }
@@ -109,7 +117,11 @@ impl OsageFs {
 
     /// Enforce sticky-bit restriction: if parent dir has the sticky bit set,
     /// only root, the directory owner, or the file owner may remove/rename the child.
-    fn check_sticky(caller_uid: u32, parent: &InodeRecord, child: &InodeRecord) -> std::result::Result<(), i32> {
+    fn check_sticky(
+        caller_uid: u32,
+        parent: &InodeRecord,
+        child: &InodeRecord,
+    ) -> std::result::Result<(), i32> {
         if parent.mode & S_ISVTX != 0
             && caller_uid != 0
             && caller_uid != parent.uid
@@ -157,7 +169,7 @@ impl OsageFs {
             let new = m & 0o7777;
             (old & 0o0777) == (new & 0o0777)              // rwx bits unchanged
                 && (old & (S_ISUID | S_ISGID)) != 0       // old had SUID/SGID
-                && (new & (S_ISUID | S_ISGID)) == 0       // new has neither
+                && (new & (S_ISUID | S_ISGID)) == 0 // new has neither
         });
         if mode.is_some() && !is_priv_strip_only && caller_uid != 0 && record.uid != caller_uid {
             return Err(EPERM);
@@ -224,6 +236,17 @@ impl OsageFs {
             if record.is_dir() {
                 return Err(EISDIR);
             }
+            if target_size > record.size && record.size == 0 {
+                // Sparse growth on an empty file: keep content holes implicit.
+                record.size = target_size;
+                record.storage = FileStorage::Segments(Vec::new());
+                if mtime.is_none() {
+                    record.mtime = OffsetDateTime::now_utc();
+                }
+                let attr = Self::record_attr(&record);
+                self.stage_inode(record)?;
+                return Ok(attr);
+            }
             let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
             Self::resize_file_data_for_setattr(&mut data, target_size)?;
             record.size = data.len() as u64;
@@ -274,7 +297,8 @@ impl OsageFs {
         let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let mut file = InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, effective_gid);
+        let mut file =
+            InodeRecord::new_file(inode_id, parent, name.clone(), path, uid, effective_gid);
         file.update_times();
         self.stage_inode(file.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
@@ -316,7 +340,8 @@ impl OsageFs {
         let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, name);
-        let mut file = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
+        let mut file =
+            InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
         file.mode = Self::apply_umask(S_IFREG | (mode & 0o7777), umask);
         file.update_times();
         self.stage_inode(file.clone())?;
@@ -346,7 +371,8 @@ impl OsageFs {
         let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let mut dir = InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, effective_gid);
+        let mut dir =
+            InodeRecord::new_directory(inode_id, parent, name.clone(), path, uid, effective_gid);
         dir.update_times();
         self.stage_inode(dir.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
@@ -399,7 +425,8 @@ impl OsageFs {
         let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, name);
-        let mut node = InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
+        let mut node =
+            InodeRecord::new_file(inode_id, parent, name.to_string(), path, uid, effective_gid);
         node.mode = Self::normalize_node_mode(mode);
         node.rdev = rdev;
         node.update_times();
@@ -431,8 +458,15 @@ impl OsageFs {
         let effective_gid = Self::effective_gid(&parent_inode, gid);
         let inode_id = self.allocate_inode_id().map_err(|_| EIO)?;
         let path = Self::build_child_path(&parent_inode, &name);
-        let record =
-            InodeRecord::new_symlink(inode_id, parent, name.clone(), path, uid, effective_gid, target);
+        let record = InodeRecord::new_symlink(
+            inode_id,
+            parent,
+            name.clone(),
+            path,
+            uid,
+            effective_gid,
+            target,
+        );
         self.stage_inode(record.clone())?;
         self.update_parent_move(parent_inode, name, inode_id)?;
         Ok(record)
@@ -448,7 +482,27 @@ impl OsageFs {
         if record.is_dir() {
             return Err(EISDIR);
         }
-        self.read_file_range(&record, offset, size).map_err(|_| EIO)
+        self.read_file_range(&record, offset, size).map_err(|e| {
+            let storage_desc = match &record.storage {
+                FileStorage::Segments(exts) => {
+                    for (i, ext) in exts.iter().enumerate() {
+                        log::error!(
+                            "  op_read extent[{}] logical_offset={} gen={} seg={} ptr_off={} ptr_len={}",
+                            i, ext.logical_offset,
+                            ext.pointer.generation, ext.pointer.segment_id,
+                            ext.pointer.offset, ext.pointer.length
+                        );
+                    }
+                    format!("segments({})", exts.len())
+                }
+                _ => "other".to_string(),
+            };
+            log::error!(
+                "op_read EIO ino={} offset={} size={} record_size={} storage={} err={:#}",
+                ino, offset, size, record.size, storage_desc, e
+            );
+            EIO
+        })
     }
 
     pub(crate) fn op_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {
@@ -479,7 +533,13 @@ impl OsageFs {
             }
             return Ok(data.len() as u32);
         }
-        if write_end > self.config.inline_threshold as u64 {
+        // For any non-append write on a file that is already larger than the
+        // inline threshold, stay on the segment path. Using the inline path
+        // here would materialize and restage the full file for tiny writes
+        // (e.g. 4KiB overwrite at offset 0 on a multi-GB file).
+        if record.size > self.config.inline_threshold as u64
+            || write_end > self.config.inline_threshold as u64
+        {
             self.write_large_segments(record, offset, data)?;
             return Ok(data.len() as u32);
         }

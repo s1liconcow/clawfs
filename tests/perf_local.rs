@@ -109,7 +109,10 @@ fn flush_metadata_batch_latency() {
     );
     let superblock = Arc::new(
         runtime
-            .block_on(SuperblockManager::load_or_init(metadata.clone(), shard_size))
+            .block_on(SuperblockManager::load_or_init(
+                metadata.clone(),
+                shard_size,
+            ))
             .unwrap(),
     );
 
@@ -124,9 +127,7 @@ fn flush_metadata_batch_latency() {
     runtime
         .block_on(metadata.persist_inodes_batch(&records, generation, shard_size, delta_batch))
         .unwrap();
-    runtime
-        .block_on(metadata.sync_metadata_writes())
-        .unwrap();
+    runtime.block_on(metadata.sync_metadata_writes()).unwrap();
     runtime
         .block_on(superblock.commit_generation(generation))
         .unwrap();
@@ -194,6 +195,7 @@ fn large_segment_staged_flush_latency() {
             vec![SegmentEntry {
                 inode: 42,
                 path: "/checkpoint.bin".into(),
+                logical_offset: 0,
                 payload: SegmentPayload::Staged(vec![chunk]),
             }],
         )
@@ -313,6 +315,7 @@ fn local_segment_batch_throughput() {
             entries.push(SegmentEntry {
                 inode,
                 path: format!("/bulk_{inode}.bin"),
+                logical_offset: 0,
                 payload: SegmentPayload::Bytes(vec![(inode & 0xff) as u8; entry_size]),
             });
         }
@@ -357,6 +360,7 @@ fn local_segment_small_file_iops() {
             entries.push(SegmentEntry {
                 inode,
                 path: format!("/small_{inode}.txt"),
+                logical_offset: 0,
                 payload: SegmentPayload::Bytes(vec![(inode & 0xff) as u8; file_size]),
             });
             inode = inode.saturating_add(1);
@@ -413,6 +417,7 @@ fn segment_sequential_read_throughput() {
             vec![SegmentEntry {
                 inode: 42,
                 path: "/large.bin".into(),
+                logical_offset: 0,
                 payload: SegmentPayload::Staged(vec![chunk]),
             }],
         )
@@ -423,13 +428,12 @@ fn segment_sequential_read_throughput() {
     let reads = data_size / read_chunk;
     let start = Instant::now();
     for _ in 0..reads {
-        let arc = segments.read_pointer_arc(ptr).unwrap();
+        let arc = segments.read_pointer_arc(&ptr.pointer).unwrap();
         // Simulate slicing the range the way read_file_range_inner does.
         assert!(arc.len() == data_size);
     }
     let elapsed = start.elapsed();
-    let throughput =
-        (reads * read_chunk) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    let throughput = (reads * read_chunk) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     eprintln!(
         "segment_sequential_read_throughput reads={} chunk={}KiB elapsed={:.1}ms throughput={:.1}MiB/s",
         reads,

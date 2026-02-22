@@ -526,7 +526,11 @@ fn stress_flush_respects_pending_threshold() {
         inodes.push(inode);
     }
     harness.fs.flush_pending().unwrap();
-    assert!(harness.fs.pending_inodes.is_empty());
+    assert!(!harness
+        .fs
+        .active_inodes
+        .iter()
+        .any(|e| e.value().lock().pending.is_some()));
     assert_eq!(*harness.fs.pending_bytes.lock(), 0);
     for inode in inodes {
         let record = harness
@@ -556,9 +560,9 @@ fn append_file_handles_staged_pending_without_panic() {
 
     let pending_len = harness
         .fs
-        .pending_inodes
+        .active_inodes
         .get(&inode)
-        .map(|entry| entry.data.as_ref().map(|d| d.len()).unwrap_or(0))
+        .map(|arc| arc.lock().pending.as_ref().and_then(|e| e.data.as_ref().map(|d| d.len())).unwrap_or(0))
         .unwrap_or(0);
     assert_eq!(pending_len, initial.len() as u64 + 3);
 }
@@ -1162,7 +1166,11 @@ fn flush_pending_for_inode_keeps_other_pending_entries() {
     harness.fs.flush_pending_for_inode(file_a.inode).unwrap();
 
     assert!(
-        harness.fs.pending_inodes.contains_key(&file_b.inode),
+        harness
+            .fs
+            .active_inodes
+            .get(&file_b.inode)
+            .map_or(false, |arc| arc.lock().pending.is_some()),
         "expected unrelated inode to remain pending"
     );
     let stored_a = harness
@@ -1199,21 +1207,21 @@ fn flush_pending_for_inode_flushes_pending_ancestor_directories() {
 
     harness.fs.flush_pending_for_inode(file.inode).unwrap();
 
-    let pending = &harness.fs.pending_inodes;
+    let pending = |ino| harness.fs.active_inodes.get(&ino).map_or(false, |arc| arc.lock().pending.is_some());
     assert!(
-        !pending.contains_key(&file.inode),
+        !pending(file.inode),
         "file inode should be flushed"
     );
     assert!(
-        !pending.contains_key(&dir_b.inode),
+        !pending(dir_b.inode),
         "direct parent should be flushed"
     );
     assert!(
-        !pending.contains_key(&dir_a.inode),
+        !pending(dir_a.inode),
         "ancestor directory should be flushed"
     );
     assert!(
-        !pending.contains_key(&ROOT_INODE),
+        !pending(ROOT_INODE),
         "root directory should be flushed when pending"
     );
 
@@ -1938,13 +1946,11 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
     stale_record.storage = FileStorage::Inline(Vec::new()); // stale placeholder
     stale_record.mode = (stale_record.mode & !0o7777) | 0o100604;
 
-    fs.pending_inodes.insert(
-        file.inode,
-        PendingEntry {
-            record: stale_record,
-            data: None,
-        },
-    );
+    let active_arc = fs.active_inodes.entry(file.inode).or_insert_with(|| std::sync::Arc::new(parking_lot::Mutex::new(crate::fs::ActiveInode::default()))).clone();
+    active_arc.lock().pending = Some(PendingEntry {
+        record: stale_record,
+        data: None,
+    });
 
     // flush_pending_selected must detect the stale Inline([]) storage,
     // reload from metadata store, and persist the merged record.
@@ -1995,7 +2001,11 @@ fn overwrite_at_offset_zero_after_flush_does_not_eio() {
 
     // Confirm the inode is committed in segment storage and not pending.
     assert!(
-        !harness.fs.pending_inodes.contains_key(&inode),
+        !harness
+            .fs
+            .active_inodes
+            .get(&inode)
+            .map_or(false, |arc| arc.lock().pending.is_some()),
         "inode should not be pending after flush"
     );
     let committed = harness
@@ -2019,7 +2029,11 @@ fn overwrite_at_offset_zero_after_flush_does_not_eio() {
 
     // The inode should now be pending with the overwrite staged.
     assert!(
-        harness.fs.pending_inodes.contains_key(&inode),
+        harness
+            .fs
+            .active_inodes
+            .get(&inode)
+            .map_or(false, |arc| arc.lock().pending.is_some()),
         "inode should be pending after overwrite"
     );
 
@@ -2274,5 +2288,50 @@ fn partial_overwrite_keeps_unmodified_tail_after_flush() {
     assert_eq!(
         got, expected,
         "partial overwrite must not drop or overread the untouched tail"
+    );
+}
+
+#[test]
+fn small_overwrite_on_large_file_does_not_restage_full_file() {
+    let dir = tempdir().unwrap();
+    let block = 1024usize; // > inline_threshold (512 in test config)
+    let harness = TestHarness::with_config(dir.path(), "small_overwrite.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+
+    let inode = harness.fs.allocate_inode_id().unwrap();
+    let record = make_file(inode, "small-overwrite.bin");
+    harness.fs.stage_file(record, Vec::new(), None).unwrap();
+
+    // Build and flush a large committed file first.
+    for i in 0..8u8 {
+        let chunk = vec![i; block];
+        harness
+            .fs
+            .op_write(inode, (i as usize * block) as u64, &chunk)
+            .expect("prefill write should succeed");
+    }
+    harness.fs.flush_pending().unwrap();
+
+    // Tiny overwrite at offset 0 should NOT materialize/restage whole file.
+    let tiny = vec![0xFE; 16];
+    harness
+        .fs
+        .op_write(inode, 0, &tiny)
+        .expect("tiny overwrite should succeed");
+
+    let active_arc = harness.fs.active_inodes.get(&inode).expect("active");
+    let state = active_arc.lock();
+    let pending = state.pending.as_ref().expect("inode should be pending after tiny overwrite");
+    let staged_bytes = match pending.data.as_ref().expect("pending data should exist") {
+        PendingData::Staged(segs) => segs.staged_bytes(),
+        PendingData::Inline(_) => panic!("large file tiny overwrite must stay on segment path"),
+    };
+    drop(state);
+    assert!(
+        staged_bytes <= (tiny.len() as u64 + block as u64),
+        "expected tiny overwrite to stage near-write-size data, got staged_bytes={}",
+        staged_bytes
     );
 }

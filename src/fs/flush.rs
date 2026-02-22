@@ -2,75 +2,17 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl OsageFs {
-    fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-        ranges.retain(|(start, end)| end > start);
-        if ranges.is_empty() {
-            return ranges;
-        }
-        ranges.sort_by_key(|(start, _)| *start);
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            if let Some((_, last_end)) = merged.last_mut()
-                && start <= *last_end
-            {
-                *last_end = (*last_end).max(end);
-                continue;
-            }
-            merged.push((start, end));
-        }
-        merged
-    }
+    // Bound per-object segment serialization working set during flush. We keep
+    // each write_batch call under this approximate payload budget and emit
+    // multiple segment objects when needed.
+    const FLUSH_SEGMENT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
 
-    fn trim_base_extents_for_overwrites(
-        mut base_extents: Vec<SegmentExtent>,
-        base_size: u64,
-        overwrite_ranges: &[(u64, u64)],
-    ) -> Vec<SegmentExtent> {
-        if base_extents.is_empty() || overwrite_ranges.is_empty() || base_size == 0 {
-            return base_extents;
+    fn segment_entry_payload_bytes(entry: &SegmentEntry) -> u64 {
+        match &entry.payload {
+            SegmentPayload::Bytes(bytes) => bytes.len() as u64,
+            SegmentPayload::SharedBytes(bytes) => bytes.len() as u64,
+            SegmentPayload::Staged(chunks) => chunks.iter().map(|chunk| chunk.len).sum(),
         }
-        base_extents.sort_by_key(|ext| ext.logical_offset);
-        let merged_overwrites = Self::merge_ranges(overwrite_ranges.to_vec());
-        if merged_overwrites.is_empty() {
-            return base_extents;
-        }
-
-        let mut trimmed: Vec<SegmentExtent> = Vec::with_capacity(base_extents.len());
-        for (idx, extent) in base_extents.iter().enumerate() {
-            let start = extent.logical_offset;
-            let next_start = base_extents
-                .get(idx + 1)
-                .map(|next| next.logical_offset)
-                .unwrap_or(base_size);
-            let end = next_start.min(base_size);
-            if end <= start {
-                continue;
-            }
-
-            let mut cursor = start;
-            for (ov_start, ov_end) in &merged_overwrites {
-                if *ov_end <= cursor || *ov_start >= end {
-                    continue;
-                }
-                if *ov_start > cursor {
-                    trimmed.push(SegmentExtent::new(
-                        cursor,
-                        extent.pointer.clone(),
-                    ));
-                }
-                cursor = cursor.max(*ov_end).min(end);
-                if cursor >= end {
-                    break;
-                }
-            }
-            if cursor < end {
-                trimmed.push(SegmentExtent::new(
-                    cursor,
-                    extent.pointer.clone(),
-                ));
-            }
-        }
-        trimmed
     }
 
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
@@ -102,13 +44,16 @@ impl OsageFs {
 
     pub(crate) fn sync_local_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
         let (inodes, staged_chunks) = {
-            let pending = &self.pending_inodes;
             let mut cursor = ino;
             let mut seen = HashSet::new();
             let mut inodes = Vec::new();
             let mut staged_chunks = Vec::new();
             while seen.insert(cursor) {
-                let Some(entry) = pending.get(&cursor) else {
+                let Some(active_arc) = self.active_inodes.get(&cursor) else {
+                    break;
+                };
+                let state = active_arc.lock();
+                let Some(entry) = state.pending.as_ref() else {
                     break;
                 };
                 inodes.push(cursor);
@@ -116,6 +61,7 @@ impl OsageFs {
                     staged_chunks.extend(segments.chunks.iter().cloned());
                 }
                 let parent = entry.record.parent;
+                drop(state);
                 if parent == cursor {
                     break;
                 }
@@ -165,18 +111,17 @@ impl OsageFs {
             let pending = {
                 let mut guard = HashMap::new();
                 let keys: Vec<u64> = self
-                    .pending_inodes
+                    .active_inodes
                     .iter()
                     .map(|entry| *entry.key())
                     .collect();
                 for inode in keys {
-                    // Insert into flushing_inodes BEFORE removing from pending_inodes so
-                    // load_inode always finds the inode in at least one map.
-                    if let Some(e) = self.pending_inodes.get(&inode) {
-                        self.flushing_inodes.insert(inode, e.value().clone());
-                    }
-                    if let Some((_, entry)) = self.pending_inodes.remove(&inode) {
-                        guard.insert(inode, entry);
+                    if let Some(active_arc) = self.active_inodes.get(&inode) {
+                        let mut state = active_arc.lock();
+                        if let Some(entry) = state.pending.take() {
+                            state.flushing = Some(entry.clone());
+                            guard.insert(inode, entry);
+                        }
                     }
                 }
                 if guard.is_empty() {
@@ -184,11 +129,15 @@ impl OsageFs {
                     return Ok(());
                 }
                 let drained = selector(&mut guard);
-                // Reinsert non-selected into pending BEFORE removing from flushing so
-                // there is no gap where load_inode cannot find the inode.
+                // Reinsert non-selected
                 for (inode, entry) in guard {
-                    self.pending_inodes.insert(inode, entry);
-                    self.flushing_inodes.remove(&inode);
+                    if let Some(active_arc) = self.active_inodes.get(&inode) {
+                        let mut state = active_arc.lock();
+                        if state.pending.is_none() {
+                            state.pending = Some(entry);
+                        }
+                        state.flushing = None;
+                    }
                 }
                 if drained.is_empty() {
                     self.touch_last_flush();
@@ -199,9 +148,6 @@ impl OsageFs {
                     .any(|entry| matches!(entry.data, Some(PendingData::Staged(_))));
                 if has_staged {
                     self.segments.rotate_stage_file();
-                }
-                for (inode, entry) in drained.iter() {
-                    self.flushing_inodes.insert(*inode, entry.clone());
                 }
                 drained
             };
@@ -235,7 +181,6 @@ impl OsageFs {
             // Map from inode -> base committed extents captured when pending data
             // was staged. Used after write_batch to merge newly-written extents.
             let mut base_extents_map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
-            let mut overwrite_ranges_map: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
             let mut records = Vec::new();
             let mut flushed_bytes: u64 = 0;
             let mut inline_files = 0;
@@ -297,13 +242,6 @@ impl OsageFs {
                                 if chunk.len == 0 {
                                     continue;
                                 }
-                                overwrite_ranges_map
-                                    .entry(record.inode)
-                                    .or_default()
-                                    .push((
-                                        chunk.logical_offset,
-                                        chunk.logical_offset.saturating_add(chunk.len),
-                                    ));
                                 let logical_offset = chunk.logical_offset;
                                 segment_entries.push(SegmentEntry {
                                     inode: record.inode,
@@ -405,35 +343,60 @@ impl OsageFs {
             let mut segment_id_logged = None;
             let mut segment_write_duration = Duration::from_secs(0);
             if !segment_entries.is_empty() {
-                let segment_id = self.allocate_segment_id().map_err(|err| {
-                    log::error!(
-                        "flush_pending allocate_segment_id failed pid={} tid={} scope={} err={err:?}",
-                        pid,
-                        tid,
-                        scope
-                    );
-                    EIO
-                })?;
-                let seg_start = Instant::now();
-                let pointers = self
-                    .segments
-                    .write_batch(target_generation, segment_id, segment_entries)
-                    .map_err(|err| {
+                let mut write_batch =
+                    |batch_entries: Vec<SegmentEntry>| -> std::result::Result<(), i32> {
+                        let segment_id = self.allocate_segment_id().map_err(|err| {
                         log::error!(
-                            "flush_pending segment write failed pid={} tid={} scope={} gen={} segment_id={} err={err:?}",
+                            "flush_pending allocate_segment_id failed pid={} tid={} scope={} err={err:?}",
                             pid,
                             tid,
-                            scope,
-                            target_generation,
-                            segment_id
+                            scope
                         );
                         EIO
                     })?;
-                for (inode, extent) in pointers {
-                    pointer_map.entry(inode).or_default().push(extent);
+                        let seg_start = Instant::now();
+                        let pointers = self
+                        .segments
+                        .write_batch(target_generation, segment_id, batch_entries)
+                        .map_err(|err| {
+                            log::error!(
+                                "flush_pending segment write failed pid={} tid={} scope={} gen={} segment_id={} err={err:?}",
+                                pid,
+                                tid,
+                                scope,
+                                target_generation,
+                                segment_id
+                            );
+                            EIO
+                        })?;
+                        for (inode, extent) in pointers {
+                            pointer_map.entry(inode).or_default().push(extent);
+                        }
+                        if segment_id_logged.is_none() {
+                            segment_id_logged = Some(segment_id);
+                        }
+                        segment_write_duration += seg_start.elapsed();
+                        Ok(())
+                    };
+
+                let mut current_batch: Vec<SegmentEntry> = Vec::new();
+                let mut current_bytes: u64 = 0;
+                for entry in segment_entries {
+                    let entry_bytes = Self::segment_entry_payload_bytes(&entry).max(1);
+                    if !current_batch.is_empty()
+                        && current_bytes.saturating_add(entry_bytes)
+                            > Self::FLUSH_SEGMENT_BATCH_BYTES
+                    {
+                        write_batch(current_batch)?;
+                        current_batch = Vec::new();
+                        current_bytes = 0;
+                    }
+                    current_bytes = current_bytes.saturating_add(entry_bytes);
+                    current_batch.push(entry);
                 }
-                segment_id_logged = Some(segment_id);
-                segment_write_duration = seg_start.elapsed();
+                if !current_batch.is_empty() {
+                    write_batch(current_batch)?;
+                }
             }
             let persist_start = Instant::now();
             for record in records.iter_mut() {
@@ -460,45 +423,24 @@ impl OsageFs {
                             .get(&record.inode)
                             .map(Vec::as_slice)
                             .unwrap_or(&[]);
-                        let overwrite_ranges = overwrite_ranges_map
-                            .get(&record.inode)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]);
                         // Use get_cached_inode (cache-only, no shard reload, no
                         // negative-cache side effects) so we can safely call it
                         // from inside the synchronous flush path.
-                        let (authoritative_base, base_size): (Vec<SegmentExtent>, u64) =
-                            if !base_extents.is_empty() {
-                                match self.metadata.get_cached_inode(record.inode) {
-                                    Some(r) => match r.storage {
-                                        FileStorage::Segments(exts) => (exts, r.size),
-                                        _ => (base_extents.to_vec(), r.size),
-                                    },
-                                    None => (base_extents.to_vec(), record.size),
-                                }
-                            } else {
-                                (base_extents.to_vec(), 0)
-                            };
-                        let mut all_extents =
-                            Self::trim_base_extents_for_overwrites(
-                                authoritative_base,
-                                base_size,
-                                overwrite_ranges,
-                            );
+                        let authoritative_base: Vec<SegmentExtent> = if !base_extents.is_empty() {
+                            match self.metadata.get_cached_inode(record.inode) {
+                                Some(r) => match r.storage {
+                                    FileStorage::Segments(exts) => exts,
+                                    _ => base_extents.to_vec(),
+                                },
+                                None => base_extents.to_vec(),
+                            }
+                        } else {
+                            base_extents.to_vec()
+                        };
+                        let mut all_extents = authoritative_base;
                         all_extents.extend(new_extents.iter().cloned());
                         all_extents.sort_by_key(|ext| ext.logical_offset);
-                        // Keep the newest extent when duplicate starts exist.
-                        let mut deduped: Vec<SegmentExtent> = Vec::with_capacity(all_extents.len());
-                        for extent in all_extents {
-                            if let Some(last) = deduped.last_mut()
-                                && last.logical_offset == extent.logical_offset
-                            {
-                                *last = extent;
-                            } else {
-                                deduped.push(extent);
-                            }
-                        }
-                        if deduped.is_empty() {
+                        if all_extents.is_empty() {
                             log::error!(
                                 "flush_pending empty segment extent map pid={} tid={} scope={} ino={} gen={}",
                                 pid,
@@ -509,7 +451,7 @@ impl OsageFs {
                             );
                             return Err(EIO);
                         } else {
-                            record.storage = FileStorage::Segments(deduped);
+                            record.storage = FileStorage::Segments(all_extents);
                         }
                     } else {
                         log::error!(
@@ -585,7 +527,10 @@ impl OsageFs {
                 .take()
                 .expect("drained pending map must exist until flush commit");
             for inode in flushed_entries.keys() {
-                self.flushing_inodes.remove(inode);
+                if let Some(active_arc) = self.active_inodes.get(inode) {
+                    let mut state = active_arc.lock();
+                    state.flushing = None;
+                }
             }
             for pending_entry in flushed_entries.into_values() {
                 if let Some(data) = pending_entry.data {
@@ -595,7 +540,11 @@ impl OsageFs {
             if let Some(journal) = &self.journal {
                 let clearable_inodes = flushed_inodes
                     .into_iter()
-                    .filter(|inode| !self.pending_inodes.contains_key(inode))
+                    .filter(|inode| {
+                        self.active_inodes
+                            .get(inode)
+                            .map_or(true, |arc| arc.lock().pending.is_none())
+                    })
                     .collect::<Vec<_>>();
                 for inode in clearable_inodes {
                     journal.clear_entry(inode).map_err(|err| {
@@ -664,21 +613,18 @@ impl OsageFs {
     pub(crate) fn restore_pending_after_failed_flush(&self, restored: HashMap<u64, PendingEntry>) {
         let mut dropped_bytes = 0u64;
         for (inode, entry) in restored {
-            // Use the entry API for an atomic check-and-insert so a concurrent write
-            // that arrived after the flush started is not overwritten.
-            // Insert into pending BEFORE removing from flushing to keep the inode visible.
-            match self.pending_inodes.entry(inode) {
-                dashmap::mapref::entry::Entry::Vacant(vac) => {
-                    vac.insert(entry);
-                }
-                dashmap::mapref::entry::Entry::Occupied(_) => {
+            if let Some(active_arc) = self.active_inodes.get(&inode) {
+                let mut state = active_arc.lock();
+                if state.pending.is_none() {
+                    state.pending = Some(entry);
+                } else {
                     if let Some(data) = entry.data {
                         dropped_bytes = dropped_bytes.saturating_add(data.len());
                         self.release_pending_data(data);
                     }
                 }
+                state.flushing = None;
             }
-            self.flushing_inodes.remove(&inode);
         }
         if dropped_bytes > 0 {
             let mut total = self.pending_bytes.lock();
@@ -744,7 +690,11 @@ impl OsageFs {
                 error!("background flush_pending failed errno={}", code);
             }
             fs.flush_scheduled.store(false, Ordering::Release);
-            if !fs.pending_inodes.is_empty() {
+            let has_pending = fs
+                .active_inodes
+                .iter()
+                .any(|entry| entry.value().lock().pending.is_some());
+            if has_pending {
                 fs.trigger_async_flush();
             }
         });

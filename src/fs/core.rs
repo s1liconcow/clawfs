@@ -106,9 +106,7 @@ impl OsageFs {
             segments,
             handle,
             client_state,
-            pending_inodes: Arc::new(DashMap::new()),
-            mutating_inodes: Arc::new(DashMap::new()),
-            flushing_inodes: Arc::new(DashMap::new()),
+            active_inodes: Arc::new(DashMap::new()),
             pending_bytes: Arc::new(Mutex::new(0)),
             perf,
             replay,
@@ -184,17 +182,18 @@ impl OsageFs {
                 }
             };
             let data_len = data_opt.as_ref().map(|d| d.len()).unwrap_or(0);
-            if let Some(old) = self.pending_inodes.insert(
-                inode,
-                PendingEntry {
-                    record,
-                    data: data_opt,
-                },
-            ) {
-                if let Some(old_data) = old.data {
+            let active_arc = self.active_inodes.entry(inode).or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default()))).clone();
+            let mut state = active_arc.lock();
+            let old = state.pending.replace(PendingEntry {
+                record,
+                data: data_opt,
+            });
+            if let Some(old_entry) = old {
+                if let Some(old_data) = old_entry.data {
                     self.release_pending_data(old_data);
                 }
             }
+            drop(state);
             if data_len > 0 {
                 let mut total = self.pending_bytes.lock();
                 *total = total.saturating_add(data_len);
@@ -271,23 +270,20 @@ impl OsageFs {
     /// Check all three in-memory dirty maps for an inode.  Returns `Some(Ok(record))`,
     /// `Some(Err(ENOENT))` (tombstone), or `None` (not found in any map).
     fn load_inode_in_memory(&self, ino: u64) -> Option<std::result::Result<InodeRecord, i32>> {
-        if let Some(entry) = self.pending_inodes.get(&ino) {
-            if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Some(Err(ENOENT));
+        if let Some(active_arc) = self.active_inodes.get(&ino) {
+            let state = active_arc.lock();
+            let mut record_opt = None;
+            if let Some(entry) = &state.pending {
+                record_opt = Some(entry.record.clone());
+            } else if let Some(entry) = &state.flushing {
+                record_opt = Some(entry.record.clone());
             }
-            return Some(Ok(entry.record.clone()));
-        }
-        if let Some(entry) = self.mutating_inodes.get(&ino) {
-            if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Some(Err(ENOENT));
+            if let Some(record) = record_opt {
+                if matches!(record.kind, InodeKind::Tombstone) {
+                    return Some(Err(ENOENT));
+                }
+                return Some(Ok(record));
             }
-            return Some(Ok(entry.record.clone()));
-        }
-        if let Some(entry) = self.flushing_inodes.get(&ino) {
-            if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Some(Err(ENOENT));
-            }
-            return Some(Ok(entry.record.clone()));
         }
         None
     }
@@ -305,11 +301,9 @@ impl OsageFs {
             Ok(record) => record,
             Err(err) => {
                 error!(
-                    "load_inode metadata error ino={} pending={} mutating={} flushing={} err={:#}",
+                    "load_inode metadata error ino={} active={} err={:#}",
                     ino,
-                    self.pending_inodes.contains_key(&ino),
-                    self.mutating_inodes.contains_key(&ino),
-                    self.flushing_inodes.contains_key(&ino),
+                    self.active_inodes.contains_key(&ino),
                     err
                 );
                 return Err(EIO);
@@ -326,11 +320,9 @@ impl OsageFs {
             return result;
         }
         debug!(
-            "load_inode miss ino={} pending={} mutating={} flushing={}",
+            "load_inode miss ino={} active={}",
             ino,
-            self.pending_inodes.contains_key(&ino),
-            self.mutating_inodes.contains_key(&ino),
-            self.flushing_inodes.contains_key(&ino)
+            self.active_inodes.contains_key(&ino)
         );
         Err(ENOENT)
     }
@@ -365,21 +357,29 @@ impl OsageFs {
         if range_end <= range_start {
             return Ok(Vec::new());
         }
-        if let Some(entry) = self.pending_inodes.get(&record.inode) {
-            if let Some(data) = &entry.data {
-                return self.slice_pending_bytes(data, range_start, range_end);
-            }
+        let (pending_data, flushing_data) = if let Some(active_arc) = self.active_inodes.get(&record.inode) {
+            let state = active_arc.lock();
+            let p_data = state.pending.as_ref().and_then(|e| e.data.clone());
+            let f_data = state.flushing.as_ref().and_then(|e| e.data.clone());
+            (p_data, f_data)
+        } else {
+            (None, None)
+        };
+        if let Some(data) = pending_data {
+            return self.slice_pending_bytes(&data, range_start, range_end);
         }
-        if let Some(entry) = self.mutating_inodes.get(&record.inode) {
-            if let Some(data) = &entry.data {
-                return self.slice_pending_bytes(data, range_start, range_end);
-            }
+        if let Some(data) = flushing_data {
+            return self.slice_pending_bytes(&data, range_start, range_end);
         }
-        if let Some(entry) = self.flushing_inodes.get(&record.inode) {
-            if let Some(data) = &entry.data {
-                return self.slice_pending_bytes(data, range_start, range_end);
-            }
-        }
+        self.read_file_range_from_storage(record, range_start, range_end)
+    }
+
+    pub(crate) fn read_file_range_from_storage(
+        &self,
+        record: &InodeRecord,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Vec<u8>> {
         match &record.storage {
             FileStorage::Inline(_) | FileStorage::InlineEncoded(_) => {
                 let bytes = self.decode_inline_storage(&record.storage)?;
@@ -392,44 +392,33 @@ impl OsageFs {
             FileStorage::Segments(extents) => {
                 let out_len = (range_end - range_start) as usize;
                 let mut buffer = vec![0u8; out_len];
-                let mut ordered = extents.to_vec();
-                ordered.sort_by_key(|ext| ext.logical_offset);
                 let plain_codec = self.segments.is_plain_codec();
-                // Pre-compute logical extent boundaries so we can skip
-                // non-overlapping extents without decompressing them.
-                let extent_bounds: Vec<(u64, u64)> = ordered
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ext)| {
-                        let start = ext.logical_offset;
-                        let end = if i + 1 < ordered.len() {
-                            ordered[i + 1].logical_offset
-                        } else {
-                            record.size
-                        };
-                        (start, end)
-                    })
-                    .collect();
-                for (i, extent) in ordered.iter().enumerate() {
-                    let (extent_start, extent_end_hint) = extent_bounds[i];
-                    // Skip extents that cannot overlap the requested range.
-                    if extent_end_hint <= range_start {
-                        continue;
-                    }
+                let mut start_idx = extents.partition_point(|ext| ext.logical_offset < range_start);
+                if start_idx > 0 {
+                    // Include one prior extent for potential overlap into range_start.
+                    start_idx -= 1;
+                }
+                // Extents may overlap after partial overwrites. We read each
+                // extent by its own payload length and overlay in sorted order
+                // so newer extents (appended later, stable-sorted after base at
+                // equal offsets) override older bytes.
+                for extent in extents[start_idx..].iter() {
+                    let extent_start = extent.logical_offset;
                     if extent_start >= range_end {
                         break;
                     }
-                    let overlap_start = extent_start.max(range_start);
-                    let overlap_end = extent_end_hint.min(range_end);
-                    if overlap_end <= overlap_start {
-                        continue;
-                    }
-                    let dst_start = (overlap_start - range_start) as usize;
-                    let dst_end = (overlap_end - range_start) as usize;
-                    // When no compression/encryption is active, read only
-                    // the needed byte range directly from the segment file
-                    // instead of loading the entire entry into memory.
                     if plain_codec {
+                        let extent_end = extent_start.saturating_add(extent.pointer.length);
+                        if extent_end <= range_start {
+                            continue;
+                        }
+                        let overlap_start = extent_start.max(range_start);
+                        let overlap_end = extent_end.min(range_end);
+                        if overlap_end <= overlap_start {
+                            continue;
+                        }
+                        let dst_start = (overlap_start - range_start) as usize;
+                        let dst_end = (overlap_end - range_start) as usize;
                         let local_start = overlap_start - extent_start;
                         let local_end = overlap_end - extent_start;
                         match self.segments.read_pointer_subrange(
@@ -455,6 +444,7 @@ impl OsageFs {
                             }
                         }
                     }
+
                     let bytes = match self.segments.read_pointer_arc(&extent.pointer) {
                         Ok(b) => b,
                         Err(e) => {
@@ -475,10 +465,18 @@ impl OsageFs {
                         }
                     };
                     let extent_end = extent_start.saturating_add(bytes.len() as u64);
-                    let overlap_end_actual = extent_end.min(range_end);
-                    let dst_end_actual = (overlap_end_actual - range_start) as usize;
-                    let src_start = (overlap_start - extent_start) as usize;
-                    let src_end = (overlap_end_actual - extent_start) as usize;
+                    if extent_end <= range_start {
+                        continue;
+                    }
+                    let overlap_start = extent_start.max(range_start);
+            let overlap_end = extent_end.min(range_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let dst_start = (overlap_start - range_start) as usize;
+            let dst_end_actual = (overlap_end - range_start) as usize;
+            let src_start = (overlap_start - extent_start) as usize;
+            let src_end = (overlap_end - extent_start) as usize;
                     buffer[dst_start..dst_end_actual].copy_from_slice(&bytes[src_start..src_end]);
                 }
                 Ok(buffer)
@@ -513,7 +511,9 @@ impl OsageFs {
         }
 
         // Move record into pending map — zero clones.
-        if let Some(mut occupied) = self.pending_inodes.get_mut(&inode) {
+        let active_arc = self.active_inodes.entry(inode).or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default()))).clone();
+        let mut state = active_arc.lock();
+        if let Some(occupied) = state.pending.as_mut() {
             if matches!(record.kind, InodeKind::Tombstone) {
                 if let Some(data) = occupied.data.take() {
                     let len = data.len();
@@ -526,9 +526,9 @@ impl OsageFs {
             }
             occupied.record = record;
         } else {
-            self.pending_inodes
-                .insert(inode, PendingEntry { record, data: None });
+            state.pending = Some(PendingEntry { record, data: None });
         }
+        drop(state);
 
         debug!(
             "stage_inode inode={} kind={} metadata-staged",
@@ -539,13 +539,16 @@ impl OsageFs {
     }
 
     pub(crate) fn drop_pending_entry(&self, inode: u64) {
-        if let Some((_, entry)) = self.pending_inodes.remove(&inode) {
-            if let Some(data) = entry.data {
-                let len = data.len();
-                self.release_pending_data(data);
-                if len > 0 {
-                    let mut total = self.pending_bytes.lock();
-                    *total = total.saturating_sub(len);
+        if let Some(active_arc) = self.active_inodes.get(&inode) {
+            let mut state = active_arc.lock();
+            if let Some(entry) = state.pending.take() {
+                if let Some(data) = entry.data {
+                    let len = data.len();
+                    self.release_pending_data(data);
+                    if len > 0 {
+                        let mut total = self.pending_bytes.lock();
+                        *total = total.saturating_sub(len);
+                    }
                 }
             }
         }
@@ -560,7 +563,7 @@ impl OsageFs {
         }
     }
 
-    fn slice_pending_bytes(
+    pub(crate) fn slice_pending_bytes(
         &self,
         data: &PendingData,
         range_start: u64,
@@ -599,12 +602,16 @@ impl OsageFs {
         let out_len = (range_end - range_start) as usize;
         let mut buffer = vec![0u8; out_len];
 
-        let mut ordered_chunks: Vec<_> = segments.chunks.as_ref().to_vec();
-        ordered_chunks.sort_by_key(|c| c.logical_offset);
-        for chunk in &ordered_chunks {
+        let chunks = segments.chunks.as_ref();
+        let start_idx =
+            chunks.partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
+        for chunk in chunks[start_idx..].iter() {
             let chunk_start = chunk.logical_offset;
             let chunk_end = chunk_start.saturating_add(chunk.len);
-            if chunk_end <= range_start || chunk_start >= range_end {
+            if chunk_start >= range_end {
+                break;
+            }
+            if chunk_end <= range_start {
                 continue;
             }
             let overlap_start = chunk_start.max(range_start);
@@ -636,37 +643,31 @@ impl OsageFs {
         let out_len = (range_end - range_start) as usize;
         let mut buffer = vec![0u8; out_len];
 
-        // Fill from committed base extents (sorted by logical offset).
-        let mut ordered_base = segments.base_extents.as_ref().to_vec();
-        ordered_base.sort_by_key(|ext| ext.logical_offset);
-        // Pre-compute logical boundaries for skip-without-decompress.
-        let base_bounds: Vec<(u64, u64)> = ordered_base
-            .iter()
-            .enumerate()
-            .map(|(i, ext)| {
-                let start = ext.logical_offset;
-                let end = if i + 1 < ordered_base.len() {
-                    ordered_base[i + 1].logical_offset
-                } else {
-                    segments.total_len
-                };
-                (start, end)
-            })
-            .collect();
+        // Fill from committed base extents (sorted by logical offset). Extents
+        // may overlap; overlay in order so later entries win.
         let plain_codec = self.segments.is_plain_codec();
-        for (i, extent) in ordered_base.iter().enumerate() {
-            let (extent_start, extent_end_hint) = base_bounds[i];
-            if extent_end_hint <= range_start || extent_start >= range_end {
-                continue;
+        let base_extents = segments.base_extents.as_ref();
+        let mut base_start_idx = base_extents.partition_point(|ext| ext.logical_offset < range_start);
+        if base_start_idx > 0 {
+            base_start_idx -= 1;
+        }
+        for extent in base_extents[base_start_idx..].iter() {
+            let extent_start = extent.logical_offset;
+            if extent_start >= range_end {
+                break;
             }
-            let overlap_start = extent_start.max(range_start);
-            let overlap_end = extent_end_hint.min(range_end);
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            let dst_start = (overlap_start - range_start) as usize;
-            let dst_end = (overlap_end - range_start) as usize;
             if plain_codec {
+                let extent_end = extent_start.saturating_add(extent.pointer.length);
+                if extent_end <= range_start {
+                    continue;
+                }
+                let overlap_start = extent_start.max(range_start);
+                let overlap_end = extent_end.min(range_end);
+                if overlap_end <= overlap_start {
+                    continue;
+                }
+                let dst_start = (overlap_start - range_start) as usize;
+                let dst_end = (overlap_end - range_start) as usize;
                 let local_start = overlap_start - extent_start;
                 let local_end = overlap_end - extent_start;
                 let bytes =
@@ -675,23 +676,36 @@ impl OsageFs {
                 buffer[dst_start..dst_end].copy_from_slice(&bytes[..dst_end - dst_start]);
                 continue;
             }
+
             let bytes = self.segments.read_pointer_arc(&extent.pointer)?;
             let extent_end = extent_start.saturating_add(bytes.len() as u64);
-            let overlap_end_actual = extent_end.min(range_end);
-            let dst_end_actual = (overlap_end_actual - range_start) as usize;
+            if extent_end <= range_start {
+                continue;
+            }
+            let overlap_start = extent_start.max(range_start);
+            let overlap_end = extent_end.min(range_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let dst_start = (overlap_start - range_start) as usize;
+            let dst_end_actual = (overlap_end - range_start) as usize;
             let src_start = (overlap_start - extent_start) as usize;
-            let src_end = (overlap_end_actual - extent_start) as usize;
+            let src_end = (overlap_end - extent_start) as usize;
             buffer[dst_start..dst_end_actual].copy_from_slice(&bytes[src_start..src_end]);
         }
 
         // Overlay with staged chunks (sorted by logical offset; newer chunks
         // override base extents for overlapping regions).
-        let mut ordered_chunks: Vec<_> = segments.chunks.as_ref().to_vec();
-        ordered_chunks.sort_by_key(|c| c.logical_offset);
-        for chunk in &ordered_chunks {
+        let chunks = segments.chunks.as_ref();
+        let chunk_start_idx =
+            chunks.partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
+        for chunk in chunks[chunk_start_idx..].iter() {
             let chunk_start = chunk.logical_offset;
             let chunk_end = chunk_start.saturating_add(chunk.len);
-            if chunk_end <= range_start || chunk_start >= range_end {
+            if chunk_start >= range_end {
+                break;
+            }
+            if chunk_end <= range_start {
                 continue;
             }
             let overlap_start = chunk_start.max(range_start);

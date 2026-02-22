@@ -57,10 +57,7 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
-    let metadata = Arc::new(runtime.block_on(MetadataStore::new(
-        &config,
-        handle.clone(),
-    ))?);
+    let metadata = Arc::new(runtime.block_on(MetadataStore::new(&config, handle.clone()))?);
     let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
         metadata.clone(),
         config.shard_size,
@@ -573,22 +570,28 @@ async fn perform_segment_compaction(
         entries.push(SegmentEntry {
             inode: record.inode,
             path: record.path.clone(),
+            logical_offset: 0,
             payload: SegmentPayload::Bytes(data.clone()),
         });
     }
     let segments_clone = segments.clone();
-    let pointer_map: HashMap<u64, SegmentPointer> = tokio::task::spawn_blocking(move || {
+    let pointer_map: HashMap<u64, Vec<SegmentExtent>> = tokio::task::spawn_blocking(move || {
         segments_clone
             .write_batch(generation, segment_id, entries)
-            .map(|res| res.into_iter().collect())
+            .map(|res| {
+                let mut map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
+                for (inode, extent) in res {
+                    map.entry(inode).or_default().push(extent);
+                }
+                map
+            })
     })
     .await??;
     let mut segments_to_delete = HashSet::new();
     let result: Result<()> = async {
         for (mut record, old_ptrs, _) in dataset {
-            if let Some(new_ptr) = pointer_map.get(&record.inode) {
-                record.storage =
-                    FileStorage::Segments(vec![SegmentExtent::new(0, new_ptr.clone())]);
+            if let Some(new_extents) = pointer_map.get(&record.inode) {
+                record.storage = FileStorage::Segments(new_extents.clone());
                 metadata
                     .persist_inode(&record, generation, snapshot.shard_size)
                     .await?;

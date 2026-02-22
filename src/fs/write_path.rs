@@ -20,21 +20,14 @@ impl OsageFs {
         });
         // Insert a placeholder into mutating_inodes BEFORE removing from pending_inodes
         // so that load_inode always sees the inode in at least one map.
-        let mutating_placeholder = self
-            .pending_inodes
-            .get(&inode)
-            .map(|e| PendingEntry {
-                record: e.record.clone(),
-                data: None,
-            })
-            .unwrap_or_else(|| PendingEntry {
-                record: record.clone(),
-                data: None,
-            });
-        self.mutating_inodes.insert(inode, mutating_placeholder);
-        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let original_entry = prev_entry.clone();
-        let mut prev_data = prev_entry.and_then(|entry| entry.data);
+        let active_arc = self
+            .active_inodes
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+            .clone();
+        let mut state = active_arc.lock();
+        let original_entry = state.pending.take();
+        let mut prev_data = original_entry.as_ref().and_then(|e| e.data.clone());
         let prev_len = prev_data.as_ref().map(|d| d.len()).unwrap_or(0);
         let inline_cap = self.config.inline_threshold as u64;
         let pending_data = if new_len <= inline_cap {
@@ -49,7 +42,7 @@ impl OsageFs {
                     let chunk = match self.segments.stage_payload(bytes.as_ref()) {
                         Ok(chunk) => chunk,
                         Err(_) => {
-                            self.restore_mutation_on_error(inode, original_entry.clone());
+                            state.pending = original_entry.clone();
                             return Err(EIO);
                         }
                     };
@@ -61,7 +54,7 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(&data) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry.clone());
+                        state.pending = original_entry.clone();
                         return Err(EIO);
                     }
                 };
@@ -71,7 +64,7 @@ impl OsageFs {
                     let chunk = match self.segments.stage_payload(&data[range]) {
                         Ok(chunk) => chunk,
                         Err(_) => {
-                            self.restore_mutation_on_error(inode, original_entry.clone());
+                            state.pending = original_entry.clone();
                             return Err(EIO);
                         }
                     };
@@ -82,7 +75,7 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(&data) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry.clone());
+                        state.pending = original_entry.clone();
                         return Err(EIO);
                     }
                 };
@@ -92,24 +85,24 @@ impl OsageFs {
                 pending
             }
         };
-        // Journal first — borrows record, no clone needed.
-        if let Some(journal) = &self.journal {
-            let journal_payload = self.snapshot_journal_payload(&pending_data);
-            journal
-                .persist_record(&record, &journal_payload)
-                .map_err(|_| EIO)?;
-        }
+        let journal_payload = if self.journal.is_some() {
+            Some(self.snapshot_journal_payload(&pending_data))
+        } else {
+            None
+        };
         // Save fields needed after move.
         let path = record.path.clone();
-        // Move record into pending map — zero clones.
-        self.pending_inodes.insert(
-            inode,
-            PendingEntry {
-                record,
-                data: Some(pending_data),
-            },
-        );
-        self.mutating_inodes.remove(&inode);
+
+        // Update state in-place.
+        state.pending = Some(PendingEntry {
+            record: record.clone(),
+            data: Some(pending_data),
+        });
+        drop(state);
+
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal.persist_record(&record, payload).map_err(|_| EIO)?;
+        }
 
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
@@ -164,22 +157,15 @@ impl OsageFs {
         }
 
         // Insert placeholder into mutating_inodes BEFORE removing from pending_inodes.
-        let mutating_placeholder = self
-            .pending_inodes
-            .get(&inode)
-            .map(|e| PendingEntry {
-                record: e.record.clone(),
-                data: None,
-            })
-            .unwrap_or_else(|| PendingEntry {
-                record: record.clone(),
-                data: None,
-            });
-        self.mutating_inodes.insert(inode, mutating_placeholder);
-        let previous_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let original_entry = previous_entry.clone();
+        let active_arc = self
+            .active_inodes
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+            .clone();
+        let mut state = active_arc.lock();
+        let original_entry = state.pending.take();
 
-        let mut working_entry = previous_entry.unwrap_or(PendingEntry {
+        let mut working_entry = original_entry.clone().unwrap_or(PendingEntry {
             record: record.clone(),
             data: None,
         });
@@ -187,10 +173,18 @@ impl OsageFs {
 
         if working_entry.data.is_none() {
             if record.size > 0 {
-                let existing = self.read_file_bytes(&record).map_err(|_| {
-                    self.restore_mutation_on_error(inode, original_entry.clone());
-                    EIO
-                })?;
+                let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing {
+                    self.slice_pending_bytes(d, 0, record.size).map_err(|_| {
+                        state.pending = original_entry.clone();
+                        EIO
+                    })?
+                } else {
+                    self.read_file_range_from_storage(&record, 0, record.size)
+                        .map_err(|_| {
+                            state.pending = original_entry.clone();
+                            EIO
+                        })?
+                };
                 working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
             } else {
                 working_entry.data = Some(PendingData::Inline(Arc::new(Vec::new())));
@@ -212,7 +206,7 @@ impl OsageFs {
                 if buf.len() as u64 > inline_cap {
                     let bytes = std::mem::take(buf);
                     let chunk = self.segments.stage_payload(&bytes).map_err(|_| {
-                        self.restore_mutation_on_error(inode, original_entry.clone());
+                        state.pending = original_entry.clone();
                         EIO
                     })?;
                     *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
@@ -220,7 +214,7 @@ impl OsageFs {
             }
             PendingData::Staged(segments) => {
                 let chunk = self.segments.stage_payload(data).map_err(|_| {
-                    self.restore_mutation_on_error(inode, original_entry.clone());
+                    state.pending = original_entry.clone();
                     EIO
                 })?;
                 segments.append(chunk);
@@ -234,15 +228,13 @@ impl OsageFs {
             .journal
             .as_ref()
             .map(|_| self.snapshot_journal_payload(slot));
-        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
-            if journal.persist_record(&record, payload).is_err() {
-                self.restore_mutation_on_error(inode, original_entry.clone());
-                return Err(EIO);
-            }
-        }
 
-        self.pending_inodes.insert(inode, working_entry);
-        self.mutating_inodes.remove(&inode);
+        state.pending = Some(working_entry);
+        drop(state);
+
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal.persist_record(&record, payload).map_err(|_| EIO)?;
+        }
 
         let delta = new_len as i64 - prev_len as i64;
         let mut total = self.pending_bytes.lock();
@@ -294,57 +286,73 @@ impl OsageFs {
         let inode = record.inode;
         record.update_times();
         // Insert placeholder into mutating_inodes BEFORE removing from pending_inodes.
-        let mutating_placeholder = self
-            .pending_inodes
-            .get(&inode)
-            .map(|e| PendingEntry {
-                record: e.record.clone(),
-                data: None,
-            })
-            .unwrap_or_else(|| PendingEntry {
-                record: record.clone(),
-                data: None,
-            });
-        self.mutating_inodes.insert(inode, mutating_placeholder);
-        let prev_entry = self.pending_inodes.remove(&inode).map(|(_, entry)| entry);
-        let original_entry = prev_entry.clone();
-        let mut entry = prev_entry.unwrap_or(PendingEntry {
+        let active_arc = self
+            .active_inodes
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+            .clone();
+        let mut state = active_arc.lock();
+        let original_entry = state.pending.take();
+        let mut entry = original_entry.clone().unwrap_or(PendingEntry {
             record: record.clone(),
             data: None,
         });
         entry.record = record.clone();
         let mut data_state = entry.data.take();
         if data_state.is_none() {
-            let existing = match self.read_file_bytes(&entry.record) {
-                Ok(existing) => existing,
-                Err(_) => {
-                    self.log_fuse_error(
-                        "write_large_segments",
-                        &format!("ino={} stage=read_existing", inode),
-                        EIO,
-                    );
-                    self.restore_mutation_on_error(inode, original_entry.clone());
-                    return Err(EIO);
+            // When the file already has committed segment storage, create pending
+            // segments backed by the existing extents without reading any segment
+            // data.  The new write will be layered on top at flush time, avoiding
+            // the O(n²) read amplification that previously occurred on every write
+            // after a flush.
+            match &entry.record.storage {
+                FileStorage::Segments(extents) if !extents.is_empty() => {
+                    data_state = Some(PendingData::Staged(
+                        PendingSegments::from_committed_extents(extents.clone(), entry.record.size),
+                    ));
                 }
-            };
-            if existing.is_empty() {
-                data_state = Some(PendingData::Staged(PendingSegments::new()));
-            } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
-                data_state = Some(PendingData::Inline(Arc::new(existing)));
-            } else {
-                let chunk = match self.segments.stage_payload(&existing) {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        self.log_fuse_error(
-                            "write_large_segments",
-                            &format!("ino={} stage=stage_existing_inline", inode),
-                            EIO,
-                        );
-                        self.restore_mutation_on_error(inode, original_entry.clone());
-                        return Err(EIO);
+                _ => {
+                    // Empty file or inline storage: materialise existing bytes.
+                    // These are small (≤ inline_threshold) so reading is cheap.
+                    let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing
+                    {
+                        self.slice_pending_bytes(d, 0, record.size).map_err(|_| EIO)
+                    } else {
+                        self.read_file_range_from_storage(&entry.record, 0, entry.record.size)
+                            .map_err(|_| EIO)
+                    };
+                    let existing = match existing {
+                        Ok(existing) => existing,
+                        Err(_) => {
+                            self.log_fuse_error(
+                                "write_large_segments",
+                                &format!("ino={} stage=read_existing", inode),
+                                EIO,
+                            );
+                            state.pending = original_entry.clone();
+                            return Err(EIO);
+                        }
+                    };
+                    if existing.is_empty() {
+                        data_state = Some(PendingData::Staged(PendingSegments::new()));
+                    } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
+                        data_state = Some(PendingData::Inline(Arc::new(existing)));
+                    } else {
+                        let chunk = match self.segments.stage_payload(&existing) {
+                            Ok(chunk) => chunk,
+                            Err(_) => {
+                                self.log_fuse_error(
+                                    "write_large_segments",
+                                    &format!("ino={} stage=stage_existing_inline", inode),
+                                    EIO,
+                                );
+                                state.pending = original_entry.clone();
+                                return Err(EIO);
+                            }
+                        };
+                        data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
                     }
-                };
-                data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+                }
             }
         }
         let mut segments = match data_state {
@@ -353,7 +361,7 @@ impl OsageFs {
                 let chunk = match self.segments.stage_payload(bytes.as_ref()) {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        self.restore_mutation_on_error(inode, original_entry.clone());
+                        state.pending = original_entry.clone();
                         return Err(EIO);
                     }
                 };
@@ -361,15 +369,19 @@ impl OsageFs {
             }
             None => PendingSegments::new(),
         };
+        // Track the original file size for append-detection (adaptive flush limit).
         let prev_len = segments.total_len;
-        if let Err(_) = segments.ensure_offset(&self.segments, offset) {
+        // Track staged bytes separately: base_extents don't count toward the
+        // in-flight dirty-byte watermark since they are already committed.
+        let prev_staged = segments.staged_bytes();
+        if let Err(_) = segments.ensure_offset(offset) {
             self.release_pending_data(PendingData::Staged(segments));
             self.log_fuse_error(
                 "write_large_segments",
                 &format!("ino={} stage=ensure_offset offset={}", inode, offset),
                 EIO,
             );
-            self.restore_mutation_on_error(inode, original_entry.clone());
+            state.pending = original_entry.clone();
             return Err(EIO);
         }
         let staged_chunk = match self.segments.stage_payload(data) {
@@ -381,7 +393,7 @@ impl OsageFs {
                     &format!("ino={} stage=stage_new_payload len={}", inode, data.len()),
                     EIO,
                 );
-                self.restore_mutation_on_error(inode, original_entry.clone());
+                state.pending = original_entry.clone();
                 return Err(EIO);
             }
         };
@@ -397,10 +409,11 @@ impl OsageFs {
                 ),
                 EIO,
             );
-            self.restore_mutation_on_error(inode, original_entry.clone());
+            state.pending = original_entry.clone();
             return Err(EIO);
         }
         let new_len = segments.total_len;
+        let new_staged = segments.staged_bytes();
         entry.record.size = new_len;
         record.size = new_len;
         entry.data = Some(PendingData::Staged(segments));
@@ -412,9 +425,16 @@ impl OsageFs {
         } else {
             None
         };
-        self.pending_inodes.insert(inode, entry);
-        self.mutating_inodes.remove(&inode);
-        let delta = new_len as i64 - prev_len as i64;
+
+        state.pending = Some(entry);
+        drop(state);
+
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal.persist_record(&record, payload).map_err(|_| EIO)?;
+        }
+        // Use the staged-bytes delta for pending_bytes, not total_len, so that
+        // base_extents (already committed) don't inflate the dirty-byte counter.
+        let delta = new_staged as i64 - prev_staged as i64;
         let mut total = self.pending_bytes.lock();
         if delta >= 0 {
             *total = total.saturating_add(delta as u64);
@@ -425,9 +445,7 @@ impl OsageFs {
         let pending_limit = self.pending_flush_limit_for_write(offset == prev_len, data.len());
         let should_flush = pending_total >= pending_limit;
         drop(total);
-        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
-            journal.persist_record(&record, payload).map_err(|_| EIO)?;
-        }
+
         let path = &record.path;
         self.log_perf(
             "stage_segments",
@@ -463,17 +481,5 @@ impl OsageFs {
         }
         self.flush_if_interval_elapsed()?;
         Ok(())
-    }
-
-    pub(crate) fn restore_mutation_on_error(&self, inode: u64, original: Option<PendingEntry>) {
-        match original {
-            Some(entry) => {
-                self.pending_inodes.insert(inode, entry);
-            }
-            None => {
-                self.pending_inodes.remove(&inode);
-            }
-        }
-        self.mutating_inodes.remove(&inode);
     }
 }

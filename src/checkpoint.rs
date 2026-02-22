@@ -37,9 +37,14 @@ pub async fn create_checkpoint(
     let superblock = store
         .load_superblock()
         .await?
-        .ok_or_else(|| anyhow::anyhow!("superblock is missing under {}", config.store_path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "superblock is missing under {}",
+                config.store_path.display()
+            )
+        })?
         .block;
-    
+
     let checkpoint = CheckpointData {
         version: CHECKPOINT_FORMAT_VERSION,
         created_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -86,8 +91,8 @@ pub async fn restore_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use tempfile::tempdir;
 

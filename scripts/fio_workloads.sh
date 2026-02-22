@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
+set -x
 
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
@@ -127,12 +128,16 @@ run_fio() {
   shift
   local output="$RAW_DIR/${name}.json"
   echo "Running workload: $name"
+  local time_args=()
+  if [[ "$name" != prefill_* ]]; then
+    time_args=(--time_based=1 --runtime="$RUNTIME_SEC")
+  fi
+
   set +e
   fio \
     --name="$name" \
     --thread=1 \
-    --time_based=1 \
-    --runtime="$RUNTIME_SEC" \
+    "${time_args[@]}" \
     --group_reporting=1 \
     --output-format=json \
     --output="$output" \
@@ -144,6 +149,25 @@ run_fio() {
     RUN_STATUS=1
     FAILED_WORKLOADS+=("$name")
   fi
+}
+
+fsync_prefill_file() {
+  local file_path=$1
+  if [[ ! -f "$file_path" ]]; then
+    echo "prefill file missing for fsync: $file_path" >&2
+    return 1
+  fi
+  python3 - "$file_path" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
 }
 
 if workload_enabled "seq_read_1m"; then
@@ -165,7 +189,16 @@ if workload_enabled "randread_4k" || workload_enabled "randrw_70r_30w_4k"; then
     --ioengine=libaio \
     --iodepth="$RAND_IODEPTH" \
     --numjobs="$RAND_NUMJOBS" \
-    --direct="$DIRECT_IO"
+    --direct="$DIRECT_IO" 
+  if [[ "$RUN_STATUS" -eq 0 ]]; then
+    echo "Syncing prefill file before read workload"
+    fsync_prefill_file "$WORK_ROOT/rand.bin" || {
+      echo "prefill fsync failed for $WORK_ROOT/rand.bin" >&2
+      RUN_STATUS=1
+      FAILED_WORKLOADS+=("prefill_rand_fsync")
+    }
+    echo "Synced"
+  fi
 fi
 
 if workload_enabled "seq_write_1m"; then

@@ -175,7 +175,12 @@ impl OsageFs {
         result
     }
 
-    pub fn nfs_remove_file(&self, parent: u64, name: &str, caller_uid: u32) -> std::result::Result<(), i32> {
+    pub fn nfs_remove_file(
+        &self,
+        parent: u64,
+        name: &str,
+        caller_uid: u32,
+    ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let result = self.op_remove_file(parent, name, caller_uid);
@@ -189,7 +194,12 @@ impl OsageFs {
         result
     }
 
-    pub fn nfs_remove_dir(&self, parent: u64, name: &str, caller_uid: u32) -> std::result::Result<(), i32> {
+    pub fn nfs_remove_dir(
+        &self,
+        parent: u64,
+        name: &str,
+        caller_uid: u32,
+    ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
         let result = self.op_remove_dir(parent, name, caller_uid);

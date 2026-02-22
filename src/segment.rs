@@ -260,6 +260,9 @@ impl SegmentManager {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
+        let has_staged_payloads = entries
+            .iter()
+            .any(|entry| matches!(entry.payload, SegmentPayload::Staged(_)));
         let original_entry_count = entries.len();
         let mut estimated_size = 4usize + 8usize;
         for entry in &entries {
@@ -276,13 +279,16 @@ impl SegmentManager {
                     estimated_size = estimated_size.saturating_add(bytes.len());
                 }
                 SegmentPayload::Staged(chunks) => {
-                    let total_len: usize = chunks.iter().map(|chunk| chunk.len as usize).sum();
-                    estimated_size = estimated_size.saturating_add(total_len);
+                    if !has_staged_payloads {
+                        let total_len: usize = chunks.iter().map(|chunk| chunk.len as usize).sum();
+                        estimated_size = estimated_size.saturating_add(total_len);
+                    }
                 }
             }
         }
         let codec_config = self.segment_codec_config();
-        let use_parallel = self.should_parallel_encode(original_entry_count, estimated_size);
+        let use_parallel =
+            !has_staged_payloads && self.should_parallel_encode(original_entry_count, estimated_size);
         let mut buffer = Vec::with_capacity(estimated_size);
         buffer.extend_from_slice(SEGMENT_MAGIC_V2);
         // Placeholder for encoded entry count; updated after encoding.
@@ -322,49 +328,90 @@ impl SegmentManager {
             }
         } else {
             for entry in entries {
-                let plain_bytes = match entry.payload {
-                    SegmentPayload::Bytes(bytes) => bytes,
-                    SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
-                    SegmentPayload::Staged(chunks) => {
-                        let total_len = chunks.iter().map(|chunk| chunk.len).sum();
-                        self.read_staged_chunks(&chunks, total_len)?
+                let SegmentEntry {
+                    inode,
+                    path,
+                    logical_offset,
+                    payload,
+                } = entry;
+
+                let mut emit_encoded_entries =
+                    |encoded_entries: Vec<EncodedSegmentEntry>| -> Result<()> {
+                        for encoded_entry in encoded_entries {
+                            buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
+                            let path_bytes = encoded_entry.path.as_bytes();
+                            buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+                            buffer.extend_from_slice(path_bytes);
+                            let offset = buffer.len() as u64;
+                            buffer.push(codec_to_u8(encoded_entry.encoded.codec));
+                            buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
+                            buffer.extend_from_slice(
+                                &(encoded_entry.encoded.payload.len() as u64).to_le_bytes(),
+                            );
+                            buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
+                            buffer.extend_from_slice(&encoded_entry.encoded.payload);
+                            encoded_entry_count = encoded_entry_count.saturating_add(1);
+                            pointers.push((
+                                encoded_entry.inode,
+                                SegmentExtent::new(
+                                    encoded_entry.logical_offset,
+                                    SegmentPointer {
+                                        segment_id,
+                                        generation,
+                                        offset,
+                                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
+                                            + encoded_entry.encoded.payload.len())
+                                            as u64,
+                                    },
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    };
+
+                match payload {
+                    SegmentPayload::Bytes(bytes) => {
+                        let encoded_entries = encode_plain_bytes_chunked(
+                            inode,
+                            path,
+                            logical_offset,
+                            bytes,
+                            &codec_config,
+                        )?;
+                        emit_encoded_entries(encoded_entries)?;
                     }
-                };
-                let encoded_entries = encode_plain_bytes_chunked(
-                    entry.inode,
-                    entry.path,
-                    entry.logical_offset,
-                    plain_bytes,
-                    &codec_config,
-                )?;
-                for encoded_entry in encoded_entries {
-                    buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
-                    let path_bytes = encoded_entry.path.as_bytes();
-                    buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
-                    buffer.extend_from_slice(path_bytes);
-                    let offset = buffer.len() as u64;
-                    buffer.push(codec_to_u8(encoded_entry.encoded.codec));
-                    buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
-                    buffer.extend_from_slice(
-                        &(encoded_entry.encoded.payload.len() as u64).to_le_bytes(),
-                    );
-                    buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
-                    buffer.extend_from_slice(&encoded_entry.encoded.payload);
-                    encoded_entry_count = encoded_entry_count.saturating_add(1);
-                    pointers.push((
-                        encoded_entry.inode,
-                        SegmentExtent::new(
-                            encoded_entry.logical_offset,
-                            SegmentPointer {
-                                segment_id,
-                                generation,
-                                offset,
-                                length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
-                                    + encoded_entry.encoded.payload.len())
-                                    as u64,
-                            },
-                        ),
-                    ));
+                    SegmentPayload::SharedBytes(bytes) => {
+                        let encoded_entries = encode_plain_bytes_chunked(
+                            inode,
+                            path,
+                            logical_offset,
+                            bytes.as_ref().to_vec(),
+                            &codec_config,
+                        )?;
+                        emit_encoded_entries(encoded_entries)?;
+                    }
+                    SegmentPayload::Staged(mut chunks) => {
+                        chunks.sort_by_key(|chunk| chunk.logical_offset);
+                        for chunk in chunks {
+                            if chunk.len == 0 {
+                                continue;
+                            }
+                            let mut chunk_off = 0u64;
+                            while chunk_off < chunk.len {
+                                let piece_len = (chunk.len - chunk_off).min(SEGMENT_CHUNK_BYTES as u64);
+                                let piece = self.read_staged_chunk_range(&chunk, chunk_off, piece_len)?;
+                                let encoded_entries = encode_plain_bytes_chunked(
+                                    inode,
+                                    path.clone(),
+                                    chunk.logical_offset.saturating_add(chunk_off),
+                                    piece,
+                                    &codec_config,
+                                )?;
+                                emit_encoded_entries(encoded_entries)?;
+                                chunk_off = chunk_off.saturating_add(piece_len);
+                            }
+                        }
+                    }
                 }
             }
         }

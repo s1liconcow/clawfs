@@ -68,7 +68,17 @@ impl Filesystem for OsageFs {
     ) {
         let replay = self.replay_start();
         let _mutation_guard = self.mutation_lock.lock();
-        let res = self.op_fuse_setattr(ino, req.uid(), req.gid(), mode, uid, gid, size, atime, mtime);
+        let res = self.op_fuse_setattr(
+            ino,
+            req.uid(),
+            req.gid(),
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+        );
         match res {
             Ok(attr) => {
                 self.log_replay(
@@ -168,7 +178,8 @@ impl Filesystem for OsageFs {
         match response {
             Ok(entries) => {
                 let entry_count = entries.len();
-                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
+                {
                     if reply.add(ino, (i + 1) as i64, kind, name) {
                         break;
                     }

@@ -164,7 +164,12 @@ impl MetadataStore {
         match result {
             Ok(get_result) => {
                 let version = get_result.meta.e_tag.clone().unwrap_or_else(|| {
-                    get_result.meta.last_modified.timestamp_nanos_opt().unwrap_or(0).to_string()
+                    get_result
+                        .meta
+                        .last_modified
+                        .timestamp_nanos_opt()
+                        .unwrap_or(0)
+                        .to_string()
                 });
                 let bytes = get_result.bytes().await?;
                 let stored: StoredSuperblock = deserialize_flex(&bytes)?;
@@ -190,7 +195,8 @@ impl MetadataStore {
         };
         let bytes = serialize_flex(&stored)?;
         let path = self.superblock_path();
-        let put_result = self.store
+        let put_result = self
+            .store
             .put(&path, PutPayload::from_bytes(Bytes::from(bytes)))
             .await?;
         self.log_backing(format_args!(
@@ -259,14 +265,15 @@ impl MetadataStore {
                     existing.block.generation
                 ));
             }
-            self.store_superblock_conditional(sb, &existing.version).await?;
+            self.store_superblock_conditional(sb, &existing.version)
+                .await?;
         } else if expected_generation != 0 {
             return Err(anyhow!(
                 "superblock missing while expecting generation {}",
                 expected_generation
             ));
         } else {
-            // Bootstrap: first write. 
+            // Bootstrap: first write.
             let stored = StoredSuperblock {
                 version: METADATA_FORMAT_VERSION,
                 block: sb.clone(),
@@ -274,12 +281,13 @@ impl MetadataStore {
             let bytes = serialize_flex(&stored)?;
             let payload = Bytes::from(bytes);
             let path = self.superblock_path();
-            
+
             let opts = object_store::PutOptions {
                 mode: object_store::PutMode::Create,
                 ..Default::default()
             };
-            let result = self.store
+            let result = self
+                .store
                 .put_opts(&path, PutPayload::from_bytes(payload.clone()), opts)
                 .await;
 
@@ -290,10 +298,23 @@ impl MetadataStore {
                         .put(&path, PutPayload::from_bytes(payload))
                         .await?;
                 }
-                Err(e) => return Err(anyhow::Error::from(e).context("initial superblock bootstrap failed")),
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context("initial superblock bootstrap failed")
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    /// Returns the committed record for this inode if it is present in the
+    /// positive in-memory cache.  Does NOT trigger a shard reload and does NOT
+    /// interact with the negative cache.  Safe to call from synchronous
+    /// contexts (e.g. inside flush_pending under flush_lock) where callers
+    /// only need extents that were committed by a prior flush.
+    pub fn get_cached_inode(&self, inode: u64) -> Option<InodeRecord> {
+        self.cache.lock().get(&inode).map(|e| e.record.clone())
     }
 
     pub async fn get_inode_with_ttl(
@@ -520,10 +541,10 @@ impl MetadataStore {
     async fn load_latest_imaps(&self) -> Result<()> {
         let mut latest: HashMap<u64, (u64, ObjectPath)> = HashMap::new();
         let prefix = self.imap_prefix();
-        
+
         // Ensure prefix exists (optional check or just list)
         // Note: list(Some(prefix)) works even if prefix is "virtual" directory
-        
+
         let mut stream = self.store.list(Some(&prefix));
         while let Some(item) = stream.next().await {
             let meta = item?;
@@ -543,7 +564,7 @@ impl MetadataStore {
         let mut cache = self.cache.lock();
         let mut shard_map = self.shards.lock();
         let mut max_generation = 0;
-        
+
         // Parallel fetch could be better here, but keep it simple for now
         for (shard_id, (_, path)) in latest {
             let bytes = self.store.get(&path).await?.bytes().await?;
@@ -574,17 +595,17 @@ impl MetadataStore {
     }
 
     pub fn apply_external_deltas(&self) -> Result<Vec<InodeRecord>> {
-        // This needs to be async or blocking. Since we are in a non-async method 
+        // This needs to be async or blocking. Since we are in a non-async method
         // that's often called from blocking context (or we need to change signature),
         // we use the handle to block.
         // However, `spawn_metadata_poller` calls this inside `spawn_blocking`.
         // So we can use `self.handle.block_on`.
-        
+
         self.handle.block_on(async {
             let mut newest = *self.last_delta_generation.lock();
             let mut files = Vec::new();
             let prefix = self.delta_prefix();
-            
+
             let mut stream = self.store.list(Some(&prefix));
             while let Some(item) = stream.next().await {
                 let meta = item?;
@@ -595,7 +616,7 @@ impl MetadataStore {
                     }
                 }
             }
-            
+
             files.sort_by_key(|(generation, _)| *generation);
             let mut updated_records = Vec::new();
             for (generation, path) in files {
@@ -640,7 +661,7 @@ impl MetadataStore {
         self.handle.block_on(async {
             let prefix = self.delta_prefix();
             let mut files: Vec<(u64, ObjectPath)> = Vec::new();
-            
+
             let mut stream = self.store.list(Some(&prefix));
             while let Some(item) = stream.next().await {
                 let meta = item?;
@@ -649,7 +670,7 @@ impl MetadataStore {
                     files.push((generation, meta.location));
                 }
             }
-            
+
             files.sort_by_key(|(generation, _)| *generation);
             let mut removed = 0;
             if files.len() > keep {
@@ -697,7 +718,7 @@ impl MetadataStore {
     async fn reload_shard(&self, shard_id: u64) -> Result<()> {
         let mut newest_path: Option<(u64, ObjectPath)> = None;
         let prefix = self.imap_prefix();
-        
+
         let mut stream = self.store.list(Some(&prefix));
         while let Some(item) = stream.next().await {
             let meta = item?;
