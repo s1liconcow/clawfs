@@ -24,10 +24,11 @@ use lru::LruCache;
 
 use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::{Config, ObjectStoreProvider};
-use crate::inode::InlinePayloadCodec;
+use crate::inode::{InlinePayloadCodec, SegmentExtent};
 
 const SEGMENT_MAGIC_V2: &[u8; 4] = b"OSG2";
 const SEGMENT_ENTRY_CODEC_HEADER_LEN: usize = 1 + 8 + 8 + 12;
+const SEGMENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentPointer {
@@ -40,6 +41,7 @@ pub struct SegmentPointer {
 pub struct SegmentEntry {
     pub inode: u64,
     pub path: String,
+    pub logical_offset: u64,
     pub payload: SegmentPayload,
 }
 
@@ -54,6 +56,10 @@ pub struct StagedChunk {
     pub path: PathBuf,
     pub offset: u64,
     pub len: u64,
+    /// Logical byte offset within the file that this chunk's data represents.
+    /// Defaults to 0 for backward compatibility with existing journal files.
+    #[serde(default)]
+    pub logical_offset: u64,
 }
 
 /// Default in-memory decoded-extent cache budget (256 MiB).
@@ -82,6 +88,7 @@ pub struct SegmentManager {
 struct EncodedSegmentEntry {
     inode: u64,
     path: String,
+    logical_offset: u64,
     plain_len: u64,
     encoded: EncodedBytes,
 }
@@ -249,11 +256,11 @@ impl SegmentManager {
         generation: u64,
         segment_id: u64,
         entries: Vec<SegmentEntry>,
-    ) -> Result<Vec<(u64, SegmentPointer)>> {
+    ) -> Result<Vec<(u64, SegmentExtent)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let entry_count = entries.len();
+        let original_entry_count = entries.len();
         let mut estimated_size = 4usize + 8usize;
         for entry in &entries {
             estimated_size = estimated_size
@@ -275,14 +282,16 @@ impl SegmentManager {
             }
         }
         let codec_config = self.segment_codec_config();
-        let use_parallel = self.should_parallel_encode(entry_count, estimated_size);
+        let use_parallel = self.should_parallel_encode(original_entry_count, estimated_size);
         let mut buffer = Vec::with_capacity(estimated_size);
         buffer.extend_from_slice(SEGMENT_MAGIC_V2);
-        buffer.extend_from_slice(&(entry_count as u64).to_le_bytes());
-        let mut pointers = Vec::with_capacity(entry_count);
+        // Placeholder for encoded entry count; updated after encoding.
+        buffer.extend_from_slice(&0u64.to_le_bytes());
+        let mut pointers = Vec::with_capacity(original_entry_count);
+        let mut encoded_entry_count: u64 = 0;
         if use_parallel {
             let encoded_entries =
-                self.encode_entries_parallel(entries, &codec_config, entry_count)?;
+                self.encode_entries_parallel(entries, &codec_config, original_entry_count)?;
             for encoded_entry in encoded_entries {
                 buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
                 let path_bytes = encoded_entry.path.as_bytes();
@@ -295,16 +304,20 @@ impl SegmentManager {
                     .extend_from_slice(&(encoded_entry.encoded.payload.len() as u64).to_le_bytes());
                 buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
                 buffer.extend_from_slice(&encoded_entry.encoded.payload);
+                encoded_entry_count = encoded_entry_count.saturating_add(1);
                 pointers.push((
                     encoded_entry.inode,
-                    SegmentPointer {
-                        segment_id,
-                        generation,
-                        offset,
-                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
-                            + encoded_entry.encoded.payload.len())
-                            as u64,
-                    },
+                    SegmentExtent::new(
+                        encoded_entry.logical_offset,
+                        SegmentPointer {
+                            segment_id,
+                            generation,
+                            offset,
+                            length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
+                                + encoded_entry.encoded.payload.len())
+                                as u64,
+                        },
+                    ),
                 ));
             }
         } else {
@@ -317,36 +330,70 @@ impl SegmentManager {
                         self.read_staged_chunks(&chunks, total_len)?
                     }
                 };
-                let plain_len = plain_bytes.len() as u64;
-                let encoded = encode_bytes(&plain_bytes, &codec_config).with_context(|| {
-                    format!("segment payload encoding failed for inode {}", entry.inode)
-                })?;
-                buffer.extend_from_slice(&entry.inode.to_le_bytes());
-                let path_bytes = entry.path.as_bytes();
-                buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
-                buffer.extend_from_slice(path_bytes);
-                let offset = buffer.len() as u64;
-                buffer.push(codec_to_u8(encoded.codec));
-                buffer.extend_from_slice(&plain_len.to_le_bytes());
-                buffer.extend_from_slice(&(encoded.payload.len() as u64).to_le_bytes());
-                buffer.extend_from_slice(&encoded.nonce.unwrap_or([0u8; 12]));
-                buffer.extend_from_slice(&encoded.payload);
-                pointers.push((
+                let encoded_entries = encode_plain_bytes_chunked(
                     entry.inode,
-                    SegmentPointer {
-                        segment_id,
-                        generation,
-                        offset,
-                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN + encoded.payload.len()) as u64,
-                    },
-                ));
+                    entry.path,
+                    entry.logical_offset,
+                    plain_bytes,
+                    &codec_config,
+                )?;
+                for encoded_entry in encoded_entries {
+                    buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
+                    let path_bytes = encoded_entry.path.as_bytes();
+                    buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+                    buffer.extend_from_slice(path_bytes);
+                    let offset = buffer.len() as u64;
+                    buffer.push(codec_to_u8(encoded_entry.encoded.codec));
+                    buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
+                    buffer.extend_from_slice(
+                        &(encoded_entry.encoded.payload.len() as u64).to_le_bytes(),
+                    );
+                    buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
+                    buffer.extend_from_slice(&encoded_entry.encoded.payload);
+                    encoded_entry_count = encoded_entry_count.saturating_add(1);
+                    pointers.push((
+                        encoded_entry.inode,
+                        SegmentExtent::new(
+                            encoded_entry.logical_offset,
+                            SegmentPointer {
+                                segment_id,
+                                generation,
+                                offset,
+                                length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
+                                    + encoded_entry.encoded.payload.len())
+                                    as u64,
+                            },
+                        ),
+                    ));
+                }
             }
         }
+        buffer[4..12].copy_from_slice(&encoded_entry_count.to_le_bytes());
         let total_bytes = buffer.len();
         let object_path = self.segment_path(generation, segment_id);
         let object_path_clone = object_path.clone();
         let store = self.store.clone();
         let payload = Bytes::from(buffer);
+        // Write the local cache file from the in-memory buffer instead of
+        // re-fetching from the store via enqueue_cache_fill.  We share the
+        // refcounted Bytes handle so there is no extra copy, and spawn the
+        // I/O on the runtime so the flush path is not blocked.
+        if self.cache_limit > 0 {
+            let cache_payload = payload.clone();
+            let cache_dir = self.cache_dir.clone();
+            let cache_limit = self.cache_limit;
+            let cache_state = self.cache_state.clone();
+            self.handle.spawn_blocking(move || {
+                let _ = Self::write_cache_file_with_state(
+                    &cache_dir,
+                    cache_limit,
+                    &cache_state,
+                    generation,
+                    segment_id,
+                    &cache_payload,
+                );
+            });
+        }
         self.run_store(
             async move {
                 store
@@ -356,13 +403,6 @@ impl SegmentManager {
             },
             || format!("writing segment {}", object_path),
         )?;
-        // Populate the local cache asynchronously after the object-store write
-        // succeeds.  Moving the cache write off the flush critical path removes
-        // a synchronous double-write of the full segment buffer (e.g. 128 MiB
-        // for a checkpoint) that was previously blocking the fsync return.
-        if self.cache_limit > 0 {
-            self.enqueue_cache_fill(generation, segment_id);
-        }
         self.log_backing(format_args!(
             "synced backing file path={} type=segment generation={} segment_id={} entries={} bytes={}",
             object_path.to_string(),
@@ -421,17 +461,13 @@ impl SegmentManager {
                                 read_staged_chunks_from_disk(&stage_dir, &chunks, total_len)?
                             }
                         };
-                        let plain_len = plain_bytes.len() as u64;
-                        let encoded =
-                            encode_bytes(&plain_bytes, &codec_config).with_context(|| {
-                                format!("segment payload encoding failed for inode {}", entry.inode)
-                            })?;
-                        out.push(EncodedSegmentEntry {
-                            inode: entry.inode,
-                            path: entry.path,
-                            plain_len,
-                            encoded,
-                        });
+                        out.extend(encode_plain_bytes_chunked(
+                            entry.inode,
+                            entry.path,
+                            entry.logical_offset,
+                            plain_bytes,
+                            &codec_config,
+                        )?);
                     }
                     Ok(out)
                 },
@@ -489,6 +525,38 @@ impl SegmentManager {
         let arc = Arc::new(decoded);
         self.decoded_cache.lock().put(key, arc.clone());
         Ok(arc)
+    }
+
+    /// Returns `true` when segment entries are stored as plain bytes (no
+    /// compression, no encryption).  In this mode the payload region of a
+    /// segment entry is the raw file data and can be sub-range-read without
+    /// decoding the entire entry.
+    pub fn is_plain_codec(&self) -> bool {
+        !self.segment_compression && self.segment_encryption_key.is_none()
+    }
+
+    /// Read a byte sub-range of a segment extent directly from the store
+    /// without loading the full entry.  Only valid when `is_plain_codec()`
+    /// returns `true`; the caller must fall back to `read_pointer_arc` when
+    /// transforms are active.
+    ///
+    /// `local_start..local_end` is relative to the beginning of the decoded
+    /// payload (i.e. relative to the extent's logical_offset).
+    pub fn read_pointer_subrange(
+        &self,
+        pointer: &SegmentPointer,
+        local_start: u64,
+        local_end: u64,
+    ) -> Result<Vec<u8>> {
+        debug_assert!(self.is_plain_codec(), "subrange read requires plain codec");
+        let payload_base = pointer.offset + SEGMENT_ENTRY_CODEC_HEADER_LEN as u64;
+        let store_start = payload_base + local_start;
+        let store_end = payload_base + local_end;
+        self.fetch_segment_range(
+            pointer.generation,
+            pointer.segment_id,
+            store_start..store_end,
+        )
     }
 
     fn decode_pointer_from_segment(
@@ -563,6 +631,7 @@ impl SegmentManager {
             path: stage.path.clone(),
             offset,
             len: data.len() as u64,
+            logical_offset: 0, // callers set the appropriate logical_offset
         };
         *state.ref_counts.entry(chunk.path.clone()).or_insert(0) += 1;
         Ok(chunk)
@@ -583,6 +652,7 @@ impl SegmentManager {
             path: chunk.path.clone(),
             offset: chunk.offset + offset,
             len,
+            logical_offset: chunk.logical_offset + offset,
         })
     }
 
@@ -605,6 +675,34 @@ impl SegmentManager {
         let mut buffer = vec![0u8; chunk.len as usize];
         file.read_exact(&mut buffer)
             .with_context(|| format!("reading staged payload {}", chunk.path.display()))?;
+        Ok(buffer)
+    }
+
+    /// Read a byte sub-range of a staged chunk without materializing the full
+    /// chunk in memory.
+    pub fn read_staged_chunk_range(
+        &self,
+        chunk: &StagedChunk,
+        start: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(start <= chunk.len, "staged chunk range start out of bounds");
+        anyhow::ensure!(
+            start + len <= chunk.len,
+            "staged chunk range exceeds bounds"
+        );
+        let mut file = File::open(&chunk.path)
+            .with_context(|| format!("opening staged payload {}", chunk.path.display()))?;
+        file.seek(SeekFrom::Start(chunk.offset + start))?;
+        let mut buffer = vec![0u8; len as usize];
+        file.read_exact(&mut buffer).with_context(|| {
+            format!(
+                "reading staged payload {} @{}+{}",
+                chunk.path.display(),
+                chunk.offset + start,
+                len
+            )
+        })?;
         Ok(buffer)
     }
 
@@ -752,8 +850,26 @@ impl SegmentManager {
         if !path.exists() {
             return Ok(None);
         }
-        let full = fs::read(path)?;
-        Ok(Some(self.decode_pointer_from_segment(&full, pointer)?))
+        let full = match fs::read(&path) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        // The cache file may be partially written (async cache fill races with
+        // reads) or corrupt.  Fall back to the range-read path instead of
+        // propagating the error.
+        match self.decode_pointer_from_segment(&full, pointer) {
+            Ok(decoded) => Ok(Some(decoded)),
+            Err(e) => {
+                log::debug!(
+                    "cache read failed gen={} seg={} path={}: {:#}; falling back to range read",
+                    pointer.generation,
+                    pointer.segment_id,
+                    path.display(),
+                    e
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn fetch_segment(&self, generation: u64, segment_id: u64) -> Result<Vec<u8>> {
@@ -872,7 +988,11 @@ impl SegmentManager {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, data)?;
+        // Write to a temporary file and rename to prevent concurrent readers
+        // from seeing a partially written cache file.
+        let tmp_path = path.with_extension("bin.tmp");
+        fs::write(&tmp_path, data)?;
+        fs::rename(&tmp_path, &path)?;
         let mut cache = cache_state.lock();
         cache.entries.push_back((path.clone(), data.len() as u64));
         cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
@@ -919,6 +1039,50 @@ impl SegmentManager {
         }
         Ok(appended)
     }
+}
+
+fn encode_plain_bytes_chunked(
+    inode: u64,
+    path: String,
+    logical_offset: u64,
+    plain_bytes: Vec<u8>,
+    codec_config: &InlineCodecConfig,
+) -> Result<Vec<EncodedSegmentEntry>> {
+    if plain_bytes.len() > SEGMENT_CHUNK_BYTES {
+        let mut out = Vec::with_capacity(plain_bytes.len().div_ceil(SEGMENT_CHUNK_BYTES));
+        let mut chunk_start = 0usize;
+        while chunk_start < plain_bytes.len() {
+            let chunk_end = (chunk_start + SEGMENT_CHUNK_BYTES).min(plain_bytes.len());
+            let chunk = &plain_bytes[chunk_start..chunk_end];
+            let encoded = encode_bytes(chunk, codec_config).with_context(|| {
+                format!(
+                    "segment payload chunk encoding failed for inode {} at logical offset {}",
+                    inode,
+                    logical_offset.saturating_add(chunk_start as u64)
+                )
+            })?;
+            out.push(EncodedSegmentEntry {
+                inode,
+                path: path.clone(),
+                logical_offset: logical_offset.saturating_add(chunk_start as u64),
+                plain_len: chunk.len() as u64,
+                encoded,
+            });
+            chunk_start = chunk_end;
+        }
+        return Ok(out);
+    }
+
+    let plain_len = plain_bytes.len() as u64;
+    let encoded = encode_bytes(&plain_bytes, codec_config)
+        .with_context(|| format!("segment payload encoding failed for inode {inode}"))?;
+    Ok(vec![EncodedSegmentEntry {
+        inode,
+        path,
+        logical_offset,
+        plain_len,
+        encoded,
+    }])
 }
 
 impl ActiveStage {
@@ -1089,12 +1253,13 @@ mod tests {
         let entries = vec![SegmentEntry {
             inode: 42,
             path: "/foo.txt".into(),
+            logical_offset: 0,
             payload: SegmentPayload::Bytes(b"hello world".to_vec()),
         }];
         let pointers = manager.write_batch(7, 1, entries).unwrap();
         assert_eq!(pointers.len(), 1);
         let ptr = &pointers[0].1;
-        let bytes = manager.read_pointer(ptr).unwrap();
+        let bytes = manager.read_pointer(&ptr.pointer).unwrap();
         assert_eq!(bytes, b"hello world");
     }
 
@@ -1109,14 +1274,15 @@ mod tests {
         let entries = vec![SegmentEntry {
             inode: 7,
             path: "/bar.txt".into(),
+            logical_offset: 0,
             payload: SegmentPayload::Bytes(b"range read data".to_vec()),
         }];
         let pointers = manager.write_batch(3, 9, entries).unwrap();
         let ptr = &pointers[0].1;
-        let bytes = manager.read_pointer(ptr).unwrap();
+        let bytes = manager.read_pointer(&ptr.pointer).unwrap();
         assert_eq!(bytes, b"range read data");
 
-        let cache_path = manager.cache_path(ptr.generation, ptr.segment_id);
+        let cache_path = manager.cache_path(ptr.pointer.generation, ptr.pointer.segment_id);
         for _ in 0..20 {
             if cache_path.exists() {
                 return;
@@ -1124,5 +1290,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("expected cache prefetch to create {}", cache_path.display());
+    }
+
+    #[test]
+    fn write_batch_chunks_large_payload_when_compressed() {
+        let dir = tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let config = build_config(dir.path());
+        let manager = SegmentManager::new(&config, handle).unwrap();
+
+        let data = vec![7u8; (SEGMENT_CHUNK_BYTES * 2) + 123];
+        let entries = vec![SegmentEntry {
+            inode: 99,
+            path: "/large.bin".into(),
+            logical_offset: 0,
+            payload: SegmentPayload::Bytes(data.clone()),
+        }];
+
+        let pointers = manager.write_batch(1, 1, entries).unwrap();
+        assert_eq!(pointers.len(), 3);
+        assert_eq!(pointers[0].1.logical_offset, 0);
+        assert_eq!(pointers[1].1.logical_offset, SEGMENT_CHUNK_BYTES as u64);
+        assert_eq!(
+            pointers[2].1.logical_offset,
+            (SEGMENT_CHUNK_BYTES * 2) as u64
+        );
+
+        let mut rebuilt = vec![0u8; data.len()];
+        for (_, extent) in pointers {
+            let chunk = manager.read_pointer(&extent.pointer).unwrap();
+            let start = extent.logical_offset as usize;
+            let end = start + chunk.len();
+            rebuilt[start..end].copy_from_slice(&chunk);
+        }
+        assert_eq!(rebuilt, data);
     }
 }

@@ -13,6 +13,12 @@ DEBUG_LOG="${DEBUG_LOG:-0}"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REPLAY_LOG_PATH="${REPLAY_LOG_PATH:-}"
 ALLOW_OTHER="${ALLOW_OTHER:-0}"
+SEGMENT_COMPRESSION="${SEGMENT_COMPRESSION:-true}"
+INLINE_COMPRESSION="${INLINE_COMPRESSION:-true}"
+HEAPTRACK="${HEAPTRACK:-0}"
+HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$ROOT_DIR/heaptrack/heaptrack.osagefs.%p}"
+HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
+HEAPTRACK_EXTRA_ARGS="${HEAPTRACK_EXTRA_ARGS:-}"
 
 osage_ensure_release_binary "$OSAGE_BIN"
 
@@ -28,6 +34,8 @@ CMD=(
   --home-prefix /home
   --disable-cleanup
   --log-file "$LOG_FILE"
+  --segment-compression "$SEGMENT_COMPRESSION"
+  --inline-compression "$INLINE_COMPRESSION"
   --foreground
 )
 
@@ -46,14 +54,35 @@ fi
 if osage_is_true "$ALLOW_OTHER"; then
   CMD+=(--allow-other)
 fi
+# Allow callers to inject additional CLI flags (e.g. --pending-bytes, --flush-interval-ms).
+if [[ -n "${OSAGEFS_EXTRA_ARGS:-}" ]]; then
+  read -ra _extra <<< "$OSAGEFS_EXTRA_ARGS"
+  CMD+=("${_extra[@]}")
+fi
+
+LAUNCH_CMD=("${CMD[@]}")
+if osage_is_true "$HEAPTRACK"; then
+  osage_require_cmd heaptrack
+  mkdir -p "$(dirname "$HEAPTRACK_OUTPUT")"
+  LAUNCH_CMD=(heaptrack -o "$HEAPTRACK_OUTPUT")
+  if osage_is_true "$HEAPTRACK_RAW"; then
+    LAUNCH_CMD+=(-r)
+  fi
+  if [[ -n "$HEAPTRACK_EXTRA_ARGS" ]]; then
+    read -ra _heap_extra <<< "$HEAPTRACK_EXTRA_ARGS"
+    LAUNCH_CMD+=("${_heap_extra[@]}")
+  fi
+  LAUNCH_CMD+=("${CMD[@]}")
+  echo "Heaptrack enabled (output pattern: $HEAPTRACK_OUTPUT)"
+fi
 
 if osage_is_true "$FOREGROUND"; then
-  exec "${CMD[@]}"
+  exec "${LAUNCH_CMD[@]}"
 fi
 
 echo "Starting osagefs in background..."
 mkdir -p "$(dirname "$LOG_FILE")"
-nohup "${CMD[@]}" >"$LOG_FILE" 2>&1 &
+nohup "${LAUNCH_CMD[@]}" >"$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 if ! osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"; then

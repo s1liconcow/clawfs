@@ -2,6 +2,77 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl OsageFs {
+    fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        ranges.retain(|(start, end)| end > start);
+        if ranges.is_empty() {
+            return ranges;
+        }
+        ranges.sort_by_key(|(start, _)| *start);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some((_, last_end)) = merged.last_mut()
+                && start <= *last_end
+            {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        merged
+    }
+
+    fn trim_base_extents_for_overwrites(
+        mut base_extents: Vec<SegmentExtent>,
+        base_size: u64,
+        overwrite_ranges: &[(u64, u64)],
+    ) -> Vec<SegmentExtent> {
+        if base_extents.is_empty() || overwrite_ranges.is_empty() || base_size == 0 {
+            return base_extents;
+        }
+        base_extents.sort_by_key(|ext| ext.logical_offset);
+        let merged_overwrites = Self::merge_ranges(overwrite_ranges.to_vec());
+        if merged_overwrites.is_empty() {
+            return base_extents;
+        }
+
+        let mut trimmed: Vec<SegmentExtent> = Vec::with_capacity(base_extents.len());
+        for (idx, extent) in base_extents.iter().enumerate() {
+            let start = extent.logical_offset;
+            let next_start = base_extents
+                .get(idx + 1)
+                .map(|next| next.logical_offset)
+                .unwrap_or(base_size);
+            let end = next_start.min(base_size);
+            if end <= start {
+                continue;
+            }
+
+            let mut cursor = start;
+            for (ov_start, ov_end) in &merged_overwrites {
+                if *ov_end <= cursor || *ov_start >= end {
+                    continue;
+                }
+                if *ov_start > cursor {
+                    trimmed.push(SegmentExtent::new(
+                        cursor,
+                        extent.pointer.clone(),
+                    ));
+                }
+                cursor = cursor.max(*ov_end).min(end);
+                if cursor >= end {
+                    break;
+                }
+            }
+            if cursor < end {
+                trimmed.push(SegmentExtent::new(
+                    cursor,
+                    extent.pointer.clone(),
+                ));
+            }
+        }
+        trimmed
+    }
+
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
         self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all")
     }
@@ -161,6 +232,10 @@ impl OsageFs {
             prepared_generation = Some(target_generation);
             let mut segment_entries = Vec::new();
             let mut segment_data_inodes = HashSet::new();
+            // Map from inode -> base committed extents captured when pending data
+            // was staged. Used after write_batch to merge newly-written extents.
+            let mut base_extents_map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
+            let mut overwrite_ranges_map: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
             let mut records = Vec::new();
             let mut flushed_bytes: u64 = 0;
             let mut inline_files = 0;
@@ -196,6 +271,7 @@ impl OsageFs {
                             segment_entries.push(SegmentEntry {
                                 inode: record.inode,
                                 path: record.path.clone(),
+                                logical_offset: 0,
                                 payload: SegmentPayload::Bytes(data_bytes.as_ref().clone()),
                             });
                             segment_data_inodes.insert(record.inode);
@@ -207,19 +283,59 @@ impl OsageFs {
                     }
                     Some(PendingData::Staged(segments)) => {
                         let mut record = pending_entry.record.clone();
-                        let data_len = segments.total_len;
-                        flushed_bytes = flushed_bytes.saturating_add(data_len);
-                        record.size = data_len;
-                        segment_entries.push(SegmentEntry {
-                            inode: record.inode,
-                            path: record.path.clone(),
-                            payload: SegmentPayload::Staged(segments.chunks.as_ref().clone()),
-                        });
-                        segment_data_inodes.insert(record.inode);
-                        record.storage = FileStorage::Inline(Vec::new());
-                        segment_files += 1;
-                        segment_bytes = segment_bytes.saturating_add(data_len);
-                        records.push(record);
+                        let staged = segments.staged_bytes();
+                        let file_size = segments.total_len;
+                        // Only newly-staged bytes count toward the flushed watermark;
+                        // base_extents are already committed and were not re-uploaded.
+                        flushed_bytes = flushed_bytes.saturating_add(staged);
+                        record.size = file_size;
+                        if staged > 0 {
+                            let mut ordered_chunks = segments.chunks.as_ref().clone();
+                            ordered_chunks.sort_by_key(|chunk| chunk.logical_offset);
+                            let mut emitted = 0usize;
+                            for chunk in ordered_chunks {
+                                if chunk.len == 0 {
+                                    continue;
+                                }
+                                overwrite_ranges_map
+                                    .entry(record.inode)
+                                    .or_default()
+                                    .push((
+                                        chunk.logical_offset,
+                                        chunk.logical_offset.saturating_add(chunk.len),
+                                    ));
+                                let logical_offset = chunk.logical_offset;
+                                segment_entries.push(SegmentEntry {
+                                    inode: record.inode,
+                                    path: record.path.clone(),
+                                    logical_offset,
+                                    payload: SegmentPayload::Staged(vec![chunk]),
+                                });
+                                emitted += 1;
+                            }
+                            if emitted > 0 {
+                                segment_data_inodes.insert(record.inode);
+                                // Save base extents to combine with newly written extents later.
+                                base_extents_map
+                                    .insert(record.inode, segments.base_extents.as_ref().clone());
+                                record.storage = FileStorage::Inline(Vec::new());
+                                segment_files += 1;
+                                segment_bytes = segment_bytes.saturating_add(staged);
+                                records.push(record);
+                            } else {
+                                record.storage =
+                                    FileStorage::Segments(segments.base_extents.as_ref().clone());
+                                metadata_only += 1;
+                                records.push(record);
+                            }
+                        } else {
+                            // No staged chunks — only base_extents with a metadata change.
+                            // Preserve the committed extents as the storage pointer.
+                            record.storage =
+                                FileStorage::Segments(segments.base_extents.as_ref().clone());
+                            metadata_only += 1;
+                            records.push(record);
+                        }
                     }
                     None => {
                         metadata_only += 1;
@@ -285,7 +401,7 @@ impl OsageFs {
                     }
                 }
             }
-            let mut pointer_map = HashMap::new();
+            let mut pointer_map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
             let mut segment_id_logged = None;
             let mut segment_write_duration = Duration::from_secs(0);
             if !segment_entries.is_empty() {
@@ -313,16 +429,88 @@ impl OsageFs {
                         );
                         EIO
                     })?;
-                pointer_map = pointers.into_iter().collect();
+                for (inode, extent) in pointers {
+                    pointer_map.entry(inode).or_default().push(extent);
+                }
                 segment_id_logged = Some(segment_id);
                 segment_write_duration = seg_start.elapsed();
             }
             let persist_start = Instant::now();
             for record in records.iter_mut() {
                 if segment_data_inodes.contains(&record.inode) {
-                    if let Some(ptr) = pointer_map.get(&record.inode) {
-                        record.storage =
-                            FileStorage::Segments(vec![SegmentExtent::new(0, ptr.clone())]);
+                    if let Some(new_extents) = pointer_map.get(&record.inode) {
+                        // Merge existing committed extents with the newly written
+                        // extents. New extents are appended last so that
+                        // stable-sorted reads prefer it over any overlapping base
+                        // extent at the same logical offset.
+                        //
+                        // We reload the authoritative committed extents from the
+                        // metadata cache rather than relying solely on the
+                        // `base_extents` captured when the pending entry was created.
+                        // An async flush may have committed new extents for this
+                        // inode *after* our pending entry was created (e.g. the
+                        // previous async flush was still running when the next write
+                        // arrived). Flushes are serialized by flush_lock, so the
+                        // metadata cache is fully up-to-date at this point.  We only
+                        // do the reload when base_extents is non-empty (i.e. there
+                        // were already committed extents when the pending entry was
+                        // created) to avoid an unnecessary shard-load for brand-new
+                        // inodes that have never been persisted.
+                        let base_extents = base_extents_map
+                            .get(&record.inode)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        let overwrite_ranges = overwrite_ranges_map
+                            .get(&record.inode)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        // Use get_cached_inode (cache-only, no shard reload, no
+                        // negative-cache side effects) so we can safely call it
+                        // from inside the synchronous flush path.
+                        let (authoritative_base, base_size): (Vec<SegmentExtent>, u64) =
+                            if !base_extents.is_empty() {
+                                match self.metadata.get_cached_inode(record.inode) {
+                                    Some(r) => match r.storage {
+                                        FileStorage::Segments(exts) => (exts, r.size),
+                                        _ => (base_extents.to_vec(), r.size),
+                                    },
+                                    None => (base_extents.to_vec(), record.size),
+                                }
+                            } else {
+                                (base_extents.to_vec(), 0)
+                            };
+                        let mut all_extents =
+                            Self::trim_base_extents_for_overwrites(
+                                authoritative_base,
+                                base_size,
+                                overwrite_ranges,
+                            );
+                        all_extents.extend(new_extents.iter().cloned());
+                        all_extents.sort_by_key(|ext| ext.logical_offset);
+                        // Keep the newest extent when duplicate starts exist.
+                        let mut deduped: Vec<SegmentExtent> = Vec::with_capacity(all_extents.len());
+                        for extent in all_extents {
+                            if let Some(last) = deduped.last_mut()
+                                && last.logical_offset == extent.logical_offset
+                            {
+                                *last = extent;
+                            } else {
+                                deduped.push(extent);
+                            }
+                        }
+                        if deduped.is_empty() {
+                            log::error!(
+                                "flush_pending empty segment extent map pid={} tid={} scope={} ino={} gen={}",
+                                pid,
+                                tid,
+                                scope,
+                                record.inode,
+                                target_generation
+                            );
+                            return Err(EIO);
+                        } else {
+                            record.storage = FileStorage::Segments(deduped);
+                        }
                     } else {
                         log::error!(
                             "flush_pending missing segment pointer pid={} tid={} scope={} ino={} gen={}",

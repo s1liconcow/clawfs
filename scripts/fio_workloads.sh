@@ -25,7 +25,14 @@ SMALLFILE_SIZE="${SMALLFILE_SIZE:-16k}"
 SMALLFILE_NUMJOBS="${SMALLFILE_NUMJOBS:-8}"
 WORKLOADS="${WORKLOADS:-all}"
 FAST_REPRO="${FAST_REPRO:-0}"
+# OsageFS tuning for benchmark workloads.
+PENDING_BYTES="${PENDING_BYTES:-67108864}"       # 64 MiB — fewer flushes, fewer extents
+FLUSH_INTERVAL_MS="${FLUSH_INTERVAL_MS:-10000}"  # 10 s — let pending_bytes drive flushes
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/fio-results-$(date +%Y%m%d-%H%M%S)}"
+HEAPTRACK="${HEAPTRACK:-0}"
+HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$RESULTS_DIR/heaptrack/heaptrack.osagefs.%p}"
+HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
+HEAPTRACK_EXTRA_ARGS="${HEAPTRACK_EXTRA_ARGS:-}"
 
 WORK_ROOT="$MOUNT_PATH/home/${USER:-$(whoami)}/fio"
 RAW_DIR="$RESULTS_DIR/raw"
@@ -100,6 +107,13 @@ if ! osage_is_true "$SKIP_OSAGE"; then
   STATE_PATH="$STATE_PATH" \
   DISABLE_JOURNAL="$DISABLE_JOURNAL" \
   DEBUG_LOG="$DEBUG_LOG" \
+  HEAPTRACK="$HEAPTRACK" \
+  HEAPTRACK_OUTPUT="$HEAPTRACK_OUTPUT" \
+  HEAPTRACK_RAW="$HEAPTRACK_RAW" \
+  HEAPTRACK_EXTRA_ARGS="$HEAPTRACK_EXTRA_ARGS" \
+  SEGMENT_COMPRESSION=false \
+  INLINE_COMPRESSION=false \
+  OSAGEFS_EXTRA_ARGS="--pending-bytes $PENDING_BYTES --flush-interval-ms $FLUSH_INTERVAL_MS" \
   "$OSAGE_BIN"
   sleep 2
 fi
@@ -310,6 +324,15 @@ PY
 echo "FIO run complete."
 echo "- Raw JSON: $RAW_DIR"
 echo "- Summary:  $SUMMARY_MD"
+if osage_is_true "$HEAPTRACK"; then
+  HEAPTRACK_DIR=$(dirname "$HEAPTRACK_OUTPUT")
+  echo "- Heaptrack output pattern: $HEAPTRACK_OUTPUT"
+  if [[ -d "$HEAPTRACK_DIR" ]] && compgen -G "$HEAPTRACK_DIR/heaptrack.*" > /dev/null; then
+    LATEST_HEAPTRACK=$(ls -1t "$HEAPTRACK_DIR"/heaptrack.* | head -n 1)
+    echo "- Heaptrack latest: $LATEST_HEAPTRACK"
+    echo "- Heaptrack analyze: heaptrack_print -f \"$LATEST_HEAPTRACK\" -p -a -n 30 -s 10"
+  fi
+fi
 if [[ "${#FAILED_WORKLOADS[@]}" -gt 0 ]]; then
   echo "- Failed workloads: ${FAILED_WORKLOADS[*]}" >&2
 fi

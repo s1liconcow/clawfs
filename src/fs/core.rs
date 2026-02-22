@@ -167,10 +167,18 @@ impl OsageFs {
                     if present.is_empty() {
                         None
                     } else {
-                        let total = present.iter().map(|c| c.len).sum();
+                        // The journal record carries the committed storage pointer
+                        // at the time of the write.  Reconstruct base_extents from
+                        // it so that flush can merge them with the replayed chunks
+                        // without re-reading segment data.
+                        let base_extents = match &record.storage {
+                            FileStorage::Segments(extents) => extents.clone(),
+                            _ => Vec::new(),
+                        };
                         Some(PendingData::Staged(PendingSegments {
+                            base_extents: Arc::new(base_extents),
                             chunks: Arc::new(present),
-                            total_len: total,
+                            total_len: record.size,
                         }))
                     }
                 }
@@ -260,24 +268,33 @@ impl OsageFs {
         }
     }
 
-    pub(crate) fn load_inode(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
+    /// Check all three in-memory dirty maps for an inode.  Returns `Some(Ok(record))`,
+    /// `Some(Err(ENOENT))` (tombstone), or `None` (not found in any map).
+    fn load_inode_in_memory(&self, ino: u64) -> Option<std::result::Result<InodeRecord, i32>> {
         if let Some(entry) = self.pending_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Err(ENOENT);
+                return Some(Err(ENOENT));
             }
-            return Ok(entry.record.clone());
+            return Some(Ok(entry.record.clone()));
         }
         if let Some(entry) = self.mutating_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Err(ENOENT);
+                return Some(Err(ENOENT));
             }
-            return Ok(entry.record.clone());
+            return Some(Ok(entry.record.clone()));
         }
         if let Some(entry) = self.flushing_inodes.get(&ino) {
             if matches!(entry.record.kind, InodeKind::Tombstone) {
-                return Err(ENOENT);
+                return Some(Err(ENOENT));
             }
-            return Ok(entry.record.clone());
+            return Some(Ok(entry.record.clone()));
+        }
+        None
+    }
+
+    pub(crate) fn load_inode(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
+        if let Some(result) = self.load_inode_in_memory(ino) {
+            return result;
         }
         let fetched = self.block_on(self.metadata.get_inode_with_ttl(
             ino,
@@ -298,16 +315,24 @@ impl OsageFs {
                 return Err(EIO);
             }
         };
-        fetched.ok_or_else(|| {
-            debug!(
-                "load_inode miss ino={} pending={} mutating={} flushing={}",
-                ino,
-                self.pending_inodes.contains_key(&ino),
-                self.mutating_inodes.contains_key(&ino),
-                self.flushing_inodes.contains_key(&ino)
-            );
-            ENOENT
-        })
+        if let Some(record) = fetched {
+            return Ok(record);
+        }
+        // Re-check in-memory maps: the inode may have been moving between
+        // pending/mutating/flushing during our sequential checks above (each
+        // DashMap lookup is atomic but the three-step sequence is not).  A
+        // second pass after the (slow) metadata lookup catches this race.
+        if let Some(result) = self.load_inode_in_memory(ino) {
+            return result;
+        }
+        debug!(
+            "load_inode miss ino={} pending={} mutating={} flushing={}",
+            ino,
+            self.pending_inodes.contains_key(&ino),
+            self.mutating_inodes.contains_key(&ino),
+            self.flushing_inodes.contains_key(&ino)
+        );
+        Err(ENOENT)
     }
 
     pub(crate) fn read_file_bytes(&self, record: &InodeRecord) -> Result<Vec<u8>> {
@@ -369,26 +394,92 @@ impl OsageFs {
                 let mut buffer = vec![0u8; out_len];
                 let mut ordered = extents.to_vec();
                 ordered.sort_by_key(|ext| ext.logical_offset);
-                for extent in ordered {
-                    let extent_start = extent.logical_offset;
-                    let bytes = self.segments.read_pointer_arc(&extent.pointer)?;
-                    let extent_end = extent_start.saturating_add(bytes.len() as u64);
-                    if extent_end <= range_start {
+                let plain_codec = self.segments.is_plain_codec();
+                // Pre-compute logical extent boundaries so we can skip
+                // non-overlapping extents without decompressing them.
+                let extent_bounds: Vec<(u64, u64)> = ordered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ext)| {
+                        let start = ext.logical_offset;
+                        let end = if i + 1 < ordered.len() {
+                            ordered[i + 1].logical_offset
+                        } else {
+                            record.size
+                        };
+                        (start, end)
+                    })
+                    .collect();
+                for (i, extent) in ordered.iter().enumerate() {
+                    let (extent_start, extent_end_hint) = extent_bounds[i];
+                    // Skip extents that cannot overlap the requested range.
+                    if extent_end_hint <= range_start {
                         continue;
                     }
                     if extent_start >= range_end {
                         break;
                     }
                     let overlap_start = extent_start.max(range_start);
-                    let overlap_end = extent_end.min(range_end);
+                    let overlap_end = extent_end_hint.min(range_end);
                     if overlap_end <= overlap_start {
                         continue;
                     }
-                    let src_start = (overlap_start - extent_start) as usize;
-                    let src_end = (overlap_end - extent_start) as usize;
                     let dst_start = (overlap_start - range_start) as usize;
                     let dst_end = (overlap_end - range_start) as usize;
-                    buffer[dst_start..dst_end].copy_from_slice(&bytes[src_start..src_end]);
+                    // When no compression/encryption is active, read only
+                    // the needed byte range directly from the segment file
+                    // instead of loading the entire entry into memory.
+                    if plain_codec {
+                        let local_start = overlap_start - extent_start;
+                        let local_end = overlap_end - extent_start;
+                        match self.segments.read_pointer_subrange(
+                            &extent.pointer,
+                            local_start,
+                            local_end,
+                        ) {
+                            Ok(bytes) => {
+                                buffer[dst_start..dst_end]
+                                    .copy_from_slice(&bytes[..dst_end - dst_start]);
+                                continue;
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "read_file_range subrange read failed ino={} extent_offset={} range={}..{} err={:#}",
+                                    record.inode,
+                                    extent_start,
+                                    range_start,
+                                    range_end,
+                                    e
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+                    let bytes = match self.segments.read_pointer_arc(&extent.pointer) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!(
+                                "read_file_range segment read failed ino={} extent_offset={} gen={} seg={} ptr_off={} ptr_len={} range={}..{} num_extents={} err={:#}",
+                                record.inode,
+                                extent_start,
+                                extent.pointer.generation,
+                                extent.pointer.segment_id,
+                                extent.pointer.offset,
+                                extent.pointer.length,
+                                range_start,
+                                range_end,
+                                extents.len(),
+                                e
+                            );
+                            return Err(e);
+                        }
+                    };
+                    let extent_end = extent_start.saturating_add(bytes.len() as u64);
+                    let overlap_end_actual = extent_end.min(range_end);
+                    let dst_end_actual = (overlap_end_actual - range_start) as usize;
+                    let src_start = (overlap_start - extent_start) as usize;
+                    let src_end = (overlap_end_actual - extent_start) as usize;
+                    buffer[dst_start..dst_end_actual].copy_from_slice(&bytes[src_start..src_end]);
                 }
                 Ok(buffer)
             }
@@ -469,24 +560,156 @@ impl OsageFs {
         }
     }
 
-    pub(crate) fn read_pending_bytes(&self, data: &PendingData) -> Result<Vec<u8>> {
-        match data {
-            PendingData::Inline(bytes) => Ok(bytes.as_ref().clone()),
-            PendingData::Staged(segments) => self
-                .segments
-                .read_staged_chunks(&segments.chunks, segments.total_len)
-                .map_err(|err| anyhow!("pending read failed: {err:?}")),
-        }
-    }
-
     fn slice_pending_bytes(
         &self,
         data: &PendingData,
         range_start: u64,
         range_end: u64,
     ) -> Result<Vec<u8>> {
-        let bytes = self.read_pending_bytes(data)?;
-        Ok(Self::slice_bytes_in_range(bytes, range_start, range_end))
+        match data {
+            PendingData::Inline(bytes) => Ok(Self::slice_bytes_in_range(
+                bytes.as_ref().clone(),
+                range_start,
+                range_end,
+            )),
+            PendingData::Staged(segments) if segments.base_extents.is_empty() => {
+                // All pending data is in staged chunks with no committed backing.
+                // Serve the requested range directly from overlapped chunks to
+                // avoid materializing the full pending payload in memory.
+                self.slice_staged_chunks_only(segments, range_start, range_end)
+            }
+            PendingData::Staged(segments) => {
+                // File has committed base extents plus staged chunks layered on top.
+                // Serve the range by reading base extents first, then overlaying
+                // staged chunks (which represent newer writes).
+                self.slice_staged_with_base_extents(segments, range_start, range_end)
+            }
+        }
+    }
+
+    /// Read a byte range from pending segments that have both committed base
+    /// extents and locally-staged chunks.  Base extents provide data for
+    /// regions not yet overwritten by staged chunks.
+    fn slice_staged_chunks_only(
+        &self,
+        segments: &PendingSegments,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Vec<u8>> {
+        let out_len = (range_end - range_start) as usize;
+        let mut buffer = vec![0u8; out_len];
+
+        let mut ordered_chunks: Vec<_> = segments.chunks.as_ref().to_vec();
+        ordered_chunks.sort_by_key(|c| c.logical_offset);
+        for chunk in &ordered_chunks {
+            let chunk_start = chunk.logical_offset;
+            let chunk_end = chunk_start.saturating_add(chunk.len);
+            if chunk_end <= range_start || chunk_start >= range_end {
+                continue;
+            }
+            let overlap_start = chunk_start.max(range_start);
+            let overlap_end = chunk_end.min(range_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let in_chunk_start = overlap_start - chunk_start;
+            let in_chunk_len = overlap_end - overlap_start;
+            let chunk_bytes =
+                self.segments
+                    .read_staged_chunk_range(chunk, in_chunk_start, in_chunk_len)?;
+            let dst_start = (overlap_start - range_start) as usize;
+            let dst_end = (overlap_end - range_start) as usize;
+            buffer[dst_start..dst_end].copy_from_slice(&chunk_bytes);
+        }
+        Ok(buffer)
+    }
+
+    /// Read a byte range from pending segments that have both committed base
+    /// extents and locally-staged chunks.  Base extents provide data for
+    /// regions not yet overwritten by staged chunks.
+    fn slice_staged_with_base_extents(
+        &self,
+        segments: &PendingSegments,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<Vec<u8>> {
+        let out_len = (range_end - range_start) as usize;
+        let mut buffer = vec![0u8; out_len];
+
+        // Fill from committed base extents (sorted by logical offset).
+        let mut ordered_base = segments.base_extents.as_ref().to_vec();
+        ordered_base.sort_by_key(|ext| ext.logical_offset);
+        // Pre-compute logical boundaries for skip-without-decompress.
+        let base_bounds: Vec<(u64, u64)> = ordered_base
+            .iter()
+            .enumerate()
+            .map(|(i, ext)| {
+                let start = ext.logical_offset;
+                let end = if i + 1 < ordered_base.len() {
+                    ordered_base[i + 1].logical_offset
+                } else {
+                    segments.total_len
+                };
+                (start, end)
+            })
+            .collect();
+        let plain_codec = self.segments.is_plain_codec();
+        for (i, extent) in ordered_base.iter().enumerate() {
+            let (extent_start, extent_end_hint) = base_bounds[i];
+            if extent_end_hint <= range_start || extent_start >= range_end {
+                continue;
+            }
+            let overlap_start = extent_start.max(range_start);
+            let overlap_end = extent_end_hint.min(range_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let dst_start = (overlap_start - range_start) as usize;
+            let dst_end = (overlap_end - range_start) as usize;
+            if plain_codec {
+                let local_start = overlap_start - extent_start;
+                let local_end = overlap_end - extent_start;
+                let bytes =
+                    self.segments
+                        .read_pointer_subrange(&extent.pointer, local_start, local_end)?;
+                buffer[dst_start..dst_end].copy_from_slice(&bytes[..dst_end - dst_start]);
+                continue;
+            }
+            let bytes = self.segments.read_pointer_arc(&extent.pointer)?;
+            let extent_end = extent_start.saturating_add(bytes.len() as u64);
+            let overlap_end_actual = extent_end.min(range_end);
+            let dst_end_actual = (overlap_end_actual - range_start) as usize;
+            let src_start = (overlap_start - extent_start) as usize;
+            let src_end = (overlap_end_actual - extent_start) as usize;
+            buffer[dst_start..dst_end_actual].copy_from_slice(&bytes[src_start..src_end]);
+        }
+
+        // Overlay with staged chunks (sorted by logical offset; newer chunks
+        // override base extents for overlapping regions).
+        let mut ordered_chunks: Vec<_> = segments.chunks.as_ref().to_vec();
+        ordered_chunks.sort_by_key(|c| c.logical_offset);
+        for chunk in &ordered_chunks {
+            let chunk_start = chunk.logical_offset;
+            let chunk_end = chunk_start.saturating_add(chunk.len);
+            if chunk_end <= range_start || chunk_start >= range_end {
+                continue;
+            }
+            let overlap_start = chunk_start.max(range_start);
+            let overlap_end = chunk_end.min(range_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let in_chunk_start = overlap_start - chunk_start;
+            let in_chunk_len = overlap_end - overlap_start;
+            let chunk_bytes =
+                self.segments
+                    .read_staged_chunk_range(chunk, in_chunk_start, in_chunk_len)?;
+            let dst_start = (overlap_start - range_start) as usize;
+            let dst_end = (overlap_end - range_start) as usize;
+            buffer[dst_start..dst_end].copy_from_slice(&chunk_bytes);
+        }
+
+        Ok(buffer)
     }
 
     fn slice_arc_in_range(bytes: &[u8], range_start: u64, range_end: u64) -> Vec<u8> {
