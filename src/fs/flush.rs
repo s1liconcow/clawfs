@@ -101,28 +101,44 @@ impl OsageFs {
     where
         F: FnOnce(&mut HashMap<u64, PendingEntry>) -> HashMap<u64, PendingEntry>,
     {
+        let flush_lock_wait_start = Instant::now();
         let _flush_guard = self.flush_lock.lock();
+        let flush_lock_wait = flush_lock_wait_start.elapsed();
         let pid = process::id();
         let tid = format!("{:?}", thread::current().id());
         let mut prepared_generation: Option<u64> = None;
         let mut drained_pending: Option<HashMap<u64, PendingEntry>> = None;
         let result = (|| {
             let start = Instant::now();
+            let drain_start = Instant::now();
+            let mut drain_skipped_locked = 0usize;
+            let mut rotate_stage_file_duration = Duration::from_secs(0);
             let pending = {
                 let mut guard = HashMap::new();
                 let keys: Vec<u64> = self
-                    .active_inodes
+                    .pending_inodes
                     .iter()
                     .map(|entry| *entry.key())
                     .collect();
                 for inode in keys {
                     if let Some(active_arc) = self.active_inodes.get(&inode) {
-                        let mut state = active_arc.lock();
-                        if let Some(entry) = state.pending.take() {
-                            state.flushing = Some(entry.clone());
-                            guard.insert(inode, entry);
+                        if let Some(mut state) = active_arc.try_lock() {
+                            if let Some(entry) = state.pending.take() {
+                                state.flushing = Some(entry.clone());
+                                guard.insert(inode, entry);
+                            } else {
+                                self.pending_inodes.remove(&inode);
+                            }
+                        } else {
+                            drain_skipped_locked = drain_skipped_locked.saturating_add(1);
                         }
                     }
+                }
+                if drain_skipped_locked > 0 {
+                    debug!(
+                        "flush_pending pid={} tid={} scope={} skipped_locked_inodes={}",
+                        pid, tid, scope, drain_skipped_locked
+                    );
                 }
                 if guard.is_empty() {
                     self.touch_last_flush();
@@ -135,6 +151,7 @@ impl OsageFs {
                         let mut state = active_arc.lock();
                         if state.pending.is_none() {
                             state.pending = Some(entry);
+                            self.pending_inodes.insert(inode);
                         }
                         state.flushing = None;
                     }
@@ -147,10 +164,16 @@ impl OsageFs {
                     .values()
                     .any(|entry| matches!(entry.data, Some(PendingData::Staged(_))));
                 if has_staged {
+                    let rotate_start = Instant::now();
                     self.segments.rotate_stage_file();
+                    rotate_stage_file_duration = rotate_start.elapsed();
                 }
                 drained
             };
+            let drain_duration = drain_start
+                .elapsed()
+                .saturating_sub(rotate_stage_file_duration);
+            let drained_inodes = pending.len();
             drained_pending = Some(pending);
             let pending = drained_pending
                 .as_ref()
@@ -162,6 +185,7 @@ impl OsageFs {
                 scope,
                 pending.len()
             );
+            let prepare_start = Instant::now();
             let snapshot = self
                 .superblock
                 .prepare_dirty_generation()
@@ -175,6 +199,7 @@ impl OsageFs {
                     EIO
                 })?;
             let target_generation = snapshot.generation;
+            let prepare_duration = prepare_start.elapsed();
             prepared_generation = Some(target_generation);
             let mut segment_entries = Vec::new();
             let mut segment_data_inodes = HashSet::new();
@@ -189,6 +214,7 @@ impl OsageFs {
             let mut segment_bytes: u64 = 0;
             let mut metadata_only = 0;
             let mut flushed_inodes = Vec::new();
+            let classify_start = Instant::now();
             for (inode, pending_entry) in pending.iter() {
                 flushed_inodes.push(*inode);
                 match &pending_entry.data {
@@ -339,6 +365,7 @@ impl OsageFs {
                     }
                 }
             }
+            let classify_duration = classify_start.elapsed();
             let mut pointer_map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
             let mut segment_id_logged = None;
             let mut segment_write_duration = Duration::from_secs(0);
@@ -398,6 +425,7 @@ impl OsageFs {
                     write_batch(current_batch)?;
                 }
             }
+            let merge_start = Instant::now();
             let persist_start = Instant::now();
             for record in records.iter_mut() {
                 if segment_data_inodes.contains(&record.inode) {
@@ -466,6 +494,8 @@ impl OsageFs {
                     }
                 }
             }
+            let merge_duration = merge_start.elapsed();
+            let persist_only_start = Instant::now();
             self.block_on(self.metadata.persist_inodes_batch(
                 &records,
                 target_generation,
@@ -482,10 +512,12 @@ impl OsageFs {
                 );
                 EIO
             })?;
+            let persist_only_duration = persist_only_start.elapsed();
             // Flush all shard/delta writes to disk with a single directory
             // fsync on each metadata subdirectory before advancing the
             // superblock.  This replaces per-file fsyncs inside write_shard /
             // write_delta, reducing O(N) fsyncs to O(2) per flush cycle.
+            let sync_metadata_start = Instant::now();
             self.block_on(self.metadata.sync_metadata_writes())
                 .map_err(|err| {
                     log::error!(
@@ -497,6 +529,7 @@ impl OsageFs {
                     );
                     EIO
                 })?;
+            let sync_metadata_duration = sync_metadata_start.elapsed();
             let metadata_duration = persist_start.elapsed();
             let commit_start = Instant::now();
             if self
@@ -519,24 +552,45 @@ impl OsageFs {
             }
             prepared_generation = None;
             let commit_duration = commit_start.elapsed();
+            let finalize_start = Instant::now();
+            let finalize_pending_bytes_start = Instant::now();
             let mut total = self.pending_bytes.lock();
             *total = total.saturating_sub(flushed_bytes);
             let pending_remaining = *total;
             drop(total);
+            let finalize_pending_bytes_duration = finalize_pending_bytes_start.elapsed();
             let flushed_entries = drained_pending
                 .take()
                 .expect("drained pending map must exist until flush commit");
+            let finalize_clear_flushing_start = Instant::now();
+            let mut finalize_flushing_lock_wait = Duration::from_secs(0);
             for inode in flushed_entries.keys() {
                 if let Some(active_arc) = self.active_inodes.get(inode) {
+                    let lock_start = Instant::now();
                     let mut state = active_arc.lock();
+                    finalize_flushing_lock_wait += lock_start.elapsed();
                     state.flushing = None;
+                    if state.pending.is_none() {
+                        self.pending_inodes.remove(inode);
+                    }
                 }
             }
+            let finalize_clear_flushing_duration = finalize_clear_flushing_start.elapsed();
+            let finalize_release_data_start = Instant::now();
+            let mut released_staged_chunks = 0u64;
             for pending_entry in flushed_entries.into_values() {
                 if let Some(data) = pending_entry.data {
+                    if let PendingData::Staged(segments) = &data {
+                        released_staged_chunks = released_staged_chunks
+                            .saturating_add(segments.chunks.len() as u64);
+                    }
                     self.release_pending_data(data);
                 }
             }
+            let finalize_release_data_duration = finalize_release_data_start.elapsed();
+            let finalize_journal_phase_start = Instant::now();
+            let mut finalize_journal_clear_duration = Duration::from_secs(0);
+            let mut journal_cleared_inodes = 0u64;
             if let Some(journal) = &self.journal {
                 let clearable_inodes = flushed_inodes
                     .into_iter()
@@ -546,6 +600,7 @@ impl OsageFs {
                             .map_or(true, |arc| arc.lock().pending.is_none())
                     })
                     .collect::<Vec<_>>();
+                let journal_clear_start = Instant::now();
                 for inode in clearable_inodes {
                     journal.clear_entry(inode).map_err(|err| {
                         log::error!(
@@ -557,8 +612,12 @@ impl OsageFs {
                         );
                         EIO
                     })?;
+                    journal_cleared_inodes = journal_cleared_inodes.saturating_add(1);
                 }
+                finalize_journal_clear_duration = journal_clear_start.elapsed();
             }
+            let finalize_journal_phase_duration = finalize_journal_phase_start.elapsed();
+            let finalize_duration = finalize_start.elapsed();
             self.log_perf(
                 "flush_pending",
                 start.elapsed(),
@@ -572,10 +631,29 @@ impl OsageFs {
                     "inline_bytes": inline_bytes,
                     "segment_bytes": segment_bytes,
                     "flushed_bytes": flushed_bytes,
+                    "drained_inodes": drained_inodes,
+                    "drain_skipped_locked": drain_skipped_locked,
                     "segment_id": segment_id_logged,
+                    "flush_lock_wait_ms": flush_lock_wait.as_secs_f64() * 1000.0,
+                    "drain_select_ms": drain_duration.as_secs_f64() * 1000.0,
+                    "rotate_stage_file_ms": rotate_stage_file_duration.as_secs_f64() * 1000.0,
+                    "prepare_generation_ms": prepare_duration.as_secs_f64() * 1000.0,
+                    "classify_records_ms": classify_duration.as_secs_f64() * 1000.0,
                     "segment_write_ms": segment_write_duration.as_secs_f64() * 1000.0,
+                    "merge_segment_extents_ms": merge_duration.as_secs_f64() * 1000.0,
+                    "metadata_persist_only_ms": persist_only_duration.as_secs_f64() * 1000.0,
+                    "metadata_sync_only_ms": sync_metadata_duration.as_secs_f64() * 1000.0,
                     "metadata_ms": metadata_duration.as_secs_f64() * 1000.0,
                     "commit_ms": commit_duration.as_secs_f64() * 1000.0,
+                    "finalize_ms": finalize_duration.as_secs_f64() * 1000.0,
+                    "finalize_pending_bytes_ms": finalize_pending_bytes_duration.as_secs_f64() * 1000.0,
+                    "finalize_clear_flushing_ms": finalize_clear_flushing_duration.as_secs_f64() * 1000.0,
+                    "finalize_clear_flushing_lock_wait_ms": finalize_flushing_lock_wait.as_secs_f64() * 1000.0,
+                    "finalize_release_pending_data_ms": finalize_release_data_duration.as_secs_f64() * 1000.0,
+                    "released_staged_chunks": released_staged_chunks,
+                    "finalize_journal_phase_ms": finalize_journal_phase_duration.as_secs_f64() * 1000.0,
+                    "finalize_journal_clear_ms": finalize_journal_clear_duration.as_secs_f64() * 1000.0,
+                    "journal_cleared_inodes": journal_cleared_inodes,
                     "pending_remaining": pending_remaining,
                 }),
             );
@@ -617,6 +695,7 @@ impl OsageFs {
                 let mut state = active_arc.lock();
                 if state.pending.is_none() {
                     state.pending = Some(entry);
+                    self.pending_inodes.insert(inode);
                 } else {
                     if let Some(data) = entry.data {
                         dropped_bytes = dropped_bytes.saturating_add(data.len());

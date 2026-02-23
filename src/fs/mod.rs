@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -63,6 +63,7 @@ pub struct OsageFs {
     handle: Handle,
     client_state: Arc<ClientStateManager>,
     active_inodes: Arc<DashMap<u64, Arc<Mutex<ActiveInode>>>>,
+    pending_inodes: Arc<DashSet<u64>>,
     pending_bytes: Arc<Mutex<u64>>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,

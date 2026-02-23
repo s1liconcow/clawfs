@@ -27,8 +27,8 @@ SMALLFILE_NUMJOBS="${SMALLFILE_NUMJOBS:-8}"
 WORKLOADS="${WORKLOADS:-all}"
 FAST_REPRO="${FAST_REPRO:-0}"
 # OsageFS tuning for benchmark workloads.
-PENDING_BYTES="${PENDING_BYTES:-67108864}"       # 64 MiB — fewer flushes, fewer extents
-FLUSH_INTERVAL_MS="${FLUSH_INTERVAL_MS:-10000}"  # 10 s — let pending_bytes drive flushes
+PENDING_BYTES="${PENDING_BYTES:-$((1024*1024*128))}"       # 128 MiB — fewer flushes, fewer extents
+FLUSH_INTERVAL_MS="${FLUSH_INTERVAL_MS:-0}"  # Disable for testing
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/fio-results-$(date +%Y%m%d-%H%M%S)}"
 HEAPTRACK="${HEAPTRACK:-0}"
 HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$RESULTS_DIR/heaptrack/heaptrack.osagefs.%p}"

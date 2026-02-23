@@ -107,6 +107,7 @@ impl OsageFs {
             handle,
             client_state,
             active_inodes: Arc::new(DashMap::new()),
+            pending_inodes: Arc::new(DashSet::new()),
             pending_bytes: Arc::new(Mutex::new(0)),
             perf,
             replay,
@@ -188,6 +189,7 @@ impl OsageFs {
                 record,
                 data: data_opt,
             });
+            self.pending_inodes.insert(inode);
             if let Some(old_entry) = old {
                 if let Some(old_data) = old_entry.data {
                     self.release_pending_data(old_data);
@@ -528,6 +530,7 @@ impl OsageFs {
         } else {
             state.pending = Some(PendingEntry { record, data: None });
         }
+        self.pending_inodes.insert(inode);
         drop(state);
 
         debug!(
@@ -551,6 +554,7 @@ impl OsageFs {
                     }
                 }
             }
+            self.pending_inodes.remove(&inode);
         }
     }
 
@@ -752,13 +756,8 @@ impl OsageFs {
 
     pub(crate) fn release_pending_data(&self, data: PendingData) {
         if let PendingData::Staged(segments) = data {
-            for chunk in segments.chunks.iter() {
-                if let Err(err) = self.segments.release_staged_chunk(&chunk) {
-                    log::warn!(
-                        "failed to release staged payload {}: {err:?}",
-                        chunk.path.display()
-                    );
-                }
+            if let Err(err) = self.segments.release_staged_chunks(segments.chunks.as_ref()) {
+                log::warn!("failed to release staged payload batch: {err:?}");
             }
         }
     }

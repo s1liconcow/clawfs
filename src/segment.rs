@@ -705,14 +705,11 @@ impl SegmentManager {
 
     pub fn rotate_stage_file(&self) {
         let mut state = self.stage_state.lock();
-        if let Some(mut active) = state.active.take() {
-            if let Err(err) = active.sync() {
-                warn!(
-                    "failed to sync staged segment {}: {err:?}",
-                    active.path.display()
-                );
-            }
-        }
+        // Rotation exists to hand subsequent writes to a new stage file while
+        // flush consumes chunks from the old one. Forcing sync_data() here can
+        // dominate flush latency under heavy write workloads and is not needed
+        // for correctness: fsync paths call sync_staged_chunks() explicitly.
+        state.active.take();
     }
 
     pub fn read_staged_chunk(&self, chunk: &StagedChunk) -> Result<Vec<u8>> {
@@ -782,21 +779,55 @@ impl SegmentManager {
     }
 
     pub fn release_staged_chunk(&self, chunk: &StagedChunk) -> Result<()> {
-        let mut state = self.stage_state.lock();
-        if let Some(count) = state.ref_counts.get_mut(&chunk.path) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                state.ref_counts.remove(&chunk.path);
-                if let Some(active) = state.active.as_mut() {
-                    if active.path == chunk.path {
-                        active.reset()?;
-                        return Ok(());
+        self.release_staged_chunks(std::slice::from_ref(chunk))
+    }
+
+    pub fn release_staged_chunks(&self, chunks: &[StagedChunk]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let mut release_counts: HashMap<PathBuf, usize> = HashMap::new();
+        for chunk in chunks {
+            *release_counts.entry(chunk.path.clone()).or_insert(0) += 1;
+        }
+
+        let mut delete_paths: Vec<PathBuf> = Vec::new();
+        {
+            let mut state = self.stage_state.lock();
+            for (path, drop_count) in release_counts {
+                let mut became_zero = false;
+                if let Some(count) = state.ref_counts.get_mut(&path) {
+                    *count = count.saturating_sub(drop_count);
+                    if *count == 0 {
+                        state.ref_counts.remove(&path);
+                        became_zero = true;
                     }
                 }
-                let _ = fs::remove_file(&chunk.path);
+                if !became_zero {
+                    continue;
+                }
+                if let Some(active) = state.active.as_mut() {
+                    if active.path == path {
+                        // Avoid synchronous truncate/reset of large active stage files
+                        // on the foreground flush path. Rotate to a new active file
+                        // and delete the old file out-of-band.
+                        let _old_active = state.active.take();
+                        state.active = Some(ActiveStage::new(&self.stage_dir)?);
+                        delete_paths.push(path);
+                        continue;
+                    }
+                }
+                delete_paths.push(path);
             }
+        }
+
+        if !delete_paths.is_empty() {
+            self.handle.spawn_blocking(move || {
+                for path in delete_paths {
+                    let _ = fs::remove_file(path);
+                }
+            });
         }
         Ok(())
     }
@@ -1152,17 +1183,6 @@ impl ActiveStage {
         Ok(offset)
     }
 
-    fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()?;
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.len = 0;
-        Ok(())
-    }
 }
 
 fn segment_prefix(user_prefix: &str) -> String {
