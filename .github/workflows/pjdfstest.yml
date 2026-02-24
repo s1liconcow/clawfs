@@ -1,0 +1,97 @@
+name: pjdfstest
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  pjdfstest:
+    name: Run pjdfstest FUSE Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 build-essential autoconf automake libtool git perl
+
+          # Enable allow_other for FUSE mounts
+          echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+
+      - name: Clone pjdfstest
+        run: |
+          git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
+          cd /tmp/pjdfstest
+          autoreconf -fvi
+          ./configure
+          make
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build OsageFS
+        run: cargo build --release
+
+      - name: Start OsageFS
+        run: |
+          mkdir -p /tmp/osagefs-mnt /tmp/osagefs-store /tmp/osagefs-cache
+
+          ./target/release/osagefs \
+            --mount-path /tmp/osagefs-mnt \
+            --store-path /tmp/osagefs-store \
+            --local-cache-path /tmp/osagefs-cache \
+            --state-path /tmp/osagefs-state.bin \
+            --object-provider local \
+            --allow-other \
+            --disable-journal \
+            --disable-cleanup \
+            --foreground &
+          echo $! > /tmp/osagefs.pid
+
+          # Wait for mount to come up
+          echo "Waiting for OsageFS mount..."
+          for i in $(seq 1 30); do
+            if mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
+              echo "OsageFS is mounted"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
+            echo "OsageFS failed to mount"
+            cat /tmp/osagefs.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Run pjdfstest
+        working-directory: /tmp/osagefs-mnt
+        run: |
+          mkdir -p pjdfstest_run
+          cd pjdfstest_run
+
+          # Get list of all test files
+          find /tmp/pjdfstest/tests -name "*.t" -type f > /tmp/all_tests.txt
+
+          # Filter out excluded tests
+          if [ -f ${{ github.workspace }}/.github/.pjdfstest-exclude ]; then
+            grep -v -f ${{ github.workspace }}/.github/.pjdfstest-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+          else
+            cp /tmp/all_tests.txt /tmp/tests_to_run.txt
+          fi
+
+          # Run the filtered test suite
+          sudo prove -rv $(cat /tmp/tests_to_run.txt)
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd /tmp
+          if [ -f /tmp/osagefs.pid ]; then
+            kill $(cat /tmp/osagefs.pid) || true
+            sleep 2
+          fi
+          sudo umount -l /tmp/osagefs-mnt || fusermount -u /tmp/osagefs-mnt || true

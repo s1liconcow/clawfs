@@ -38,9 +38,19 @@ osage_require_path() {
 
 osage_ensure_release_binary() {
   local osage_bin=${1:-"$ROOT_DIR/target/release/osagefs"}
+  local needs_build=0
+
   if [[ ! -x "$osage_bin" ]]; then
+    needs_build=1
+  elif [[ "$ROOT_DIR/Cargo.toml" -nt "$osage_bin" ]] || [[ "$ROOT_DIR/Cargo.lock" -nt "$osage_bin" ]]; then
+    needs_build=1
+  elif find "$ROOT_DIR/src" "$ROOT_DIR/fuser-mt" -type f -newer "$osage_bin" -print -quit 2>/dev/null | grep -q .; then
+    needs_build=1
+  fi
+
+  if [[ $needs_build -eq 1 ]]; then
     echo "Building osagefs --release ..."
-    (cd "$ROOT_DIR" && cargo build --release)
+    (cd "$ROOT_DIR" && cargo build --release --bin osagefs)
   fi
 }
 

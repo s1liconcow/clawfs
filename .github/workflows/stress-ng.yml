@@ -1,0 +1,76 @@
+name: stress-ng
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  stress-ng:
+    name: Run stress-ng on FUSE mount
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 stress-ng
+          echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build OsageFS
+        run: cargo build --release
+
+      - name: Start OsageFS
+        run: |
+          mkdir -p /tmp/osagefs-mnt /tmp/osagefs-store /tmp/osagefs-cache
+
+          ./target/release/osagefs \
+            --mount-path /tmp/osagefs-mnt \
+            --store-path /tmp/osagefs-store \
+            --local-cache-path /tmp/osagefs-cache \
+            --state-path /tmp/osagefs-state.bin \
+            --object-provider local \
+            --allow-other \
+            --disable-journal \
+            --disable-cleanup \
+            --foreground &
+          echo $! > /tmp/osagefs.pid
+
+          echo "Waiting for OsageFS mount..."
+          for i in $(seq 1 30); do
+            if mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
+              echo "OsageFS is mounted"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
+            echo "OsageFS failed to mount"
+            exit 1
+          fi
+
+      - name: Run stress-ng
+        run: |
+          cd /tmp/osagefs-mnt
+          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1 \
+            --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
+            --fd-fork 1 --filename 1 --fstat 1 \
+            --getdent 1 --link 1 \
+            --metamix 1 --open 1 --rename 1 --symlink 1 \
+            --touch 1 --utime 1 --timeout 60s
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd /tmp
+          if [ -f /tmp/osagefs.pid ]; then
+            kill $(cat /tmp/osagefs.pid) || true
+            sleep 2
+          fi
+          sudo umount -l /tmp/osagefs-mnt || fusermount -u /tmp/osagefs-mnt || true

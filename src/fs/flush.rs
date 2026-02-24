@@ -554,10 +554,19 @@ impl OsageFs {
             let commit_duration = commit_start.elapsed();
             let finalize_start = Instant::now();
             let finalize_pending_bytes_start = Instant::now();
-            let mut total = self.pending_bytes.lock();
-            *total = total.saturating_sub(flushed_bytes);
-            let pending_remaining = *total;
-            drop(total);
+            // Use a CAS loop that floors at 0 instead of wrapping, as a
+            // defense-in-depth measure against residual accounting mismatches
+            // (e.g. write during flushing state creating entries whose
+            // staged_bytes exceeds the pending_bytes delta that was added).
+            let pending_remaining = loop {
+                let current = self.pending_bytes.load(Ordering::Relaxed);
+                let new_val = current.saturating_sub(flushed_bytes);
+                if self.pending_bytes.compare_exchange_weak(
+                    current, new_val, Ordering::Relaxed, Ordering::Relaxed
+                ).is_ok() {
+                    break new_val;
+                }
+            };
             let finalize_pending_bytes_duration = finalize_pending_bytes_start.elapsed();
             let flushed_entries = drained_pending
                 .take()
@@ -706,8 +715,7 @@ impl OsageFs {
             }
         }
         if dropped_bytes > 0 {
-            let mut total = self.pending_bytes.lock();
-            *total = total.saturating_sub(dropped_bytes);
+            self.pending_bytes.fetch_sub(dropped_bytes, Ordering::Relaxed);
         }
     }
 
@@ -783,11 +791,10 @@ impl OsageFs {
         let Some(interval) = self.flush_interval else {
             return Ok(());
         };
-        let elapsed = {
-            let guard = self.last_flush.lock();
-            guard.elapsed()
-        };
-        if elapsed < interval {
+        let now = super::core::epoch_millis_now();
+        let last = self.last_flush.load(Ordering::Relaxed);
+        let elapsed_ms = now.saturating_sub(last);
+        if elapsed_ms < interval.as_millis() as u64 {
             return Ok(());
         }
         debug!(
@@ -799,7 +806,7 @@ impl OsageFs {
     }
 
     pub(crate) fn touch_last_flush(&self) {
-        *self.last_flush.lock() = Instant::now();
+        self.last_flush.store(super::core::epoch_millis_now(), Ordering::Relaxed);
     }
 
     pub(crate) fn log_fuse_error(&self, op: &str, detail: &str, code: i32) {

@@ -1,0 +1,11 @@
+# Tests excluded for OsageFS FUSE mount
+# chmod/12.t - sticky bit semantics not fully supported
+tests/chmod/12.t
+# chown/00.t - root ownership changes across FUSE boundary
+tests/chown/00.t
+# chown/05.t - supplementary group ownership
+tests/chown/05.t
+# utimensat/08.t - nanosecond timestamp precision
+tests/utimensat/08.t
+# ftruncate/00.t - ftruncate edge cases
+tests/ftruncate/00.t

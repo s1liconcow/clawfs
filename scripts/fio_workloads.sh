@@ -25,8 +25,7 @@ SMALLFILE_COUNT="${SMALLFILE_COUNT:-4000}"
 SMALLFILE_SIZE="${SMALLFILE_SIZE:-16k}"
 SMALLFILE_NUMJOBS="${SMALLFILE_NUMJOBS:-8}"
 WORKLOADS="${WORKLOADS:-all}"
-FAST_REPRO="${FAST_REPRO:-0}"
-# OsageFS tuning for benchmark workloads.
+ # OsageFS tuning for benchmark workloads.
 PENDING_BYTES="${PENDING_BYTES:-$((1024*1024*128))}"       # 128 MiB — fewer flushes, fewer extents
 FLUSH_INTERVAL_MS="${FLUSH_INTERVAL_MS:-0}"  # Disable for testing
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/fio-results-$(date +%Y%m%d-%H%M%S)}"
@@ -43,17 +42,6 @@ FAILED_WORKLOADS=()
 
 osage_require_cmd fio
 osage_require_cmd python3
-
-if osage_is_true "$FAST_REPRO"; then
-  RUNTIME_SEC=2
-  SEQ_SIZE=16M
-  RAND_SIZE=16M
-  RAND_NUMJOBS=1
-  RAND_IODEPTH=2
-  SMALLFILE_COUNT=300
-  SMALLFILE_SIZE=8k
-  SMALLFILE_NUMJOBS=8
-fi
 
 workload_enabled() {
   local name=$1

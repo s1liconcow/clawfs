@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -64,12 +64,12 @@ pub struct OsageFs {
     client_state: Arc<ClientStateManager>,
     active_inodes: Arc<DashMap<u64, Arc<Mutex<ActiveInode>>>>,
     pending_inodes: Arc<DashSet<u64>>,
-    pending_bytes: Arc<Mutex<u64>>,
+    pending_bytes: Arc<AtomicU64>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
-    last_flush: Arc<Mutex<Instant>>,
+    last_flush: Arc<AtomicU64>,
     flush_lock: Arc<Mutex<()>>,
     mutation_lock: Arc<Mutex<()>>,
     flush_scheduled: Arc<AtomicBool>,

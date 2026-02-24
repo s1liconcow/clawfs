@@ -817,6 +817,8 @@ fn build_config(cli: &Cli) -> Config {
         log_file: None,
         debug_log: false,
         imap_delta_batch: 512,
+        writeback_cache: false,
+        fuse_threads: 0,
         allow_other: false,
     }
 }

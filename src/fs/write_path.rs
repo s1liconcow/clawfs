@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl OsageFs {
     pub(crate) fn stage_file(
@@ -105,16 +106,14 @@ impl OsageFs {
             journal.persist_record(&record, payload).map_err(|_| EIO)?;
         }
 
-        let delta = new_len as i64 - prev_len as i64;
-        let mut total = self.pending_bytes.lock();
-        if delta >= 0 {
-            *total = total.saturating_add(delta as u64);
+        let pending_total = if new_len >= prev_len {
+            self.pending_bytes.fetch_add(new_len - prev_len, Ordering::Relaxed)
+                .saturating_add(new_len - prev_len)
         } else {
-            *total = total.saturating_sub((-delta) as u64);
-        }
-        let pending_total = *total;
+            self.pending_bytes.fetch_sub(prev_len - new_len, Ordering::Relaxed)
+                .saturating_sub(prev_len - new_len)
+        };
         let should_flush = pending_total >= self.config.pending_bytes;
-        drop(total);
         self.log_perf(
             "stage_file",
             start.elapsed(),
@@ -238,16 +237,14 @@ impl OsageFs {
             journal.persist_record(&record, payload).map_err(|_| EIO)?;
         }
 
-        let delta = new_len as i64 - prev_len as i64;
-        let mut total = self.pending_bytes.lock();
-        if delta >= 0 {
-            *total = total.saturating_add(delta as u64);
+        let pending_total = if new_len >= prev_len {
+            self.pending_bytes.fetch_add(new_len - prev_len, Ordering::Relaxed)
+                .saturating_add(new_len - prev_len)
         } else {
-            *total = total.saturating_sub((-delta) as u64);
-        }
-        let pending_total = *total;
+            self.pending_bytes.fetch_sub(prev_len - new_len, Ordering::Relaxed)
+                .saturating_sub(prev_len - new_len)
+        };
         let should_flush = pending_total >= self.config.pending_bytes;
-        drop(total);
 
         let path = &record.path;
         self.log_perf(
@@ -314,45 +311,78 @@ impl OsageFs {
                     ));
                 }
                 _ => {
-                    // Empty file or inline storage: materialise existing bytes.
-                    // These are small (≤ inline_threshold) so reading is cheap.
-                    let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing
+                    // Check if the flushing entry has segment data we can
+                    // reference without materialising.  This avoids re-staging
+                    // already-flushing bytes which would inflate staged_bytes /
+                    // pending_bytes and cause underflow on the next flush
+                    // fetch_sub.
+                    if let Some(PendingEntry {
+                        data: Some(PendingData::Staged(flushing_segs)),
+                        ..
+                    }) = &state.flushing
                     {
-                        self.slice_pending_bytes(d, 0, record.size).map_err(|_| EIO)
-                    } else {
-                        self.read_file_range_from_storage(&entry.record, 0, entry.record.size)
-                            .map_err(|_| EIO)
-                    };
-                    let existing = match existing {
-                        Ok(existing) => existing,
-                        Err(_) => {
-                            self.log_fuse_error(
-                                "write_large_segments",
-                                &format!("ino={} stage=read_existing", inode),
-                                EIO,
-                            );
-                            state.pending = original_entry.clone();
-                            return Err(EIO);
+                        // Try to find committed extents: metadata cache first,
+                        // then the flushing entry's base_extents.
+                        let committed = self
+                            .metadata
+                            .get_cached_inode(inode)
+                            .and_then(|r| match r.storage {
+                                FileStorage::Segments(exts) if !exts.is_empty() => Some(exts),
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                let base = flushing_segs.base_extents.as_ref();
+                                if base.is_empty() { None } else { Some(base.clone()) }
+                            });
+                        if let Some(exts) = committed {
+                            data_state = Some(PendingData::Staged(
+                                PendingSegments::from_committed_extents(exts, entry.record.size),
+                            ));
                         }
-                    };
-                    if existing.is_empty() {
-                        data_state = Some(PendingData::Staged(PendingSegments::new()));
-                    } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
-                        data_state = Some(PendingData::Inline(Arc::new(existing)));
-                    } else {
-                        let chunk = match self.segments.stage_payload(&existing) {
-                            Ok(chunk) => chunk,
+                        // else: first flush for this inode, no committed extents
+                        // yet — fall through to materialise path below.
+                    }
+                    if data_state.is_none() {
+                        // Empty file or inline storage: materialise existing bytes.
+                        // These are small (≤ inline_threshold) so reading is cheap.
+                        let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing
+                        {
+                            self.slice_pending_bytes(d, 0, record.size).map_err(|_| EIO)
+                        } else {
+                            self.read_file_range_from_storage(&entry.record, 0, entry.record.size)
+                                .map_err(|_| EIO)
+                        };
+                        let existing = match existing {
+                            Ok(existing) => existing,
                             Err(_) => {
                                 self.log_fuse_error(
                                     "write_large_segments",
-                                    &format!("ino={} stage=stage_existing_inline", inode),
+                                    &format!("ino={} stage=read_existing", inode),
                                     EIO,
                                 );
                                 state.pending = original_entry.clone();
                                 return Err(EIO);
                             }
                         };
-                        data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+                        if existing.is_empty() {
+                            data_state = Some(PendingData::Staged(PendingSegments::new()));
+                        } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
+                            data_state = Some(PendingData::Inline(Arc::new(existing)));
+                        } else {
+                            let chunk = match self.segments.stage_payload(&existing) {
+                                Ok(chunk) => chunk,
+                                Err(_) => {
+                                    self.log_fuse_error(
+                                        "write_large_segments",
+                                        &format!("ino={} stage=stage_existing_inline", inode),
+                                        EIO,
+                                    );
+                                    state.pending = original_entry.clone();
+                                    return Err(EIO);
+                                }
+                            };
+                            data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+                        }
                     }
                 }
             }
@@ -437,17 +467,15 @@ impl OsageFs {
         }
         // Use the staged-bytes delta for pending_bytes, not total_len, so that
         // base_extents (already committed) don't inflate the dirty-byte counter.
-        let delta = new_staged as i64 - prev_staged as i64;
-        let mut total = self.pending_bytes.lock();
-        if delta >= 0 {
-            *total = total.saturating_add(delta as u64);
+        let pending_total = if new_staged >= prev_staged {
+            self.pending_bytes.fetch_add(new_staged - prev_staged, Ordering::Relaxed)
+                .saturating_add(new_staged - prev_staged)
         } else {
-            *total = total.saturating_sub((-delta) as u64);
-        }
-        let pending_total = *total;
+            self.pending_bytes.fetch_sub(prev_staged - new_staged, Ordering::Relaxed)
+                .saturating_sub(prev_staged - new_staged)
+        };
         let pending_limit = self.pending_flush_limit_for_write(offset == prev_len, data.len());
         let should_flush = pending_total >= pending_limit;
-        drop(total);
 
         let path = &record.path;
         self.log_perf(

@@ -1,5 +1,13 @@
 use super::*;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::SystemTime;
+
+pub(crate) fn epoch_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 impl OsageFs {
     pub(crate) fn mode_to_file_type(mode: u32) -> FileType {
@@ -108,12 +116,12 @@ impl OsageFs {
             client_state,
             active_inodes: Arc::new(DashMap::new()),
             pending_inodes: Arc::new(DashSet::new()),
-            pending_bytes: Arc::new(Mutex::new(0)),
+            pending_bytes: Arc::new(AtomicU64::new(0)),
             perf,
             replay,
             fsync_on_close,
             flush_interval,
-            last_flush: Arc::new(Mutex::new(Instant::now())),
+            last_flush: Arc::new(AtomicU64::new(epoch_millis_now())),
             flush_lock: Arc::new(Mutex::new(())),
             mutation_lock: Arc::new(Mutex::new(())),
             flush_scheduled: Arc::new(AtomicBool::new(false)),
@@ -197,8 +205,7 @@ impl OsageFs {
             }
             drop(state);
             if data_len > 0 {
-                let mut total = self.pending_bytes.lock();
-                *total = total.saturating_add(data_len);
+                self.pending_bytes.fetch_add(data_len, Ordering::Relaxed);
             }
             restored += 1;
         }
@@ -373,7 +380,30 @@ impl OsageFs {
         if let Some(data) = flushing_data {
             return self.slice_pending_bytes(&data, range_start, range_end);
         }
+        // When both pending and flushing data are None but the record
+        // carries a stale placeholder storage (e.g. Inline([]) for a
+        // non-zero-size file — set during flush classify), fall back to
+        // the metadata cache for the authoritative committed storage.
+        // This happens when stage_inode (rename, setattr, etc.) creates a
+        // metadata-only pending entry from a record loaded while the inode
+        // was in the flushing state, and the flush completes before the
+        // next read.
+        if record.size > 0 && Self::is_placeholder_storage(&record.storage) {
+            if let Some(committed) = self.metadata.get_cached_inode(record.inode) {
+                if !Self::is_placeholder_storage(&committed.storage) {
+                    return self.read_file_range_from_storage(&committed, range_start, range_end);
+                }
+            }
+        }
         self.read_file_range_from_storage(record, range_start, range_end)
+    }
+
+    fn is_placeholder_storage(storage: &FileStorage) -> bool {
+        match storage {
+            FileStorage::Inline(bytes) => bytes.is_empty(),
+            FileStorage::InlineEncoded(bytes) => bytes.payload.is_empty(),
+            _ => false,
+        }
     }
 
     pub(crate) fn read_file_range_from_storage(
@@ -521,13 +551,28 @@ impl OsageFs {
                     let len = data.len();
                     self.release_pending_data(data);
                     if len > 0 {
-                        let mut total = self.pending_bytes.lock();
-                        *total = total.saturating_sub(len);
+                        self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     }
                 }
             }
             occupied.record = record;
         } else {
+            // When there is no existing pending entry, this is a metadata-only
+            // stage (rename, setattr, etc.).  If the record carries a stale
+            // placeholder storage (Inline([]) for a non-zero file) — typically
+            // because it was loaded from a flushing entry — fix it from the
+            // metadata cache so subsequent reads don't get zero bytes.
+            let mut record = record;
+            if record.size > 0
+                && !matches!(record.kind, InodeKind::Tombstone)
+                && Self::is_placeholder_storage(&record.storage)
+            {
+                if let Some(committed) = self.metadata.get_cached_inode(inode) {
+                    if !Self::is_placeholder_storage(&committed.storage) {
+                        record.storage = committed.storage;
+                    }
+                }
+            }
             state.pending = Some(PendingEntry { record, data: None });
         }
         self.pending_inodes.insert(inode);
@@ -549,8 +594,7 @@ impl OsageFs {
                     let len = data.len();
                     self.release_pending_data(data);
                     if len > 0 {
-                        let mut total = self.pending_bytes.lock();
-                        *total = total.saturating_sub(len);
+                        self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     }
                 }
             }

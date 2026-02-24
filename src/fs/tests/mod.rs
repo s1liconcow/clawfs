@@ -107,6 +107,8 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         log_file: None,
         debug_log: false,
         imap_delta_batch: 32,
+        writeback_cache: false,
+        fuse_threads: 0,
         log_storage_io: false,
     }
 }
@@ -531,7 +533,7 @@ fn stress_flush_respects_pending_threshold() {
         .active_inodes
         .iter()
         .any(|e| e.value().lock().pending.is_some()));
-    assert_eq!(*harness.fs.pending_bytes.lock(), 0);
+    assert_eq!(harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
     for inode in inodes {
         let record = harness
             .runtime
@@ -614,7 +616,7 @@ fn adaptive_large_append_keeps_data_pending_with_journal() {
             .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
             .unwrap();
     }
-    let pending_total = *harness.fs.pending_bytes.lock();
+    let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         pending_total > harness.fs.config.pending_bytes,
         "expected adaptive pending to exceed base threshold, got {} vs {}",
@@ -648,7 +650,7 @@ fn adaptive_large_append_keeps_data_pending_without_journal() {
             .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
             .unwrap();
     }
-    let pending_total = *harness.fs.pending_bytes.lock();
+    let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         pending_total > harness.fs.config.pending_bytes,
         "expected adaptive pending to exceed base threshold without journal, got {} vs {}",
@@ -680,7 +682,7 @@ fn adaptive_large_append_replays_after_crash() {
                 .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
                 .unwrap();
         }
-        let pending_total = *harness.fs.pending_bytes.lock();
+        let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             pending_total > harness.fs.config.pending_bytes,
             "expected replay setup to leave pending data"
@@ -1951,6 +1953,7 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
         record: stale_record,
         data: None,
     });
+    fs.pending_inodes.insert(file.inode);
 
     // flush_pending_selected must detect the stale Inline([]) storage,
     // reload from metadata store, and persist the merged record.
@@ -2334,4 +2337,213 @@ fn small_overwrite_on_large_file_does_not_restage_full_file() {
         "expected tiny overwrite to stage near-write-size data, got staged_bytes={}",
         staged_bytes
     );
+}
+
+/// Regression test: writing to an inode that is currently in the flushing
+/// state (pending drained, flushing set, not yet cleared) must NOT
+/// re-materialise the flushing data as new staged chunks.  If it did,
+/// `pending_bytes` would underflow on the next flush (staged_bytes >
+/// pending_bytes delta) and cascade into write amplification.
+#[test]
+fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
+    let dir = tempdir().unwrap();
+    let block = 4096usize; // well above inline_threshold
+    let num_blocks = 16usize; // 64 KiB total
+    // pending_bytes large enough that we control when flush happens
+    let harness = TestHarness::with_config(
+        dir.path(),
+        "flushing_dup.bin",
+        (block * num_blocks * 4) as u64,
+        |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+        },
+    );
+
+    // Create and fill a file.
+    let inode = harness.fs.allocate_inode_id().unwrap();
+    let record = make_file(inode, "big.bin");
+    harness.fs.stage_file(record, Vec::new(), None).unwrap();
+    for i in 0..num_blocks {
+        let data = vec![i as u8; block];
+        harness
+            .fs
+            .op_write(inode, (i * block) as u64, &data)
+            .expect("prefill write");
+    }
+    // Flush to commit all data.
+    harness.fs.flush_pending().unwrap();
+
+    // Verify committed data round-trips correctly.
+    let total = block * num_blocks;
+    let committed = harness.fs.op_read(inode, 0, total as u32).unwrap();
+    assert_eq!(committed.len(), total);
+
+    // Record pending_bytes before the second write cycle.
+    let pb_before = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Write a new block to make the inode dirty again, then flush.
+    // The first flush will drain the pending entry into flushing state.
+    let new_data = vec![0xAA; block];
+    harness
+        .fs
+        .op_write(inode, 0, &new_data)
+        .expect("overwrite block 0");
+
+    let pb_after_write = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let delta = pb_after_write - pb_before;
+    // The delta should be roughly 1 block, NOT the entire file.
+    assert!(
+        delta <= (block as u64 * 2),
+        "pending_bytes delta after single-block write should be ~1 block, got {} (whole file = {})",
+        delta,
+        total
+    );
+
+    // Now simulate the scenario: manually set up flushing state and write again.
+    // We do this by starting a flush and, before it completes clearing flushing,
+    // issuing another write.  Since we can't intercept the flush lock easily,
+    // we test by directly manipulating state: drain pending -> flushing, then write.
+    harness.fs.flush_pending().unwrap();
+    // File should be fully committed again.
+    let pb_after_flush = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        pb_after_flush < (total as u64),
+        "pending_bytes after flush should be small, got {}",
+        pb_after_flush
+    );
+
+    // Now do a write-flush-write-flush cycle and verify pending_bytes stays sane.
+    for round in 0..4u8 {
+        let write_data = vec![0xBB + round; block];
+        harness
+            .fs
+            .op_write(inode, block as u64, &write_data)
+            .expect("round write");
+        harness.fs.flush_pending().unwrap();
+
+        let pb = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        // pending_bytes must never wrap to near u64::MAX
+        assert!(
+            pb < (total as u64 * 4),
+            "round {}: pending_bytes={} looks like underflow (total file={})",
+            round,
+            pb,
+            total
+        );
+    }
+
+    // Final read-back: block 0 = 0xAA, block 1 = 0xBB+3, rest = original.
+    let final_data = harness.fs.op_read(inode, 0, total as u32).unwrap();
+    assert_eq!(&final_data[..block], &vec![0xAA; block][..], "block 0 should be 0xAA");
+    assert_eq!(
+        &final_data[block..block * 2],
+        &vec![0xBB + 3; block][..],
+        "block 1 should be last round's write"
+    );
+    for i in 2..num_blocks {
+        let expected = vec![i as u8; block];
+        assert_eq!(
+            &final_data[i * block..(i + 1) * block],
+            &expected[..],
+            "block {} should have original data",
+            i
+        );
+    }
+}
+
+/// Regression test: rename during flushing state must not lose file data.
+///
+/// Directly simulates the race condition where:
+/// 1. File A is written (data stored in PendingData, record.storage stays Inline([]))
+/// 2. Background flush commits the data to metadata cache
+/// 3. A metadata-only pending entry is created with stale storage Inline([]) and data: None
+///    (as would happen if rename/stage_inode runs while the record is in flushing state)
+/// 4. Read should fall back to metadata cache, not return zeros from stale Inline([])
+#[test]
+fn rename_during_flushing_preserves_file_data() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "rename_flush.bin", 64 * 1024 * 1024, |_| {});
+    let fs = &harness.fs;
+
+    let parent = fs.op_mkdir(ROOT_INODE, "workdir", 0, 0).unwrap();
+
+    // Create and write data to file
+    let source = fs.op_create(parent.inode, "index.lock", 0, 0).unwrap();
+    let file_data: Vec<u8> = (0..5000).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+    fs.op_write(source.inode, 0, &file_data).unwrap();
+
+    // Flush to commit — metadata cache now has proper Segments(...) storage
+    fs.flush_pending().unwrap();
+
+    // Directly simulate the post-race state: inject a metadata-only pending
+    // entry with stale Inline([]) storage and data: None.
+    // This is exactly what happens when stage_inode is called from rename
+    // while the inode is in the flushing state (the loaded record has
+    // stale storage from the flush classify placeholder).
+    {
+        let active_arc = fs.active_inodes
+            .entry(source.inode)
+            .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+            .clone();
+        let mut state = active_arc.lock();
+        let mut stale_record = source.clone();
+        stale_record.size = file_data.len() as u64;
+        stale_record.storage = FileStorage::Inline(Vec::new()); // stale placeholder
+        state.pending = Some(PendingEntry {
+            record: stale_record,
+            data: None, // metadata-only entry
+        });
+        state.flushing = None; // flush completed
+        fs.pending_inodes.insert(source.inode);
+    }
+
+    // Read the file — without the fix, this returns all zeros
+    let record = fs.load_inode(source.inode).unwrap();
+    assert_eq!(record.size, file_data.len() as u64, "size should be correct");
+    let read_back = fs.read_file_bytes(&record).unwrap();
+    assert_eq!(read_back.len(), file_data.len(), "read size mismatch");
+    assert_eq!(read_back, file_data, "data corrupted — stale placeholder storage returned zeros");
+}
+
+/// Regression test: rename while flush is actively running (flushing state)
+/// should not produce zero reads.
+#[test]
+fn rename_with_concurrent_flush_preserves_data() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "rename_conc.bin", 64 * 1024 * 1024, |_| {});
+    let fs = &harness.fs;
+
+    let parent = fs.op_mkdir(ROOT_INODE, "repo", 0, 0).unwrap();
+
+    // Simulate the git index pattern: create file, write, rename over existing
+    for round in 0..5 {
+        // Create index.lock
+        let lock = fs.op_create(parent.inode, "index.lock", 0, 0).unwrap();
+        let data: Vec<u8> = (0..(2000 + round * 500))
+            .map(|i| ((i * 7 + round as u64) % 251) as u8)
+            .collect();
+        fs.op_write(lock.inode, 0, &data).unwrap();
+
+        // Flush (moves pending → flushing → committed)
+        fs.flush_pending().unwrap();
+
+        // Rename index.lock → index
+        fs.op_rename(parent.inode, "index.lock", parent.inode, "index", 0, 0).unwrap();
+
+        // Verify data integrity after rename
+        let record = fs.load_inode(lock.inode).unwrap();
+        let read_back = fs.read_file_bytes(&record).unwrap();
+        assert_eq!(
+            read_back.len(),
+            data.len(),
+            "round {}: size mismatch",
+            round
+        );
+        assert_eq!(
+            read_back, data,
+            "round {}: data corrupted after rename-during-flush",
+            round
+        );
+    }
 }

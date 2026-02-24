@@ -32,6 +32,9 @@ impl Filesystem for OsageFs {
         // Allow deeper in-flight queues under fsync-heavy small-file workloads.
         let _ = config.set_max_background(1024);
         let _ = config.set_congestion_threshold(768);
+        if self.config.writeback_cache {
+            let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
+        }
         Ok(())
     }
 
@@ -67,7 +70,6 @@ impl Filesystem for OsageFs {
         reply: ReplyAttr,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
         let res = self.op_fuse_setattr(
             ino,
             req.uid(),
@@ -503,7 +505,6 @@ impl Filesystem for OsageFs {
         reply: ReplyWrite,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
         let res = self.op_write(ino, offset as u64, data);
         match res {
             Ok(size) => {

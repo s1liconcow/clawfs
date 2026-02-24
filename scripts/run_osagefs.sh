@@ -15,6 +15,8 @@ REPLAY_LOG_PATH="${REPLAY_LOG_PATH:-}"
 ALLOW_OTHER="${ALLOW_OTHER:-0}"
 SEGMENT_COMPRESSION="${SEGMENT_COMPRESSION:-true}"
 INLINE_COMPRESSION="${INLINE_COMPRESSION:-true}"
+FUSE_THREADS="${FUSE_THREADS:-4}"
+NO_WRITEBACK_CACHE="${NO_WRITEBACK_CACHE:-0}"
 HEAPTRACK="${HEAPTRACK:-0}"
 HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$ROOT_DIR/heaptrack/heaptrack.osagefs.%p}"
 HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
@@ -36,8 +38,6 @@ CMD=(
   --log-file "$LOG_FILE"
   --segment-compression "$SEGMENT_COMPRESSION"
   --inline-compression "$INLINE_COMPRESSION"
-  --log-storage-io
-  --debug-log
   --foreground
 )
 
@@ -55,6 +55,10 @@ if [[ -n "$REPLAY_LOG_PATH" ]]; then
 fi
 if osage_is_true "$ALLOW_OTHER"; then
   CMD+=(--allow-other)
+fi
+CMD+=(--fuse-threads "$FUSE_THREADS")
+if osage_is_true "${WRITEBACK_CACHE:-}"; then
+  CMD+=(--writeback-cache)
 fi
 # Allow callers to inject additional CLI flags (e.g. --pending-bytes, --flush-interval-ms).
 if [[ -n "${OSAGEFS_EXTRA_ARGS:-}" ]]; then

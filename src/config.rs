@@ -83,7 +83,7 @@ pub struct Cli {
     pub segment_batch: u64,
 
     /// Total pending data (bytes) before forcing a flush to the backing store.
-    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub pending_bytes: u64,
 
     /// Prefix under which auto-provisioned home directories should live.
@@ -149,6 +149,21 @@ pub struct Cli {
     /// Number of inode records to pack into each metadata delta file (higher reduces API calls).
     #[arg(long, default_value_t = 512)]
     pub imap_delta_batch: usize,
+
+    /// Disable FUSE writeback cache (disabled by default; writeback cache can
+    /// lose writes on file-create-write-rename patterns under some kernels).
+    #[arg(long, default_value_t = true)]
+    pub no_writeback_cache: bool,
+
+    /// Enable FUSE writeback cache for higher sequential write throughput.
+    /// WARNING: may cause data corruption for create-write-rename patterns
+    /// (e.g. git, editors) on some Linux kernels including WSL2.
+    #[arg(long, default_value_t = false)]
+    pub writeback_cache: bool,
+
+    /// Number of FUSE dispatch threads (0 = single-threaded legacy mode).
+    #[arg(long, default_value_t = 4)]
+    pub fuse_threads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +204,8 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub debug_log: bool,
     pub imap_delta_batch: usize,
+    pub writeback_cache: bool,
+    pub fuse_threads: usize,
 }
 
 impl From<Cli> for Config {
@@ -248,6 +265,8 @@ impl From<Cli> for Config {
             log_file,
             debug_log: cli.debug_log,
             imap_delta_batch: cli.imap_delta_batch.max(1),
+            writeback_cache: cli.writeback_cache && !cli.no_writeback_cache,
+            fuse_threads: cli.fuse_threads,
         }
     }
 }

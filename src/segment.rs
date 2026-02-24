@@ -1306,6 +1306,8 @@ mod tests {
             log_file: None,
             debug_log: false,
             imap_delta_batch: 32,
+            writeback_cache: false,
+            fuse_threads: 0,
             log_storage_io: false,
         }
     }

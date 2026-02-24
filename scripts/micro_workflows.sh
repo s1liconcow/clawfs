@@ -906,8 +906,12 @@ run_suite_for_fs() {
       RUN_FAILURES=1
     fi
   done
-  if ! optional_build_probe "$fs_type" "$base_dir"; then
-    RUN_FAILURES=1
+  # Skip the build probe when TEST_FILTER is active — it's not one of the
+  # filterable test names and shouldn't run when the user asked for specific tests.
+  if [[ -z "$TEST_FILTER" ]]; then
+    if ! optional_build_probe "$fs_type" "$base_dir"; then
+      RUN_FAILURES=1
+    fi
   fi
 }
 

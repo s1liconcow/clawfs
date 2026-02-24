@@ -169,8 +169,19 @@ fn main() -> Result<()> {
     } else {
         options.push(MountOption::AutoUnmount);
     }
-    info!("Mounting OsageFS at {}", config.mount_path.display());
-    fuser::mount2(fs, &config.mount_path, &options)?;
+    let fuse_threads = config.fuse_threads;
+    info!(
+        "Mounting OsageFS at {} (fuse_threads={}, writeback_cache={})",
+        config.mount_path.display(),
+        fuse_threads,
+        config.writeback_cache,
+    );
+    if fuse_threads > 0 {
+        let mut session = fuser::Session::new(fs, &config.mount_path, &options)?;
+        session.run_multithreaded(fuse_threads)?;
+    } else {
+        fuser::mount2(fs, &config.mount_path, &options)?;
+    }
 
     runtime.block_on(async {
         superblock.mark_clean().await.ok();

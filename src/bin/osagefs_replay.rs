@@ -454,6 +454,8 @@ fn build_config(
         log_file: None,
         debug_log: false,
         imap_delta_batch: effective.imap_delta_batch,
+        writeback_cache: false,
+        fuse_threads: 0,
     }
 }
 

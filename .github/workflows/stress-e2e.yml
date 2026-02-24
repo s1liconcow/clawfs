@@ -1,0 +1,29 @@
+name: stress-e2e
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  stress-e2e:
+    name: Run stress E2E smoke tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build OsageFS
+        run: cargo build --release
+
+      - name: Run stress E2E
+        run: ./scripts/stress_e2e.sh
