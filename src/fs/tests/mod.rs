@@ -109,6 +109,7 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         imap_delta_batch: 32,
         writeback_cache: false,
         fuse_threads: 0,
+        fuse_fsname: "osagefs".into(),
         log_storage_io: false,
     }
 }
@@ -2546,4 +2547,674 @@ fn rename_with_concurrent_flush_preserves_data() {
             round
         );
     }
+}
+
+/// Simulates a parallel kernel build (`make -j8`): many files created in the
+/// same directory interleaved with background flushes.  After all creates
+/// complete, every file must still be visible via lookup and unlink must
+/// succeed.  This exercises the race between flush drain (which takes the
+/// parent directory's pending entry) and create (which reads and re-stages
+/// the parent with a new child).
+#[test]
+fn parallel_build_create_flush_lookup_unlink() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "par_build.bin", 4096, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let fs = &harness.fs;
+
+    // Create a subdirectory to hold the "object files"
+    let parent = fs.op_mkdir(ROOT_INODE, "kernel", 0, 0).unwrap();
+    let parent_ino = parent.inode;
+
+    let num_files = 200;
+    let mut created_inos: Vec<(String, u64)> = Vec::new();
+
+    for i in 0..num_files {
+        let name = format!("file_{i:04}.o");
+        let (file, created) = fs
+            .op_create_fuse(parent_ino, &name, 0, 0, 0o100644, 0o022, 0)
+            .unwrap();
+        assert!(created, "file {} should be newly created", name);
+        created_inos.push((name.clone(), file.inode));
+
+        // Write some data so the file isn't empty
+        let data = vec![0xABu8; 128];
+        fs.op_write(file.inode, 0, &data).unwrap();
+
+        // Trigger flushes periodically to exercise the race
+        if i % 5 == 4 {
+            fs.flush_pending().unwrap();
+        }
+    }
+
+    // Final flush to ensure everything is committed
+    fs.flush_pending().unwrap();
+
+    // Verify every created file is still visible via lookup
+    for (name, expected_ino) in &created_inos {
+        let result = fs.op_lookup(parent_ino, name);
+        assert!(
+            result.is_ok(),
+            "lookup failed for {} (ino {}) after create+flush cycle: {:?}",
+            name,
+            expected_ino,
+            result.err()
+        );
+        let record = result.unwrap();
+        assert_eq!(
+            record.inode, *expected_ino,
+            "inode mismatch for {}",
+            name
+        );
+    }
+
+    // Verify all children appear in the parent directory
+    let parent_record = fs.load_inode(parent_ino).unwrap();
+    let children = parent_record.children().unwrap();
+    for (name, expected_ino) in &created_inos {
+        assert!(
+            children.contains_key(name),
+            "parent directory missing child {}",
+            name
+        );
+        assert_eq!(children[name], *expected_ino);
+    }
+
+    // Verify unlink works for all files (the `.o.d` pattern)
+    for (name, ino) in &created_inos {
+        let result = fs.op_remove_file(parent_ino, name, 0);
+        assert!(
+            result.is_ok(),
+            "unlink failed for {} (ino {}): errno={}",
+            name,
+            ino,
+            result.err().unwrap_or(0)
+        );
+    }
+}
+
+/// Regression test: a stale shard reload must not overwrite cache entries
+/// committed at a higher generation.  This exercises the race where a lookup
+/// triggers `reload_shard_for_inode` for a shard whose on-disk version is
+/// older than what `persist_inodes_batch` just committed to the in-memory
+/// cache.  Without the generation guard in `reload_shard`, the stale shard
+/// data would overwrite the fresh parent directory record, causing child
+/// lookups to fail with ENOENT.
+#[test]
+fn shard_reload_does_not_overwrite_newer_cache_entry() {
+    let dir = tempdir().unwrap();
+    // Use a very short lookup TTL so lookups trigger shard reloads.
+    let harness = TestHarness::with_config(dir.path(), "shard_reload.bin", 1 << 30, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+    let fs = &harness.fs;
+
+    // Create a subdirectory and a few files; flush to commit generation N.
+    let parent = fs.op_mkdir(ROOT_INODE, "builddir", 0, 0).unwrap();
+    let parent_ino = parent.inode;
+    let (file_a, _) = fs
+        .op_create_fuse(parent_ino, "a.o", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    fs.op_write(file_a.inode, 0, &[1u8; 64]).unwrap();
+    fs.flush_pending().unwrap(); // generation N
+
+    // Create more files and flush to commit generation N+1.
+    let (file_b, _) = fs
+        .op_create_fuse(parent_ino, "b.o", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    fs.op_write(file_b.inode, 0, &[2u8; 64]).unwrap();
+    let (file_c, _) = fs
+        .op_create_fuse(parent_ino, "c.o", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    fs.op_write(file_c.inode, 0, &[3u8; 64]).unwrap();
+    fs.flush_pending().unwrap(); // generation N+1
+
+    // Now force a shard reload by looking up via metadata with zero TTL.
+    // This will trigger reload_shard_for_inode which reads the shard file
+    // from disk. If the reload incorrectly overwrites the cache, the parent
+    // directory would revert to generation N's children (only "a.o").
+    //
+    // First, clear in-memory state to force metadata path:
+    // We can't easily clear active_inodes, but with TTL=0, load_inode will
+    // check the cache every time. The key is that after flush, the parent's
+    // active_inodes entry has pending=None and flushing=None, so
+    // load_inode_in_memory returns None and falls through to get_inode_with_ttl.
+
+    // Verify all three files are visible via lookup
+    for name in &["a.o", "b.o", "c.o"] {
+        let result = fs.op_lookup(parent_ino, name);
+        assert!(
+            result.is_ok(),
+            "lookup for {} failed after flush: {:?}",
+            name,
+            result.err()
+        );
+    }
+
+    // Verify parent directory has all children
+    let parent_record = fs.load_inode(parent_ino).unwrap();
+    let children = parent_record.children().unwrap();
+    assert!(children.contains_key("a.o"), "missing a.o");
+    assert!(children.contains_key("b.o"), "missing b.o");
+    assert!(children.contains_key("c.o"), "missing c.o");
+}
+
+/// Concurrent version: creates files and flushes from different threads to
+/// hit the window where flush drain takes the parent's pending entry while
+/// a create is building its updated children map from the old snapshot.
+#[test]
+fn concurrent_create_and_flush_preserves_directory_children() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "cc_flush.bin", 4096, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let fs = &harness.fs;
+
+    let parent = fs.op_mkdir(ROOT_INODE, "build", 0, 0).unwrap();
+    let parent_ino = parent.inode;
+
+    let num_files = 200;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let created = thread::scope(|scope| {
+        let creator_barrier = barrier.clone();
+        let creator = scope.spawn(move || {
+            let mut inos = Vec::new();
+            creator_barrier.wait();
+            for i in 0..num_files {
+                let name = format!("obj_{i:04}.o");
+                let (file, _) = fs
+                    .op_create_fuse(parent_ino, &name, 0, 0, 0o100644, 0o022, 0)
+                    .unwrap();
+                fs.op_write(file.inode, 0, &[0xCDu8; 64]).unwrap();
+                inos.push((name, file.inode));
+            }
+            inos
+        });
+
+        let flusher_barrier = barrier.clone();
+        let flusher = scope.spawn(move || {
+            flusher_barrier.wait();
+            for _ in 0..num_files {
+                let _ = fs.flush_pending();
+                std::thread::yield_now();
+            }
+        });
+
+        let result = creator.join().unwrap();
+        flusher.join().unwrap();
+        result
+    });
+
+    // Final flush
+    fs.flush_pending().unwrap();
+
+    // Verify all files visible
+    let parent_record = fs.load_inode(parent_ino).unwrap();
+    let children = parent_record.children().unwrap();
+    for (name, expected_ino) in &created {
+        assert!(
+            children.contains_key(name),
+            "child {} (ino {}) missing from parent directory after concurrent create+flush",
+            name,
+            expected_ino,
+        );
+        let lookup = fs.op_lookup(parent_ino, name);
+        assert!(
+            lookup.is_ok(),
+            "lookup failed for {} after concurrent create+flush",
+            name,
+        );
+    }
+}
+
+/// Regression test: O_TRUNC on a segment-backed file, then writing new content
+/// must NOT inherit committed extents from the previous file incarnation.
+///
+/// Before the fix, `write_large_segments` checked `record.storage` for
+/// committed segment extents without verifying that `record.size > 0`.  After
+/// O_TRUNC (size=0), the stale `Segments([...])` storage was inherited as
+/// `base_extents`, causing old segment data to bleed into the new file content.
+#[test]
+fn truncate_then_write_does_not_inherit_old_segment_extents() {
+    let dir = tempdir().unwrap();
+    // Use a small inline_threshold so even moderate writes go through the
+    // segment path.
+    let harness = TestHarness::new(dir.path(), "trunc_old_ext.bin", 1 << 20);
+    let fs = &harness.fs;
+
+    // Step 1: create file and write >inline_threshold bytes, flush to commit.
+    let file = fs.nfs_create(ROOT_INODE, "obj.o", 0, 0).unwrap();
+    let ino = file.inode;
+    let old_data = vec![0xAAu8; 2048]; // >512 inline threshold → segment
+    fs.nfs_write(ino, 0, &old_data).unwrap();
+    fs.flush_pending().unwrap();
+
+    // Verify committed storage is Segments.
+    let committed = harness.metadata.get_cached_inode(ino);
+    assert!(
+        committed.is_some(),
+        "inode should be committed after flush"
+    );
+    assert!(
+        matches!(committed.unwrap().storage, FileStorage::Segments(ref e) if !e.is_empty()),
+        "committed storage should be non-empty Segments"
+    );
+
+    // Step 2: O_TRUNC the file (simulates `open(O_TRUNC)` or `create(O_TRUNC)`).
+    let (opened, _) = fs
+        .fuse_create_file(ROOT_INODE, "obj.o", 0, 0, 0o644, 0, libc::O_TRUNC)
+        .unwrap();
+    assert_eq!(opened.size, 0);
+
+    // Step 3: write new content that is completely different from the old data.
+    // Write at a non-zero offset (like an assembler writing an ELF section).
+    let section_data = vec![0xBBu8; 1024];
+    fs.op_write(ino, 512, &section_data).unwrap();
+    // Now write the header at offset 0.
+    let header_data = vec![0xCCu8; 512];
+    fs.op_write(ino, 0, &header_data).unwrap();
+
+    // Step 4: flush the new content.
+    fs.flush_pending().unwrap();
+
+    // Step 5: verify that the file contains ONLY the new data, not old 0xAA bytes.
+    let total_size = 512 + 1024;
+    let result = fs.nfs_read(ino, 0, total_size as u32).unwrap();
+    assert_eq!(result.len(), total_size);
+    // Header at offset 0..512 should be 0xCC.
+    assert!(
+        result[..512].iter().all(|&b| b == 0xCC),
+        "header region 0..512 should be 0xCC, got {:?}...",
+        &result[..16]
+    );
+    // Section at offset 512..1536 should be 0xBB.
+    assert!(
+        result[512..].iter().all(|&b| b == 0xBB),
+        "section region 512..1536 should be 0xBB, got {:?}...",
+        &result[512..528]
+    );
+}
+
+/// Tests the flush-draining race: O_TRUNC is being flushed (flushing state)
+/// when a new write arrives at a HIGH offset.  The old committed extents
+/// (covering offset 0..2048) must NOT be inherited as base_extents, otherwise
+/// old 0xAA data bleeds through at offset 0 where there is no new write.
+#[test]
+fn truncate_flushing_then_write_does_not_inherit_old_extents() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "trunc_flush_race.bin", 1 << 20);
+    let fs = &harness.fs;
+
+    // Create and commit a segment-backed file with 2048 bytes of 0xAA.
+    let file = fs.nfs_create(ROOT_INODE, "race.o", 0, 0).unwrap();
+    let ino = file.inode;
+    let old_data = vec![0xAAu8; 2048];
+    fs.nfs_write(ino, 0, &old_data).unwrap();
+    fs.flush_pending().unwrap();
+
+    // O_TRUNC.
+    fs.fuse_create_file(ROOT_INODE, "race.o", 0, 0, 0o644, 0, libc::O_TRUNC)
+        .unwrap();
+
+    // Simulate flush draining the truncation: manually move pending → flushing.
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        let pending_entry = state.pending.take().unwrap();
+        state.flushing = Some(pending_entry);
+    }
+
+    // Write new content at HIGH offset while truncation is flushing.
+    // This leaves offsets 0..1024 with NO new write — if old extents
+    // are inherited, they will contribute stale 0xAA data there.
+    let new_data = vec![0xDDu8; 1024];
+    fs.op_write(ino, 1024, &new_data).unwrap();
+
+    // Clear the flushing state (simulating flush completion).
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = None;
+    }
+
+    // Flush the new write.
+    fs.flush_pending().unwrap();
+
+    // Verify: file should be 2048 bytes. Offsets 0..1024 should be 0x00
+    // (zero-filled gap from truncation), NOT 0xAA from old extents.
+    let result = fs.nfs_read(ino, 0, 4096).unwrap();
+    assert_eq!(result.len(), 2048, "file should be 2048 bytes");
+    assert!(
+        result[..1024].iter().all(|&b| b == 0x00),
+        "gap 0..1024 should be zero-filled, not stale 0xAA from old extents; got {:02x} {:02x} {:02x} {:02x}...",
+        result[0], result[1], result[2], result[3],
+    );
+    assert!(
+        result[1024..].iter().all(|&b| b == 0xDD),
+        "data 1024..2048 should be 0xDD"
+    );
+}
+
+/// Tests that O_TRUNC followed by non-sequential writes (mimicking assembler
+/// object file generation) produces correct content after flush.
+#[test]
+fn truncate_then_nonsequential_writes_correct_after_flush() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "trunc_nonseq.bin", 1 << 20);
+    let fs = &harness.fs;
+
+    // Create, write, flush — establish committed segments.
+    let file = fs.nfs_create(ROOT_INODE, "asm.o", 0, 0).unwrap();
+    let ino = file.inode;
+    fs.nfs_write(ino, 0, &vec![0x11u8; 4096]).unwrap();
+    fs.flush_pending().unwrap();
+
+    // O_TRUNC.
+    fs.fuse_create_file(ROOT_INODE, "asm.o", 0, 0, 0o644, 0, libc::O_TRUNC)
+        .unwrap();
+
+    // Non-sequential writes (high offsets first, then header, like `as` does):
+    let section_text = vec![0x22u8; 1024];
+    fs.op_write(ino, 2048, &section_text).unwrap();  // .text at offset 2048
+    let section_data = vec![0x33u8; 512];
+    fs.op_write(ino, 1024, &section_data).unwrap();   // .data at offset 1024
+    // Fill gap at 1536..2048 with zeros.
+    let gap = vec![0x00u8; 512];
+    fs.op_write(ino, 1536, &gap).unwrap();
+    // Header at offset 0.
+    let header = vec![0x44u8; 1024];
+    fs.op_write(ino, 0, &header).unwrap();
+
+    // Flush with intermediate drains: flush after header write.
+    fs.flush_pending().unwrap();
+
+    // Verify full file content.
+    let result = fs.nfs_read(ino, 0, 4096).unwrap();
+    assert_eq!(result.len(), 3072, "file should be 3072 bytes (3 * 1024)");
+    assert!(result[..1024].iter().all(|&b| b == 0x44), "header 0..1024 should be 0x44");
+    assert!(result[1024..1536].iter().all(|&b| b == 0x33), ".data 1024..1536 should be 0x33");
+    assert!(result[1536..2048].iter().all(|&b| b == 0x00), "gap 1536..2048 should be 0x00");
+    assert!(result[2048..3072].iter().all(|&b| b == 0x22), ".text 2048..3072 should be 0x22");
+}
+
+/// Regression test: if an inode has moved to flushing state with staged chunks,
+/// a new write arriving in that window must preserve those in-flight chunks.
+#[test]
+fn write_during_flushing_preserves_in_flight_chunks() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "write_during_flushing.bin", 1 << 20);
+    let fs = &harness.fs;
+
+    let file = fs.nfs_create(ROOT_INODE, "race_flush_write.o", 0, 0).unwrap();
+    let ino = file.inode;
+
+    // Establish committed segment-backed data.
+    let base = vec![0x11u8; 4096];
+    fs.nfs_write(ino, 0, &base).unwrap();
+    fs.flush_pending().unwrap();
+
+    // Stage two disjoint overwrites that have not been flushed yet.
+    let first = vec![0x22u8; 1024];
+    let third = vec![0x33u8; 1024];
+    fs.op_write(ino, 0, &first).unwrap();
+    fs.op_write(ino, 2048, &third).unwrap();
+
+    // Simulate flush drain by moving pending -> flushing.
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = Some(state.pending.take().unwrap());
+    }
+
+    // New write arrives while prior data is still in flushing.
+    let second = vec![0x44u8; 1024];
+    fs.op_write(ino, 1024, &second).unwrap();
+
+    // Simulate completion of the prior flush.
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = None;
+    }
+
+    fs.flush_pending().unwrap();
+
+    let result = fs.nfs_read(ino, 0, 4096).unwrap();
+    assert_eq!(result.len(), 4096);
+
+    let mut expected = vec![0x11u8; 4096];
+    expected[0..1024].copy_from_slice(&first);
+    expected[1024..2048].copy_from_slice(&second);
+    expected[2048..3072].copy_from_slice(&third);
+    assert_eq!(
+        result, expected,
+        "write during flushing must preserve prior in-flight staged chunks"
+    );
+}
+
+/// Regression test: append path must not truncate in-flight flushing data when
+/// the caller's record size is stale.
+#[test]
+fn append_while_flushing_uses_flushing_data_len_not_stale_record_size() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "append_stale_size.bin", 1 << 20);
+    let fs = &harness.fs;
+
+    let file = fs
+        .nfs_create(ROOT_INODE, "append_stale_size.o", 0, 0)
+        .unwrap();
+    let ino = file.inode;
+
+    let base = vec![0x11u8; 4096];
+    fs.nfs_write(ino, 0, &base).unwrap();
+    fs.flush_pending().unwrap();
+
+    let rewrite = vec![0x22u8; 4096];
+    fs.op_write(ino, 0, &rewrite).unwrap();
+
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = Some(state.pending.take().unwrap());
+    }
+
+    let mut stale = fs.load_inode(ino).unwrap();
+    stale.size = 0;
+    fs.append_file(stale, b"XYZ").unwrap();
+
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = None;
+    }
+
+    fs.flush_pending().unwrap();
+
+    let result = fs.nfs_read(ino, 0, 5000).unwrap();
+    assert_eq!(result.len(), 4099);
+    assert!(result[..4096].iter().all(|&b| b == 0x22));
+    assert_eq!(&result[4096..], b"XYZ");
+}
+
+/// Replays the observed out-of-order `nfs4trace.o` write pattern from
+/// osagefs.log and verifies byte-exact results across a flushing handoff.
+#[test]
+fn nfs4trace_pattern_preserved_across_flushing_handoff() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "nfs4trace_pattern.bin", 1 << 20);
+    let fs = &harness.fs;
+    let file = fs
+        .nfs_create(ROOT_INODE, "nfs4trace.o", 0, 0)
+        .expect("create nfs4trace.o");
+    let ino = file.inode;
+
+    let ops_text = "\
+262928 3312
+266240 784
+267024 3312
+270336 784
+271120 3312
+274432 784
+275216 3312
+278528 784
+279312 3312
+282624 784
+283408 3312
+286720 784
+287504 802
+64 4032
+4096 4096
+8192 4096
+12288 4096
+16384 4096
+20480 4096
+24576 4096
+28672 3193
+31872 896
+32768 4096
+36864 4096
+40960 4096
+45056 4096
+49152 4096
+53248 4096
+57344 4096
+61440 4096
+65536 4096
+69632 4096
+73728 4096
+77824 4096
+81920 4096
+86016 4096
+90112 4096
+94208 4096
+98304 4096
+102400 4096
+106496 4096
+110592 4096
+114688 4096
+118784 4096
+122880 4096
+126976 4096
+131072 4096
+135168 4096
+139264 4096
+143360 4096
+147456 4096
+151552 4096
+155648 4096
+159744 4096
+163840 3850
+167696 240
+167936 1546
+169504 2528
+172032 4096
+176128 4096
+180224 4096
+184320 4096
+188416 4096
+192512 4096
+196608 4096
+200704 4096
+204800 4096
+208896 4096
+212992 4096
+217088 2325
+219416 448
+219872 1312
+221184 2792
+223984 1296
+225280 4096
+229376 744
+230144 3328
+233472 3359
+236832 32
+288312 16384
+304696 2504
+307200 1592
+308792 2504
+311296 9784
+321080 2504
+323584 1592
+325176 2504
+327680 1592
+329272 2504
+331776 1592
+333368 2504
+335872 67128
+403000 2504
+405504 1592
+407096 2504
+409600 1592
+411192 2504
+413696 1592
+415288 2504
+417792 1592
+419384 2504
+421888 1592
+423480 2504
+425984 1592
+427576 2504
+430080 1592
+431672 880
+236864 24576
+261440 704
+262144 784
+432552 358
+0 64
+432912 2240";
+
+    let ops: Vec<(u64, usize)> = ops_text
+        .lines()
+        .map(|line| {
+            let mut it = line.split_whitespace();
+            let off = it.next().unwrap().parse::<u64>().unwrap();
+            let len = it.next().unwrap().parse::<usize>().unwrap();
+            (off, len)
+        })
+        .collect();
+    let file_len = ops
+        .iter()
+        .map(|(off, len)| off.saturating_add(*len as u64) as usize)
+        .max()
+        .unwrap();
+    let mut expected = vec![0u8; file_len];
+
+    // Reproduce a pending->flushing handoff roughly where the build log
+    // showed asynchronous flush activity while writes were still arriving.
+    let handoff_at = 16usize;
+
+    for (i, (offset, len)) in ops.iter().copied().enumerate() {
+        if i == handoff_at {
+            let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+            let mut state = active_arc.lock();
+            state.flushing = state.pending.take();
+        }
+
+        let fill = ((i % 251) + 1) as u8;
+        let payload = vec![fill; len];
+        fs.op_write(ino, offset, &payload)
+            .unwrap_or_else(|e| panic!("op_write failed at op={} errno={}", i, e));
+        expected[offset as usize..offset as usize + len].copy_from_slice(&payload);
+    }
+
+    {
+        let active_arc = fs.active_inodes.get(&ino).unwrap().clone();
+        let mut state = active_arc.lock();
+        state.flushing = None;
+    }
+
+    fs.flush_pending().unwrap();
+    let actual = fs.nfs_read(ino, 0, file_len as u32).unwrap();
+    assert_eq!(actual.len(), file_len);
+    assert_eq!(
+        actual, expected,
+        "log-derived nfs4trace write pattern must preserve exact bytes",
+    );
 }

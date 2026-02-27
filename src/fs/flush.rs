@@ -451,16 +451,24 @@ impl OsageFs {
                             .get(&record.inode)
                             .map(Vec::as_slice)
                             .unwrap_or(&[]);
-                        // Use get_cached_inode (cache-only, no shard reload, no
-                        // negative-cache side effects) so we can safely call it
-                        // from inside the synchronous flush path.
+                        // Prefer cache for the hot path, but fall back to an
+                        // authoritative metadata lookup on cache miss. Using
+                        // stale `base_extents` here can drop recently committed
+                        // extents when a write races with an async flush.
                         let authoritative_base: Vec<SegmentExtent> = if !base_extents.is_empty() {
                             match self.metadata.get_cached_inode(record.inode) {
                                 Some(r) => match r.storage {
                                     FileStorage::Segments(exts) => exts,
                                     _ => base_extents.to_vec(),
                                 },
-                                None => base_extents.to_vec(),
+                                None => match self.block_on(self.metadata.get_inode(record.inode))
+                                {
+                                    Ok(Some(r)) => match r.storage {
+                                        FileStorage::Segments(exts) => exts,
+                                        _ => base_extents.to_vec(),
+                                    },
+                                    _ => base_extents.to_vec(),
+                                },
                             }
                         } else {
                             base_extents.to_vec()

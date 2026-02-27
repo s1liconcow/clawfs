@@ -126,5 +126,6 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         imap_delta_batch: 32,
         writeback_cache: false,
         fuse_threads: 0,
+        fuse_fsname: "osagefs".to_string(),
     }
 }

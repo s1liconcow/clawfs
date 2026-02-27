@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
-set -x
 
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
@@ -10,7 +9,7 @@ OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_osagefs.sh}"
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 
 DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
-DEBUG_LOG="${DEBUG_LOG:-0}"
+DEBUG_LOG="${DEBUG_LOG:--1}"
 SKIP_OSAGE="${SKIP_OSAGE:-0}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-0}"
 KEEP_MOUNT="${KEEP_MOUNT:-0}"

@@ -456,6 +456,7 @@ fn build_config(
         imap_delta_batch: effective.imap_delta_batch,
         writeback_cache: false,
         fuse_threads: 0,
+        fuse_fsname: "osagefs".to_string(),
     }
 }
 

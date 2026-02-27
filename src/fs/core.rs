@@ -179,7 +179,7 @@ impl OsageFs {
                         // it so that flush can merge them with the replayed chunks
                         // without re-reading segment data.
                         let base_extents = match &record.storage {
-                            FileStorage::Segments(extents) => extents.clone(),
+                            FileStorage::Segments(extents) if record.size > 0 => extents.clone(),
                             _ => Vec::new(),
                         };
                         Some(PendingData::Staged(PendingSegments {

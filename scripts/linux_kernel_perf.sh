@@ -10,8 +10,9 @@ OSAGE_BIN="$TARGET_DIR/osagefs"
 
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
-LINUX_VERSION="${LINUX_VERSION:-}"
+LINUX_VERSION="${LINUX_VERSION:-6.11}"
 HOME_PREFIX="${HOME_PREFIX:-/home}"
+DEBUG_LOG="${DEBUG_LOG:--1}"
 DO_CLEANUP=1
 SKIP_EXTRACT=0
 REUSE_TREE=0
@@ -150,6 +151,10 @@ CMD=(
 if [[ -n "$PERF_LOG_PATH" ]]; then
   CMD+=(--perf-log "$PERF_LOG_PATH")
   echo "Perf trace -> $PERF_LOG_PATH"
+fi
+if [[ -n "$DEBUG_LOG" ]]; then
+  CMD+=(--debug-log)
+  echo "Debug logging enabled."
 fi
 "${CMD[@]}" &
 OSAGE_PID=$!

@@ -78,6 +78,9 @@ pub struct VersionedSuperblock {
 struct CacheEntry {
     record: InodeRecord,
     refreshed: Instant,
+    /// Generation at which this record was committed.  Used to prevent stale
+    /// shard reloads from overwriting a fresher cache entry.
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -395,7 +398,7 @@ impl MetadataStore {
             let mut neg = self.negative_cache.lock();
             for record in records {
                 neg.remove(&record.inode);
-                cache.insert(record.inode, CacheEntry::new(record.clone()));
+                cache.insert(record.inode, CacheEntry::with_generation(record.clone(), generation));
                 let shard_id = record.shard_index(shard_size);
                 let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
                     shard: InodeShard::new(shard_id),
@@ -579,7 +582,7 @@ impl MetadataStore {
                 shard.inodes.insert(ino, record);
             }
             for (ino, record) in &shard.inodes {
-                cache.insert(*ino, CacheEntry::new(record.clone()));
+                cache.insert(*ino, CacheEntry::with_generation(record.clone(), stored.generation));
             }
             max_generation = max_generation.max(stored.generation);
             shard_map.insert(
@@ -633,7 +636,7 @@ impl MetadataStore {
                     } else {
                         self.cache
                             .lock()
-                            .insert(record.inode, CacheEntry::new(record.clone()));
+                            .insert(record.inode, CacheEntry::with_generation(record.clone(), generation));
                         updated_records.push(record.clone());
                     }
                 }
@@ -747,11 +750,28 @@ impl MetadataStore {
             }
             let mut cache = self.cache.lock();
             for (ino, record) in &shard.inodes {
-                cache.insert(*ino, CacheEntry::new(record.clone()));
+                // Only update the cache if this shard reload is at least as
+                // fresh as the existing entry.  A concurrent
+                // `persist_inodes_batch` may have already committed a newer
+                // generation between our directory listing and this point;
+                // overwriting that entry would revert directory children or
+                // file storage to a stale snapshot.
+                let dominated = cache
+                    .get(ino)
+                    .map(|existing| existing.generation > generation)
+                    .unwrap_or(false);
+                if !dominated {
+                    cache.insert(*ino, CacheEntry::with_generation(record.clone(), generation));
+                }
             }
-            self.shards
-                .lock()
-                .insert(shard_id, ShardEntry { shard, generation });
+            let mut shard_map = self.shards.lock();
+            let dominated_shard = shard_map
+                .get(&shard_id)
+                .map(|existing| existing.generation > generation)
+                .unwrap_or(false);
+            if !dominated_shard {
+                shard_map.insert(shard_id, ShardEntry { shard, generation });
+            }
         }
         Ok(())
     }
@@ -805,12 +825,13 @@ fn parse_delta_filename(name: &str) -> Option<u64> {
 }
 
 impl CacheEntry {
-    fn new(record: InodeRecord) -> Self {
+    fn with_generation(record: InodeRecord, generation: u64) -> Self {
         let mut normalized = record;
         normalized.normalize_storage();
         Self {
             record: normalized,
             refreshed: Instant::now(),
+            generation,
         }
     }
 }

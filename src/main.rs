@@ -148,7 +148,7 @@ fn main() -> Result<()> {
     }
 
     let mut options = vec![
-        MountOption::FSName("osagefs".to_string()),
+        MountOption::FSName(config.fuse_fsname.clone()),
         MountOption::DefaultPermissions,
     ];
     let allow_other = if config.allow_other {
@@ -225,6 +225,7 @@ fn log_boot_config(config: &Config, allow_other: bool) {
             "metadata_poll_interval_ms": config.metadata_poll_interval_ms,
             "segment_cache_bytes": config.segment_cache_bytes,
             "imap_delta_batch": config.imap_delta_batch,
+            "fuse_fsname": &config.fuse_fsname,
             "allow_other_effective": allow_other,
             "foreground": config.foreground,
             "perf_log": config.perf_log.as_ref().map(|p| p.display().to_string()),

@@ -172,19 +172,20 @@ impl OsageFs {
         working_entry.record = record.clone();
 
         if working_entry.data.is_none() {
-            if record.size > 0 {
-                let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing {
-                    self.slice_pending_bytes(d, 0, record.size).map_err(|_| {
+            if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing {
+                let existing_len = d.len();
+                let existing = self.slice_pending_bytes(d, 0, existing_len).map_err(|_| {
+                    state.pending = original_entry.clone();
+                    EIO
+                })?;
+                working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
+            } else if record.size > 0 {
+                let existing = self
+                    .read_file_range_from_storage(&record, 0, record.size)
+                    .map_err(|_| {
                         state.pending = original_entry.clone();
                         EIO
-                    })?
-                } else {
-                    self.read_file_range_from_storage(&record, 0, record.size)
-                        .map_err(|_| {
-                            state.pending = original_entry.clone();
-                            EIO
-                        })?
-                };
+                    })?;
                 working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
             } else {
                 working_entry.data = Some(PendingData::Inline(Arc::new(Vec::new())));
@@ -199,7 +200,7 @@ impl OsageFs {
         match slot {
             PendingData::Inline(buf) => {
                 let buf = Arc::make_mut(buf);
-                if buf.len() as u64 != record.size {
+                if (buf.len() as u64) < record.size {
                     buf.resize(record.size as usize, 0);
                 }
                 buf.extend_from_slice(data);
@@ -299,59 +300,68 @@ impl OsageFs {
         entry.record = record.clone();
         let mut data_state = entry.data.take();
         if data_state.is_none() {
-            // When the file already has committed segment storage, create pending
-            // segments backed by the existing extents without reading any segment
-            // data.  The new write will be layered on top at flush time, avoiding
-            // the O(n²) read amplification that previously occurred on every write
-            // after a flush.
-            match &entry.record.storage {
-                FileStorage::Segments(extents) if !extents.is_empty() => {
-                    data_state = Some(PendingData::Staged(
-                        PendingSegments::from_committed_extents(extents.clone(), entry.record.size),
-                    ));
-                }
-                _ => {
-                    // Check if the flushing entry has segment data we can
-                    // reference without materialising.  This avoids re-staging
-                    // already-flushing bytes which would inflate staged_bytes /
-                    // pending_bytes and cause underflow on the next flush
-                    // fetch_sub.
-                    if let Some(PendingEntry {
-                        data: Some(PendingData::Staged(flushing_segs)),
-                        ..
-                    }) = &state.flushing
-                    {
-                        // Try to find committed extents: metadata cache first,
-                        // then the flushing entry's base_extents.
-                        let committed = self
-                            .metadata
-                            .get_cached_inode(inode)
-                            .and_then(|r| match r.storage {
-                                FileStorage::Segments(exts) if !exts.is_empty() => Some(exts),
-                                _ => None,
-                            })
-                            .or_else(|| {
-                                let base = flushing_segs.base_extents.as_ref();
-                                if base.is_empty() { None } else { Some(base.clone()) }
-                            });
-                        if let Some(exts) = committed {
-                            data_state = Some(PendingData::Staged(
-                                PendingSegments::from_committed_extents(exts, entry.record.size),
-                            ));
-                        }
-                        // else: first flush for this inode, no committed extents
-                        // yet — fall through to materialise path below.
+            // Correctness-first flushing race fallback: if a previous flush is in
+            // progress for this inode, rebuild from the flushing bytes so
+            // in-flight (not yet committed) writes are preserved.
+            if let Some(PendingEntry {
+                data: Some(flushing_data),
+                ..
+            }) = &state.flushing
+            {
+                let existing_len = flushing_data.len();
+                let existing = match self.slice_pending_bytes(flushing_data, 0, existing_len) {
+                    Ok(existing) => existing,
+                    Err(_) => {
+                        self.log_fuse_error(
+                            "write_large_segments",
+                            &format!("ino={} stage=read_flushing_existing", inode),
+                            EIO,
+                        );
+                        state.pending = original_entry.clone();
+                        return Err(EIO);
                     }
-                    if data_state.is_none() {
-                        // Empty file or inline storage: materialise existing bytes.
-                        // These are small (≤ inline_threshold) so reading is cheap.
-                        let existing = if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing
-                        {
-                            self.slice_pending_bytes(d, 0, record.size).map_err(|_| EIO)
-                        } else {
-                            self.read_file_range_from_storage(&entry.record, 0, entry.record.size)
-                                .map_err(|_| EIO)
-                        };
+                };
+                if existing.is_empty() {
+                    data_state = Some(PendingData::Staged(PendingSegments::new()));
+                } else if existing.len() as u64 <= self.config.inline_threshold as u64 {
+                    data_state = Some(PendingData::Inline(Arc::new(existing)));
+                } else {
+                    let chunk = match self.segments.stage_payload(&existing) {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            self.log_fuse_error(
+                                "write_large_segments",
+                                &format!("ino={} stage=stage_flushing_existing", inode),
+                                EIO,
+                            );
+                            state.pending = original_entry.clone();
+                            return Err(EIO);
+                        }
+                    };
+                    data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+                }
+            }
+            if data_state.is_none() {
+                // When no flush is in progress and the file already has committed
+                // segment storage, create pending segments backed by committed
+                // extents without materialising file bytes.
+                match &entry.record.storage {
+                    FileStorage::Segments(extents)
+                        if !extents.is_empty() && entry.record.size > 0 =>
+                    {
+                        data_state = Some(PendingData::Staged(
+                            PendingSegments::from_committed_extents(
+                                extents.clone(),
+                                entry.record.size,
+                            ),
+                        ));
+                    }
+                    _ => {
+                        // Empty file or inline storage: materialise existing
+                        // bytes directly from committed storage.
+                        let existing = self
+                            .read_file_range_from_storage(&entry.record, 0, entry.record.size)
+                            .map_err(|_| EIO);
                         let existing = match existing {
                             Ok(existing) => existing,
                             Err(_) => {
@@ -381,7 +391,8 @@ impl OsageFs {
                                     return Err(EIO);
                                 }
                             };
-                            data_state = Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
+                            data_state =
+                                Some(PendingData::Staged(PendingSegments::from_chunk(chunk)));
                         }
                     }
                 }

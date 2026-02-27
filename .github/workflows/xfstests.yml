@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
             gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
             libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
-            uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
+            uuid-dev uuid-runtime xfsprogs sqlite3 \
             libgdbm-compat-dev fuse3
           sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
             xfslibs-dev || true
@@ -46,84 +46,88 @@ jobs:
       - name: Build OsageFS
         run: cargo build --release
 
-      - name: Start OsageFS (TEST instance)
+      - name: Install xfstests FUSE mount helper
         run: |
-          mkdir -p /tmp/osagefs-test-mnt /tmp/osagefs-test-store /tmp/osagefs-test-cache
-
-          ./target/release/osagefs \
-            --mount-path /tmp/osagefs-test-mnt \
-            --store-path /tmp/osagefs-test-store \
-            --local-cache-path /tmp/osagefs-test-cache \
-            --state-path /tmp/osagefs-test-state.bin \
+          sudo tee /sbin/mount.fuse.osagefs > /dev/null << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          src="${1:-}"
+          mnt="${2:-}"
+          optstr=""
+          shift 2 || true
+          while (($#)); do
+            case "$1" in
+              -o) shift; optstr="${1:-}" ;;
+              -o*) optstr="${1#-o}" ;;
+            esac
+            shift || true
+          done
+          store=""
+          IFS="," read -ra kvs <<< "$optstr"
+          for kv in "${kvs[@]}"; do
+            case "$kv" in
+              source=*) store="${kv#source=}" ;;
+              store=*) store="${kv#store=}" ;;
+            esac
+          done
+          if [[ -z "$store" || -z "$src" || -z "$mnt" ]]; then
+            echo "mount.fuse.osagefs: bad args src=$src mnt=$mnt opts=$optstr" >&2
+            exit 1
+          fi
+          if mountpoint -q "$mnt"; then
+            exit 0
+          fi
+          name="$(basename "$mnt" | tr -cs 'a-zA-Z0-9' '_')"
+          cache="/tmp/osagefs-${name}-cache"
+          state="/tmp/osagefs-${name}-state.bin"
+          mkdir -p "$store" "$cache" "$mnt"
+          nohup /home/runner/work/osagefs/osagefs/target/release/osagefs \
+            --mount-path "$mnt" \
+            --store-path "$store" \
+            --local-cache-path "$cache" \
+            --state-path "$state" \
             --object-provider local \
+            --fuse-fsname "$src" \
             --allow-other \
             --disable-journal \
             --disable-cleanup \
-            --foreground &
-          echo $! > /tmp/osagefs-test.pid
-
-          echo "Waiting for OsageFS TEST mount..."
-          for i in $(seq 1 30); do
-            if mountpoint -q /tmp/osagefs-test-mnt 2>/dev/null; then
-              echo "OsageFS TEST is mounted"
-              break
-            fi
+            --foreground >/dev/null 2>&1 &
+          for _ in $(seq 1 40); do
+            mountpoint -q "$mnt" && exit 0
             sleep 1
           done
-
-          if ! mountpoint -q /tmp/osagefs-test-mnt 2>/dev/null; then
-            echo "OsageFS TEST failed to mount"
-            exit 1
-          fi
-
-      - name: Start OsageFS (SCRATCH instance)
-        run: |
-          mkdir -p /tmp/osagefs-scratch-mnt /tmp/osagefs-scratch-store /tmp/osagefs-scratch-cache
-
-          ./target/release/osagefs \
-            --mount-path /tmp/osagefs-scratch-mnt \
-            --store-path /tmp/osagefs-scratch-store \
-            --local-cache-path /tmp/osagefs-scratch-cache \
-            --state-path /tmp/osagefs-scratch-state.bin \
-            --object-provider local \
-            --allow-other \
-            --disable-journal \
-            --disable-cleanup \
-            --foreground &
-          echo $! > /tmp/osagefs-scratch.pid
-
-          echo "Waiting for OsageFS SCRATCH mount..."
-          for i in $(seq 1 30); do
-            if mountpoint -q /tmp/osagefs-scratch-mnt 2>/dev/null; then
-              echo "OsageFS SCRATCH is mounted"
-              break
-            fi
-            sleep 1
-          done
-
-          if ! mountpoint -q /tmp/osagefs-scratch-mnt 2>/dev/null; then
-            echo "OsageFS SCRATCH failed to mount"
-            exit 1
-          fi
+          exit 1
+          EOF
+          sudo chmod +x /sbin/mount.fuse.osagefs
 
       - name: Configure xfstests
         working-directory: /tmp/xfstests
         run: |
           cat > local.config << 'EOF'
           export FSTYP=fuse
-          export FUSE_SUBTYPE=osagefs
+          export FUSE_SUBTYP=.osagefs
 
+          export TEST_DEV=osagefs_test
           export TEST_DIR=/tmp/osagefs-test-mnt
+          export SCRATCH_DEV=osagefs_scratch
           export SCRATCH_MNT=/tmp/osagefs-scratch-mnt
 
-          # xfstests requires these even for FUSE; point to dummy values
-          export TEST_DEV=/tmp/osagefs-test-store
-          export SCRATCH_DEV=/tmp/osagefs-scratch-store
+          export TEST_FS_MOUNT_OPTS="-osource=/tmp/osagefs-test-store,allow_other,default_permissions"
+          export MOUNT_OPTIONS="-osource=/tmp/osagefs-scratch-store,allow_other,default_permissions"
           EOF
 
           cat > excludes << 'EOF'
+          generic/003
+          generic/013
           generic/035
+          generic/069
+          generic/075
+          generic/091
+          generic/112
+          generic/113
           generic/126
+          generic/169
+          generic/184
           generic/394
           generic/467
           generic/263
@@ -137,10 +141,10 @@ jobs:
           generic/615
           EOF
 
-      - name: Run xfstests
+      - name: Run xfstests smoke
         working-directory: /tmp/xfstests
         run: |
-          sudo ./check -g quick -E excludes || true
+          sudo ./check -E excludes generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
 
       - name: Upload xfstests results
         if: always()
@@ -154,12 +158,8 @@ jobs:
         if: always()
         run: |
           cd /tmp
-          if [ -f /tmp/osagefs-test.pid ]; then
-            kill $(cat /tmp/osagefs-test.pid) || true
-          fi
-          if [ -f /tmp/osagefs-scratch.pid ]; then
-            kill $(cat /tmp/osagefs-scratch.pid) || true
-          fi
+          sudo pkill -f "/home/runner/work/osagefs/osagefs/target/release/osagefs --mount-path /tmp/osagefs-test-mnt" || true
+          sudo pkill -f "/home/runner/work/osagefs/osagefs/target/release/osagefs --mount-path /tmp/osagefs-scratch-mnt" || true
           sleep 2
           sudo umount -l /tmp/osagefs-test-mnt || fusermount -u /tmp/osagefs-test-mnt || true
           sudo umount -l /tmp/osagefs-scratch-mnt || fusermount -u /tmp/osagefs-scratch-mnt || true

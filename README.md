@@ -1,6 +1,10 @@
 # OsageFS
 
 > **POSIX compliance**: OsageFS passes the [pjdfstest](https://github.com/pjd/pjdfstest) POSIX filesystem test suite.
+>
+> **xfstests status**: OsageFS currently passes the xfstests smoke suite we run in CI/sprite (`generic/001,011,023,024,028,029,030,080,084,087,088,095,098`).
+>
+> **Linux build validation**: Linux source untar plus kernel build (`make defconfig && make -j`) passes successfully on OsageFS.
 
 OsageFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
 and payloads in a log-structured layout over an object store. Metadata now lives

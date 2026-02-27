@@ -51,6 +51,7 @@ fn perf_config(root: &PathBuf) -> Config {
         imap_delta_batch: 16,
         writeback_cache: false,
         fuse_threads: 0,
+        fuse_fsname: "osagefs".into(),
         log_storage_io: false,
     }
 }

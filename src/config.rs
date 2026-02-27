@@ -164,6 +164,10 @@ pub struct Cli {
     /// Number of FUSE dispatch threads (0 = single-threaded legacy mode).
     #[arg(long, default_value_t = 4)]
     pub fuse_threads: usize,
+
+    /// Filesystem name reported to the kernel mount table.
+    #[arg(long, default_value = "osagefs")]
+    pub fuse_fsname: String,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +210,7 @@ pub struct Config {
     pub imap_delta_batch: usize,
     pub writeback_cache: bool,
     pub fuse_threads: usize,
+    pub fuse_fsname: String,
 }
 
 impl From<Cli> for Config {
@@ -267,6 +272,11 @@ impl From<Cli> for Config {
             imap_delta_batch: cli.imap_delta_batch.max(1),
             writeback_cache: cli.writeback_cache && !cli.no_writeback_cache,
             fuse_threads: cli.fuse_threads,
+            fuse_fsname: if cli.fuse_fsname.trim().is_empty() {
+                "osagefs".to_string()
+            } else {
+                cli.fuse_fsname
+            },
         }
     }
 }
