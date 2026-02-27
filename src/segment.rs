@@ -287,8 +287,8 @@ impl SegmentManager {
             }
         }
         let codec_config = self.segment_codec_config();
-        let use_parallel =
-            !has_staged_payloads && self.should_parallel_encode(original_entry_count, estimated_size);
+        let use_parallel = !has_staged_payloads
+            && self.should_parallel_encode(original_entry_count, estimated_size);
         let mut buffer = Vec::with_capacity(estimated_size);
         buffer.extend_from_slice(SEGMENT_MAGIC_V2);
         // Placeholder for encoded entry count; updated after encoding.
@@ -348,7 +348,9 @@ impl SegmentManager {
                             buffer.extend_from_slice(
                                 &(encoded_entry.encoded.payload.len() as u64).to_le_bytes(),
                             );
-                            buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
+                            buffer.extend_from_slice(
+                                &encoded_entry.encoded.nonce.unwrap_or([0u8; 12]),
+                            );
                             buffer.extend_from_slice(&encoded_entry.encoded.payload);
                             encoded_entry_count = encoded_entry_count.saturating_add(1);
                             pointers.push((
@@ -398,8 +400,10 @@ impl SegmentManager {
                             }
                             let mut chunk_off = 0u64;
                             while chunk_off < chunk.len {
-                                let piece_len = (chunk.len - chunk_off).min(SEGMENT_CHUNK_BYTES as u64);
-                                let piece = self.read_staged_chunk_range(&chunk, chunk_off, piece_len)?;
+                                let piece_len =
+                                    (chunk.len - chunk_off).min(SEGMENT_CHUNK_BYTES as u64);
+                                let piece =
+                                    self.read_staged_chunk_range(&chunk, chunk_off, piece_len)?;
                                 let encoded_entries = encode_plain_bytes_chunked(
                                     inode,
                                     path.clone(),
@@ -452,7 +456,7 @@ impl SegmentManager {
         )?;
         self.log_backing(format_args!(
             "synced backing file path={} type=segment generation={} segment_id={} entries={} bytes={}",
-            object_path.to_string(),
+            object_path,
             generation,
             segment_id,
             pointers.len(),
@@ -807,16 +811,16 @@ impl SegmentManager {
                 if !became_zero {
                     continue;
                 }
-                if let Some(active) = state.active.as_mut() {
-                    if active.path == path {
-                        // Avoid synchronous truncate/reset of large active stage files
-                        // on the foreground flush path. Rotate to a new active file
-                        // and delete the old file out-of-band.
-                        let _old_active = state.active.take();
-                        state.active = Some(ActiveStage::new(&self.stage_dir)?);
-                        delete_paths.push(path);
-                        continue;
-                    }
+                if let Some(active) = state.active.as_mut()
+                    && active.path == path
+                {
+                    // Avoid synchronous truncate/reset of large active stage files
+                    // on the foreground flush path. Rotate to a new active file
+                    // and delete the old file out-of-band.
+                    let _old_active = state.active.take();
+                    state.active = Some(ActiveStage::new(&self.stage_dir)?);
+                    delete_paths.push(path);
+                    continue;
                 }
                 delete_paths.push(path);
             }
@@ -1169,6 +1173,7 @@ impl ActiveStage {
         let path = stage_dir.join(filename);
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -1182,7 +1187,6 @@ impl ActiveStage {
         self.len += data.len() as u64;
         Ok(offset)
     }
-
 }
 
 fn segment_prefix(user_prefix: &str) -> String {

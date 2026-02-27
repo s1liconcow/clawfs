@@ -305,41 +305,41 @@ fn effective_config(cli: &Cli, captured: Option<&CapturedFsConfig>) -> Effective
         segment_cache_bytes: 512 * 1024 * 1024,
         imap_delta_batch: 256,
     };
-    if cli.use_trace_config {
-        if let Some(c) = captured {
-            if let Some(v) = &c.home_prefix {
-                cfg.home_prefix = v.clone();
-            }
-            if let Some(v) = c.inline_threshold {
-                cfg.inline_threshold = v;
-            }
-            if let Some(v) = c.pending_bytes {
-                cfg.pending_bytes = v;
-            }
-            if let Some(v) = c.fsync_on_close {
-                cfg.fsync_on_close = v;
-            }
-            if let Some(v) = c.flush_interval_ms {
-                cfg.flush_interval_ms = v;
-            }
-            if let Some(v) = c.disable_journal {
-                cfg.disable_journal = v;
-            }
-            if let Some(v) = c.lookup_cache_ttl_ms {
-                cfg.lookup_cache_ttl_ms = v;
-            }
-            if let Some(v) = c.dir_cache_ttl_ms {
-                cfg.dir_cache_ttl_ms = v;
-            }
-            if let Some(v) = c.metadata_poll_interval_ms {
-                cfg.metadata_poll_interval_ms = v;
-            }
-            if let Some(v) = c.segment_cache_bytes {
-                cfg.segment_cache_bytes = v;
-            }
-            if let Some(v) = c.imap_delta_batch {
-                cfg.imap_delta_batch = v.max(1);
-            }
+    if cli.use_trace_config
+        && let Some(c) = captured
+    {
+        if let Some(v) = &c.home_prefix {
+            cfg.home_prefix = v.clone();
+        }
+        if let Some(v) = c.inline_threshold {
+            cfg.inline_threshold = v;
+        }
+        if let Some(v) = c.pending_bytes {
+            cfg.pending_bytes = v;
+        }
+        if let Some(v) = c.fsync_on_close {
+            cfg.fsync_on_close = v;
+        }
+        if let Some(v) = c.flush_interval_ms {
+            cfg.flush_interval_ms = v;
+        }
+        if let Some(v) = c.disable_journal {
+            cfg.disable_journal = v;
+        }
+        if let Some(v) = c.lookup_cache_ttl_ms {
+            cfg.lookup_cache_ttl_ms = v;
+        }
+        if let Some(v) = c.dir_cache_ttl_ms {
+            cfg.dir_cache_ttl_ms = v;
+        }
+        if let Some(v) = c.metadata_poll_interval_ms {
+            cfg.metadata_poll_interval_ms = v;
+        }
+        if let Some(v) = c.segment_cache_bytes {
+            cfg.segment_cache_bytes = v;
+        }
+        if let Some(v) = c.imap_delta_batch {
+            cfg.imap_delta_batch = v.max(1);
         }
     }
     if let Some(home) = &cli.home_prefix {
@@ -633,13 +633,11 @@ fn read_trace_text(path: &PathBuf) -> Result<TraceText> {
 
     let mut dropped_partial_lines = 0usize;
     let mut lines: Vec<String> = text.lines().map(ToString::to_string).collect();
-    if repaired {
-        if let Some(last) = lines.last() {
-            let trimmed = last.trim();
-            if !trimmed.is_empty() && !trimmed.ends_with('}') {
-                lines.pop();
-                dropped_partial_lines = 1;
-            }
+    if repaired && let Some(last) = lines.last() {
+        let trimmed = last.trim();
+        if !trimmed.is_empty() && !trimmed.ends_with('}') {
+            lines.pop();
+            dropped_partial_lines = 1;
         }
     }
     Ok(TraceText {

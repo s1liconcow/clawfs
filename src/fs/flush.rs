@@ -461,14 +461,15 @@ impl OsageFs {
                                     FileStorage::Segments(exts) => exts,
                                     _ => base_extents.to_vec(),
                                 },
-                                None => match self.block_on(self.metadata.get_inode(record.inode))
-                                {
-                                    Ok(Some(r)) => match r.storage {
-                                        FileStorage::Segments(exts) => exts,
+                                None => {
+                                    match self.block_on(self.metadata.get_inode(record.inode)) {
+                                        Ok(Some(r)) => match r.storage {
+                                            FileStorage::Segments(exts) => exts,
+                                            _ => base_extents.to_vec(),
+                                        },
                                         _ => base_extents.to_vec(),
-                                    },
-                                    _ => base_extents.to_vec(),
-                                },
+                                    }
+                                }
                             }
                         } else {
                             base_extents.to_vec()
@@ -569,9 +570,11 @@ impl OsageFs {
             let pending_remaining = loop {
                 let current = self.pending_bytes.load(Ordering::Relaxed);
                 let new_val = current.saturating_sub(flushed_bytes);
-                if self.pending_bytes.compare_exchange_weak(
-                    current, new_val, Ordering::Relaxed, Ordering::Relaxed
-                ).is_ok() {
+                if self
+                    .pending_bytes
+                    .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     break new_val;
                 }
             };
@@ -598,8 +601,8 @@ impl OsageFs {
             for pending_entry in flushed_entries.into_values() {
                 if let Some(data) = pending_entry.data {
                     if let PendingData::Staged(segments) = &data {
-                        released_staged_chunks = released_staged_chunks
-                            .saturating_add(segments.chunks.len() as u64);
+                        released_staged_chunks =
+                            released_staged_chunks.saturating_add(segments.chunks.len() as u64);
                     }
                     self.release_pending_data(data);
                 }
@@ -614,7 +617,7 @@ impl OsageFs {
                     .filter(|inode| {
                         self.active_inodes
                             .get(inode)
-                            .map_or(true, |arc| arc.lock().pending.is_none())
+                            .is_none_or(|arc| arc.lock().pending.is_none())
                     })
                     .collect::<Vec<_>>();
                 let journal_clear_start = Instant::now();
@@ -713,17 +716,16 @@ impl OsageFs {
                 if state.pending.is_none() {
                     state.pending = Some(entry);
                     self.pending_inodes.insert(inode);
-                } else {
-                    if let Some(data) = entry.data {
-                        dropped_bytes = dropped_bytes.saturating_add(data.len());
-                        self.release_pending_data(data);
-                    }
+                } else if let Some(data) = entry.data {
+                    dropped_bytes = dropped_bytes.saturating_add(data.len());
+                    self.release_pending_data(data);
                 }
                 state.flushing = None;
             }
         }
         if dropped_bytes > 0 {
-            self.pending_bytes.fetch_sub(dropped_bytes, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_sub(dropped_bytes, Ordering::Relaxed);
         }
     }
 
@@ -814,7 +816,8 @@ impl OsageFs {
     }
 
     pub(crate) fn touch_last_flush(&self) {
-        self.last_flush.store(super::core::epoch_millis_now(), Ordering::Relaxed);
+        self.last_flush
+            .store(super::core::epoch_millis_now(), Ordering::Relaxed);
     }
 
     pub(crate) fn log_fuse_error(&self, op: &str, detail: &str, code: i32) {

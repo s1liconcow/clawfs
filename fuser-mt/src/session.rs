@@ -271,20 +271,18 @@ impl<FS: 'static + Filesystem + Clone + Send> Session<FS> {
                             break;
                         }
                         match ch.receive(buf) {
-                            Ok(size) => {
-                                match Request::new(sender.clone(), &buf[..size]) {
-                                    Some(req) => {
-                                        req.dispatch_on_worker(
-                                            &mut fs,
-                                            &allowed,
-                                            session_owner,
-                                            proto_major,
-                                            proto_minor,
-                                        );
-                                    }
-                                    None => break,
+                            Ok(size) => match Request::new(sender.clone(), &buf[..size]) {
+                                Some(req) => {
+                                    req.dispatch_on_worker(
+                                        &mut fs,
+                                        &allowed,
+                                        session_owner,
+                                        proto_major,
+                                        proto_minor,
+                                    );
                                 }
-                            }
+                                None => break,
+                            },
                             Err(err) => match err.raw_os_error() {
                                 Some(ENOENT) | Some(EINTR) | Some(EAGAIN) => continue,
                                 Some(ENODEV) => break,

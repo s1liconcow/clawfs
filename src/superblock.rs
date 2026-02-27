@@ -196,7 +196,6 @@ impl SuperblockManager {
                     bail!("generation {} not pending", generation);
                 }
 
-
                 let expected_version = guard.version.clone();
                 guard.block.generation = generation;
                 guard.block.state = FilesystemState::Clean;

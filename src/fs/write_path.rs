@@ -107,10 +107,12 @@ impl OsageFs {
         }
 
         let pending_total = if new_len >= prev_len {
-            self.pending_bytes.fetch_add(new_len - prev_len, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_add(new_len - prev_len, Ordering::Relaxed)
                 .saturating_add(new_len - prev_len)
         } else {
-            self.pending_bytes.fetch_sub(prev_len - new_len, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_sub(prev_len - new_len, Ordering::Relaxed)
                 .saturating_sub(prev_len - new_len)
         };
         let should_flush = pending_total >= self.config.pending_bytes;
@@ -239,10 +241,12 @@ impl OsageFs {
         }
 
         let pending_total = if new_len >= prev_len {
-            self.pending_bytes.fetch_add(new_len - prev_len, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_add(new_len - prev_len, Ordering::Relaxed)
                 .saturating_add(new_len - prev_len)
         } else {
-            self.pending_bytes.fetch_sub(prev_len - new_len, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_sub(prev_len - new_len, Ordering::Relaxed)
                 .saturating_sub(prev_len - new_len)
         };
         let should_flush = pending_total >= self.config.pending_bytes;
@@ -417,7 +421,7 @@ impl OsageFs {
         // Track staged bytes separately: base_extents don't count toward the
         // in-flight dirty-byte watermark since they are already committed.
         let prev_staged = segments.staged_bytes();
-        if let Err(_) = segments.ensure_offset(offset) {
+        if segments.ensure_offset(offset).is_err() {
             self.release_pending_data(PendingData::Staged(segments));
             self.log_fuse_error(
                 "write_large_segments",
@@ -440,7 +444,10 @@ impl OsageFs {
                 return Err(EIO);
             }
         };
-        if let Err(_) = segments.write_range(&self.segments, offset, staged_chunk) {
+        if segments
+            .write_range(&self.segments, offset, staged_chunk)
+            .is_err()
+        {
             self.release_pending_data(PendingData::Staged(segments));
             self.log_fuse_error(
                 "write_large_segments",
@@ -479,10 +486,12 @@ impl OsageFs {
         // Use the staged-bytes delta for pending_bytes, not total_len, so that
         // base_extents (already committed) don't inflate the dirty-byte counter.
         let pending_total = if new_staged >= prev_staged {
-            self.pending_bytes.fetch_add(new_staged - prev_staged, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_add(new_staged - prev_staged, Ordering::Relaxed)
                 .saturating_add(new_staged - prev_staged)
         } else {
-            self.pending_bytes.fetch_sub(prev_staged - new_staged, Ordering::Relaxed)
+            self.pending_bytes
+                .fetch_sub(prev_staged - new_staged, Ordering::Relaxed)
                 .saturating_sub(prev_staged - new_staged)
         };
         let pending_limit = self.pending_flush_limit_for_write(offset == prev_len, data.len());

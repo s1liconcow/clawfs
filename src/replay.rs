@@ -21,10 +21,10 @@ pub struct ReplayLogger {
 
 impl ReplayLogger {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {

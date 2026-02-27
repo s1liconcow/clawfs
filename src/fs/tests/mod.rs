@@ -489,9 +489,9 @@ fn untar_style_perf_mixture() {
         cfg.flush_interval_ms = 0;
     });
     let mut sizes = Vec::new();
-    sizes.extend(std::iter::repeat(4 * 1024).take(2000));
-    sizes.extend(std::iter::repeat(64 * 1024).take(512));
-    sizes.extend(std::iter::repeat(512 * 1024).take(64));
+    sizes.extend(std::iter::repeat_n(4 * 1024, 2000));
+    sizes.extend(std::iter::repeat_n(64 * 1024, 512));
+    sizes.extend(std::iter::repeat_n(512 * 1024, 64));
     let mut total_bytes = 0usize;
     let start = Instant::now();
     for (idx, size) in sizes.into_iter().enumerate() {
@@ -529,12 +529,20 @@ fn stress_flush_respects_pending_threshold() {
         inodes.push(inode);
     }
     harness.fs.flush_pending().unwrap();
-    assert!(!harness
-        .fs
-        .active_inodes
-        .iter()
-        .any(|e| e.value().lock().pending.is_some()));
-    assert_eq!(harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(
+        !harness
+            .fs
+            .active_inodes
+            .iter()
+            .any(|e| e.value().lock().pending.is_some())
+    );
+    assert_eq!(
+        harness
+            .fs
+            .pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     for inode in inodes {
         let record = harness
             .runtime
@@ -565,7 +573,13 @@ fn append_file_handles_staged_pending_without_panic() {
         .fs
         .active_inodes
         .get(&inode)
-        .map(|arc| arc.lock().pending.as_ref().and_then(|e| e.data.as_ref().map(|d| d.len())).unwrap_or(0))
+        .map(|arc| {
+            arc.lock()
+                .pending
+                .as_ref()
+                .and_then(|e| e.data.as_ref().map(|d| d.len()))
+                .unwrap_or(0)
+        })
         .unwrap_or(0);
     assert_eq!(pending_len, initial.len() as u64 + 3);
 }
@@ -617,7 +631,10 @@ fn adaptive_large_append_keeps_data_pending_with_journal() {
             .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
             .unwrap();
     }
-    let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let pending_total = harness
+        .fs
+        .pending_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         pending_total > harness.fs.config.pending_bytes,
         "expected adaptive pending to exceed base threshold, got {} vs {}",
@@ -651,7 +668,10 @@ fn adaptive_large_append_keeps_data_pending_without_journal() {
             .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
             .unwrap();
     }
-    let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let pending_total = harness
+        .fs
+        .pending_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         pending_total > harness.fs.config.pending_bytes,
         "expected adaptive pending to exceed base threshold without journal, got {} vs {}",
@@ -683,7 +703,10 @@ fn adaptive_large_append_replays_after_crash() {
                 .write_large_segments(record, (i * chunk.len()) as u64, &chunk)
                 .unwrap();
         }
-        let pending_total = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let pending_total = harness
+            .fs
+            .pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             pending_total > harness.fs.config.pending_bytes,
             "expected replay setup to leave pending data"
@@ -1173,7 +1196,7 @@ fn flush_pending_for_inode_keeps_other_pending_entries() {
             .fs
             .active_inodes
             .get(&file_b.inode)
-            .map_or(false, |arc| arc.lock().pending.is_some()),
+            .is_some_and(|arc| arc.lock().pending.is_some()),
         "expected unrelated inode to remain pending"
     );
     let stored_a = harness
@@ -1210,15 +1233,15 @@ fn flush_pending_for_inode_flushes_pending_ancestor_directories() {
 
     harness.fs.flush_pending_for_inode(file.inode).unwrap();
 
-    let pending = |ino| harness.fs.active_inodes.get(&ino).map_or(false, |arc| arc.lock().pending.is_some());
-    assert!(
-        !pending(file.inode),
-        "file inode should be flushed"
-    );
-    assert!(
-        !pending(dir_b.inode),
-        "direct parent should be flushed"
-    );
+    let pending = |ino| {
+        harness
+            .fs
+            .active_inodes
+            .get(&ino)
+            .is_some_and(|arc| arc.lock().pending.is_some())
+    };
+    assert!(!pending(file.inode), "file inode should be flushed");
+    assert!(!pending(dir_b.inode), "direct parent should be flushed");
     assert!(
         !pending(dir_a.inode),
         "ancestor directory should be flushed"
@@ -1638,6 +1661,31 @@ fn sticky_bit_blocks_rename_by_third_party() {
 }
 
 #[test]
+fn unlink_last_link_keeps_open_inode_readable_and_writable() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "unlink_open.bin", 8 * 1024 * 1024);
+    let fs = &harness.fs;
+
+    let file = fs.op_create(ROOT_INODE, "victim.txt", 1000, 1000).unwrap();
+    let ino = file.inode;
+    let payload = b"Hello, World!";
+    fs.op_write(ino, 0, payload).unwrap();
+
+    fs.op_remove_file(ROOT_INODE, "victim.txt", 1000).unwrap();
+    assert_eq!(fs.op_lookup(ROOT_INODE, "victim.txt").unwrap_err(), ENOENT);
+
+    let stat_after_unlink = fs.op_getattr(ino).unwrap();
+    assert_eq!(stat_after_unlink.link_count, 0);
+
+    let read_back = fs.op_read(ino, 0, payload.len() as u32).unwrap();
+    assert_eq!(read_back, payload);
+
+    fs.op_write(ino, payload.len() as u64, b"++").unwrap();
+    let read_back2 = fs.op_read(ino, 0, (payload.len() + 2) as u32).unwrap();
+    assert_eq!(read_back2, b"Hello, World!++");
+}
+
+#[test]
 fn sticky_bit_allows_rename_by_file_owner() {
     let dir = tempdir().unwrap();
     let harness = TestHarness::new(dir.path(), "sticky_ren_fown.bin", 8 * 1024 * 1024);
@@ -1949,7 +1997,13 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
     stale_record.storage = FileStorage::Inline(Vec::new()); // stale placeholder
     stale_record.mode = (stale_record.mode & !0o7777) | 0o100604;
 
-    let active_arc = fs.active_inodes.entry(file.inode).or_insert_with(|| std::sync::Arc::new(parking_lot::Mutex::new(crate::fs::ActiveInode::default()))).clone();
+    let active_arc = fs
+        .active_inodes
+        .entry(file.inode)
+        .or_insert_with(|| {
+            std::sync::Arc::new(parking_lot::Mutex::new(crate::fs::ActiveInode::default()))
+        })
+        .clone();
     active_arc.lock().pending = Some(PendingEntry {
         record: stale_record,
         data: None,
@@ -2005,11 +2059,11 @@ fn overwrite_at_offset_zero_after_flush_does_not_eio() {
 
     // Confirm the inode is committed in segment storage and not pending.
     assert!(
-        !harness
+        harness
             .fs
             .active_inodes
             .get(&inode)
-            .map_or(false, |arc| arc.lock().pending.is_some()),
+            .is_none_or(|arc| arc.lock().pending.is_none()),
         "inode should not be pending after flush"
     );
     let committed = harness
@@ -2037,7 +2091,7 @@ fn overwrite_at_offset_zero_after_flush_does_not_eio() {
             .fs
             .active_inodes
             .get(&inode)
-            .map_or(false, |arc| arc.lock().pending.is_some()),
+            .is_some_and(|arc| arc.lock().pending.is_some()),
         "inode should be pending after overwrite"
     );
 
@@ -2327,7 +2381,10 @@ fn small_overwrite_on_large_file_does_not_restage_full_file() {
 
     let active_arc = harness.fs.active_inodes.get(&inode).expect("active");
     let state = active_arc.lock();
-    let pending = state.pending.as_ref().expect("inode should be pending after tiny overwrite");
+    let pending = state
+        .pending
+        .as_ref()
+        .expect("inode should be pending after tiny overwrite");
     let staged_bytes = match pending.data.as_ref().expect("pending data should exist") {
         PendingData::Staged(segs) => segs.staged_bytes(),
         PendingData::Inline(_) => panic!("large file tiny overwrite must stay on segment path"),
@@ -2381,7 +2438,10 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
     assert_eq!(committed.len(), total);
 
     // Record pending_bytes before the second write cycle.
-    let pb_before = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let pb_before = harness
+        .fs
+        .pending_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Write a new block to make the inode dirty again, then flush.
     // The first flush will drain the pending entry into flushing state.
@@ -2391,7 +2451,10 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
         .op_write(inode, 0, &new_data)
         .expect("overwrite block 0");
 
-    let pb_after_write = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let pb_after_write = harness
+        .fs
+        .pending_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     let delta = pb_after_write - pb_before;
     // The delta should be roughly 1 block, NOT the entire file.
     assert!(
@@ -2407,7 +2470,10 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
     // we test by directly manipulating state: drain pending -> flushing, then write.
     harness.fs.flush_pending().unwrap();
     // File should be fully committed again.
-    let pb_after_flush = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let pb_after_flush = harness
+        .fs
+        .pending_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         pb_after_flush < (total as u64),
         "pending_bytes after flush should be small, got {}",
@@ -2423,7 +2489,10 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
             .expect("round write");
         harness.fs.flush_pending().unwrap();
 
-        let pb = harness.fs.pending_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let pb = harness
+            .fs
+            .pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         // pending_bytes must never wrap to near u64::MAX
         assert!(
             pb < (total as u64 * 4),
@@ -2436,7 +2505,11 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
 
     // Final read-back: block 0 = 0xAA, block 1 = 0xBB+3, rest = original.
     let final_data = harness.fs.op_read(inode, 0, total as u32).unwrap();
-    assert_eq!(&final_data[..block], &vec![0xAA; block][..], "block 0 should be 0xAA");
+    assert_eq!(
+        &final_data[..block],
+        &vec![0xAA; block][..],
+        "block 0 should be 0xAA"
+    );
     assert_eq!(
         &final_data[block..block * 2],
         &vec![0xBB + 3; block][..],
@@ -2464,7 +2537,8 @@ fn write_during_flushing_state_does_not_duplicate_staged_bytes() {
 #[test]
 fn rename_during_flushing_preserves_file_data() {
     let dir = tempdir().unwrap();
-    let harness = TestHarness::with_config(dir.path(), "rename_flush.bin", 64 * 1024 * 1024, |_| {});
+    let harness =
+        TestHarness::with_config(dir.path(), "rename_flush.bin", 64 * 1024 * 1024, |_| {});
     let fs = &harness.fs;
 
     let parent = fs.op_mkdir(ROOT_INODE, "workdir", 0, 0).unwrap();
@@ -2483,7 +2557,8 @@ fn rename_during_flushing_preserves_file_data() {
     // while the inode is in the flushing state (the loaded record has
     // stale storage from the flush classify placeholder).
     {
-        let active_arc = fs.active_inodes
+        let active_arc = fs
+            .active_inodes
             .entry(source.inode)
             .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
             .clone();
@@ -2501,10 +2576,17 @@ fn rename_during_flushing_preserves_file_data() {
 
     // Read the file — without the fix, this returns all zeros
     let record = fs.load_inode(source.inode).unwrap();
-    assert_eq!(record.size, file_data.len() as u64, "size should be correct");
+    assert_eq!(
+        record.size,
+        file_data.len() as u64,
+        "size should be correct"
+    );
     let read_back = fs.read_file_bytes(&record).unwrap();
     assert_eq!(read_back.len(), file_data.len(), "read size mismatch");
-    assert_eq!(read_back, file_data, "data corrupted — stale placeholder storage returned zeros");
+    assert_eq!(
+        read_back, file_data,
+        "data corrupted — stale placeholder storage returned zeros"
+    );
 }
 
 /// Regression test: rename while flush is actively running (flushing state)
@@ -2522,7 +2604,7 @@ fn rename_with_concurrent_flush_preserves_data() {
         // Create index.lock
         let lock = fs.op_create(parent.inode, "index.lock", 0, 0).unwrap();
         let data: Vec<u8> = (0..(2000 + round * 500))
-            .map(|i| ((i * 7 + round as u64) % 251) as u8)
+            .map(|i| ((i * 7 + round) % 251) as u8)
             .collect();
         fs.op_write(lock.inode, 0, &data).unwrap();
 
@@ -2530,7 +2612,8 @@ fn rename_with_concurrent_flush_preserves_data() {
         fs.flush_pending().unwrap();
 
         // Rename index.lock → index
-        fs.op_rename(parent.inode, "index.lock", parent.inode, "index", 0, 0).unwrap();
+        fs.op_rename(parent.inode, "index.lock", parent.inode, "index", 0, 0)
+            .unwrap();
 
         // Verify data integrity after rename
         let record = fs.load_inode(lock.inode).unwrap();
@@ -2603,11 +2686,7 @@ fn parallel_build_create_flush_lookup_unlink() {
             result.err()
         );
         let record = result.unwrap();
-        assert_eq!(
-            record.inode, *expected_ino,
-            "inode mismatch for {}",
-            name
-        );
+        assert_eq!(record.inode, *expected_ino, "inode mismatch for {}", name);
     }
 
     // Verify all children appear in the parent directory
@@ -2798,10 +2877,7 @@ fn truncate_then_write_does_not_inherit_old_segment_extents() {
 
     // Verify committed storage is Segments.
     let committed = harness.metadata.get_cached_inode(ino);
-    assert!(
-        committed.is_some(),
-        "inode should be committed after flush"
-    );
+    assert!(committed.is_some(), "inode should be committed after flush");
     assert!(
         matches!(committed.unwrap().storage, FileStorage::Segments(ref e) if !e.is_empty()),
         "committed storage should be non-empty Segments"
@@ -2894,7 +2970,10 @@ fn truncate_flushing_then_write_does_not_inherit_old_extents() {
     assert!(
         result[..1024].iter().all(|&b| b == 0x00),
         "gap 0..1024 should be zero-filled, not stale 0xAA from old extents; got {:02x} {:02x} {:02x} {:02x}...",
-        result[0], result[1], result[2], result[3],
+        result[0],
+        result[1],
+        result[2],
+        result[3],
     );
     assert!(
         result[1024..].iter().all(|&b| b == 0xDD),
@@ -2922,9 +3001,9 @@ fn truncate_then_nonsequential_writes_correct_after_flush() {
 
     // Non-sequential writes (high offsets first, then header, like `as` does):
     let section_text = vec![0x22u8; 1024];
-    fs.op_write(ino, 2048, &section_text).unwrap();  // .text at offset 2048
+    fs.op_write(ino, 2048, &section_text).unwrap(); // .text at offset 2048
     let section_data = vec![0x33u8; 512];
-    fs.op_write(ino, 1024, &section_data).unwrap();   // .data at offset 1024
+    fs.op_write(ino, 1024, &section_data).unwrap(); // .data at offset 1024
     // Fill gap at 1536..2048 with zeros.
     let gap = vec![0x00u8; 512];
     fs.op_write(ino, 1536, &gap).unwrap();
@@ -2938,10 +3017,22 @@ fn truncate_then_nonsequential_writes_correct_after_flush() {
     // Verify full file content.
     let result = fs.nfs_read(ino, 0, 4096).unwrap();
     assert_eq!(result.len(), 3072, "file should be 3072 bytes (3 * 1024)");
-    assert!(result[..1024].iter().all(|&b| b == 0x44), "header 0..1024 should be 0x44");
-    assert!(result[1024..1536].iter().all(|&b| b == 0x33), ".data 1024..1536 should be 0x33");
-    assert!(result[1536..2048].iter().all(|&b| b == 0x00), "gap 1536..2048 should be 0x00");
-    assert!(result[2048..3072].iter().all(|&b| b == 0x22), ".text 2048..3072 should be 0x22");
+    assert!(
+        result[..1024].iter().all(|&b| b == 0x44),
+        "header 0..1024 should be 0x44"
+    );
+    assert!(
+        result[1024..1536].iter().all(|&b| b == 0x33),
+        ".data 1024..1536 should be 0x33"
+    );
+    assert!(
+        result[1536..2048].iter().all(|&b| b == 0x00),
+        "gap 1536..2048 should be 0x00"
+    );
+    assert!(
+        result[2048..3072].iter().all(|&b| b == 0x22),
+        ".text 2048..3072 should be 0x22"
+    );
 }
 
 /// Regression test: if an inode has moved to flushing state with staged chunks,
@@ -2952,7 +3043,9 @@ fn write_during_flushing_preserves_in_flight_chunks() {
     let harness = TestHarness::new(dir.path(), "write_during_flushing.bin", 1 << 20);
     let fs = &harness.fs;
 
-    let file = fs.nfs_create(ROOT_INODE, "race_flush_write.o", 0, 0).unwrap();
+    let file = fs
+        .nfs_create(ROOT_INODE, "race_flush_write.o", 0, 0)
+        .unwrap();
     let ino = file.inode;
 
     // Establish committed segment-backed data.

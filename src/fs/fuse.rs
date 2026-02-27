@@ -3,6 +3,7 @@ use super::*;
 impl OsageFs {
     // FUSE create semantics differ from nfs_create: O_CREAT without O_EXCL should open
     // an existing file instead of returning EEXIST when a parallel creator won the race.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fuse_create_file(
         &self,
         parent: u64,

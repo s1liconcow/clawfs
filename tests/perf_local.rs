@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ use tempfile::tempdir;
 use time::OffsetDateTime;
 use tokio::runtime::Runtime;
 
-fn perf_config(root: &PathBuf) -> Config {
+fn perf_config(root: &Path) -> Config {
     Config {
         mount_path: root.join("mnt"),
         store_path: root.join("store"),
@@ -276,7 +276,7 @@ fn local_disk_stage_throughput() {
     std::fs::create_dir_all(&config.local_cache_path).unwrap();
     let runtime = Runtime::new().unwrap();
     let segments = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
-    let chunk_size = 1 * 1024 * 1024; // 1 MiB writes
+    let chunk_size = 1024 * 1024; // 1 MiB writes
     let iterations = 40; // 40 MiB total
     let payload = vec![0x55u8; chunk_size];
     let start = Instant::now();

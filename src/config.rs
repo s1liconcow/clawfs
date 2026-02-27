@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, ValueEnum};
 
@@ -288,11 +288,11 @@ fn default_user_config_root() -> PathBuf {
         .join(".osagefs")
 }
 
-fn default_state_path(root: &PathBuf) -> PathBuf {
+fn default_state_path(root: &Path) -> PathBuf {
     root.join("state").join("client_state.bin")
 }
 
-fn default_local_cache_path(root: &PathBuf) -> PathBuf {
+fn default_local_cache_path(root: &Path) -> PathBuf {
     root.join("cache")
 }
 

@@ -256,12 +256,11 @@ impl InodeRecord {
     }
 
     pub fn segment_extents_mut(&mut self) -> Option<&mut Vec<SegmentExtent>> {
-        if matches!(self.storage, FileStorage::LegacySegment(_)) {
-            if let FileStorage::LegacySegment(ptr) =
+        if matches!(self.storage, FileStorage::LegacySegment(_))
+            && let FileStorage::LegacySegment(ptr) =
                 std::mem::replace(&mut self.storage, FileStorage::Inline(Vec::new()))
-            {
-                self.storage = FileStorage::Segments(vec![SegmentExtent::new(0, ptr)]);
-            }
+        {
+            self.storage = FileStorage::Segments(vec![SegmentExtent::new(0, ptr)]);
         }
         match &mut self.storage {
             FileStorage::Segments(extents) => Some(extents),

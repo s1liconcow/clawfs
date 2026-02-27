@@ -339,10 +339,10 @@ impl MetadataStore {
         // Negative cache: skip shard load if we recently confirmed ENOENT.
         {
             let neg = self.negative_cache.lock();
-            if let Some(&expires) = neg.get(&inode) {
-                if Instant::now() < expires {
-                    return Ok(None);
-                }
+            if let Some(&expires) = neg.get(&inode)
+                && Instant::now() < expires
+            {
+                return Ok(None);
             }
         }
 
@@ -398,7 +398,10 @@ impl MetadataStore {
             let mut neg = self.negative_cache.lock();
             for record in records {
                 neg.remove(&record.inode);
-                cache.insert(record.inode, CacheEntry::with_generation(record.clone(), generation));
+                cache.insert(
+                    record.inode,
+                    CacheEntry::with_generation(record.clone(), generation),
+                );
                 let shard_id = record.shard_index(shard_size);
                 let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
                     shard: InodeShard::new(shard_id),
@@ -564,8 +567,7 @@ impl MetadataStore {
             }
         }
 
-        let mut cache = self.cache.lock();
-        let mut shard_map = self.shards.lock();
+        let mut loaded_shards = Vec::new();
         let mut max_generation = 0;
 
         // Parallel fetch could be better here, but keep it simple for now
@@ -577,12 +579,21 @@ impl MetadataStore {
                 "unsupported shard version {}",
                 stored.version
             );
+            loaded_shards.push((shard_id, stored));
+        }
+
+        let mut cache = self.cache.lock();
+        let mut shard_map = self.shards.lock();
+        for (shard_id, stored) in loaded_shards {
             let mut shard = InodeShard::new(shard_id);
             for (ino, record) in stored.entries {
                 shard.inodes.insert(ino, record);
             }
             for (ino, record) in &shard.inodes {
-                cache.insert(*ino, CacheEntry::with_generation(record.clone(), stored.generation));
+                cache.insert(
+                    *ino,
+                    CacheEntry::with_generation(record.clone(), stored.generation),
+                );
             }
             max_generation = max_generation.max(stored.generation);
             shard_map.insert(
@@ -613,10 +624,10 @@ impl MetadataStore {
             while let Some(item) = stream.next().await {
                 let meta = item?;
                 let name = meta.location.filename().unwrap_or_default();
-                if let Some(generation) = parse_delta_filename(name) {
-                    if generation > newest {
-                        files.push((generation, meta.location));
-                    }
+                if let Some(generation) = parse_delta_filename(name)
+                    && generation > newest
+                {
+                    files.push((generation, meta.location));
                 }
             }
 
@@ -634,9 +645,10 @@ impl MetadataStore {
                     if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
                         self.cache.lock().remove(&record.inode);
                     } else {
-                        self.cache
-                            .lock()
-                            .insert(record.inode, CacheEntry::with_generation(record.clone(), generation));
+                        self.cache.lock().insert(
+                            record.inode,
+                            CacheEntry::with_generation(record.clone(), generation),
+                        );
                         updated_records.push(record.clone());
                     }
                 }
@@ -726,13 +738,13 @@ impl MetadataStore {
         while let Some(item) = stream.next().await {
             let meta = item?;
             let name = meta.location.filename().unwrap_or_default();
-            if let Some((generation, shard)) = parse_imap_filename(name) {
-                if shard == shard_id {
-                    newest_path = match newest_path {
-                        Some((existing_gen, _)) if existing_gen >= generation => newest_path,
-                        _ => Some((generation, meta.location)),
-                    };
-                }
+            if let Some((generation, shard)) = parse_imap_filename(name)
+                && shard == shard_id
+            {
+                newest_path = match newest_path {
+                    Some((existing_gen, _)) if existing_gen >= generation => newest_path,
+                    _ => Some((generation, meta.location)),
+                };
             }
         }
 
@@ -761,7 +773,10 @@ impl MetadataStore {
                     .map(|existing| existing.generation > generation)
                     .unwrap_or(false);
                 if !dominated {
-                    cache.insert(*ino, CacheEntry::with_generation(record.clone(), generation));
+                    cache.insert(
+                        *ino,
+                        CacheEntry::with_generation(record.clone(), generation),
+                    );
                 }
             }
             let mut shard_map = self.shards.lock();
@@ -817,7 +832,7 @@ fn parse_delta_filename(name: &str) -> Option<u64> {
     }
     let trimmed = name.trim_start_matches('d').trim_start_matches('_');
     let parts: Vec<&str> = trimmed.split('_').collect();
-    if parts.len() < 1 {
+    if parts.is_empty() {
         return None;
     }
     let generation = parts[0].parse::<u64>().ok()?;

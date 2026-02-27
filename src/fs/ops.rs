@@ -58,6 +58,7 @@ impl OsageFs {
         Ok(entries)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_nfs_setattr(
         &self,
         ino: u64,
@@ -164,7 +165,7 @@ impl OsageFs {
         // FUSE setattr with req.uid() = writer's uid and the new mode = old mode
         // with SUID/SGID stripped.  We must honour this or the write() syscall
         // itself fails with EPERM (file_remove_privs returns the setattr error).
-        let is_priv_strip_only = mode.map_or(false, |m| {
+        let is_priv_strip_only = mode.is_some_and(|m| {
             let old = record.mode & 0o7777;
             let new = m & 0o7777;
             (old & 0o0777) == (new & 0o0777)              // rwx bits unchanged
@@ -180,10 +181,11 @@ impl OsageFs {
         //   - gid change: root always; owner may change to any group they belong to.
         //     FUSE does not expose supplementary groups, so we allow the owner to
         //     change the gid freely (permissive but necessary given the API limit).
-        if let Some(new_uid) = uid {
-            if caller_uid != 0 && new_uid != record.uid {
-                return Err(EPERM);
-            }
+        if let Some(new_uid) = uid
+            && caller_uid != 0
+            && new_uid != record.uid
+        {
+            return Err(EPERM);
         }
         if let Some(new_gid) = gid {
             if caller_uid != 0 && record.uid != caller_uid {
@@ -305,6 +307,7 @@ impl OsageFs {
         Ok(file)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_create_fuse(
         &self,
         parent: u64,

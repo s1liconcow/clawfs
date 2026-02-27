@@ -50,7 +50,7 @@ const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
 const NAME_MAX_BYTES: usize = 255;
 
 #[cfg(target_os = "linux")]
-const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE as u32;
+const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE;
 #[cfg(not(target_os = "linux"))]
 const RENAME_NOREPLACE_FLAG: u32 = 0;
 
@@ -252,10 +252,10 @@ impl PendingSegments {
             let chunk_start = existing.logical_offset;
             let chunk_end = chunk_start.saturating_add(existing.len);
             if chunk_end <= offset || chunk_start >= write_end {
-                if chunk_start >= write_end {
-                    if let Some(new_chunk) = pending_chunk.take() {
-                        result.push(new_chunk);
-                    }
+                if chunk_start >= write_end
+                    && let Some(new_chunk) = pending_chunk.take()
+                {
+                    result.push(new_chunk);
                 }
                 result.push(existing);
             } else {

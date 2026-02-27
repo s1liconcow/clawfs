@@ -31,6 +31,7 @@ const DELTA_COMPACT_THRESHOLD: usize = 128;
 const DELTA_COMPACT_KEEP: usize = 32;
 const SEGMENT_COMPACT_BATCH: usize = 8;
 const SEGMENT_COMPACT_LAG: u64 = 3;
+type SegmentCompactionEntry = (InodeRecord, Vec<SegmentPointer>, Vec<u8>);
 const WELCOME_FILENAME: &str = "WELCOME.txt";
 const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
 \n\
@@ -451,29 +452,28 @@ fn spawn_cleanup_worker(
             .await
             .unwrap_or(Ok(0))
             .unwrap_or(0);
-            if delta_count > DELTA_COMPACT_THRESHOLD {
-                if superblock
+            if delta_count > DELTA_COMPACT_THRESHOLD
+                && superblock
                     .try_acquire_cleanup(CleanupTaskKind::DeltaCompaction, &client_id, lease_ttl)
                     .await
                     .unwrap_or(false)
+            {
+                if let Err(err) = task::spawn_blocking({
+                    let md = metadata.clone();
+                    move || md.prune_deltas(DELTA_COMPACT_KEEP)
+                })
+                .await
+                .unwrap_or(Ok(0))
                 {
-                    if let Err(err) = task::spawn_blocking({
-                        let md = metadata.clone();
-                        move || md.prune_deltas(DELTA_COMPACT_KEEP)
-                    })
-                    .await
-                    .unwrap_or(Ok(0))
-                    {
-                        warn!("delta prune failed: {err:?}");
-                    }
-                    if let Err(err) = superblock
-                        .complete_cleanup(CleanupTaskKind::DeltaCompaction, &client_id)
-                        .await
-                    {
-                        warn!("cleanup lease release failed: {err:?}");
-                    }
-                    did_work = true;
+                    warn!("delta prune failed: {err:?}");
                 }
+                if let Err(err) = superblock
+                    .complete_cleanup(CleanupTaskKind::DeltaCompaction, &client_id)
+                    .await
+                {
+                    warn!("cleanup lease release failed: {err:?}");
+                }
+                did_work = true;
             }
             if !did_work {
                 let current_generation = superblock.snapshot().generation;
@@ -541,7 +541,7 @@ async fn perform_segment_compaction(
     }
     let dataset = task::spawn_blocking({
         let segs = segments.clone();
-        move || -> Result<Vec<(InodeRecord, Vec<SegmentPointer>, Vec<u8>)>> {
+        move || -> Result<Vec<SegmentCompactionEntry>> {
             let mut out = Vec::new();
             for record in candidates {
                 match record.storage.clone() {
@@ -627,6 +627,7 @@ async fn perform_segment_compaction(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_directory_path(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,

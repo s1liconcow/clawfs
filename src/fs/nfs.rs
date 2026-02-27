@@ -40,6 +40,7 @@ impl OsageFs {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn nfs_setattr(
         &self,
         ino: u64,

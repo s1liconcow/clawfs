@@ -88,6 +88,7 @@ impl OsageFs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         metadata: Arc<MetadataStore>,
@@ -191,17 +192,21 @@ impl OsageFs {
                 }
             };
             let data_len = data_opt.as_ref().map(|d| d.len()).unwrap_or(0);
-            let active_arc = self.active_inodes.entry(inode).or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default()))).clone();
+            let active_arc = self
+                .active_inodes
+                .entry(inode)
+                .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+                .clone();
             let mut state = active_arc.lock();
             let old = state.pending.replace(PendingEntry {
                 record,
                 data: data_opt,
             });
             self.pending_inodes.insert(inode);
-            if let Some(old_entry) = old {
-                if let Some(old_data) = old_entry.data {
-                    self.release_pending_data(old_data);
-                }
+            if let Some(old_entry) = old
+                && let Some(old_data) = old_entry.data
+            {
+                self.release_pending_data(old_data);
             }
             drop(state);
             if data_len > 0 {
@@ -237,9 +242,7 @@ impl OsageFs {
     }
 
     pub(crate) fn build_child_path(parent: &InodeRecord, name: &str) -> String {
-        if parent.inode == ROOT_INODE {
-            format!("/{}", name)
-        } else if parent.path == "/" {
+        if parent.inode == ROOT_INODE || parent.path == "/" {
             format!("/{}", name)
         } else {
             format!("{}/{}", parent.path.trim_end_matches('/'), name)
@@ -256,7 +259,7 @@ impl OsageFs {
         FileAttr {
             ino: record.inode,
             size: record.size,
-            blocks: (record.size + 511) / 512,
+            blocks: record.size.div_ceil(512),
             atime: to_system_time(record.atime),
             mtime: to_system_time(record.mtime),
             ctime: to_system_time(record.ctime),
@@ -366,14 +369,15 @@ impl OsageFs {
         if range_end <= range_start {
             return Ok(Vec::new());
         }
-        let (pending_data, flushing_data) = if let Some(active_arc) = self.active_inodes.get(&record.inode) {
-            let state = active_arc.lock();
-            let p_data = state.pending.as_ref().and_then(|e| e.data.clone());
-            let f_data = state.flushing.as_ref().and_then(|e| e.data.clone());
-            (p_data, f_data)
-        } else {
-            (None, None)
-        };
+        let (pending_data, flushing_data) =
+            if let Some(active_arc) = self.active_inodes.get(&record.inode) {
+                let state = active_arc.lock();
+                let p_data = state.pending.as_ref().and_then(|e| e.data.clone());
+                let f_data = state.flushing.as_ref().and_then(|e| e.data.clone());
+                (p_data, f_data)
+            } else {
+                (None, None)
+            };
         if let Some(data) = pending_data {
             return self.slice_pending_bytes(&data, range_start, range_end);
         }
@@ -388,12 +392,12 @@ impl OsageFs {
         // metadata-only pending entry from a record loaded while the inode
         // was in the flushing state, and the flush completes before the
         // next read.
-        if record.size > 0 && Self::is_placeholder_storage(&record.storage) {
-            if let Some(committed) = self.metadata.get_cached_inode(record.inode) {
-                if !Self::is_placeholder_storage(&committed.storage) {
-                    return self.read_file_range_from_storage(&committed, range_start, range_end);
-                }
-            }
+        if record.size > 0
+            && Self::is_placeholder_storage(&record.storage)
+            && let Some(committed) = self.metadata.get_cached_inode(record.inode)
+            && !Self::is_placeholder_storage(&committed.storage)
+        {
+            return self.read_file_range_from_storage(&committed, range_start, range_end);
         }
         self.read_file_range_from_storage(record, range_start, range_end)
     }
@@ -426,10 +430,7 @@ impl OsageFs {
                 let mut buffer = vec![0u8; out_len];
                 let plain_codec = self.segments.is_plain_codec();
                 let mut start_idx = extents.partition_point(|ext| ext.logical_offset < range_start);
-                if start_idx > 0 {
-                    // Include one prior extent for potential overlap into range_start.
-                    start_idx -= 1;
-                }
+                start_idx = start_idx.saturating_sub(1);
                 // Extents may overlap after partial overwrites. We read each
                 // extent by its own payload length and overlay in sorted order
                 // so newer extents (appended later, stable-sorted after base at
@@ -501,14 +502,14 @@ impl OsageFs {
                         continue;
                     }
                     let overlap_start = extent_start.max(range_start);
-            let overlap_end = extent_end.min(range_end);
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            let dst_start = (overlap_start - range_start) as usize;
-            let dst_end_actual = (overlap_end - range_start) as usize;
-            let src_start = (overlap_start - extent_start) as usize;
-            let src_end = (overlap_end - extent_start) as usize;
+                    let overlap_end = extent_end.min(range_end);
+                    if overlap_end <= overlap_start {
+                        continue;
+                    }
+                    let dst_start = (overlap_start - range_start) as usize;
+                    let dst_end_actual = (overlap_end - range_start) as usize;
+                    let src_start = (overlap_start - extent_start) as usize;
+                    let src_end = (overlap_end - extent_start) as usize;
                     buffer[dst_start..dst_end_actual].copy_from_slice(&bytes[src_start..src_end]);
                 }
                 Ok(buffer)
@@ -543,16 +544,20 @@ impl OsageFs {
         }
 
         // Move record into pending map — zero clones.
-        let active_arc = self.active_inodes.entry(inode).or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default()))).clone();
+        let active_arc = self
+            .active_inodes
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
+            .clone();
         let mut state = active_arc.lock();
         if let Some(occupied) = state.pending.as_mut() {
-            if matches!(record.kind, InodeKind::Tombstone) {
-                if let Some(data) = occupied.data.take() {
-                    let len = data.len();
-                    self.release_pending_data(data);
-                    if len > 0 {
-                        self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
-                    }
+            if matches!(record.kind, InodeKind::Tombstone)
+                && let Some(data) = occupied.data.take()
+            {
+                let len = data.len();
+                self.release_pending_data(data);
+                if len > 0 {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                 }
             }
             occupied.record = record;
@@ -566,12 +571,10 @@ impl OsageFs {
             if record.size > 0
                 && !matches!(record.kind, InodeKind::Tombstone)
                 && Self::is_placeholder_storage(&record.storage)
+                && let Some(committed) = self.metadata.get_cached_inode(inode)
+                && !Self::is_placeholder_storage(&committed.storage)
             {
-                if let Some(committed) = self.metadata.get_cached_inode(inode) {
-                    if !Self::is_placeholder_storage(&committed.storage) {
-                        record.storage = committed.storage;
-                    }
-                }
+                record.storage = committed.storage;
             }
             state.pending = Some(PendingEntry { record, data: None });
         }
@@ -584,22 +587,6 @@ impl OsageFs {
         );
         self.flush_if_interval_elapsed()?;
         Ok(())
-    }
-
-    pub(crate) fn drop_pending_entry(&self, inode: u64) {
-        if let Some(active_arc) = self.active_inodes.get(&inode) {
-            let mut state = active_arc.lock();
-            if let Some(entry) = state.pending.take() {
-                if let Some(data) = entry.data {
-                    let len = data.len();
-                    self.release_pending_data(data);
-                    if len > 0 {
-                        self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
-                    }
-                }
-            }
-            self.pending_inodes.remove(&inode);
-        }
     }
 
     pub(crate) fn snapshot_journal_payload(&self, data: &PendingData) -> JournalPayload {
@@ -651,8 +638,8 @@ impl OsageFs {
         let mut buffer = vec![0u8; out_len];
 
         let chunks = segments.chunks.as_ref();
-        let start_idx =
-            chunks.partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
+        let start_idx = chunks
+            .partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
         for chunk in chunks[start_idx..].iter() {
             let chunk_start = chunk.logical_offset;
             let chunk_end = chunk_start.saturating_add(chunk.len);
@@ -695,10 +682,9 @@ impl OsageFs {
         // may overlap; overlay in order so later entries win.
         let plain_codec = self.segments.is_plain_codec();
         let base_extents = segments.base_extents.as_ref();
-        let mut base_start_idx = base_extents.partition_point(|ext| ext.logical_offset < range_start);
-        if base_start_idx > 0 {
-            base_start_idx -= 1;
-        }
+        let mut base_start_idx =
+            base_extents.partition_point(|ext| ext.logical_offset < range_start);
+        base_start_idx = base_start_idx.saturating_sub(1);
         for extent in base_extents[base_start_idx..].iter() {
             let extent_start = extent.logical_offset;
             if extent_start >= range_end {
@@ -745,8 +731,8 @@ impl OsageFs {
         // Overlay with staged chunks (sorted by logical offset; newer chunks
         // override base extents for overlapping regions).
         let chunks = segments.chunks.as_ref();
-        let chunk_start_idx =
-            chunks.partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
+        let chunk_start_idx = chunks
+            .partition_point(|chunk| chunk.logical_offset.saturating_add(chunk.len) <= range_start);
         for chunk in chunks[chunk_start_idx..].iter() {
             let chunk_start = chunk.logical_offset;
             let chunk_end = chunk_start.saturating_add(chunk.len);
@@ -799,10 +785,12 @@ impl OsageFs {
     }
 
     pub(crate) fn release_pending_data(&self, data: PendingData) {
-        if let PendingData::Staged(segments) = data {
-            if let Err(err) = self.segments.release_staged_chunks(segments.chunks.as_ref()) {
-                log::warn!("failed to release staged payload batch: {err:?}");
-            }
+        if let PendingData::Staged(segments) = data
+            && let Err(err) = self
+                .segments
+                .release_staged_chunks(segments.chunks.as_ref())
+        {
+            log::warn!("failed to release staged payload batch: {err:?}");
         }
     }
 
@@ -870,9 +858,11 @@ impl OsageFs {
             record.update_times();
             self.stage_inode(record.clone())?
         } else {
-            self.drop_pending_entry(record.inode);
-            let tombstone = InodeRecord::tombstone(record.inode);
-            self.stage_inode(tombstone)?
+            // Keep the inode record (with nlink=0) so open file handles can
+            // continue I/O after unlink, matching POSIX semantics.
+            record.link_count = 0;
+            record.update_times();
+            self.stage_inode(record.clone())?;
         }
         Ok(())
     }

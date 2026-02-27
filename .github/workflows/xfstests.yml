@@ -51,10 +51,42 @@ jobs:
           sudo tee /sbin/mount.fuse.osagefs > /dev/null << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          src="${1:-}"
-          mnt="${2:-}"
+          src=""
+          mnt=""
           optstr=""
-          shift 2 || true
+          args=("$@")
+          i=0
+          while ((i < ${#args[@]})); do
+            arg="${args[$i]}"
+            case "$arg" in
+              -o)
+                ((i+=1))
+                optstr="${args[$i]:-}"
+                ;;
+              -o*)
+                optstr="${arg#-o}"
+                ;;
+              -t|-O|-U)
+                # consume option value
+                ((i+=1))
+                ;;
+              -r|-w|-f|-n|-v|-s|-i|-l)
+                # handled/ignored mount(8) flags
+                ;;
+              -*)
+                # ignore unknown flags
+                ;;
+              *)
+                if [[ -z "$src" ]]; then
+                  src="$arg"
+                elif [[ -z "$mnt" ]]; then
+                  mnt="$arg"
+                fi
+                ;;
+            esac
+            ((i+=1))
+          done
+
           while (($#)); do
             case "$1" in
               -o) shift; optstr="${1:-}" ;;
@@ -62,6 +94,7 @@ jobs:
             esac
             shift || true
           done
+
           store=""
           IFS="," read -ra kvs <<< "$optstr"
           for kv in "${kvs[@]}"; do
@@ -71,7 +104,7 @@ jobs:
             esac
           done
           if [[ -z "$store" || -z "$src" || -z "$mnt" ]]; then
-            echo "mount.fuse.osagefs: bad args src=$src mnt=$mnt opts=$optstr" >&2
+            echo "mount.fuse.osagefs: bad args src=$src mnt=$mnt opts=$optstr argv=$*" >&2
             exit 1
           fi
           if mountpoint -q "$mnt"; then
@@ -112,8 +145,8 @@ jobs:
           export SCRATCH_DEV=osagefs_scratch
           export SCRATCH_MNT=/tmp/osagefs-scratch-mnt
 
-          export TEST_FS_MOUNT_OPTS="-osource=/tmp/osagefs-test-store,allow_other,default_permissions"
-          export MOUNT_OPTIONS="-osource=/tmp/osagefs-scratch-store,allow_other,default_permissions"
+          export TEST_FS_MOUNT_OPTS="source=/tmp/osagefs-test-store,allow_other,default_permissions"
+          export MOUNT_OPTIONS="source=/tmp/osagefs-scratch-store,allow_other,default_permissions"
           EOF
 
           cat > excludes << 'EOF'
@@ -144,6 +177,7 @@ jobs:
       - name: Run xfstests smoke
         working-directory: /tmp/xfstests
         run: |
+          sudo mkdir -p /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
           sudo ./check -E excludes generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
 
       - name: Upload xfstests results

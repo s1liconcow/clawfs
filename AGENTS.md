@@ -43,6 +43,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - `scripts/checkpoint.sh`: offline checkpoint helper (`create`/`restore`) for `metadata/superblock.bin`; aborts when mount/process checks indicate OsageFS is still running unless `FORCE=1`.
 
 ## Testing / Tools
+- Default code-change validation sequence for agent runs: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test` (or a clearly documented narrower test target when full test suite is not feasible).
 - `cargo test`: runs unit tests (including new integration-like tests in `src/fs/tests/mod.rs`, `segment.rs`, `state.rs`).
 - `OSAGEFS_RUN_PERF=1 cargo test --test perf_local -- --nocapture`: local performance suite includes stage throughput, batched segment throughput, and small-file IOPS checks.
 - `scripts/linux_kernel_perf.sh`: Perf test; requires `user_allow_other` in `/etc/fuse.conf`, `flex`, `bison`, `curl`, `python3`, etc. Sets `PERF_LOG_PATH` (default `$ROOT/osagefs-perf.jsonl`) so runs automatically emit JSONL timing data.
@@ -60,6 +61,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - `scripts/run_osagefs.sh`: Convenience launcher; defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` which can be disabled via `PERF_LOG_PATH=`.
 - `scripts/run_osagefs.sh` now rebuilds `target/release/osagefs` automatically when missing or older than `Cargo.toml`/`Cargo.lock`/`src`/`fuser-mt` inputs, so normal launches pick up fresh code without a manual build step.
 - `scripts/run_osagefs.sh` + `scripts/run_nfs_gateway.sh`: set `REPLAY_LOG_PATH=/path/replay.jsonl.gz` to pass `--replay-log` and capture replay traces for FUSE or direct NFS traffic.
+- Update (2026-02-27): repo-local pre-commit hook now lives at `.githooks/pre-commit` and runs `cargo fmt --all --check` plus `cargo clippy --all-targets --all-features -- -D warnings`; enable with `git config core.hooksPath .githooks`.
 - `src/bin/osagefs_replay.rs`: direct API replayer (`cargo run --release --bin osagefs_replay -- ...`) that replays captured events through `OsageFs::nfs_*` methods (bypasses FUSE/NFS transport), preserving order/timing and synthesizing write payload bytes. It now bootstraps fresh-init state to match normal startup (`/`, `WELCOME.txt`, and `/home/<user>` by default; configurable via `--home-prefix` / `--user-name`).
 - `cargo test checkpoint::tests::checkpoint_restore_round_trip_resets_superblock`: validates checkpoint capture + restore round-trip against persisted superblock state.
 - `src/bin/osagefs_replay.rs` brute-force mode: `--iterations N` replays from fresh-init state N times with deterministic seeds (`--seed`) and optional chaos knobs (`--jitter-us`, `--chaos-sleep-prob`, `--chaos-sleep-max-us`, `--chaos-flush-prob`) to shake out timing-sensitive issues.
@@ -97,6 +99,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - Update (2026-02-22): `flush_pending` drain now uses per-inode `try_lock` (non-blocking) when moving `pending -> flushing`; contended inodes are skipped for that cycle (`drain_skipped_locked` in perf details) instead of stalling flush behind active writers.
 - Update (2026-02-22): flush drain now scans `pending_inodes` (dirty-index `DashSet`) instead of all `active_inodes`; pending stage/recovery paths maintain this index and flush removes entries once pending is cleared. This avoids O(total-active-inodes) scans when only a few inodes are dirty.
 - Update (2026-02-27): in `flush_pending` segment-extent merge, cache miss on `get_cached_inode()` now falls back to authoritative `metadata.get_inode()` before combining `base_extents` + new extents. This avoids stale-base fallback under heavy churn that could otherwise drop recently committed extents.
+- Update (2026-02-27): unlink semantics fix for `pjdfstest` `unlink/14.t`: on last unlink (`link_count == 1`), keep inode data with `link_count=0` instead of immediate tombstone so open file handles continue to support `fstat`/I/O after path removal. Regression test: `unlink_last_link_keeps_open_inode_readable_and_writable`.
 - Update (2026-02-22): `SegmentManager::rotate_stage_file()` no longer calls `sync_data()` on the active stage file during flush rotation. This split-point now only hands new writes to a fresh stage file; explicit durability boundaries still use `sync_staged_chunks()` (`fsync`/close-sync paths). This removes multi-second `rotate_stage_file_ms` stalls from flush.
 - Update (2026-02-22): staged chunk cleanup now batches per-path release (`SegmentManager::release_staged_chunks`) so flush finalize no longer acquires `stage_state` lock and performs file operations once per chunk; `release_pending_data` now uses the batched API.
 - Update (2026-02-22): staged chunk release for the active stage file now rotates to a fresh stage file instead of synchronous in-place truncate/reset, and staged file deletes are dispatched via background blocking tasks. This removes foreground flush finalize stalls from large stage-file cleanup.
@@ -161,6 +164,7 @@ Example bootstrap (Debian/Ubuntu sprite):
 - Do not mount FUSE or run NFS services locally.
 - Privileged commands MUST be executed in the sprite via `sprite exec -s <sprite> -- <cmd...>`.
 - Prefer idempotent steps: the sprite may be fresh or may contain old state.
+- For every code-changing task, run and report `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and tests (`cargo test` by default) before handing off.
 
 ## Sprite name
 Use deterministic sprite names per worktree/task so repeated runs reuse VM state.
