@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -149,6 +152,7 @@ fn flush_metadata_batch_latency() {
         "metadata batch flush took {:.1}ms — should be < 5000ms",
         ms
     );
+    emit_perf_metric("flush_metadata_batch_latency_ms", ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +222,7 @@ fn large_segment_staged_flush_latency() {
         "large staged flush only {:.1} MiB/s (need >= 50 MiB/s)",
         throughput
     );
+    emit_perf_metric("large_segment_staged_flush_mib_per_s", throughput);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +266,7 @@ fn journal_write_throughput() {
         "journal write iops only {:.0} (need >= 5000)",
         iops
     );
+    emit_perf_metric("journal_write_iops", iops);
 }
 
 #[test]
@@ -291,6 +297,7 @@ fn local_disk_stage_throughput() {
         "local disk throughput only {:.2} MiB/s (need >= 10 MiB/s)",
         throughput
     );
+    emit_perf_metric("local_disk_stage_mib_per_s", throughput);
 }
 
 #[test]
@@ -337,6 +344,7 @@ fn local_segment_batch_throughput() {
         "segment batch throughput only {:.2} MiB/s (need >= 80 MiB/s)",
         throughput_mib
     );
+    emit_perf_metric("local_segment_batch_mib_per_s", throughput_mib);
 }
 
 #[test]
@@ -383,6 +391,7 @@ fn local_segment_small_file_iops() {
         "small-file iops only {:.0} ops/s (need >= 20000)",
         iops
     );
+    emit_perf_metric("local_segment_small_file_iops", iops);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +462,7 @@ fn segment_sequential_read_throughput() {
         "sequential read throughput only {:.1} MiB/s (need >= 100 MiB/s)",
         throughput
     );
+    emit_perf_metric("segment_sequential_read_mib_per_s", throughput);
 }
 
 fn perf_enabled(name: &str) -> bool {
@@ -461,4 +471,118 @@ fn perf_enabled(name: &str) -> bool {
     }
     eprintln!("skipping {name}; set OSAGEFS_RUN_PERF=1 to enable");
     false
+}
+
+#[test]
+fn inode_clone_directory_heavy() {
+    if !perf_enabled("inode_clone_directory_heavy") {
+        return;
+    }
+    let now = OffsetDateTime::now_utc();
+    let children = 8_000usize;
+    let iterations = 4_000usize;
+    let mut map = BTreeMap::new();
+    for i in 0..children {
+        map.insert(format!("f_{i:05}.txt"), (i + 2) as u64);
+    }
+    let record = InodeRecord {
+        inode: 1,
+        parent: 1,
+        name: "/".into(),
+        path: "/".into(),
+        kind: InodeKind::Directory {
+            children: Arc::new(map),
+        },
+        size: 0,
+        mode: 0o40755,
+        uid: 1000,
+        gid: 1000,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        link_count: 1,
+        rdev: 0,
+        storage: FileStorage::Inline(Vec::new()),
+    };
+
+    let start = Instant::now();
+    let mut observed = 0usize;
+    for _ in 0..iterations {
+        let cloned = record.clone();
+        if let InodeKind::Directory { children } = cloned.kind {
+            observed = observed.saturating_add(children.len());
+        }
+    }
+    let elapsed = start.elapsed();
+    let clones_per_sec = iterations as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "inode_clone_directory_heavy children={} iterations={} elapsed={:.1}ms clones_per_sec={:.0} observed={}",
+        children,
+        iterations,
+        elapsed.as_secs_f64() * 1000.0,
+        clones_per_sec,
+        observed
+    );
+    assert!(observed > 0);
+    emit_perf_metric("inode_clone_directory_heavy_clones_per_s", clones_per_sec);
+}
+
+#[test]
+fn inline_resize_strategy_benchmark() {
+    if !perf_enabled("inline_resize_strategy_benchmark") {
+        return;
+    }
+    let iters = 200_000usize;
+    let payload = vec![0xAB; 4096];
+    let mut old_sum = 0usize;
+    let mut new_sum = 0usize;
+
+    let old_start = Instant::now();
+    for i in 0..iters {
+        let mut buf = vec![0u8; 16];
+        let offset = 64 + (i % 96);
+        if offset > buf.len() {
+            buf.resize(offset, 0);
+        }
+        if offset + payload.len() > buf.len() {
+            buf.resize(offset + payload.len(), 0);
+        }
+        buf[offset..offset + payload.len()].copy_from_slice(&payload);
+        old_sum = old_sum.saturating_add(buf[offset] as usize);
+    }
+    let old_elapsed = old_start.elapsed();
+
+    let new_start = Instant::now();
+    for i in 0..iters {
+        let mut buf = vec![0u8; 16];
+        let offset = 64 + (i % 96);
+        let end = offset + payload.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[offset..offset + payload.len()].copy_from_slice(&payload);
+        new_sum = new_sum.saturating_add(buf[offset] as usize);
+    }
+    let new_elapsed = new_start.elapsed();
+
+    let old_ms = old_elapsed.as_secs_f64() * 1000.0;
+    let new_ms = new_elapsed.as_secs_f64() * 1000.0;
+    let speedup = old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64();
+    eprintln!(
+        "inline_resize_strategy_benchmark iters={} old={:.1}ms new={:.1}ms speedup={:.2}x",
+        iters, old_ms, new_ms, speedup
+    );
+    assert_eq!(old_sum, new_sum);
+    emit_perf_metric("inline_resize_strategy_speedup_x", speedup);
+}
+
+fn emit_perf_metric(name: &str, value: f64) {
+    let Some(path) = std::env::var_os("OSAGEFS_PERF_METRICS_FILE") else {
+        return;
+    };
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = writeln!(file, "{{\"metric\":\"{}\",\"value\":{}}}", name, value);
 }

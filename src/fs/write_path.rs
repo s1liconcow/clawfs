@@ -203,7 +203,8 @@ impl OsageFs {
             PendingData::Inline(buf) => {
                 let buf = Arc::make_mut(buf);
                 if (buf.len() as u64) < record.size {
-                    buf.resize(record.size as usize, 0);
+                    let target_len = usize::try_from(record.size).map_err(|_| EFBIG)?;
+                    buf.resize(target_len, 0);
                 }
                 buf.extend_from_slice(data);
                 if buf.len() as u64 > inline_cap {

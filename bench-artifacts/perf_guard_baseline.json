@@ -1,0 +1,45 @@
+{
+  "description": "Baseline performance guard for tests/perf_local.rs metrics",
+  "metrics": {
+    "flush_metadata_batch_latency_ms": {
+      "direction": "lower",
+      "value": 35.915,
+      "max_regression_pct": 80.0
+    },
+    "large_segment_staged_flush_mib_per_s": {
+      "direction": "higher",
+      "value": 771.95,
+      "max_regression_pct": 70.0
+    },
+    "journal_write_iops": {
+      "direction": "higher",
+      "value": 100686.83,
+      "max_regression_pct": 70.0
+    },
+    "local_disk_stage_mib_per_s": {
+      "direction": "higher",
+      "value": 1892.67,
+      "max_regression_pct": 70.0
+    },
+    "local_segment_batch_mib_per_s": {
+      "direction": "higher",
+      "value": 2416.66,
+      "max_regression_pct": 70.0
+    },
+    "local_segment_small_file_iops": {
+      "direction": "higher",
+      "value": 1028624.56,
+      "max_regression_pct": 70.0
+    },
+    "inode_clone_directory_heavy_clones_per_s": {
+      "direction": "higher",
+      "value": 42996882.73,
+      "max_regression_pct": 70.0
+    },
+    "inline_resize_strategy_speedup_x": {
+      "direction": "higher",
+      "value": 1.204,
+      "max_regression_pct": 50.0
+    }
+  }
+}

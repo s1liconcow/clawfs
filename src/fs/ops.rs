@@ -5,11 +5,41 @@ const S_ISGID: u32 = 0o2000;
 const S_ISUID: u32 = 0o4000;
 
 impl OsageFs {
+    fn lookup_child_fast_path(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> Option<std::result::Result<u64, i32>> {
+        if let Some(active_arc) = self.active_inodes.get(&parent) {
+            let state = active_arc.lock();
+            let record = state
+                .pending
+                .as_ref()
+                .map(|entry| &entry.record)
+                .or_else(|| state.flushing.as_ref().map(|entry| &entry.record));
+            if let Some(record) = record {
+                if matches!(record.kind, InodeKind::Tombstone) {
+                    return Some(Err(ENOENT));
+                }
+                return match &record.kind {
+                    InodeKind::Directory { children } => {
+                        Some(children.get(name).copied().ok_or(ENOENT))
+                    }
+                    _ => Some(Err(ENOTDIR)),
+                };
+            }
+        }
+        self.metadata.lookup_cached_child(parent, name)
+    }
+
     pub(crate) fn op_lookup(
         &self,
         parent: u64,
         name: &str,
     ) -> std::result::Result<InodeRecord, i32> {
+        if let Some(child) = self.lookup_child_fast_path(parent, name) {
+            return self.load_inode(child?);
+        }
         let parent_inode = self.load_inode(parent)?;
         let child = parent_inode
             .children()
@@ -547,12 +577,10 @@ impl OsageFs {
             return Ok(data.len() as u32);
         }
         let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        let offset = offset as usize;
-        if offset > existing.len() {
-            existing.resize(offset, 0);
-        }
-        if offset + data.len() > existing.len() {
-            existing.resize(offset + data.len(), 0);
+        let offset = usize::try_from(offset).map_err(|_| EFBIG)?;
+        let write_end = offset.checked_add(data.len()).ok_or(EFBIG)?;
+        if write_end > existing.len() {
+            existing.resize(write_end, 0);
         }
         existing[offset..offset + data.len()].copy_from_slice(data);
         record.update_times();
