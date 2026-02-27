@@ -120,7 +120,9 @@ fn summarize_inode_kind_truncates_directory_children() {
     for i in 0..20u64 {
         children.insert(format!("f_{i}"), i + 10);
     }
-    let summary = OsageFs::summarize_inode_kind(&InodeKind::Directory { children });
+    let summary = OsageFs::summarize_inode_kind(&InodeKind::Directory {
+        children: children.into(),
+    });
     assert!(summary.contains("Directory(children=20"));
     assert!(summary.contains("truncated="));
     assert!(summary.len() < 300);
@@ -221,6 +223,39 @@ fn make_symlink(inode: u64, name: &str, target: &str) -> InodeRecord {
         0,
         target.as_bytes().to_vec(),
     )
+}
+
+#[test]
+fn perf_lookup_hot_cached() {
+    if env::var("OSAGEFS_RUN_PERF").is_err() {
+        eprintln!("skipping perf_lookup_hot_cached; set OSAGEFS_RUN_PERF=1 to enable");
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let harness = TestHarness::new(temp.path(), "state.bin", 16 * 1024 * 1024);
+    let file_count = 2048usize;
+    for i in 0..file_count {
+        let name = format!("f_{i:04}.txt");
+        stage_named_file(&harness, &name, vec![0x11; 64]);
+    }
+    harness.fs.flush_pending().unwrap();
+
+    let lookups = 200_000usize;
+    let start = std::time::Instant::now();
+    for i in 0..lookups {
+        let name = format!("f_{:04}.txt", i % file_count);
+        let record = harness.fs.op_lookup(ROOT_INODE, &name).unwrap();
+        assert!(matches!(record.kind, InodeKind::File));
+    }
+    let elapsed = start.elapsed();
+    let lps = lookups as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "perf_lookup_hot_cached files={} lookups={} elapsed={:.1}ms lps={:.0}",
+        file_count,
+        lookups,
+        elapsed.as_secs_f64() * 1000.0,
+        lps
+    );
 }
 
 #[test]

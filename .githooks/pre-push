@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if [[ "${SKIP_PERF_GUARD:-0}" == "1" ]]; then
+  echo "[pre-push] SKIP_PERF_GUARD=1 set; skipping perf guard"
+  exit 0
+fi
+
+echo "[pre-push] scripts/perf_guard.sh"
+./scripts/perf_guard.sh
+

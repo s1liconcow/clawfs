@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -10,7 +11,9 @@ pub const ROOT_INODE: u64 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InodeKind {
     File,
-    Directory { children: BTreeMap<String, u64> },
+    Directory {
+        children: Arc<BTreeMap<String, u64>>,
+    },
     Symlink,
     Tombstone,
 }
@@ -84,7 +87,7 @@ impl InodeRecord {
             name,
             path,
             kind: InodeKind::Directory {
-                children: BTreeMap::new(),
+                children: Arc::new(BTreeMap::new()),
             },
             size: 0,
             mode: 0o40755,
@@ -202,7 +205,7 @@ impl InodeRecord {
 
     pub fn children_mut(&mut self) -> Option<&mut BTreeMap<String, u64>> {
         match &mut self.kind {
-            InodeKind::Directory { children } => Some(children),
+            InodeKind::Directory { children } => Some(Arc::make_mut(children)),
             _ => None,
         }
     }

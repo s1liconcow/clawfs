@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use bincode::Options;
 use bytes::Bytes;
 use futures::StreamExt;
+use libc::{ENOENT, ENOTDIR};
 use log::{debug, info};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -13,12 +15,12 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
-use crate::codec::{deserialize_flex, serialize_flex};
+use crate::codec::deserialize_flex;
 use crate::config::{Config, ObjectStoreProvider};
-use crate::inode::{FileStorage, InodeRecord, InodeShard};
+use crate::inode::{FileStorage, InodeKind, InodeRecord, InodeShard};
 use crate::superblock::Superblock;
 
 /// How long an ENOENT result is served from the negative cache before we
@@ -28,6 +30,29 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_millis(1_500);
 
 const SUPERBLOCK_FILE: &str = "superblock.bin";
 const METADATA_FORMAT_VERSION: u32 = 1;
+const METADATA_BIN_MAGIC: &[u8] = b"OSGBIN1";
+
+fn metadata_bin_opts() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+}
+
+fn serialize_metadata<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let payload = metadata_bin_opts().serialize(value)?;
+    let mut out = Vec::with_capacity(METADATA_BIN_MAGIC.len() + payload.len());
+    out.extend_from_slice(METADATA_BIN_MAGIC);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn deserialize_metadata<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    if let Some(payload) = bytes.strip_prefix(METADATA_BIN_MAGIC) {
+        return Ok(metadata_bin_opts().deserialize(payload)?);
+    }
+    // Backward-compatible fallback for pre-bincode metadata blobs.
+    deserialize_flex(bytes)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredDelta {
@@ -175,7 +200,7 @@ impl MetadataStore {
                         .to_string()
                 });
                 let bytes = get_result.bytes().await?;
-                let stored: StoredSuperblock = deserialize_flex(&bytes)?;
+                let stored: StoredSuperblock = deserialize_metadata(&bytes)?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
                     "unsupported superblock format version {}",
@@ -196,7 +221,7 @@ impl MetadataStore {
             version: METADATA_FORMAT_VERSION,
             block: sb.clone(),
         };
-        let bytes = serialize_flex(&stored)?;
+        let bytes = serialize_metadata(&stored)?;
         let path = self.superblock_path();
         let put_result = self
             .store
@@ -218,7 +243,7 @@ impl MetadataStore {
             version: METADATA_FORMAT_VERSION,
             block: sb.clone(),
         };
-        let bytes = serialize_flex(&stored)?;
+        let bytes = serialize_metadata(&stored)?;
         let path = self.superblock_path();
 
         let opts = object_store::PutOptions {
@@ -281,7 +306,7 @@ impl MetadataStore {
                 version: METADATA_FORMAT_VERSION,
                 block: sb.clone(),
             };
-            let bytes = serialize_flex(&stored)?;
+            let bytes = serialize_metadata(&stored)?;
             let payload = Bytes::from(bytes);
             let path = self.superblock_path();
 
@@ -318,6 +343,25 @@ impl MetadataStore {
     /// only need extents that were committed by a prior flush.
     pub fn get_cached_inode(&self, inode: u64) -> Option<InodeRecord> {
         self.cache.lock().get(&inode).map(|e| e.record.clone())
+    }
+
+    /// Fast-path child lookup that avoids cloning the parent inode record.
+    /// Returns `Some(result)` when the parent is present in the positive cache,
+    /// otherwise `None` so callers can fall back to normal load/reload logic.
+    pub fn lookup_cached_child(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> Option<std::result::Result<u64, i32>> {
+        let cache = self.cache.lock();
+        let entry = cache.get(&parent)?;
+        if matches!(entry.record.kind, InodeKind::Tombstone) {
+            return Some(Err(ENOENT));
+        }
+        match &entry.record.kind {
+            InodeKind::Directory { children } => Some(children.get(name).copied().ok_or(ENOENT)),
+            _ => Some(Err(ENOTDIR)),
+        }
     }
 
     pub async fn get_inode_with_ttl(
@@ -391,7 +435,7 @@ impl MetadataStore {
         }
 
         // Phase 1: update in-memory caches + shards under lock
-        let mut touched_shard_ids = Vec::new();
+        let mut touched_shard_ids = HashSet::new();
         {
             let mut cache = self.cache.lock();
             let mut shards = self.shards.lock();
@@ -409,9 +453,7 @@ impl MetadataStore {
                 });
                 entry.shard.upsert(record.clone());
                 entry.generation = generation;
-                if !touched_shard_ids.contains(&shard_id) {
-                    touched_shard_ids.push(shard_id);
-                }
+                touched_shard_ids.insert(shard_id);
             }
         }
 
@@ -419,7 +461,9 @@ impl MetadataStore {
         let shard_writes: Vec<(ObjectPath, Vec<u8>, u64, usize)> = {
             let shards = self.shards.lock();
             let base_path = self.imap_prefix();
-            touched_shard_ids
+            let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
+            shard_ids.sort_unstable();
+            shard_ids
                 .iter()
                 .filter_map(|&shard_id| {
                     let entry = shards.get(&shard_id)?;
@@ -433,7 +477,7 @@ impl MetadataStore {
                             .map(|(ino, rec)| (*ino, rec))
                             .collect(),
                     };
-                    let data = serialize_flex(&stored).ok()?;
+                    let data = serialize_metadata(&stored).ok()?;
                     let count = entry.shard.inodes.len();
                     let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
                     let path = base_path.child(filename.as_str());
@@ -501,7 +545,7 @@ impl MetadataStore {
                     .map(|(ino, rec)| (*ino, rec))
                     .collect(),
             };
-            (serialize_flex(&stored)?, entry.shard.inodes.len())
+            (serialize_metadata(&stored)?, entry.shard.inodes.len())
         };
         self.store
             .put(&path, PutPayload::from_bytes(Bytes::from(data)))
@@ -527,7 +571,7 @@ impl MetadataStore {
             generation,
             records,
         };
-        let data = serialize_flex(&stored)?;
+        let data = serialize_metadata(&stored)?;
         {
             let mut guard = self.last_delta_generation.lock();
             *guard = (*guard).max(generation);
@@ -573,7 +617,7 @@ impl MetadataStore {
         // Parallel fetch could be better here, but keep it simple for now
         for (shard_id, (_, path)) in latest {
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_flex(&bytes)?;
+            let stored: StoredShard = deserialize_metadata(&bytes)?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
                 "unsupported shard version {}",
@@ -635,7 +679,7 @@ impl MetadataStore {
             let mut updated_records = Vec::new();
             for (generation, path) in files {
                 let bytes = self.store.get(&path).await?.bytes().await?;
-                let stored: StoredDelta = deserialize_flex(&bytes)?;
+                let stored: StoredDelta = deserialize_metadata(&bytes)?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
                     "unsupported delta version {}",
@@ -750,7 +794,7 @@ impl MetadataStore {
 
         if let Some((generation, path)) = newest_path {
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_flex(&bytes)?;
+            let stored: StoredShard = deserialize_metadata(&bytes)?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
                 "unsupported shard version {}",
