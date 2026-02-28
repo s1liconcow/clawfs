@@ -1,6 +1,7 @@
 use super::*;
 use std::env;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
@@ -420,6 +421,47 @@ fn read_file_range_for_segment_storage_returns_expected_window() {
     expected.extend_from_slice(&vec![0u8; 4096]);
     expected.extend_from_slice(&second[..2048]);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn plain_codec_sparse_extents_do_not_leak_segment_entry_headers() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(
+        dir.path(),
+        "plain_sparse_gap.bin",
+        64 * 1024 * 1024,
+        |cfg| {
+            cfg.inline_threshold = 1;
+            cfg.segment_compression = false;
+            cfg.segment_encryption_key = None;
+        },
+    );
+    let inode = stage_named_file(&harness, "plain_sparse_gap.dat", Vec::new());
+
+    let first = vec![0xA1; 64];
+    let second = vec![0xB2; 64];
+    let record = harness.fs.load_inode(inode).unwrap();
+    harness.fs.write_large_segments(record, 0, &first).unwrap();
+    let record = harness.fs.load_inode(inode).unwrap();
+    harness
+        .fs
+        .write_large_segments(record, 4096, &second)
+        .unwrap();
+    harness.fs.flush_pending().unwrap();
+
+    let stored = harness
+        .runtime
+        .block_on(harness.metadata.get_inode(inode))
+        .unwrap()
+        .unwrap();
+    let bytes = harness.fs.read_file_range(&stored, 0, 4160).unwrap();
+    assert_eq!(bytes.len(), 4160);
+    assert_eq!(&bytes[..64], &first);
+    assert!(
+        bytes[64..4096].iter().all(|&b| b == 0),
+        "sparse gap should remain zero-filled; got non-zero bytes in 64..4096",
+    );
+    assert_eq!(&bytes[4096..], &second);
 }
 
 #[test]
@@ -2816,6 +2858,91 @@ fn shard_reload_does_not_overwrite_newer_cache_entry() {
     assert!(children.contains_key("a.o"), "missing a.o");
     assert!(children.contains_key("b.o"), "missing b.o");
     assert!(children.contains_key("c.o"), "missing c.o");
+}
+
+/// Regression test: metadata decode/read errors under lookup-vs-flush churn
+/// must not surface as EIO to callers.
+#[test]
+fn concurrent_reload_and_flush_does_not_return_eio() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "decode_churn.bin", 4096, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+    let fs = &harness.fs;
+
+    let parent = fs.op_mkdir(ROOT_INODE, "scan", 0, 0).unwrap();
+    let parent_ino = parent.inode;
+    let (seed, _) = fs
+        .op_create_fuse(parent_ino, "seed.rs", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    fs.op_write(seed.inode, 0, b"fn seed() {}\n").unwrap();
+    fs.flush_pending().unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let saw_eio = Arc::new(AtomicBool::new(false));
+
+    thread::scope(|scope| {
+        let writer_barrier = barrier.clone();
+        let saw_eio_writer = saw_eio.clone();
+        let writer = scope.spawn(move || {
+            writer_barrier.wait();
+            for i in 0..300usize {
+                let name = format!("f_{i:04}.rs");
+                let created = fs.op_create_fuse(parent_ino, &name, 0, 0, 0o100644, 0o022, 0);
+                let (record, _) = match created {
+                    Ok(v) => v,
+                    Err(code) => {
+                        if code == EIO {
+                            saw_eio_writer.store(true, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                };
+                if let Err(code) = fs.op_write(record.inode, 0, b"pub struct X;\n") {
+                    if code == EIO {
+                        saw_eio_writer.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+                if i % 2 == 1
+                    && let Err(code) = fs.flush_pending()
+                {
+                    if code == EIO {
+                        saw_eio_writer.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+            }
+            let _ = fs.flush_pending();
+        });
+
+        let reader_barrier = barrier.clone();
+        let saw_eio_reader = saw_eio.clone();
+        let reader = scope.spawn(move || {
+            reader_barrier.wait();
+            for _ in 0..2500usize {
+                if fs.load_inode(ROOT_INODE).err() == Some(EIO)
+                    || fs.op_lookup(parent_ino, "seed.rs").err() == Some(EIO)
+                {
+                    saw_eio_reader.store(true, Ordering::Relaxed);
+                    break;
+                }
+                thread::yield_now();
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+
+    assert!(
+        !saw_eio.load(Ordering::Relaxed),
+        "lookup/flush churn returned EIO (likely metadata decode/reload failure)"
+    );
+    assert!(fs.op_lookup(parent_ino, "seed.rs").is_ok());
 }
 
 /// Concurrent version: creates files and flushes from different threads to

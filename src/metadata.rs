@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use bincode::Options;
 use bytes::Bytes;
+use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
 use libc::{ENOENT, ENOTDIR};
 use log::{debug, info};
@@ -18,7 +18,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
-use crate::codec::deserialize_flex;
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{FileStorage, InodeKind, InodeRecord, InodeShard};
 use crate::superblock::Superblock;
@@ -30,28 +29,29 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_millis(1_500);
 
 const SUPERBLOCK_FILE: &str = "superblock.bin";
 const METADATA_FORMAT_VERSION: u32 = 1;
-const METADATA_BIN_MAGIC: &[u8] = b"OSGBIN1";
-
-fn metadata_bin_opts() -> impl bincode::Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-}
+const METADATA_FB_MAGIC: &[u8] = b"OSGFB1";
 
 fn serialize_metadata<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let payload = metadata_bin_opts().serialize(value)?;
-    let mut out = Vec::with_capacity(METADATA_BIN_MAGIC.len() + payload.len());
-    out.extend_from_slice(METADATA_BIN_MAGIC);
-    out.extend_from_slice(&payload);
+    let payload = serde_json::to_vec(value)?;
+    let mut builder = FlatBufferBuilder::with_capacity(payload.len() + 64);
+    let vector = builder.create_vector(payload.as_slice());
+    builder.finish_minimal(vector);
+    let fb = builder.finished_data();
+
+    let mut out = Vec::with_capacity(METADATA_FB_MAGIC.len() + fb.len());
+    out.extend_from_slice(METADATA_FB_MAGIC);
+    out.extend_from_slice(fb);
     Ok(out)
 }
 
 fn deserialize_metadata<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    if let Some(payload) = bytes.strip_prefix(METADATA_BIN_MAGIC) {
-        return Ok(metadata_bin_opts().deserialize(payload)?);
-    }
-    // Backward-compatible fallback for pre-bincode metadata blobs.
-    deserialize_flex(bytes)
+    let fb_bytes = bytes
+        .strip_prefix(METADATA_FB_MAGIC)
+        .ok_or_else(|| anyhow!("unsupported metadata encoding (missing OSGFB1 magic)"))?;
+    let vector = flatbuffers::root::<flatbuffers::Vector<'_, u8>>(fb_bytes)
+        .map_err(|err| anyhow!("flatbuffer decode failed: {err}"))?;
+    let payload: Vec<u8> = vector.iter().collect();
+    Ok(serde_json::from_slice(&payload)?)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -69,8 +69,7 @@ struct StoredShard {
 }
 
 /// Borrow-friendly serialization struct for shards — avoids cloning every
-/// InodeRecord just to serialize the shard snapshot to disk.  The flexbuffer
-/// wire format is identical to [`StoredShard`] so deserialization is unchanged.
+/// InodeRecord just to serialize the shard snapshot to disk.
 #[derive(Serialize)]
 struct StoredShardRef<'a> {
     version: u32,
@@ -589,7 +588,7 @@ impl MetadataStore {
     }
 
     async fn load_latest_imaps(&self) -> Result<()> {
-        let mut latest: HashMap<u64, (u64, ObjectPath)> = HashMap::new();
+        let mut candidates: HashMap<u64, Vec<(u64, ObjectPath)>> = HashMap::new();
         let prefix = self.imap_prefix();
 
         // Ensure prefix exists (optional check or just list)
@@ -600,28 +599,35 @@ impl MetadataStore {
             let meta = item?;
             let name = meta.location.filename().unwrap_or_default();
             if let Some((generation, shard_id)) = parse_imap_filename(name) {
-                latest
+                candidates
                     .entry(shard_id)
-                    .and_modify(|current| {
-                        if generation > current.0 {
-                            *current = (generation, meta.location.clone());
-                        }
-                    })
-                    .or_insert((generation, meta.location));
+                    .or_default()
+                    .push((generation, meta.location));
             }
         }
 
         let mut loaded_shards = Vec::new();
         let mut max_generation = 0;
 
-        // Parallel fetch could be better here, but keep it simple for now
-        for (shard_id, (_, path)) in latest {
+        for (shard_id, mut files) in candidates {
+            files.sort_by(|a, b| b.0.cmp(&a.0));
+            let Some((generation, path)) = files.into_iter().next() else {
+                continue;
+            };
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_metadata(&bytes)?;
+            let stored: StoredShard = deserialize_metadata(&bytes).with_context(|| {
+                format!(
+                    "decoding newest shard failed shard={} generation={} path={}",
+                    shard_id, generation, path
+                )
+            })?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
-                "unsupported shard version {}",
-                stored.version
+                "unsupported shard version {} for shard={} generation={} path={}",
+                stored.version,
+                shard_id,
+                generation,
+                path
             );
             loaded_shards.push((shard_id, stored));
         }
@@ -775,7 +781,7 @@ impl MetadataStore {
     }
 
     async fn reload_shard(&self, shard_id: u64) -> Result<()> {
-        let mut newest_path: Option<(u64, ObjectPath)> = None;
+        let mut candidates = Vec::new();
         let prefix = self.imap_prefix();
 
         let mut stream = self.store.list(Some(&prefix));
@@ -785,20 +791,26 @@ impl MetadataStore {
             if let Some((generation, shard)) = parse_imap_filename(name)
                 && shard == shard_id
             {
-                newest_path = match newest_path {
-                    Some((existing_gen, _)) if existing_gen >= generation => newest_path,
-                    _ => Some((generation, meta.location)),
-                };
+                candidates.push((generation, meta.location));
             }
         }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
-        if let Some((generation, path)) = newest_path {
+        if let Some((generation, path)) = candidates.into_iter().next() {
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_metadata(&bytes)?;
+            let stored: StoredShard = deserialize_metadata(&bytes).with_context(|| {
+                format!(
+                    "decoding newest shard failed shard={} generation={} path={}",
+                    shard_id, generation, path
+                )
+            })?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
-                "unsupported shard version {}",
-                stored.version
+                "unsupported shard version {} for shard={} generation={} path={}",
+                stored.version,
+                shard_id,
+                generation,
+                path
             );
             let mut shard = InodeShard::new(shard_id);
             for (ino, record) in stored.entries {

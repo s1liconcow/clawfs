@@ -27,7 +27,7 @@ use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{InlinePayloadCodec, SegmentExtent};
 
 const SEGMENT_MAGIC_V2: &[u8; 4] = b"OSG2";
-const SEGMENT_ENTRY_CODEC_HEADER_LEN: usize = 1 + 8 + 8 + 12;
+pub const SEGMENT_ENTRY_CODEC_HEADER_LEN: usize = 1 + 8 + 8 + 12;
 const SEGMENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

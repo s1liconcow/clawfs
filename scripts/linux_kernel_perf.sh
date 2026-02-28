@@ -12,13 +12,13 @@ CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
 LINUX_VERSION="${LINUX_VERSION:-6.11}"
 HOME_PREFIX="${HOME_PREFIX:-/home}"
-DEBUG_LOG="${DEBUG_LOG:--1}"
 DO_CLEANUP=1
 SKIP_EXTRACT=0
 REUSE_TREE=0
 EXTRA_FLAGS=(--disable-cleanup --disable-journal)
 RUN_CLEANUP="$ROOT_DIR/scripts/cleanup.sh"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
+DEBUG_LOG="${DEBUG_LOG:-}"
 
 usage() {
   cat <<USAGE

@@ -441,7 +441,11 @@ impl OsageFs {
                         break;
                     }
                     if plain_codec {
-                        let extent_end = extent_start.saturating_add(extent.pointer.length);
+                        let payload_len = extent
+                            .pointer
+                            .length
+                            .saturating_sub(crate::segment::SEGMENT_ENTRY_CODEC_HEADER_LEN as u64);
+                        let extent_end = extent_start.saturating_add(payload_len);
                         if extent_end <= range_start {
                             continue;
                         }
@@ -691,7 +695,11 @@ impl OsageFs {
                 break;
             }
             if plain_codec {
-                let extent_end = extent_start.saturating_add(extent.pointer.length);
+                let payload_len = extent
+                    .pointer
+                    .length
+                    .saturating_sub(crate::segment::SEGMENT_ENTRY_CODEC_HEADER_LEN as u64);
+                let extent_end = extent_start.saturating_add(payload_len);
                 if extent_end <= range_start {
                     continue;
                 }
