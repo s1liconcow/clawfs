@@ -145,8 +145,8 @@ jobs:
           export SCRATCH_DEV=osagefs_scratch
           export SCRATCH_MNT=/tmp/osagefs-scratch-mnt
 
-          export TEST_FS_MOUNT_OPTS="-osource=/tmp/osagefs-test-store,allow_other,default_permissions"
-          export MOUNT_OPTIONS="-osource=/tmp/osagefs-scratch-store,allow_other,default_permissions"
+          export TEST_FS_MOUNT_OPTS="-o source=/tmp/osagefs-test-store,allow_other,default_permissions"
+          export MOUNT_OPTIONS="-o source=/tmp/osagefs-scratch-store,allow_other,default_permissions"
           EOF
 
           cat > excludes << 'EOF'

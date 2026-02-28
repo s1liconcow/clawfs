@@ -129,6 +129,75 @@ fn summarize_inode_kind_truncates_directory_children() {
     assert!(summary.len() < 300);
 }
 
+#[test]
+fn xfstests_local_config_mount_opts_include_dash_o_prefix() {
+    let launcher_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("sprite_validate_parallel.sh");
+    let launcher = match std::fs::read_to_string(&launcher_path) {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!(
+                "skipping xfstests launcher assertion; missing {}",
+                launcher_path.display()
+            );
+            return;
+        }
+    };
+    assert!(
+        launcher.contains(
+            "export TEST_FS_MOUNT_OPTS=\"-o source=/tmp/osagefs-test-store,allow_other,default_permissions\""
+        ),
+        "xfstests launcher should export TEST_FS_MOUNT_OPTS with -o",
+    );
+    assert!(
+        launcher.contains(
+            "export MOUNT_OPTIONS=\"-o source=/tmp/osagefs-scratch-store,allow_other,default_permissions\""
+        ),
+        "xfstests launcher should export MOUNT_OPTIONS with -o",
+    );
+    assert!(
+        !launcher.contains("export TEST_FS_MOUNT_OPTS=\"source="),
+        "launcher must not omit -o for TEST_FS_MOUNT_OPTS",
+    );
+    assert!(
+        !launcher.contains("export MOUNT_OPTIONS=\"source="),
+        "launcher must not omit -o for MOUNT_OPTIONS",
+    );
+    assert!(
+        launcher.contains("log=\"/tmp/osagefs-\\${name}-u\\$(id -u).log\""),
+        "mount helper log path should be uid-scoped to avoid cross-user permission collisions",
+    );
+}
+
+#[test]
+fn github_xfstests_workflow_uses_dash_o_mount_opts() {
+    let workflow = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/xfstests.yml"
+    ));
+    assert!(
+        workflow.contains(
+            "export TEST_FS_MOUNT_OPTS=\"-o source=/tmp/osagefs-test-store,allow_other,default_permissions\""
+        ),
+        "github xfstests workflow should export TEST_FS_MOUNT_OPTS with '-o source=' format",
+    );
+    assert!(
+        workflow.contains(
+            "export MOUNT_OPTIONS=\"-o source=/tmp/osagefs-scratch-store,allow_other,default_permissions\""
+        ),
+        "github xfstests workflow should export MOUNT_OPTIONS with '-o source=' format",
+    );
+    assert!(
+        !workflow.contains("export TEST_FS_MOUNT_OPTS=\"-osource="),
+        "github xfstests workflow must not use '-osource=' format",
+    );
+    assert!(
+        !workflow.contains("export MOUNT_OPTIONS=\"-osource="),
+        "github xfstests workflow must not use '-osource=' format",
+    );
+}
+
 fn ensure_root_for_tests(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,
