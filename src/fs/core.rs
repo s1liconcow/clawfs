@@ -269,7 +269,7 @@ impl OsageFs {
             nlink: if record.is_dir() {
                 2 + record.children().map(|c| c.len() as u32).unwrap_or(0)
             } else {
-                record.link_count.max(1)
+                record.link_count
             },
             uid: record.uid,
             gid: record.gid,

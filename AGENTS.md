@@ -41,6 +41,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - `scripts/fio_workloads.sh` supports `WORKLOADS`, `FAST_REPRO=1`, `HEAPTRACK=1`. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
 - `scripts/micro_workflows.sh`: `MODE=both BUILD_MODE=check`, `WORKFLOW_PROFILE=quick|realistic|all`. Knobs: `SMALLFILE_COUNT=5000`, `DEV_SCAN_TREE_COPIES=8`, `ETL_ROWS=500000`, etc.
 - xfstests (Sprite): use `FUSE_SUBTYP` (not `FUSE_SUBTYPE`), install `/sbin/mount.fuse.osagefs`, set distinct `--fuse-fsname` for TEST/SCRATCH. CLI: options before tests.
+- xfstests mount opts: set `TEST_FS_MOUNT_OPTS`/`MOUNT_OPTIONS` with `-o...` (for example `-osource=/tmp/osagefs-test-store,...`); omitting `-o` causes `mount: bad usage` before the helper runs.
 - Mount validation: `scripts/common.sh` provides `osage_assert_welcome_file`; tune with `MOUNT_CHECK_TIMEOUT_SEC`.
 - `scripts/run_osagefs.sh` auto-rebuilds when source is newer. Defaults `PERF_LOG_PATH=$ROOT/osagefs-perf.jsonl` (set `=` to disable).
 - Replay: `REPLAY_LOG_PATH=/path/replay.jsonl.gz` for both FUSE and NFS scripts.
