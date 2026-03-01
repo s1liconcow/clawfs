@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+WORKDIR_REMOTE="${WORKDIR_REMOTE:-/work/osagefs}"
+SYNC_REPO=1
+SKIP_BOOTSTRAP=0
+TASKS_CSV="xfstests,linux,pjdfstest"
+LOG_DIR="${LOG_DIR:-$ROOT_DIR/validation-results-$(date +%Y%m%d-%H%M%S)}"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/sprite_validate_parallel.sh [options]
+
+Run validation suites in parallel on dedicated sprites:
+  - xfstests
+  - linux kernel compile perf script
+  - pjdfstest
+
+Options:
+  --tasks <csv>        Comma-separated list: xfstests,linux,pjdfstest
+  --no-sync            Skip tar sync into sprites (assume /work/osagefs is current)
+  --skip-bootstrap     Skip apt/bootstrap steps inside sprites
+  --log-dir <path>     Local directory for per-task logs
+  -h, --help           Show help
+
+Examples:
+  scripts/sprite_validate_parallel.sh
+  scripts/sprite_validate_parallel.sh --tasks xfstests,linux
+  scripts/sprite_validate_parallel.sh --no-sync --skip-bootstrap
+USAGE
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr -cs 'a-zA-Z0-9' '-' \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/^-*//; s/-*$//'
+}
+
+derive_raw_base() {
+  local repo_slug branch_slug
+  repo_slug="$(slugify "$(basename "$(git -C "$ROOT_DIR" rev-parse --show-toplevel)")")"
+  branch_slug="$(slugify "$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)")"
+  printf '%s-%s' "$repo_slug" "$branch_slug"
+}
+
+derive_sprite_name() {
+  local raw_base="$1"
+  local role="$2"
+  local role_slug raw_name name_hash max_base_len base_trimmed
+  role_slug="$(slugify "$role" | cut -c1-12)"
+  raw_name="${raw_base}-${role_slug}"
+  name_hash="$(printf '%s' "$raw_name" | sha1sum | cut -c1-8)"
+  max_base_len=$((55 - 1 - ${#role_slug} - 1 - 8))
+  base_trimmed="$(printf '%s' "$raw_base" | cut -c1-"$max_base_len" | sed 's/-$//')"
+  printf '%s-%s-%s' "$base_trimmed" "$role_slug" "$name_hash"
+}
+
+contains_task() {
+  local want="$1"
+  local t
+  IFS=',' read -r -a _tasks <<< "$TASKS_CSV"
+  for t in "${_tasks[@]}"; do
+    if [[ "$t" == "$want" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_sprite() {
+  local sprite="$1"
+  if ! sprite list | rg -qx "$sprite"; then
+    echo "Creating sprite $sprite"
+    sprite create "$sprite" >/dev/null
+  fi
+}
+
+sync_repo_to_sprite() {
+  local sprite="$1"
+  tar \
+    --exclude='.git' \
+    --exclude='target' \
+    --exclude='linux-local' \
+    --exclude='out' \
+    --exclude='fio-results-*' \
+    --exclude='*.log' \
+    -czf - . \
+    | sprite exec -s "$sprite" -- bash -lc "rm -rf '$WORKDIR_REMOTE' && mkdir -p '$WORKDIR_REMOTE' && tar -xzf - -C '$WORKDIR_REMOTE'"
+}
+
+bootstrap_common_cmd() {
+  cat <<'EOF'
+set -euo pipefail
+sudo apt-get update
+sudo apt-get install -y \
+  bash coreutils findutils procps psmisc tar gzip xz-utils curl git python3 \
+  make gcc g++ binutils bc bison flex perl rsync cpio pv time ripgrep strace \
+  fio fuse3 util-linux sudo
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf >/dev/null || true
+EOF
+}
+
+run_xfstests_cmd() {
+  cat <<EOF
+set -euo pipefail
+cd '$WORKDIR_REMOTE'
+if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
+  $(bootstrap_common_cmd)
+  sudo apt-get install -y \
+    acl attr automake dbench dump e2fsprogs gawk indent \
+    libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
+    liburing-dev libuuid1 lvm2 quota sed uuid-dev uuid-runtime xfsprogs \
+    sqlite3 libgdbm-compat-dev systemd-coredump systemd jq pkg-config \
+    exfatprogs f2fs-tools ocfs2-tools udftools xfsdump xfslibs-dev || true
+fi
+
+if [[ ! -d /tmp/xfstests ]]; then
+  git clone https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
+  (cd /tmp/xfstests && make && sudo make install)
+fi
+
+cargo build --release --bin osagefs
+
+# Avoid cross-user residue from prior runs (root vs fsgqa vs sprite).
+sudo rm -rf /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+sudo mkdir -p /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+sudo chmod 0777 /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+
+sudo tee /sbin/mount.fuse.osagefs > /dev/null <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+src="\${1:-}"
+mnt="\${2:-}"
+optstr=""
+shift 2 || true
+while ((\$#)); do
+  case "\$1" in
+    -o) shift; optstr="\${1:-}" ;;
+    -o*) optstr="\${1#-o}" ;;
+  esac
+  shift || true
+done
+store=""
+IFS="," read -ra kvs <<< "\$optstr"
+for kv in "\${kvs[@]}"; do
+  case "\$kv" in
+    source=*) store="\${kv#source=}" ;;
+    store=*) store="\${kv#store=}" ;;
+  esac
+done
+if [[ -z "\$store" || -z "\$src" || -z "\$mnt" ]]; then
+  echo "mount.fuse.osagefs: bad args src=\$src mnt=\$mnt opts=\$optstr" >&2
+  exit 1
+fi
+if mountpoint -q "\$mnt"; then
+  exit 0
+fi
+name="\$(basename "\$mnt" | tr -cs 'a-zA-Z0-9' '_')"
+cache="/tmp/osagefs-\${name}-cache"
+state="/tmp/osagefs-\${name}-state.bin"
+log="/tmp/osagefs-\${name}-u\$(id -u).log"
+mkdir -p "\$store" "\$cache" "\$mnt"
+nohup /work/osagefs/target/release/osagefs \
+  --mount-path "\$mnt" \
+  --store-path "\$store" \
+  --local-cache-path "\$cache" \
+  --state-path "\$state" \
+  --object-provider local \
+  --fuse-fsname "\$src" \
+  --allow-other \
+  --disable-journal \
+  --disable-cleanup \
+  --foreground >"\$log" 2>&1 &
+for _ in \$(seq 1 40); do
+  mountpoint -q "\$mnt" && exit 0
+  sleep 1
+done
+exit 1
+HELPER
+sudo chmod +x /sbin/mount.fuse.osagefs
+
+cd /tmp/xfstests
+cat > local.config <<'LOCALCFG'
+export FSTYP=fuse
+export FUSE_SUBTYP=.osagefs
+
+export TEST_DEV=osagefs_test
+export TEST_DIR=/tmp/osagefs-test-mnt
+export SCRATCH_DEV=osagefs_scratch
+export SCRATCH_MNT=/tmp/osagefs-scratch-mnt
+
+export TEST_FS_MOUNT_OPTS="-o source=/tmp/osagefs-test-store,allow_other,default_permissions"
+export MOUNT_OPTIONS="-o source=/tmp/osagefs-scratch-store,allow_other,default_permissions"
+LOCALCFG
+
+cat > excludes <<'EX'
+generic/003
+generic/013
+generic/035
+generic/069
+generic/075
+generic/091
+generic/112
+generic/113
+generic/126
+generic/169
+generic/184
+generic/394
+generic/467
+generic/263
+generic/759
+generic/760
+generic/477
+generic/564
+generic/633
+generic/696
+generic/591
+generic/615
+EX
+
+sudo ./check -E excludes \
+  generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 \
+  generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
+EOF
+}
+
+run_linux_cmd() {
+  cat <<EOF
+set -euo pipefail
+cd '$WORKDIR_REMOTE'
+if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
+  $(bootstrap_common_cmd)
+  sudo apt-get install -y libelf-dev dwarves
+fi
+LOG_FILE='$WORKDIR_REMOTE/linux_build_timings.log' \
+PERF_LOG_PATH='$WORKDIR_REMOTE/osagefs-perf.jsonl' \
+./scripts/linux_kernel_perf.sh
+EOF
+}
+
+run_pjdfstest_cmd() {
+  cat <<EOF
+set -euo pipefail
+cd '$WORKDIR_REMOTE'
+if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
+  $(bootstrap_common_cmd)
+  sudo apt-get install -y prove libtest2-suite-perl || true
+fi
+if [[ ! -d /tmp/pjdfstest ]]; then
+  git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
+fi
+cargo build --release --bin osagefs
+PJDFSTEST_DIR=/tmp/pjdfstest TESTDIR=/tmp/osagefs-mnt JOBS=8 ./scripts/run_pjdfstest.sh
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tasks)
+      TASKS_CSV="$2"
+      shift 2
+      ;;
+    --no-sync)
+      SYNC_REPO=0
+      shift
+      ;;
+    --skip-bootstrap)
+      SKIP_BOOTSTRAP=1
+      shift
+      ;;
+    --log-dir)
+      LOG_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+require_cmd sprite
+require_cmd rg
+require_cmd tar
+require_cmd sha1sum
+require_cmd git
+
+# Support both explicit token auth and pre-authenticated local sprite sessions.
+if ! sprite list >/dev/null 2>&1; then
+  echo "sprite is not authenticated. Set SPRITES_TOKEN or run 'sprite login' first." >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+RAW_BASE="$(derive_raw_base)"
+echo "Validation log dir: $LOG_DIR"
+
+declare -A SPRITE_BY_TASK
+declare -A PID_BY_TASK
+declare -A LOG_BY_TASK
+
+for task in xfstests linux pjdfstest; do
+  if ! contains_task "$task"; then
+    continue
+  fi
+  sprite_name="$(derive_sprite_name "$RAW_BASE" "validate-$task")"
+  SPRITE_BY_TASK["$task"]="$sprite_name"
+  LOG_BY_TASK["$task"]="$LOG_DIR/${task}.log"
+  ensure_sprite "$sprite_name"
+done
+
+if [[ "$SYNC_REPO" -eq 1 ]]; then
+  for task in "${!SPRITE_BY_TASK[@]}"; do
+    echo "Syncing repo to ${SPRITE_BY_TASK[$task]} ($task)"
+    sync_repo_to_sprite "${SPRITE_BY_TASK[$task]}"
+  done
+fi
+
+launch_task() {
+  local task="$1"
+  local sprite="$2"
+  local log_path="$3"
+  local cmd=""
+  case "$task" in
+    xfstests) cmd="$(run_xfstests_cmd)" ;;
+    linux) cmd="$(run_linux_cmd)" ;;
+    pjdfstest) cmd="$(run_pjdfstest_cmd)" ;;
+    *) echo "Unknown task $task" >&2; return 1 ;;
+  esac
+
+  (
+    echo "[$task] sprite=$sprite"
+    sprite exec -s "$sprite" -- bash -lc "$cmd"
+  ) >"$log_path" 2>&1 &
+  PID_BY_TASK["$task"]=$!
+}
+
+for task in "${!SPRITE_BY_TASK[@]}"; do
+  launch_task "$task" "${SPRITE_BY_TASK[$task]}" "${LOG_BY_TASK[$task]}"
+done
+
+overall_rc=0
+for task in "${!PID_BY_TASK[@]}"; do
+  pid="${PID_BY_TASK[$task]}"
+  if wait "$pid"; then
+    echo "[PASS] $task (log: ${LOG_BY_TASK[$task]})"
+  else
+    rc=$?
+    overall_rc=1
+    echo "[FAIL] $task rc=$rc (log: ${LOG_BY_TASK[$task]})"
+  fi
+done
+
+echo
+echo "Sprite assignment:"
+for task in "${!SPRITE_BY_TASK[@]}"; do
+  echo "  $task -> ${SPRITE_BY_TASK[$task]}"
+done
+
+exit "$overall_rc"

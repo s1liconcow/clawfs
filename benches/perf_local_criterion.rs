@@ -50,7 +50,7 @@ fn configured_criterion() -> Criterion {
         "fast" => base
             .sample_size(20)
             .warm_up_time(Duration::from_secs(1))
-            .measurement_time(Duration::from_secs(3)),
+            .measurement_time(Duration::from_secs(13)),
         "thorough" => base
             .sample_size(40)
             .warm_up_time(Duration::from_secs(4))

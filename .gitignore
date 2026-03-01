@@ -9,3 +9,4 @@ pjdfstest_nfs
 micro-results-*
 pjdfstest_*
 fio-results-*
+scripts/__pycache__

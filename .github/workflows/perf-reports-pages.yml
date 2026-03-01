@@ -1,0 +1,69 @@
+name: Perf Reports Pages
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Pages content
+        id: prepare
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/pages-site"
+          mkdir -p "$out_dir/perf_guard_graphs"
+
+          if [[ -d "bench-artifacts/perf_guard_graphs" ]]; then
+            cp -a "bench-artifacts/perf_guard_graphs/." "$out_dir/perf_guard_graphs/"
+          fi
+
+          touch "$out_dir/.nojekyll"
+
+          {
+            echo "<!doctype html>"
+            echo "<html><head><meta charset=\"utf-8\"><title>OsageFS Perf Reports</title></head><body>"
+            echo "<h1>OsageFS Perf Reports</h1>"
+            echo "<p>Run folders are date-prefixed for lexical ordering.</p>"
+            echo "<ul>"
+            find "$out_dir/perf_guard_graphs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r | while read -r run; do
+              if [[ -f "$out_dir/perf_guard_graphs/$run/report/index.html" ]]; then
+                echo "<li><a href=\"perf_guard_graphs/$run/report/index.html\">$run</a></li>"
+              else
+                echo "<li>$run (no report/index.html)</li>"
+              fi
+            done
+            echo "</ul>"
+            echo "</body></html>"
+          } > "$out_dir/index.html"
+
+          echo "site_dir=$out_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.prepare.outputs.site_dir }}
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

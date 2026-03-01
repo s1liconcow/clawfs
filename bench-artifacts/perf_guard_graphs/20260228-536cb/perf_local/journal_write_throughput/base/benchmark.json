@@ -1,0 +1,1 @@
+{"group_id":"perf_local","function_id":"journal_write_throughput","value_str":null,"throughput":{"Elements":5000},"full_id":"perf_local/journal_write_throughput","directory_name":"perf_local/journal_write_throughput","title":"perf_local/journal_write_throughput"}

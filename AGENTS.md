@@ -38,6 +38,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 ## Testing / Tools
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
 - `OSAGEFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`: local performance suite (profiles: `fast|balanced|thorough`).
+- `OSAGEFS_PERF_PROFILE=fast` in `benches/perf_local_criterion.rs` keeps `sample_size=20` but increases `measurement_time` to 13s to avoid "Unable to complete 20 samples in 3.0s" warnings on slower local hosts.
 - Perf guard uses `scripts/perf_guard.sh` + `OSAGEFS_BENCH_METRICS_FILE` JSONL exported by `benches/perf_local_criterion.rs`.
 - `scripts/perf_guard.sh` now copies Criterion HTML reports (`target/criterion/report`) into `bench-artifacts/perf_guard_graphs/<commit5>/` by default (`PERF_GUARD_GRAPH_ROOT`/`PERF_GUARD_GRAPH_DIR` override paths).
 - Hook runs can skip graph artifact copies with `PERF_GUARD_WRITE_GRAPHS=0` (used by `.githooks/pre-push` to avoid staging large report trees).
