@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, PlottingBackend, Throughput};
+use osagefs::codec::{InlineCodecConfig, encode_inline_storage};
 use osagefs::inode::{InodeKind, InodeRecord};
 use osagefs::journal::{JournalEntry, JournalManager, JournalPayload};
 use osagefs::metadata::MetadataStore;
@@ -115,6 +116,76 @@ fn write_guard_metrics_if_requested() {
             "n": guard_sample_count(),
         });
         let _ = writeln!(file, "{rec}");
+    }
+}
+
+/// Simulates the hot path for a Linux untar workload: encode inline payloads
+/// (LZ4 compression) then persist 5 000 inode records to the metadata store.
+/// This captures both the CPU cost of inline encoding and the I/O cost of
+/// writing shard + delta objects — the two phases that dominate untar flush
+/// latency in practice.
+fn run_untar_flush_latency_once() -> RunResult {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("store")).expect("create store");
+
+    let shard_size = 2048u64;
+    let delta_batch = 512usize;
+    let n_inodes = 5_000usize;
+    // Typical small source file: 4 KiB, highly compressible text.
+    let file_payload = vec![0x61u8; 4096]; // 'a' × 4096
+
+    let mut config = perf_config(&root);
+    config.shard_size = shard_size;
+    config.imap_delta_batch = delta_batch;
+
+    let codec_config = InlineCodecConfig {
+        compression: true,
+        encryption_key: None,
+    };
+
+    let runtime = Runtime::new().expect("tokio runtime");
+    let metadata = std::sync::Arc::new(
+        runtime
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+            .expect("metadata init"),
+    );
+    let superblock = std::sync::Arc::new(
+        runtime
+            .block_on(SuperblockManager::load_or_init(
+                metadata.clone(),
+                shard_size,
+            ))
+            .expect("superblock init"),
+    );
+
+    // Pre-build inode records with encoded (compressed) inline storage, mirroring
+    // what flush_pending does before calling persist_inodes_batch.
+    let records: Vec<InodeRecord> = (2..=(n_inodes as u64 + 1))
+        .map(|ino| {
+            let mut rec = make_file_record(ino, 1, file_payload.clone());
+            rec.storage =
+                encode_inline_storage(&file_payload, &codec_config).expect("encode inline storage");
+            rec
+        })
+        .collect();
+
+    let start = Instant::now();
+    let snapshot = superblock.prepare_dirty_generation().expect("prepare gen");
+    let generation = snapshot.generation;
+    runtime
+        .block_on(metadata.persist_inodes_batch(&records, generation, shard_size, delta_batch))
+        .expect("persist inode batch");
+    runtime
+        .block_on(metadata.sync_metadata_writes())
+        .expect("sync metadata");
+    runtime
+        .block_on(superblock.commit_generation(generation))
+        .expect("commit generation");
+    let elapsed = start.elapsed();
+    RunResult {
+        duration: elapsed,
+        metric: elapsed.as_secs_f64() * 1000.0,
     }
 }
 
@@ -478,6 +549,20 @@ fn run_inline_resize_strategy_speedup_once() -> RunResult {
     }
 }
 
+fn bench_untar_flush_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perf_local");
+    group.bench_function("untar_flush_latency", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_untar_flush_latency_once().duration;
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
 fn bench_flush_metadata_batch_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("perf_local");
     group.bench_function("flush_metadata_batch_latency", |b| {
@@ -646,6 +731,7 @@ fn collect_guard_metrics() {
         "inline_resize_strategy_speedup_x",
         run_inline_resize_strategy_speedup_once,
     );
+    collect_guard_metric("untar_flush_latency_ms", run_untar_flush_latency_once);
 }
 
 fn main() {
@@ -659,6 +745,7 @@ fn main() {
     bench_segment_sequential_read_throughput(&mut criterion);
     bench_inode_clone_directory_heavy(&mut criterion);
     bench_inline_resize_strategy_benchmark(&mut criterion);
+    bench_untar_flush_latency(&mut criterion);
     criterion.final_summary();
 
     collect_guard_metrics();
