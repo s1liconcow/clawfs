@@ -86,6 +86,7 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - `scripts/micro_workflows.sh` preserves caller-provided `PERF_LOG_PATH` on exit; perf logging is opt-in.
 - Troubleshooting policy: reproduce with a failing automated test in `src/fs/tests/mod.rs` before fixing.
 - Sprite quirks: `fusermount -u` may fail without `/etc/mtab` (fallback: `umount -l`); `cd /tmp` before daemon shutdown to avoid stale-mount errors.
+- Sprite xfstests may print `System has not been booted with systemd...` from `systemd-run`; treat as noise unless `./check` reports a failed test or non-zero exit.
 - Linux kernel build deps in sprite: `flex`, `bison`, `libelf-dev`, `dwarves`.
 - `scripts/linux_kernel_perf.sh` fails fast on stale/inaccessible mount or existing daemon.
 - `scripts/checkpoint.sh` process guard can false-positive match; run checkpoint steps in separate shells.

@@ -169,6 +169,10 @@ fn xfstests_local_config_mount_opts_include_dash_o_prefix() {
         launcher.contains("log=\"/tmp/osagefs-\\${name}-u\\$(id -u).log\""),
         "mount helper log path should be uid-scoped to avoid cross-user permission collisions",
     );
+    assert!(
+        launcher.contains("optstr=\"\\${optstr},\\${cur}\""),
+        "mount helper should merge multiple -o options so remount paths preserve source=...",
+    );
 }
 
 #[test]
@@ -196,6 +200,10 @@ fn github_xfstests_workflow_uses_dash_o_mount_opts() {
     assert!(
         !workflow.contains("export MOUNT_OPTIONS=\"-osource="),
         "github xfstests workflow must not use '-osource=' format",
+    );
+    assert!(
+        workflow.contains("optstr=\"${optstr},${cur}\""),
+        "github xfstests mount helper should merge multiple -o options so remount preserves source=...",
     );
 }
 

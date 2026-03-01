@@ -144,8 +144,27 @@ optstr=""
 shift 2 || true
 while ((\$#)); do
   case "\$1" in
-    -o) shift; optstr="\${1:-}" ;;
-    -o*) optstr="\${1#-o}" ;;
+    -o)
+      shift
+      cur="\${1:-}"
+      if [[ -n "\$cur" ]]; then
+        if [[ -n "\$optstr" ]]; then
+          optstr="\${optstr},\${cur}"
+        else
+          optstr="\$cur"
+        fi
+      fi
+      ;;
+    -o*)
+      cur="\${1#-o}"
+      if [[ -n "\$cur" ]]; then
+        if [[ -n "\$optstr" ]]; then
+          optstr="\${optstr},\${cur}"
+        else
+          optstr="\$cur"
+        fi
+      fi
+      ;;
   esac
   shift || true
 done
