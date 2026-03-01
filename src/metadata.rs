@@ -486,26 +486,60 @@ impl MetadataStore {
                 .collect()
         };
 
-        // Phase 3: pre-serialize delta chunks
-        let chunk_size = delta_batch.max(1);
-        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = records
-            .chunks(chunk_size)
-            .filter(|c| !c.is_empty())
-            .map(|chunk_records| {
-                let bloom = chunk_records
-                    .iter()
-                    .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
-                let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-                let path = self.delta_prefix().child(filename.as_str());
-                let stored = StoredDeltaRef {
-                    version: METADATA_FORMAT_VERSION,
-                    generation,
-                    records: chunk_records,
-                };
-                let data = serialize_metadata(&stored)?;
-                Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Phase 3: serialize all delta records into a single file per flush.
+        //
+        // Writing N small delta files (one per delta_batch chunk) causes severe
+        // directory inode lock contention when all N parallel puts complete with
+        // renames into the same imap_deltas/ directory.  On local filesystems
+        // this serialises the renames, giving O(N) latency instead of O(1).
+        // Consolidating into one file reduces N renames to 1, cutting flush
+        // latency proportionally to N.
+        //
+        // Bloom-filter granularity is preserved in the filename (OR of all
+        // record blooms).  Readers (apply_external_deltas) already read every
+        // delta file for newer generations, so coarser granularity is fine.
+        //
+        // For very large batches (> MAX_DELTA_SINGLE_FILE records) we fall back
+        // to delta_batch chunking to bound per-file memory and I/O size.
+        const MAX_DELTA_SINGLE_FILE: usize = 50_000;
+        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = if records.is_empty() {
+            vec![]
+        } else if records.len() <= MAX_DELTA_SINGLE_FILE {
+            // Fast path: one delta file for the entire batch.
+            let bloom = records
+                .iter()
+                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+            let path = self.delta_prefix().child(filename.as_str());
+            let stored = StoredDeltaRef {
+                version: METADATA_FORMAT_VERSION,
+                generation,
+                records,
+            };
+            let data = serialize_metadata(&stored)?;
+            vec![(path, Bytes::from(data), records.len())]
+        } else {
+            // Large-batch fallback: chunk to keep individual files manageable.
+            let chunk_size = delta_batch.max(1);
+            records
+                .chunks(chunk_size)
+                .filter(|c| !c.is_empty())
+                .map(|chunk_records| {
+                    let bloom = chunk_records
+                        .iter()
+                        .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+                    let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+                    let path = self.delta_prefix().child(filename.as_str());
+                    let stored = StoredDeltaRef {
+                        version: METADATA_FORMAT_VERSION,
+                        generation,
+                        records: chunk_records,
+                    };
+                    let data = serialize_metadata(&stored)?;
+                    Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
         // Update last_delta_generation before issuing writes.
         if !delta_writes.is_empty() {
