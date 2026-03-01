@@ -1,12 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use flatbuffers::FlatBufferBuilder;
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use futures::StreamExt;
+use futures::future::try_join_all;
 use libc::{ENOENT, ENOTDIR};
 use log::{debug, info};
 use object_store::aws::AmazonS3Builder;
@@ -19,7 +20,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
 use crate::config::{Config, ObjectStoreProvider};
-use crate::inode::{FileStorage, InodeKind, InodeRecord, InodeShard};
+use crate::inode::{
+    FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord, InodeShard,
+    SegmentExtent,
+};
+use crate::segment::SegmentPointer;
 use crate::superblock::Superblock;
 
 /// How long an ENOENT result is served from the negative cache before we
@@ -54,6 +59,414 @@ fn deserialize_metadata<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(serde_json::from_slice(&payload)?)
 }
 
+// ── OSGFB2: schema-based FlatBuffers for shards and deltas ───────────────────
+//
+// Replaces the OSGFB1 format (JSON bytes wrapped in a FlatBuffer byte-vector).
+// OSGFB2 uses proper FlatBuffer tables, storing Vec<u8> payloads as compact
+// binary byte vectors instead of JSON integer arrays, giving ~3× smaller
+// serialized size for inline-storage inodes.
+//
+// Schema (field index → VOffset = (index+2)*2):
+//
+// SegExtent table:
+//   0(vt=4)  logical_offset: u64
+//   1(vt=6)  segment_id:     u64
+//   2(vt=8)  generation:     u64
+//   3(vt=10) offset:         u64
+//   4(vt=12) length:         u64
+//
+// InodeRecord table:
+//    0(vt=4)  inode:         u64
+//    1(vt=6)  parent:        u64
+//    2(vt=8)  name:          string
+//    3(vt=10) path:          string
+//    4(vt=12) kind_tag:      u8   (0=File,1=Dir,2=Symlink,3=Tombstone)
+//    5(vt=14) dir_keys:      [string]  (Directory only)
+//    6(vt=16) dir_values:    [u64]     (Directory only)
+//    7(vt=18) size:          u64
+//    8(vt=20) mode:          u32
+//    9(vt=22) uid:           u32
+//   10(vt=24) gid:           u32
+//   11(vt=26) atime_ns:      i64  (nanoseconds since Unix epoch)
+//   12(vt=28) mtime_ns:      i64
+//   13(vt=30) ctime_ns:      i64
+//   14(vt=32) link_count:    u32
+//   15(vt=34) rdev:          u32
+//   16(vt=36) storage_tag:   u8   (0=Inline,1=InlineEncoded,2=Segments)
+//   17(vt=38) storage_bytes: [u8] (Inline payload OR InlineEncoded.payload)
+//   18(vt=40) storage_codec: u8   (InlineEncoded: 1=Lz4,2=ChaCha,3=Lz4ChaCha)
+//   19(vt=42) storage_orig:  u64  (InlineEncoded original_len; 0 = absent)
+//   20(vt=44) storage_nonce: [u8] (InlineEncoded nonce, 12 bytes)
+//   21(vt=46) seg_extents:   [SegExtent] (Segments)
+//
+// StoredDocument table (covers both shard and delta):
+//   0(vt=4) version:    u32
+//   1(vt=6) generation: u64
+//   2(vt=8) records:    [InodeRecord]
+// ─────────────────────────────────────────────────────────────────────────────
+
+const METADATA_FB2_MAGIC: &[u8] = b"OSGFB2";
+
+/// VOffset for FlatBuffer table field at zero-based `index`: `(index + 2) * 2`.
+#[inline(always)]
+const fn fvt(index: u16) -> u16 {
+    (index + 2) * 2
+}
+
+// ── Write path ────────────────────────────────────────────────────────────────
+
+fn build_seg_extent_fb<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    ext: &SegmentExtent,
+) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u64>(fvt(0), ext.logical_offset);
+    fbb.push_slot_always::<u64>(fvt(1), ext.pointer.segment_id);
+    fbb.push_slot_always::<u64>(fvt(2), ext.pointer.generation);
+    fbb.push_slot_always::<u64>(fvt(3), ext.pointer.offset);
+    fbb.push_slot_always::<u64>(fvt(4), ext.pointer.length);
+    fbb.end_table(start)
+}
+
+fn build_inode_record_fb<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    record: &InodeRecord,
+) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
+    // All reference types (strings, vectors, nested tables) must be built
+    // BEFORE start_table() since they write into the same buffer.
+    let name_wip = fbb.create_string(&record.name);
+    let path_wip = fbb.create_string(&record.path);
+
+    let (kind_tag, dir_keys_wip, dir_values_wip) = match &record.kind {
+        InodeKind::File => (0u8, None, None),
+        InodeKind::Directory { children } => {
+            let keys: Vec<WIPOffset<&str>> =
+                children.keys().map(|k| fbb.create_string(k)).collect();
+            let keys_wip = fbb.create_vector(&keys);
+            let vals: Vec<u64> = children.values().copied().collect();
+            let vals_wip = fbb.create_vector(&vals);
+            (1u8, Some(keys_wip), Some(vals_wip))
+        }
+        InodeKind::Symlink => (2u8, None, None),
+        InodeKind::Tombstone => (3u8, None, None),
+    };
+
+    let (storage_tag, storage_bytes_wip, codec_u8, orig_len, nonce_wip, extents_wip) =
+        match &record.storage {
+            FileStorage::Inline(bytes) => {
+                let wip = fbb.create_vector(bytes.as_slice());
+                (0u8, Some(wip), 0u8, 0u64, None, None)
+            }
+            FileStorage::InlineEncoded(p) => {
+                let bytes_wip = fbb.create_vector(p.payload.as_slice());
+                let nonce_wip = p.nonce.as_ref().map(|n| fbb.create_vector(n.as_slice()));
+                let codec_u8 = match p.codec {
+                    InlinePayloadCodec::None => 0u8,
+                    InlinePayloadCodec::Lz4 => 1u8,
+                    InlinePayloadCodec::ChaCha20Poly1305 => 2u8,
+                    InlinePayloadCodec::Lz4ChaCha20Poly1305 => 3u8,
+                };
+                (
+                    1u8,
+                    Some(bytes_wip),
+                    codec_u8,
+                    p.original_len.unwrap_or(0),
+                    nonce_wip,
+                    None,
+                )
+            }
+            FileStorage::LegacySegment(ptr) => {
+                let ext = SegmentExtent {
+                    logical_offset: 0,
+                    pointer: ptr.clone(),
+                };
+                let ext_wip = build_seg_extent_fb(fbb, &ext);
+                let vec_wip = fbb.create_vector(&[ext_wip]);
+                (2u8, None, 0u8, 0u64, None, Some(vec_wip))
+            }
+            FileStorage::Segments(extents) => {
+                let ext_wips: Vec<WIPOffset<_>> = extents
+                    .iter()
+                    .map(|e| build_seg_extent_fb(fbb, e))
+                    .collect();
+                let vec_wip = fbb.create_vector(&ext_wips);
+                (2u8, None, 0u8, 0u64, None, Some(vec_wip))
+            }
+        };
+
+    let atime_ns = record.atime.unix_timestamp() * 1_000_000_000 + record.atime.nanosecond() as i64;
+    let mtime_ns = record.mtime.unix_timestamp() * 1_000_000_000 + record.mtime.nanosecond() as i64;
+    let ctime_ns = record.ctime.unix_timestamp() * 1_000_000_000 + record.ctime.nanosecond() as i64;
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u64>(fvt(0), record.inode);
+    fbb.push_slot_always::<u64>(fvt(1), record.parent);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(2), name_wip);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(3), path_wip);
+    fbb.push_slot_always::<u8>(fvt(4), kind_tag);
+    if let Some(wip) = dir_keys_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(5), wip);
+    }
+    if let Some(wip) = dir_values_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(6), wip);
+    }
+    fbb.push_slot_always::<u64>(fvt(7), record.size);
+    fbb.push_slot_always::<u32>(fvt(8), record.mode);
+    fbb.push_slot_always::<u32>(fvt(9), record.uid);
+    fbb.push_slot_always::<u32>(fvt(10), record.gid);
+    fbb.push_slot_always::<i64>(fvt(11), atime_ns);
+    fbb.push_slot_always::<i64>(fvt(12), mtime_ns);
+    fbb.push_slot_always::<i64>(fvt(13), ctime_ns);
+    fbb.push_slot_always::<u32>(fvt(14), record.link_count);
+    fbb.push_slot_always::<u32>(fvt(15), record.rdev);
+    fbb.push_slot_always::<u8>(fvt(16), storage_tag);
+    if let Some(wip) = storage_bytes_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(17), wip);
+    }
+    if codec_u8 != 0 {
+        fbb.push_slot_always::<u8>(fvt(18), codec_u8);
+    }
+    if orig_len > 0 {
+        fbb.push_slot_always::<u64>(fvt(19), orig_len);
+    }
+    if let Some(wip) = nonce_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(20), wip);
+    }
+    if let Some(wip) = extents_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(21), wip);
+    }
+    fbb.end_table(start)
+}
+
+/// Serialize `records` as an OSGFB2 FlatBuffer document (with magic prefix).
+fn serialize_inodes_fb2<'a>(
+    version: u32,
+    generation: u64,
+    records: impl IntoIterator<Item = &'a InodeRecord>,
+) -> Vec<u8> {
+    let records: Vec<&InodeRecord> = records.into_iter().collect();
+    let mut fbb = FlatBufferBuilder::with_capacity(records.len() * 512 + 256);
+
+    let rec_wips: Vec<WIPOffset<_>> = records
+        .iter()
+        .map(|r| build_inode_record_fb(&mut fbb, r))
+        .collect();
+    let records_vec = fbb.create_vector(&rec_wips);
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u32>(fvt(0), version);
+    fbb.push_slot_always::<u64>(fvt(1), generation);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(2), records_vec);
+    let root = fbb.end_table(start);
+    fbb.finish_minimal(root);
+
+    let fb = fbb.finished_data();
+    let mut out = Vec::with_capacity(METADATA_FB2_MAGIC.len() + fb.len());
+    out.extend_from_slice(METADATA_FB2_MAGIC);
+    out.extend_from_slice(fb);
+    out
+}
+
+// ── Read path ─────────────────────────────────────────────────────────────────
+
+fn read_seg_extent_fb2(t: flatbuffers::Table<'_>) -> SegmentExtent {
+    // Safety: t was produced by our own OSGFB2 writer so the schema matches.
+    let logical_offset = unsafe { t.get::<u64>(fvt(0), Some(0)) }.unwrap_or(0);
+    let segment_id = unsafe { t.get::<u64>(fvt(1), Some(0)) }.unwrap_or(0);
+    let generation = unsafe { t.get::<u64>(fvt(2), Some(0)) }.unwrap_or(0);
+    let offset = unsafe { t.get::<u64>(fvt(3), Some(0)) }.unwrap_or(0);
+    let length = unsafe { t.get::<u64>(fvt(4), Some(0)) }.unwrap_or(0);
+    SegmentExtent {
+        logical_offset,
+        pointer: SegmentPointer {
+            segment_id,
+            generation,
+            offset,
+            length,
+        },
+    }
+}
+
+fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
+    use flatbuffers::{ForwardsUOffset, Table, Vector};
+
+    // Safety: t was produced by our own OSGFB2 writer so the schema matches.
+    let inode = unsafe { t.get::<u64>(fvt(0), Some(0)) }.unwrap_or(0);
+    let parent = unsafe { t.get::<u64>(fvt(1), Some(0)) }.unwrap_or(0);
+    let name = unsafe { t.get::<ForwardsUOffset<&str>>(fvt(2), Some("")) }
+        .unwrap_or("")
+        .to_owned();
+    let path = unsafe { t.get::<ForwardsUOffset<&str>>(fvt(3), Some("")) }
+        .unwrap_or("")
+        .to_owned();
+    let kind_tag = unsafe { t.get::<u8>(fvt(4), Some(0)) }.unwrap_or(0);
+    let size = unsafe { t.get::<u64>(fvt(7), Some(0)) }.unwrap_or(0);
+    let mode = unsafe { t.get::<u32>(fvt(8), Some(0)) }.unwrap_or(0);
+    let uid = unsafe { t.get::<u32>(fvt(9), Some(0)) }.unwrap_or(0);
+    let gid = unsafe { t.get::<u32>(fvt(10), Some(0)) }.unwrap_or(0);
+    let atime_ns = unsafe { t.get::<i64>(fvt(11), Some(0)) }.unwrap_or(0);
+    let mtime_ns = unsafe { t.get::<i64>(fvt(12), Some(0)) }.unwrap_or(0);
+    let ctime_ns = unsafe { t.get::<i64>(fvt(13), Some(0)) }.unwrap_or(0);
+    let link_count = unsafe { t.get::<u32>(fvt(14), Some(0)) }.unwrap_or(0);
+    let rdev = unsafe { t.get::<u32>(fvt(15), Some(0)) }.unwrap_or(0);
+    let storage_tag = unsafe { t.get::<u8>(fvt(16), Some(0)) }.unwrap_or(0);
+    let storage_codec_u8 = unsafe { t.get::<u8>(fvt(18), Some(0)) }.unwrap_or(0);
+    let storage_orig_len = unsafe { t.get::<u64>(fvt(19), Some(0)) }.unwrap_or(0);
+
+    let kind = match kind_tag {
+        0 => InodeKind::File,
+        1 => {
+            let keys_vec = unsafe {
+                t.get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<&str>>>>(fvt(5), None)
+            };
+            let vals_vec = unsafe { t.get::<ForwardsUOffset<Vector<'_, u64>>>(fvt(6), None) };
+            let mut children = BTreeMap::new();
+            if let (Some(kv), Some(vv)) = (keys_vec, vals_vec) {
+                for i in 0..kv.len().min(vv.len()) {
+                    children.insert(kv.get(i).to_owned(), vv.get(i));
+                }
+            }
+            InodeKind::Directory {
+                children: Arc::new(children),
+            }
+        }
+        2 => InodeKind::Symlink,
+        3 => InodeKind::Tombstone,
+        v => anyhow::bail!("fb2: unknown kind_tag {v}"),
+    };
+
+    let storage = match storage_tag {
+        0 => {
+            let bytes =
+                unsafe { t.get::<ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(17), None) }
+                    .map(|v| v.bytes().to_vec())
+                    .unwrap_or_default();
+            FileStorage::Inline(bytes)
+        }
+        1 => {
+            let payload =
+                unsafe { t.get::<ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(17), None) }
+                    .map(|v| v.bytes().to_vec())
+                    .unwrap_or_default();
+            let nonce: Option<[u8; 12]> =
+                unsafe { t.get::<ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(20), None) }
+                    .and_then(|v| {
+                        let b = v.bytes();
+                        if b.len() == 12 {
+                            let mut arr = [0u8; 12];
+                            arr.copy_from_slice(b);
+                            Some(arr)
+                        } else {
+                            None
+                        }
+                    });
+            let codec = match storage_codec_u8 {
+                0 => InlinePayloadCodec::None,
+                1 => InlinePayloadCodec::Lz4,
+                2 => InlinePayloadCodec::ChaCha20Poly1305,
+                3 => InlinePayloadCodec::Lz4ChaCha20Poly1305,
+                v => anyhow::bail!("fb2: unknown codec {v}"),
+            };
+            let original_len = (storage_orig_len > 0).then_some(storage_orig_len);
+            FileStorage::InlineEncoded(InlinePayload {
+                codec,
+                payload,
+                original_len,
+                nonce,
+            })
+        }
+        2 => {
+            let exts_vec = unsafe {
+                t.get::<ForwardsUOffset<flatbuffers::Vector<'_, ForwardsUOffset<Table<'_>>>>>(
+                    fvt(21),
+                    None,
+                )
+            };
+            let extents = match exts_vec {
+                None => Vec::new(),
+                Some(ev) => (0..ev.len())
+                    .map(|i| read_seg_extent_fb2(ev.get(i)))
+                    .collect(),
+            };
+            FileStorage::Segments(extents)
+        }
+        v => anyhow::bail!("fb2: unknown storage_tag {v}"),
+    };
+
+    let atime = time::OffsetDateTime::from_unix_timestamp_nanos(atime_ns as i128)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let mtime = time::OffsetDateTime::from_unix_timestamp_nanos(mtime_ns as i128)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let ctime = time::OffsetDateTime::from_unix_timestamp_nanos(ctime_ns as i128)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+
+    Ok(InodeRecord {
+        inode,
+        parent,
+        name,
+        path,
+        kind,
+        size,
+        mode,
+        uid,
+        gid,
+        atime,
+        mtime,
+        ctime,
+        link_count,
+        rdev,
+        storage,
+    })
+}
+
+fn deserialize_fb2_document(data: &[u8]) -> Result<(u32, u64, Vec<InodeRecord>)> {
+    use flatbuffers::{ForwardsUOffset, Table, Vector};
+
+    // Safety: called only after verifying OSGFB2 magic; data was written by our writer.
+    let doc = unsafe { flatbuffers::root_unchecked::<Table<'_>>(data) };
+    let version = unsafe { doc.get::<u32>(fvt(0), Some(0)) }.unwrap_or(0);
+    let generation = unsafe { doc.get::<u64>(fvt(1), Some(0)) }.unwrap_or(0);
+    let records_vec =
+        unsafe { doc.get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<Table<'_>>>>>(fvt(2), None) };
+
+    let records = match records_vec {
+        None => Vec::new(),
+        Some(rv) => (0..rv.len())
+            .map(|i| read_inode_record_fb2(rv.get(i)))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    Ok((version, generation, records))
+}
+
+/// Deserialize a shard, supporting both OSGFB1 (JSON) and OSGFB2 (schema FlatBuffers).
+fn deserialize_shard(bytes: &[u8]) -> Result<StoredShard> {
+    if let Some(fb2_bytes) = bytes.strip_prefix(METADATA_FB2_MAGIC) {
+        let (version, generation, records) = deserialize_fb2_document(fb2_bytes)?;
+        let entries = records.into_iter().map(|r| (r.inode, r)).collect();
+        Ok(StoredShard {
+            version,
+            generation,
+            entries,
+        })
+    } else {
+        deserialize_metadata::<StoredShard>(bytes)
+    }
+}
+
+/// Deserialize a delta, supporting both OSGFB1 (JSON) and OSGFB2 (schema FlatBuffers).
+fn deserialize_delta(bytes: &[u8]) -> Result<StoredDelta> {
+    if let Some(fb2_bytes) = bytes.strip_prefix(METADATA_FB2_MAGIC) {
+        let (version, generation, records) = deserialize_fb2_document(fb2_bytes)?;
+        Ok(StoredDelta {
+            version,
+            generation,
+            records,
+        })
+    } else {
+        deserialize_metadata::<StoredDelta>(bytes)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredDelta {
     version: u32,
@@ -66,24 +479,6 @@ struct StoredShard {
     version: u32,
     generation: u64,
     entries: Vec<(u64, InodeRecord)>,
-}
-
-/// Borrow-friendly serialization struct for shards — avoids cloning every
-/// InodeRecord just to serialize the shard snapshot to disk.
-#[derive(Serialize)]
-struct StoredShardRef<'a> {
-    version: u32,
-    generation: u64,
-    entries: Vec<(u64, &'a InodeRecord)>,
-}
-
-/// Borrow-friendly serialization struct for deltas — avoids the
-/// `records.to_vec()` clone that the owned [`StoredDelta`] required.
-#[derive(Serialize)]
-struct StoredDeltaRef<'a> {
-    version: u32,
-    generation: u64,
-    records: &'a [InodeRecord],
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -456,8 +851,8 @@ impl MetadataStore {
             }
         }
 
-        // Phase 2: serialize touched shards
-        let shard_writes: Vec<(ObjectPath, Vec<u8>, u64, usize)> = {
+        // Phase 2: pre-serialize touched shards
+        let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
             let shards = self.shards.lock();
             let base_path = self.imap_prefix();
             let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
@@ -466,40 +861,134 @@ impl MetadataStore {
                 .iter()
                 .filter_map(|&shard_id| {
                     let entry = shards.get(&shard_id)?;
-                    let stored = StoredShardRef {
-                        version: METADATA_FORMAT_VERSION,
+                    let data = serialize_inodes_fb2(
+                        METADATA_FORMAT_VERSION,
                         generation,
-                        entries: entry
-                            .shard
-                            .inodes
-                            .iter()
-                            .map(|(ino, rec)| (*ino, rec))
-                            .collect(),
-                    };
-                    let data = serialize_metadata(&stored).ok()?;
+                        entry.shard.inodes.values(),
+                    );
                     let count = entry.shard.inodes.len();
                     let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
                     let path = base_path.child(filename.as_str());
-                    Some((path, data, shard_id, count))
+                    Some((path, Bytes::from(data), shard_id, count))
                 })
                 .collect()
         };
 
-        for (path, data, shard_id, count) in shard_writes {
-            self.store
-                .put(&path, PutPayload::from_bytes(Bytes::from(data)))
-                .await?;
-            self.log_backing(format_args!(
-                "synced backing file path={} type=imap shard={} generation={} entries={}",
-                path, shard_id, generation, count
-            ));
+        // Phase 3: serialize all delta records into a single file per flush.
+        //
+        // Writing N small delta files (one per delta_batch chunk) causes severe
+        // directory inode lock contention when all N parallel puts complete with
+        // renames into the same imap_deltas/ directory.  On local filesystems
+        // this serialises the renames, giving O(N) latency instead of O(1).
+        // Consolidating into one file reduces N renames to 1, cutting flush
+        // latency proportionally to N.
+        //
+        // Bloom-filter granularity is preserved in the filename (OR of all
+        // record blooms).  Readers (apply_external_deltas) already read every
+        // delta file for newer generations, so coarser granularity is fine.
+        //
+        // For very large batches (> MAX_DELTA_SINGLE_FILE records) we fall back
+        // to delta_batch chunking to bound per-file memory and I/O size.
+        const MAX_DELTA_SINGLE_FILE: usize = 50_000;
+        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = if records.is_empty() {
+            vec![]
+        } else if records.len() <= MAX_DELTA_SINGLE_FILE {
+            // Fast path: one delta file for the entire batch.
+            let bloom = records
+                .iter()
+                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+            let path = self.delta_prefix().child(filename.as_str());
+            let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
+            vec![(path, Bytes::from(data), records.len())]
+        } else {
+            // Large-batch fallback: chunk to keep individual files manageable.
+            let chunk_size = delta_batch.max(1);
+            records
+                .chunks(chunk_size)
+                .filter(|c| !c.is_empty())
+                .map(|chunk_records| {
+                    let bloom = chunk_records
+                        .iter()
+                        .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+                    let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+                    let path = self.delta_prefix().child(filename.as_str());
+                    let data = serialize_inodes_fb2(
+                        METADATA_FORMAT_VERSION,
+                        generation,
+                        chunk_records.iter(),
+                    );
+                    Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // Update last_delta_generation before issuing writes.
+        if !delta_writes.is_empty() {
+            let mut guard = self.last_delta_generation.lock();
+            *guard = (*guard).max(generation);
         }
 
-        // Phase 3: write deltas
-        let chunk = delta_batch.max(1);
-        for chunk_records in records.chunks(chunk) {
-            self.write_delta_ref(generation, chunk_records).await?;
+        // Phase 4: write all shards and deltas in parallel.
+        // Collect into a uniform Vec of boxed futures so shard and delta futures
+        // (which have different concrete types) can be driven together.
+        let log_storage_io = self.log_storage_io;
+        let store = self.store.clone();
+        let mut all_futs: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+        > = Vec::with_capacity(shard_writes.len() + delta_writes.len());
+
+        for (path, data, shard_id, count) in shard_writes {
+            let store = store.clone();
+            all_futs.push(Box::pin(async move {
+                store
+                    .put(&path, PutPayload::from_bytes(data))
+                    .await
+                    .with_context(|| {
+                        format!("writing imap shard={shard_id} generation={generation}")
+                    })?;
+                if log_storage_io {
+                    info!(
+                        target: "backing",
+                        "synced backing file path={} type=imap shard={} generation={} entries={}",
+                        path, shard_id, generation, count
+                    );
+                } else {
+                    debug!(
+                        target: "backing",
+                        "synced backing file path={} type=imap shard={} generation={} entries={}",
+                        path, shard_id, generation, count
+                    );
+                }
+                Ok(())
+            }));
         }
+
+        for (path, data, record_count) in delta_writes {
+            let store = store.clone();
+            all_futs.push(Box::pin(async move {
+                store
+                    .put(&path, PutPayload::from_bytes(data))
+                    .await
+                    .with_context(|| format!("writing delta generation={generation}"))?;
+                if log_storage_io {
+                    info!(
+                        target: "backing",
+                        "synced backing file path={} type=delta generation={} records={}",
+                        path, generation, record_count
+                    );
+                } else {
+                    debug!(
+                        target: "backing",
+                        "synced backing file path={} type=delta generation={} records={}",
+                        path, generation, record_count
+                    );
+                }
+                Ok(())
+            }));
+        }
+
+        try_join_all(all_futs).await?;
         Ok(())
     }
 
@@ -534,17 +1023,14 @@ impl MetadataStore {
                 Some(e) => e,
                 None => return Ok(()),
             };
-            let stored = StoredShardRef {
-                version: METADATA_FORMAT_VERSION,
-                generation,
-                entries: entry
-                    .shard
-                    .inodes
-                    .iter()
-                    .map(|(ino, rec)| (*ino, rec))
-                    .collect(),
-            };
-            (serialize_metadata(&stored)?, entry.shard.inodes.len())
+            (
+                serialize_inodes_fb2(
+                    METADATA_FORMAT_VERSION,
+                    generation,
+                    entry.shard.inodes.values(),
+                ),
+                entry.shard.inodes.len(),
+            )
         };
         self.store
             .put(&path, PutPayload::from_bytes(Bytes::from(data)))
@@ -565,12 +1051,7 @@ impl MetadataStore {
             .fold(0u128, |mask, record| mask | bloom_mask(record.inode));
         let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
         let path = self.delta_prefix().child(filename.as_str());
-        let stored = StoredDeltaRef {
-            version: METADATA_FORMAT_VERSION,
-            generation,
-            records,
-        };
-        let data = serialize_metadata(&stored)?;
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
         {
             let mut guard = self.last_delta_generation.lock();
             *guard = (*guard).max(generation);
@@ -615,7 +1096,7 @@ impl MetadataStore {
                 continue;
             };
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_metadata(&bytes).with_context(|| {
+            let stored: StoredShard = deserialize_shard(&bytes).with_context(|| {
                 format!(
                     "decoding newest shard failed shard={} generation={} path={}",
                     shard_id, generation, path
@@ -685,7 +1166,7 @@ impl MetadataStore {
             let mut updated_records = Vec::new();
             for (generation, path) in files {
                 let bytes = self.store.get(&path).await?.bytes().await?;
-                let stored: StoredDelta = deserialize_metadata(&bytes)?;
+                let stored: StoredDelta = deserialize_delta(&bytes)?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
                     "unsupported delta version {}",
@@ -798,7 +1279,7 @@ impl MetadataStore {
 
         if let Some((generation, path)) = candidates.into_iter().next() {
             let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_metadata(&bytes).with_context(|| {
+            let stored: StoredShard = deserialize_shard(&bytes).with_context(|| {
                 format!(
                     "decoding newest shard failed shard={} generation={} path={}",
                     shard_id, generation, path
