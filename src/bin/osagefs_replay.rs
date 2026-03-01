@@ -436,6 +436,7 @@ fn build_config(
         bucket: None,
         region: None,
         endpoint: None,
+        entry_ttl_secs: 10,
         object_prefix: String::new(),
         gcs_service_account: None,
         state_path: state_path.to_path_buf(),

@@ -51,7 +51,7 @@ pub struct Cli {
     pub state_path: Option<PathBuf>,
 
     /// Inline write threshold in bytes; payloads <= threshold stay inside metadata objects.
-    #[arg(long, default_value_t = 4 * 1024)]
+    #[arg(long, default_value_t = 32 * 1024)]
     pub inline_threshold: usize,
 
     /// Enable inline payload compression for metadata-resident file/symlink data.
@@ -83,7 +83,7 @@ pub struct Cli {
     pub segment_batch: u64,
 
     /// Total pending data (bytes) before forcing a flush to the backing store.
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
     pub pending_bytes: u64,
 
     /// Prefix under which auto-provisioned home directories should live.
@@ -162,8 +162,11 @@ pub struct Cli {
     pub writeback_cache: bool,
 
     /// Number of FUSE dispatch threads (0 = single-threaded legacy mode).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = default_fuse_threads())]
     pub fuse_threads: usize,
+
+    #[arg(long, default_value_t = 5)]
+    pub entry_ttl_secs: u64,
 
     /// Filesystem name reported to the kernel mount table.
     #[arg(long, default_value = "osagefs")]
@@ -210,6 +213,7 @@ pub struct Config {
     pub imap_delta_batch: usize,
     pub writeback_cache: bool,
     pub fuse_threads: usize,
+    pub entry_ttl_secs: u64,
     pub fuse_fsname: String,
 }
 
@@ -272,6 +276,7 @@ impl From<Cli> for Config {
             imap_delta_batch: cli.imap_delta_batch.max(1),
             writeback_cache: cli.writeback_cache && !cli.no_writeback_cache,
             fuse_threads: cli.fuse_threads,
+            entry_ttl_secs: cli.entry_ttl_secs,
             fuse_fsname: if cli.fuse_fsname.trim().is_empty() {
                 "osagefs".to_string()
             } else {
@@ -294,6 +299,12 @@ fn default_state_path(root: &Path) -> PathBuf {
 
 fn default_local_cache_path(root: &Path) -> PathBuf {
     root.join("cache")
+}
+
+fn default_fuse_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

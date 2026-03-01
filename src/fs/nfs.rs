@@ -52,7 +52,7 @@ impl OsageFs {
         mtime: Option<OffsetDateTime>,
     ) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(ino);
         let result = self.op_nfs_setattr(ino, mode, uid, gid, size, atime, mtime);
         self.log_replay(
             "nfs",
@@ -72,7 +72,7 @@ impl OsageFs {
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let result = self.op_create(parent, name, uid, gid);
         self.log_replay(
             "nfs",
@@ -92,7 +92,7 @@ impl OsageFs {
         gid: u32,
     ) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let result = self.op_mkdir(parent, name, uid, gid);
         self.log_replay(
             "nfs",
@@ -114,7 +114,7 @@ impl OsageFs {
     ) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
         let target_len = target.len();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let result = self.op_symlink(parent, name, target, uid, gid);
         self.log_replay(
             "nfs",
@@ -159,7 +159,7 @@ impl OsageFs {
 
     pub fn nfs_write(&self, ino: u64, offset: u64, data: &[u8]) -> std::result::Result<u32, i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(ino);
         let result = self.op_write(ino, offset, data);
         self.log_replay(
             "nfs",
@@ -183,7 +183,7 @@ impl OsageFs {
         caller_uid: u32,
     ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let result = self.op_remove_file(parent, name, caller_uid);
         self.log_replay(
             "nfs",
@@ -202,7 +202,7 @@ impl OsageFs {
         caller_uid: u32,
     ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let result = self.op_remove_dir(parent, name, caller_uid);
         self.log_replay(
             "nfs",
@@ -224,7 +224,7 @@ impl OsageFs {
         caller_uid: u32,
     ) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let (_dir_guard_a, _dir_guard_b) = self.lock_dir_pair(parent, newparent);
         let result = self.op_rename(parent, name, newparent, newname, flags, caller_uid);
         self.log_replay(
             "nfs",

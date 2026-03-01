@@ -39,13 +39,12 @@ use crate::superblock::SuperblockManager;
 use log::{debug, error, info};
 use serde_json::json;
 
-const TTL: Duration = Duration::from_secs(1);
 const FUSE_NODE_GENERATION: u64 = 1;
 const STATFS_BLOCK_SIZE: u32 = 4096;
 const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
 const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
 const ADAPTIVE_PENDING_MULTIPLIER: u64 = 16;
-const ADAPTIVE_PENDING_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const ADAPTIVE_PENDING_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
 const NAME_MAX_BYTES: usize = 255;
 
@@ -71,8 +70,9 @@ pub struct OsageFs {
     flush_interval: Option<Duration>,
     last_flush: Arc<AtomicU64>,
     flush_lock: Arc<Mutex<()>>,
-    mutation_lock: Arc<Mutex<()>>,
+    dir_locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
     flush_scheduled: Arc<AtomicBool>,
+    fuse_entry_ttl: Duration,
     lookup_cache_ttl: Duration,
     dir_cache_ttl: Duration,
     journal: Option<Arc<JournalManager>>,

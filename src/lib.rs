@@ -6,6 +6,7 @@ pub mod inode;
 pub mod journal;
 pub mod metadata;
 pub mod perf;
+pub mod perf_bench;
 pub mod replay;
 pub mod segment;
 pub mod state;

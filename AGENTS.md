@@ -37,8 +37,10 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 
 ## Testing / Tools
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
-- `OSAGEFS_RUN_PERF=1 cargo test --test perf_local -- --nocapture`: local performance suite.
-- `segment_sequential_read_throughput` in `tests/perf_local.rs` must treat `write_batch` output as a logical extent list (sorted by `logical_offset`), not a single pointer: large payloads are chunked into 4 MiB segment extents.
+- `OSAGEFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`: local performance suite (profiles: `fast|balanced|thorough`).
+- Perf guard uses `scripts/perf_guard.sh` + `OSAGEFS_BENCH_METRICS_FILE` JSONL exported by `benches/perf_local_criterion.rs`.
+- `scripts/perf_guard.sh` now copies Criterion HTML reports (`target/criterion/report`) into `bench-artifacts/perf_guard_graphs/<commit5>/` by default (`PERF_GUARD_GRAPH_ROOT`/`PERF_GUARD_GRAPH_DIR` override paths).
+- `segment_sequential_read_throughput` in `benches/perf_local_criterion.rs` must treat `write_batch` output as a logical extent list (sorted by `logical_offset`), not a single pointer: large payloads are chunked into 4 MiB segment extents.
 - `scripts/fio_workloads.sh` supports `WORKLOADS`, `FAST_REPRO=1`, `HEAPTRACK=1`. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
 - `scripts/micro_workflows.sh`: `MODE=both BUILD_MODE=check`, `WORKFLOW_PROFILE=quick|realistic|all`. Knobs: `SMALLFILE_COUNT=5000`, `DEV_SCAN_TREE_COPIES=8`, `ETL_ROWS=500000`, etc.
 - xfstests (Sprite): use `FUSE_SUBTYP` (not `FUSE_SUBTYPE`), install `/sbin/mount.fuse.osagefs`, set distinct `--fuse-fsname` for TEST/SCRATCH. CLI: options before tests.

@@ -116,6 +116,7 @@ mod tests {
             inode_batch: 128,
             segment_batch: 128,
             pending_bytes: 1024,
+            entry_ttl_secs: 5,
             home_prefix: "/home".to_string(),
             object_provider: ObjectStoreProvider::Local,
             bucket: None,

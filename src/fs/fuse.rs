@@ -91,7 +91,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "size": size, "mode": mode, "uid": uid, "gid": gid }),
                 );
-                reply.attr(&TTL, &attr)
+                reply.attr(&self.fuse_entry_ttl, &attr)
             }
             Err(code) => {
                 self.log_replay(
@@ -134,7 +134,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name_str, "ino": inode.inode }),
                 );
                 let attr = Self::record_attr(&inode);
-                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -159,7 +159,7 @@ impl Filesystem for OsageFs {
             Ok(record) => {
                 self.log_replay("fuse", "getattr", replay, None, json!({ "ino": ino }));
                 let attr = Self::record_attr(&record);
-                reply.attr(&TTL, &attr);
+                reply.attr(&self.fuse_entry_ttl, &attr);
             }
             Err(code) => {
                 self.log_replay("fuse", "getattr", replay, Some(code), json!({ "ino": ino }));
@@ -219,7 +219,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEntry,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -236,7 +236,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": dir.inode }),
                 );
                 let attr = Self::record_attr(&dir);
-                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -262,7 +262,7 @@ impl Filesystem for OsageFs {
         reply: ReplyCreate,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -290,7 +290,7 @@ impl Filesystem for OsageFs {
                     }),
                 );
                 let attr = Self::record_attr(&file);
-                reply.created(&TTL, &attr, FUSE_NODE_GENERATION, 0, 0);
+                reply.created(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION, 0, 0);
             }
             Err(code) => {
                 self.log_replay(
@@ -326,7 +326,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEntry,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let uid = req.uid();
         let gid = req.gid();
         let res = (|| {
@@ -344,7 +344,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "mode": mode, "rdev": rdev, "ino": node.inode }),
                 );
                 let attr = Self::record_attr(&node);
-                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -368,7 +368,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEntry,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let uid = req.uid();
         let gid = req.gid();
         let target_len = path_to_bytes(link).len();
@@ -386,7 +386,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "target_len": target_len, "ino": record.inode }),
                 );
                 let attr = Self::record_attr(&record);
-                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -535,7 +535,7 @@ impl Filesystem for OsageFs {
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let caller_uid = req.uid();
         let res = (|| {
             let name = Self::validate_os_name(name)?;
@@ -569,7 +569,7 @@ impl Filesystem for OsageFs {
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(parent);
         let caller_uid = req.uid();
         let res = (|| {
             let name = Self::validate_os_name(name)?;
@@ -610,7 +610,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEmpty,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let (_dir_guard_a, _dir_guard_b) = self.lock_dir_pair(parent, newparent);
         let caller_uid = req.uid();
         let res = (|| {
             let old_name = Self::validate_os_name(name)?;
@@ -662,7 +662,7 @@ impl Filesystem for OsageFs {
         reply: ReplyEntry,
     ) {
         let replay = self.replay_start();
-        let _mutation_guard = self.mutation_lock.lock();
+        let _dir_guard = self.lock_dir(newparent);
         let res = (|| {
             let name = Self::validate_os_name(newname)?;
             self.op_link(ino, newparent, &name)
@@ -677,7 +677,7 @@ impl Filesystem for OsageFs {
                     json!({ "ino": ino, "newparent": newparent, "newname": newname.to_string_lossy() }),
                 );
                 let attr = Self::record_attr(&record);
-                reply.entry(&TTL, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(

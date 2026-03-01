@@ -101,6 +101,7 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         inode_batch: 128,
         segment_batch: 128,
         pending_bytes: 1024 * 1024,
+        entry_ttl_secs: 10,
         home_prefix: "/home".to_string(),
         object_provider: ObjectStoreProvider::Local,
         bucket: None,

@@ -85,6 +85,7 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         inode_batch: 8,
         segment_batch: 8,
         pending_bytes,
+        entry_ttl_secs: 5,
         object_provider: ObjectStoreProvider::Local,
         bucket: None,
         region: None,

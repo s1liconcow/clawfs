@@ -1287,6 +1287,7 @@ mod tests {
             inode_batch: 16,
             segment_batch: 32,
             pending_bytes: 1024 * 1024,
+            entry_ttl_secs: 5,
             object_provider: ObjectStoreProvider::Local,
             bucket: None,
             region: None,

@@ -195,6 +195,13 @@ tests (e.g. `./scripts/run_osagefs.sh`, which now defaults to `$ROOT/osagefs-per
 The Linux kernel perf harness (`scripts/linux_kernel_perf.sh`) enables perf
 logging by default via `$PERF_LOG_PATH` (set it to an empty string to disable).
 
+For local microbenchmarks and regression tracking, use Criterion:
+
+```bash
+OSAGEFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion
+scripts/perf_guard.sh
+```
+
 Close-time durability normally relies on the local journal under
 `$STORE/journal`. Each staged inode writes a record so a crash can replay pending
 data before the mount finishes. For benchmarking you can pass

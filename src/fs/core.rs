@@ -108,6 +108,7 @@ impl OsageFs {
         };
         let lookup_cache_ttl = Duration::from_millis(config.lookup_cache_ttl_ms);
         let dir_cache_ttl = Duration::from_millis(config.dir_cache_ttl_ms);
+        let fuse_entry_ttl = Duration::from_secs(config.entry_ttl_secs);
         Self {
             config,
             metadata,
@@ -124,8 +125,9 @@ impl OsageFs {
             flush_interval,
             last_flush: Arc::new(AtomicU64::new(epoch_millis_now())),
             flush_lock: Arc::new(Mutex::new(())),
-            mutation_lock: Arc::new(Mutex::new(())),
+            dir_locks: Arc::new(DashMap::new()),
             flush_scheduled: Arc::new(AtomicBool::new(false)),
+            fuse_entry_ttl,
             lookup_cache_ttl,
             dir_cache_ttl,
             journal,
@@ -239,6 +241,35 @@ impl OsageFs {
             .next_segment_id(self.config.segment_batch, |count| {
                 self.block_on(self.superblock.reserve_segments(count))
             })
+    }
+
+    pub(crate) fn lock_dir(
+        &self,
+        parent: u64,
+    ) -> parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ()> {
+        let lock = self
+            .dir_locks
+            .entry(parent)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        parking_lot::Mutex::lock_arc(&lock)
+    }
+
+    pub(crate) fn lock_dir_pair(
+        &self,
+        a: u64,
+        b: u64,
+    ) -> (
+        parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ()>,
+        Option<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ()>>,
+    ) {
+        if a == b {
+            return (self.lock_dir(a), None);
+        }
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        let g1 = self.lock_dir(first);
+        let g2 = self.lock_dir(second);
+        (g1, Some(g2))
     }
 
     pub(crate) fn build_child_path(parent: &InodeRecord, name: &str) -> String {
