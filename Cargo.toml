@@ -33,7 +33,6 @@ dashmap = "6"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-plotters = "0.3"
 
 [[bench]]
 name = "perf_local_criterion"

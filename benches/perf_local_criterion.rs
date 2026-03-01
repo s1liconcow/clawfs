@@ -55,9 +55,9 @@ fn configured_criterion() -> Criterion {
             .warm_up_time(Duration::from_secs(4))
             .measurement_time(Duration::from_secs(12)),
         _ => base
-            .sample_size(30)
-            .warm_up_time(Duration::from_secs(2))
-            .measurement_time(Duration::from_secs(6)),
+            .sample_size(24)
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(4)),
     }
 }
 

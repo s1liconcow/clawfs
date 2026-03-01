@@ -40,6 +40,9 @@ If a new tool (or modifying an existing) can help with your work, propose buildi
 - `OSAGEFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`: local performance suite (profiles: `fast|balanced|thorough`).
 - Perf guard uses `scripts/perf_guard.sh` + `OSAGEFS_BENCH_METRICS_FILE` JSONL exported by `benches/perf_local_criterion.rs`.
 - `scripts/perf_guard.sh` now copies Criterion HTML reports (`target/criterion/report`) into `bench-artifacts/perf_guard_graphs/<commit5>/` by default (`PERF_GUARD_GRAPH_ROOT`/`PERF_GUARD_GRAPH_DIR` override paths).
+- Hook runs can skip graph artifact copies with `PERF_GUARD_WRITE_GRAPHS=0` (used by `.githooks/pre-push` to avoid staging large report trees).
+- GitHub Pages publish workflow: `.github/workflows/perf-reports-pages.yml` deploys `bench-artifacts/perf_guard_graphs` and creates a root index linking each `<date>-<commit5>/report/index.html`.
+- CI note: Criterion `html_reports` needs native `fontconfig`; keep `pkg-config` + `libfontconfig1-dev` installed in Rust CI jobs that build tests/benches.
 - `segment_sequential_read_throughput` in `benches/perf_local_criterion.rs` must treat `write_batch` output as a logical extent list (sorted by `logical_offset`), not a single pointer: large payloads are chunked into 4 MiB segment extents.
 - `scripts/fio_workloads.sh` supports `WORKLOADS`, `FAST_REPRO=1`, `HEAPTRACK=1`. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
 - `scripts/micro_workflows.sh`: `MODE=both BUILD_MODE=check`, `WORKFLOW_PROFILE=quick|realistic|all`. Knobs: `SMALLFILE_COUNT=5000`, `DEV_SCAN_TREE_COPIES=8`, `ETL_ROWS=500000`, etc.

@@ -51,42 +51,10 @@ jobs:
           sudo tee /sbin/mount.fuse.osagefs > /dev/null << 'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          src=""
-          mnt=""
+          src="${1:-}"
+          mnt="${2:-}"
           optstr=""
-          args=("$@")
-          i=0
-          while ((i < ${#args[@]})); do
-            arg="${args[$i]}"
-            case "$arg" in
-              -o)
-                ((i+=1))
-                optstr="${args[$i]:-}"
-                ;;
-              -o*)
-                optstr="${arg#-o}"
-                ;;
-              -t|-O|-U)
-                # consume option value
-                ((i+=1))
-                ;;
-              -r|-w|-f|-n|-v|-s|-i|-l)
-                # handled/ignored mount(8) flags
-                ;;
-              -*)
-                # ignore unknown flags
-                ;;
-              *)
-                if [[ -z "$src" ]]; then
-                  src="$arg"
-                elif [[ -z "$mnt" ]]; then
-                  mnt="$arg"
-                fi
-                ;;
-            esac
-            ((i+=1))
-          done
-
+          shift 2 || true
           while (($#)); do
             case "$1" in
               -o) shift; optstr="${1:-}" ;;
@@ -104,7 +72,7 @@ jobs:
             esac
           done
           if [[ -z "$store" || -z "$src" || -z "$mnt" ]]; then
-            echo "mount.fuse.osagefs: bad args src=$src mnt=$mnt opts=$optstr argv=$*" >&2
+            echo "mount.fuse.osagefs: bad args src=$src mnt=$mnt opts=$optstr" >&2
             exit 1
           fi
           if mountpoint -q "$mnt"; then
@@ -113,6 +81,7 @@ jobs:
           name="$(basename "$mnt" | tr -cs 'a-zA-Z0-9' '_')"
           cache="/tmp/osagefs-${name}-cache"
           state="/tmp/osagefs-${name}-state.bin"
+          log="/tmp/osagefs-${name}-u$(id -u).log"
           mkdir -p "$store" "$cache" "$mnt"
           nohup /home/runner/work/osagefs/osagefs/target/release/osagefs \
             --mount-path "$mnt" \
@@ -124,7 +93,7 @@ jobs:
             --allow-other \
             --disable-journal \
             --disable-cleanup \
-            --foreground >/dev/null 2>&1 &
+            --foreground >"$log" 2>&1 &
           for _ in $(seq 1 40); do
             mountpoint -q "$mnt" && exit 0
             sleep 1

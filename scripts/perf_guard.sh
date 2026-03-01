@@ -18,6 +18,7 @@ CRITERION_DIR="$TARGET_DIR/criterion"
 CRITERION_REPORT_INDEX="$CRITERION_DIR/report/index.html"
 PERF_GUARD_PROFILE="${PERF_GUARD_PROFILE:-release}" # release|debug
 OSAGEFS_PERF_PROFILE="${OSAGEFS_PERF_PROFILE:-fast}" # fast|balanced|thorough
+PERF_GUARD_WRITE_GRAPHS="${PERF_GUARD_WRITE_GRAPHS:-1}"
 
 rm -f "$METRICS_FILE"
 
@@ -34,11 +35,13 @@ echo "[perf-guard] collecting perf metrics (profile=$PERF_GUARD_PROFILE, rigor=$
   fi
 )
 
-if [[ -f "$CRITERION_REPORT_INDEX" ]]; then
+if [[ "$PERF_GUARD_WRITE_GRAPHS" == "1" ]] && [[ -f "$CRITERION_REPORT_INDEX" ]]; then
   rm -rf "$GRAPH_DIR"
   mkdir -p "$GRAPH_DIR"
   cp -a "$CRITERION_DIR"/. "$GRAPH_DIR"/
   echo "[perf-guard] criterion html report -> $GRAPH_DIR/report/index.html"
+elif [[ "$PERF_GUARD_WRITE_GRAPHS" != "1" ]]; then
+  echo "[perf-guard] skipping graph copy (PERF_GUARD_WRITE_GRAPHS=$PERF_GUARD_WRITE_GRAPHS)"
 else
   echo "[perf-guard] warning: criterion report not found: $CRITERION_REPORT_INDEX"
 fi
