@@ -202,11 +202,17 @@ impl OsageFs {
         match slot {
             PendingData::Inline(buf) => {
                 let buf = Arc::make_mut(buf);
-                if (buf.len() as u64) < record.size {
-                    let target_len = usize::try_from(record.size).map_err(|_| EFBIG)?;
-                    buf.resize(target_len, 0);
+                let fill_end = usize::try_from(record.size).map_err(|_| EFBIG)?;
+                let target_end = fill_end.saturating_add(data.len());
+                if buf.len() < fill_end {
+                    // Resize directly to the final length in one step: zero-fills the
+                    // gap and allocates space for the appended data simultaneously,
+                    // avoiding a second reallocation from extend_from_slice.
+                    buf.resize(target_end, 0);
+                    buf[fill_end..target_end].copy_from_slice(data);
+                } else {
+                    buf.extend_from_slice(data);
                 }
-                buf.extend_from_slice(data);
                 if buf.len() as u64 > inline_cap {
                     let bytes = std::mem::take(buf);
                     let chunk = self.segments.stage_payload(&bytes).map_err(|_| {

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
 use futures::StreamExt;
+use futures::future::try_join_all;
 use libc::{ENOENT, ENOTDIR};
 use log::{debug, info};
 use object_store::aws::AmazonS3Builder;
@@ -456,8 +457,8 @@ impl MetadataStore {
             }
         }
 
-        // Phase 2: serialize touched shards
-        let shard_writes: Vec<(ObjectPath, Vec<u8>, u64, usize)> = {
+        // Phase 2: pre-serialize touched shards
+        let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
             let shards = self.shards.lock();
             let base_path = self.imap_prefix();
             let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
@@ -480,26 +481,98 @@ impl MetadataStore {
                     let count = entry.shard.inodes.len();
                     let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
                     let path = base_path.child(filename.as_str());
-                    Some((path, data, shard_id, count))
+                    Some((path, Bytes::from(data), shard_id, count))
                 })
                 .collect()
         };
 
-        for (path, data, shard_id, count) in shard_writes {
-            self.store
-                .put(&path, PutPayload::from_bytes(Bytes::from(data)))
-                .await?;
-            self.log_backing(format_args!(
-                "synced backing file path={} type=imap shard={} generation={} entries={}",
-                path, shard_id, generation, count
-            ));
+        // Phase 3: pre-serialize delta chunks
+        let chunk_size = delta_batch.max(1);
+        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = records
+            .chunks(chunk_size)
+            .filter(|c| !c.is_empty())
+            .map(|chunk_records| {
+                let bloom = chunk_records
+                    .iter()
+                    .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+                let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+                let path = self.delta_prefix().child(filename.as_str());
+                let stored = StoredDeltaRef {
+                    version: METADATA_FORMAT_VERSION,
+                    generation,
+                    records: chunk_records,
+                };
+                let data = serialize_metadata(&stored)?;
+                Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Update last_delta_generation before issuing writes.
+        if !delta_writes.is_empty() {
+            let mut guard = self.last_delta_generation.lock();
+            *guard = (*guard).max(generation);
         }
 
-        // Phase 3: write deltas
-        let chunk = delta_batch.max(1);
-        for chunk_records in records.chunks(chunk) {
-            self.write_delta_ref(generation, chunk_records).await?;
+        // Phase 4: write all shards and deltas in parallel.
+        // Collect into a uniform Vec of boxed futures so shard and delta futures
+        // (which have different concrete types) can be driven together.
+        let log_storage_io = self.log_storage_io;
+        let store = self.store.clone();
+        let mut all_futs: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+        > = Vec::with_capacity(shard_writes.len() + delta_writes.len());
+
+        for (path, data, shard_id, count) in shard_writes {
+            let store = store.clone();
+            all_futs.push(Box::pin(async move {
+                store
+                    .put(&path, PutPayload::from_bytes(data))
+                    .await
+                    .with_context(|| {
+                        format!("writing imap shard={shard_id} generation={generation}")
+                    })?;
+                if log_storage_io {
+                    info!(
+                        target: "backing",
+                        "synced backing file path={} type=imap shard={} generation={} entries={}",
+                        path, shard_id, generation, count
+                    );
+                } else {
+                    debug!(
+                        target: "backing",
+                        "synced backing file path={} type=imap shard={} generation={} entries={}",
+                        path, shard_id, generation, count
+                    );
+                }
+                Ok(())
+            }));
         }
+
+        for (path, data, record_count) in delta_writes {
+            let store = store.clone();
+            all_futs.push(Box::pin(async move {
+                store
+                    .put(&path, PutPayload::from_bytes(data))
+                    .await
+                    .with_context(|| format!("writing delta generation={generation}"))?;
+                if log_storage_io {
+                    info!(
+                        target: "backing",
+                        "synced backing file path={} type=delta generation={} records={}",
+                        path, generation, record_count
+                    );
+                } else {
+                    debug!(
+                        target: "backing",
+                        "synced backing file path={} type=delta generation={} records={}",
+                        path, generation, record_count
+                    );
+                }
+                Ok(())
+            }));
+        }
+
+        try_join_all(all_futs).await?;
         Ok(())
     }
 
