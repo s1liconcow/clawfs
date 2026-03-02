@@ -109,7 +109,7 @@ const METADATA_FB2_MAGIC: &[u8] = b"OSGFB2";
 
 /// VOffset for FlatBuffer table field at zero-based `index`: `(index + 2) * 2`.
 #[inline(always)]
-const fn fvt(index: u16) -> u16 {
+pub(crate) const fn fvt(index: u16) -> u16 {
     (index + 2) * 2
 }
 
@@ -128,7 +128,7 @@ fn build_seg_extent_fb<'fbb>(
     fbb.end_table(start)
 }
 
-fn build_inode_record_fb<'fbb>(
+pub(crate) fn build_inode_record_fb<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
     record: &InodeRecord,
 ) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
@@ -305,7 +305,7 @@ fn read_seg_extent_fb2(t: flatbuffers::Table<'_>) -> SegmentExtent {
     }
 }
 
-fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
+pub(crate) fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
     use flatbuffers::{ForwardsUOffset, Table, Vector};
 
     // Safety: t was produced by our own OSGFB2 writer so the schema matches.
