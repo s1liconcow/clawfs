@@ -496,43 +496,48 @@ impl SegmentManager {
             chunks.push(chunk);
         }
 
-        let mut handles = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let codec_config = codec_config.clone();
-            let stage_dir = self.stage_dir.clone();
-            handles.push(std::thread::spawn(
-                move || -> Result<Vec<EncodedSegmentEntry>> {
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for entry in chunk {
-                        let plain_bytes = match entry.payload {
-                            SegmentPayload::Bytes(bytes) => bytes,
-                            SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
-                            SegmentPayload::Staged(chunks) => {
-                                let total_len = chunks.iter().map(|chunk| chunk.len).sum();
-                                read_staged_chunks_from_disk(&stage_dir, &chunks, total_len)?
-                            }
-                        };
-                        out.extend(encode_plain_bytes_chunked(
-                            entry.inode,
-                            entry.path,
-                            entry.logical_offset,
-                            plain_bytes,
-                            &codec_config,
-                        )?);
-                    }
-                    Ok(out)
-                },
-            ));
-        }
+        // Use scoped threads to borrow codec_config and stage_dir instead of
+        // cloning them for each worker.
+        let stage_dir = &self.stage_dir;
+        let result: Result<Vec<EncodedSegmentEntry>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    scope.spawn(move || -> Result<Vec<EncodedSegmentEntry>> {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for entry in chunk {
+                            let plain_bytes = match entry.payload {
+                                SegmentPayload::Bytes(bytes) => bytes,
+                                SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
+                                SegmentPayload::Staged(chunks) => {
+                                    let total_len = chunks.iter().map(|chunk| chunk.len).sum();
+                                    read_staged_chunks_from_disk(stage_dir, &chunks, total_len)?
+                                }
+                            };
+                            out.extend(encode_plain_bytes_chunked(
+                                entry.inode,
+                                entry.path,
+                                entry.logical_offset,
+                                plain_bytes,
+                                codec_config,
+                            )?);
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
 
-        let mut out = Vec::with_capacity(entry_count);
-        for handle in handles {
-            let chunk_entries = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("segment encode worker panicked"))??;
-            out.extend(chunk_entries);
-        }
-        Ok(out)
+            let mut out = Vec::with_capacity(entry_count);
+            for handle in handles {
+                let chunk_entries = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("segment encode worker panicked"))??;
+                out.extend(chunk_entries);
+            }
+            Ok(out)
+        });
+
+        result
     }
 
     pub fn read_pointer(&self, pointer: &SegmentPointer) -> Result<Vec<u8>> {

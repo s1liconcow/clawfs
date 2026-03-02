@@ -12,8 +12,11 @@
 //! On recovery, `load_entries` replays the WAL and returns the last live
 //! (non-tombstoned) entry per inode.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -21,8 +24,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{deserialize_flex, serialize_flex};
-use crate::inode::{InodeKind, InodeRecord};
-use crate::segment::StagedChunk;
+use crate::inode::{
+    FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord, SegmentExtent,
+};
+use crate::segment::{SegmentPointer, StagedChunk};
 
 const JOURNAL_VERSION: u32 = 1;
 /// Maximum number of total WAL records (live + tombstones) before we rewrite
@@ -30,6 +35,9 @@ const JOURNAL_VERSION: u32 = 1;
 const WAL_COMPACT_THRESHOLD: usize = 8_192;
 /// BufWriter internal buffer – large enough to batch many small-file entries.
 const WAL_BUF_BYTES: usize = 256 * 1024;
+
+/// Magic bytes for the fast binary journal format (version 2).
+const JOURNAL_FAST_MAGIC: &[u8; 4] = b"JN2\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JournalPayload {
@@ -50,16 +58,6 @@ struct StoredJournalEntry {
     version: u32,
     record: InodeRecord,
     payload: JournalPayload,
-}
-
-/// Borrow-friendly serialization struct — avoids cloning the InodeRecord
-/// and JournalPayload on every `persist_entry` call.  The flexbuffer wire
-/// format is identical to [`StoredJournalEntry`].
-#[derive(Serialize)]
-struct StoredJournalEntryRef<'a> {
-    version: u32,
-    record: &'a InodeRecord,
-    payload: &'a JournalPayload,
 }
 
 // ── WAL state held under the lock ─────────────────────────────────────────
@@ -106,20 +104,17 @@ impl JournalManager {
     /// arguments so callers can avoid constructing an intermediate
     /// `JournalEntry` (and the associated clone).
     pub fn persist_record(&self, record: &InodeRecord, payload: &JournalPayload) -> Result<()> {
-        let stored = StoredJournalEntryRef {
-            version: JOURNAL_VERSION,
-            record,
-            payload,
-        };
-        let data = serialize_flex(&stored)?;
-        let len = data.len() as u32;
+        // Fast binary serialization outside the lock to reduce lock hold time.
+        let mut buf = Vec::with_capacity(1024);
+        serialize_journal_fast(&mut buf, record, payload);
+        let len = buf.len() as u32;
 
         let mut state = self.state.lock();
         let writer = self.ensure_writer(&mut state)?;
         writer
             .write_all(&len.to_le_bytes())
             .context("writing WAL record length")?;
-        writer.write_all(&data).context("writing WAL record data")?;
+        writer.write_all(&buf).context("writing WAL record data")?;
         state.live_count += 1;
         state.total_records += 1;
         Ok(())
@@ -210,23 +205,22 @@ impl JournalManager {
             let slice = &raw[pos..pos + record_len];
             cursor.seek(SeekFrom::Current(record_len as i64))?;
 
-            let stored: StoredJournalEntry = match deserialize_flex(slice) {
-                Ok(s) => s,
-                Err(_) => continue, // corrupt record, skip
-            };
-            if stored.version != JOURNAL_VERSION {
-                continue;
-            }
-            if matches!(stored.record.kind, InodeKind::Tombstone) {
-                live.remove(&stored.record.inode);
+            // Try fast binary format first, fall back to flexbuffers.
+            let (record, payload) = if let Some((record, payload)) = deserialize_journal_fast(slice)
+            {
+                (record, payload)
+            } else if let Ok(stored) = deserialize_flex::<StoredJournalEntry>(slice) {
+                if stored.version != JOURNAL_VERSION {
+                    continue;
+                }
+                (stored.record, stored.payload)
             } else {
-                live.insert(
-                    stored.record.inode,
-                    JournalEntry {
-                        record: stored.record,
-                        payload: stored.payload,
-                    },
-                );
+                continue; // corrupt record, skip
+            };
+            if matches!(record.kind, InodeKind::Tombstone) {
+                live.remove(&record.inode);
+            } else {
+                live.insert(record.inode, JournalEntry { record, payload });
             }
         }
 
@@ -331,5 +325,385 @@ impl JournalManager {
             .with_context(|| format!("opening journal dir {}", self.dir.display()))?;
         dir.sync_all()
             .with_context(|| format!("syncing journal dir {}", self.dir.display()))
+    }
+}
+
+// ── Fast binary journal serialization ────────────────────────────────────────
+//
+// Replaces flexbuffers for the write path with a compact binary format that
+// avoids serde reflection overhead and per-entry allocations.  The reader
+// detects the format via a 4-byte magic header and falls back to flexbuffers
+// for legacy WAL entries.
+
+fn serialize_journal_fast(buf: &mut Vec<u8>, record: &InodeRecord, payload: &JournalPayload) {
+    buf.extend_from_slice(JOURNAL_FAST_MAGIC);
+    buf.extend_from_slice(&JOURNAL_VERSION.to_le_bytes());
+    write_inode_record_bin(buf, record);
+    write_journal_payload_bin(buf, payload);
+}
+
+fn write_inode_record_bin(buf: &mut Vec<u8>, r: &InodeRecord) {
+    buf.extend_from_slice(&r.inode.to_le_bytes());
+    buf.extend_from_slice(&r.parent.to_le_bytes());
+    write_str_bin(buf, &r.name);
+    write_str_bin(buf, &r.path);
+    match &r.kind {
+        InodeKind::File => buf.push(0),
+        InodeKind::Directory { children } => {
+            buf.push(1);
+            buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
+            for (key, &val) in children.as_ref() {
+                write_str_bin(buf, key);
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        InodeKind::Symlink => buf.push(2),
+        InodeKind::Tombstone => buf.push(3),
+    }
+    buf.extend_from_slice(&r.size.to_le_bytes());
+    buf.extend_from_slice(&r.mode.to_le_bytes());
+    buf.extend_from_slice(&r.uid.to_le_bytes());
+    buf.extend_from_slice(&r.gid.to_le_bytes());
+    write_time_bin(buf, &r.atime);
+    write_time_bin(buf, &r.mtime);
+    write_time_bin(buf, &r.ctime);
+    buf.extend_from_slice(&r.link_count.to_le_bytes());
+    buf.extend_from_slice(&r.rdev.to_le_bytes());
+    write_storage_bin(buf, &r.storage);
+}
+
+fn write_str_bin(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn write_time_bin(buf: &mut Vec<u8>, t: &time::OffsetDateTime) {
+    buf.extend_from_slice(&t.unix_timestamp().to_le_bytes());
+    buf.extend_from_slice(&(t.nanosecond() as i32).to_le_bytes());
+}
+
+fn write_storage_bin(buf: &mut Vec<u8>, s: &FileStorage) {
+    match s {
+        FileStorage::Inline(bytes) => {
+            buf.push(0);
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        FileStorage::InlineEncoded(p) => {
+            buf.push(1);
+            buf.push(match p.codec {
+                InlinePayloadCodec::None => 0,
+                InlinePayloadCodec::Lz4 => 1,
+                InlinePayloadCodec::ChaCha20Poly1305 => 2,
+                InlinePayloadCodec::Lz4ChaCha20Poly1305 => 3,
+            });
+            buf.extend_from_slice(&p.original_len.unwrap_or(0).to_le_bytes());
+            if let Some(nonce) = &p.nonce {
+                buf.push(1);
+                buf.extend_from_slice(nonce);
+            } else {
+                buf.push(0);
+            }
+            buf.extend_from_slice(&(p.payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&p.payload);
+        }
+        FileStorage::LegacySegment(ptr) => {
+            buf.push(2);
+            buf.extend_from_slice(&1u32.to_le_bytes()); // 1 extent
+            write_seg_extent_bin(buf, 0, ptr);
+        }
+        FileStorage::Segments(extents) => {
+            buf.push(2);
+            buf.extend_from_slice(&(extents.len() as u32).to_le_bytes());
+            for ext in extents {
+                write_seg_extent_bin(buf, ext.logical_offset, &ext.pointer);
+            }
+        }
+    }
+}
+
+fn write_seg_extent_bin(buf: &mut Vec<u8>, logical_offset: u64, ptr: &SegmentPointer) {
+    buf.extend_from_slice(&logical_offset.to_le_bytes());
+    buf.extend_from_slice(&ptr.segment_id.to_le_bytes());
+    buf.extend_from_slice(&ptr.generation.to_le_bytes());
+    buf.extend_from_slice(&ptr.offset.to_le_bytes());
+    buf.extend_from_slice(&ptr.length.to_le_bytes());
+}
+
+fn write_journal_payload_bin(buf: &mut Vec<u8>, p: &JournalPayload) {
+    match p {
+        JournalPayload::None => buf.push(0),
+        JournalPayload::Inline(bytes) => {
+            buf.push(1);
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        JournalPayload::StageFile(chunk) => {
+            buf.push(2);
+            write_staged_chunk_bin(buf, chunk);
+        }
+        JournalPayload::StageChunks(chunks) => {
+            buf.push(3);
+            buf.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+            for chunk in chunks {
+                write_staged_chunk_bin(buf, chunk);
+            }
+        }
+    }
+}
+
+fn write_staged_chunk_bin(buf: &mut Vec<u8>, chunk: &StagedChunk) {
+    let path_bytes = chunk.path.as_os_str().as_encoded_bytes();
+    buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(path_bytes);
+    buf.extend_from_slice(&chunk.offset.to_le_bytes());
+    buf.extend_from_slice(&chunk.len.to_le_bytes());
+    buf.extend_from_slice(&chunk.logical_offset.to_le_bytes());
+}
+
+// ── Fast binary journal deserialization ──────────────────────────────────────
+
+fn deserialize_journal_fast(data: &[u8]) -> Option<(InodeRecord, JournalPayload)> {
+    let mut cursor = data;
+    if cursor.len() < 8 {
+        return None;
+    }
+    if &cursor[..4] != JOURNAL_FAST_MAGIC {
+        return None;
+    }
+    cursor = &cursor[4..];
+    let _version = read_u32(&mut cursor)?;
+    let record = read_inode_record_bin(&mut cursor)?;
+    let payload = read_journal_payload_bin(&mut cursor)?;
+    Some((record, payload))
+}
+
+fn read_u8(cursor: &mut &[u8]) -> Option<u8> {
+    if cursor.is_empty() {
+        return None;
+    }
+    let val = cursor[0];
+    *cursor = &cursor[1..];
+    Some(val)
+}
+
+fn read_u32(cursor: &mut &[u8]) -> Option<u32> {
+    if cursor.len() < 4 {
+        return None;
+    }
+    let val = u32::from_le_bytes(cursor[..4].try_into().ok()?);
+    *cursor = &cursor[4..];
+    Some(val)
+}
+
+fn read_u64(cursor: &mut &[u8]) -> Option<u64> {
+    if cursor.len() < 8 {
+        return None;
+    }
+    let val = u64::from_le_bytes(cursor[..8].try_into().ok()?);
+    *cursor = &cursor[8..];
+    Some(val)
+}
+
+fn read_i64(cursor: &mut &[u8]) -> Option<i64> {
+    if cursor.len() < 8 {
+        return None;
+    }
+    let val = i64::from_le_bytes(cursor[..8].try_into().ok()?);
+    *cursor = &cursor[8..];
+    Some(val)
+}
+
+fn read_i32(cursor: &mut &[u8]) -> Option<i32> {
+    if cursor.len() < 4 {
+        return None;
+    }
+    let val = i32::from_le_bytes(cursor[..4].try_into().ok()?);
+    *cursor = &cursor[4..];
+    Some(val)
+}
+
+fn read_bytes(cursor: &mut &[u8], len: usize) -> Option<Vec<u8>> {
+    if cursor.len() < len {
+        return None;
+    }
+    let val = cursor[..len].to_vec();
+    *cursor = &cursor[len..];
+    Some(val)
+}
+
+fn read_str_bin(cursor: &mut &[u8]) -> Option<String> {
+    let len = read_u32(cursor)? as usize;
+    let bytes = read_bytes(cursor, len)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn read_time_bin(cursor: &mut &[u8]) -> Option<time::OffsetDateTime> {
+    let secs = read_i64(cursor)?;
+    let nanos = read_i32(cursor)?;
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .map(|t| t.replace_nanosecond(nanos as u32).unwrap_or(t))
+}
+
+fn read_seg_extent_bin(cursor: &mut &[u8]) -> Option<SegmentExtent> {
+    let logical_offset = read_u64(cursor)?;
+    let segment_id = read_u64(cursor)?;
+    let generation = read_u64(cursor)?;
+    let offset = read_u64(cursor)?;
+    let length = read_u64(cursor)?;
+    Some(SegmentExtent::new(
+        logical_offset,
+        SegmentPointer {
+            segment_id,
+            generation,
+            offset,
+            length,
+        },
+    ))
+}
+
+fn read_storage_bin(cursor: &mut &[u8]) -> Option<FileStorage> {
+    let tag = read_u8(cursor)?;
+    match tag {
+        0 => {
+            let len = read_u32(cursor)? as usize;
+            let data = read_bytes(cursor, len)?;
+            Some(FileStorage::Inline(data))
+        }
+        1 => {
+            let codec_u8 = read_u8(cursor)?;
+            let codec = match codec_u8 {
+                0 => InlinePayloadCodec::None,
+                1 => InlinePayloadCodec::Lz4,
+                2 => InlinePayloadCodec::ChaCha20Poly1305,
+                3 => InlinePayloadCodec::Lz4ChaCha20Poly1305,
+                _ => return None,
+            };
+            let orig_len_raw = read_u64(cursor)?;
+            let has_nonce = read_u8(cursor)?;
+            let nonce = if has_nonce != 0 {
+                let nonce_bytes = read_bytes(cursor, 12)?;
+                let mut arr = [0u8; 12];
+                arr.copy_from_slice(&nonce_bytes);
+                Some(arr)
+            } else {
+                None
+            };
+            let payload_len = read_u32(cursor)? as usize;
+            let payload = read_bytes(cursor, payload_len)?;
+            Some(FileStorage::InlineEncoded(InlinePayload {
+                codec,
+                payload,
+                original_len: if orig_len_raw == 0 {
+                    None
+                } else {
+                    Some(orig_len_raw)
+                },
+                nonce,
+            }))
+        }
+        2 => {
+            let num = read_u32(cursor)? as usize;
+            let mut extents = Vec::with_capacity(num);
+            for _ in 0..num {
+                extents.push(read_seg_extent_bin(cursor)?);
+            }
+            Some(FileStorage::Segments(extents))
+        }
+        _ => None,
+    }
+}
+
+fn read_inode_record_bin(cursor: &mut &[u8]) -> Option<InodeRecord> {
+    let inode = read_u64(cursor)?;
+    let parent = read_u64(cursor)?;
+    let name = read_str_bin(cursor)?;
+    let path = read_str_bin(cursor)?;
+    let kind_tag = read_u8(cursor)?;
+    let kind = match kind_tag {
+        0 => InodeKind::File,
+        1 => {
+            let num_children = read_u32(cursor)? as usize;
+            let mut children = std::collections::BTreeMap::new();
+            for _ in 0..num_children {
+                let key = read_str_bin(cursor)?;
+                let val = read_u64(cursor)?;
+                children.insert(key, val);
+            }
+            InodeKind::Directory {
+                children: std::sync::Arc::new(children),
+            }
+        }
+        2 => InodeKind::Symlink,
+        3 => InodeKind::Tombstone,
+        _ => return None,
+    };
+    let size = read_u64(cursor)?;
+    let mode = read_u32(cursor)?;
+    let uid = read_u32(cursor)?;
+    let gid = read_u32(cursor)?;
+    let atime = read_time_bin(cursor)?;
+    let mtime = read_time_bin(cursor)?;
+    let ctime = read_time_bin(cursor)?;
+    let link_count = read_u32(cursor)?;
+    let rdev = read_u32(cursor)?;
+    let storage = read_storage_bin(cursor)?;
+    Some(InodeRecord {
+        inode,
+        parent,
+        name,
+        path,
+        kind,
+        size,
+        mode,
+        uid,
+        gid,
+        atime,
+        mtime,
+        ctime,
+        link_count,
+        rdev,
+        storage,
+    })
+}
+
+fn read_staged_chunk_bin(cursor: &mut &[u8]) -> Option<StagedChunk> {
+    let path_len = read_u32(cursor)? as usize;
+    let path_bytes = read_bytes(cursor, path_len)?;
+    let path = PathBuf::from(OsString::from_vec(path_bytes));
+    let offset = read_u64(cursor)?;
+    let len = read_u64(cursor)?;
+    let logical_offset = read_u64(cursor)?;
+    Some(StagedChunk {
+        path,
+        offset,
+        len,
+        logical_offset,
+    })
+}
+
+fn read_journal_payload_bin(cursor: &mut &[u8]) -> Option<JournalPayload> {
+    let tag = read_u8(cursor)?;
+    match tag {
+        0 => Some(JournalPayload::None),
+        1 => {
+            let len = read_u32(cursor)? as usize;
+            let data = read_bytes(cursor, len)?;
+            Some(JournalPayload::Inline(data))
+        }
+        2 => {
+            let chunk = read_staged_chunk_bin(cursor)?;
+            Some(JournalPayload::StageFile(chunk))
+        }
+        3 => {
+            let num = read_u32(cursor)? as usize;
+            let mut chunks = Vec::with_capacity(num);
+            for _ in 0..num {
+                chunks.push(read_staged_chunk_bin(cursor)?);
+            }
+            Some(JournalPayload::StageChunks(chunks))
+        }
+        _ => None,
     }
 }

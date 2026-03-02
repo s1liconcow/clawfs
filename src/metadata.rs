@@ -245,7 +245,25 @@ fn serialize_inodes_fb2<'a>(
     records: impl IntoIterator<Item = &'a InodeRecord>,
 ) -> Vec<u8> {
     let records: Vec<&InodeRecord> = records.into_iter().collect();
-    let mut fbb = FlatBufferBuilder::with_capacity(records.len() * 512 + 256);
+    // Estimate capacity based on actual storage sizes to avoid reallocations.
+    // Per record: ~200 bytes fixed overhead (vtable, table, scalar fields,
+    // string length prefixes) + variable-length strings + storage payload.
+    let estimated_cap: usize = records.iter().fold(256, |acc, r| {
+        let storage_bytes = match &r.storage {
+            FileStorage::Inline(bytes) => bytes.len(),
+            FileStorage::InlineEncoded(p) => p.payload.len() + 16,
+            FileStorage::Segments(exts) => exts.len() * 48,
+            FileStorage::LegacySegment(_) => 48,
+        };
+        let children_bytes = match &r.kind {
+            InodeKind::Directory { children } => {
+                children.keys().map(|k| k.len() + 12).sum::<usize>() + children.len() * 8
+            }
+            _ => 0,
+        };
+        acc + 200 + r.name.len() + r.path.len() + storage_bytes + children_bytes
+    });
+    let mut fbb = FlatBufferBuilder::with_capacity(estimated_cap);
 
     let rec_wips: Vec<WIPOffset<_>> = records
         .iter()
@@ -828,7 +846,9 @@ impl MetadataStore {
             return Ok(());
         }
 
-        // Phase 1: update in-memory caches + shards under lock
+        // Phase 1: update in-memory caches + shards under lock.
+        // Normalize once and share between cache and shard to halve
+        // normalization overhead.
         let mut touched_shard_ids = HashSet::new();
         {
             let mut cache = self.cache.lock();
@@ -836,92 +856,113 @@ impl MetadataStore {
             let mut neg = self.negative_cache.lock();
             for record in records {
                 neg.remove(&record.inode);
-                cache.insert(
-                    record.inode,
-                    CacheEntry::with_generation(record.clone(), generation),
-                );
                 let shard_id = record.shard_index(shard_size);
                 let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
                     shard: InodeShard::new(shard_id),
                     generation,
                 });
-                entry.shard.upsert(record.clone());
                 entry.generation = generation;
                 touched_shard_ids.insert(shard_id);
+                if matches!(record.kind, InodeKind::Tombstone) {
+                    entry.shard.inodes.remove(&record.inode);
+                    cache.insert(
+                        record.inode,
+                        CacheEntry::with_generation(record.clone(), generation),
+                    );
+                } else {
+                    // Normalize once, clone for cache, move into shard.
+                    let mut normalized = record.clone();
+                    normalized.normalize_storage();
+                    let for_cache = normalized.clone();
+                    entry.shard.inodes.insert(normalized.inode, normalized);
+                    cache.insert(
+                        record.inode,
+                        CacheEntry {
+                            record: for_cache,
+                            refreshed: Instant::now(),
+                            generation,
+                        },
+                    );
+                }
             }
         }
 
-        // Phase 2: pre-serialize touched shards
-        let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
-            let shards = self.shards.lock();
-            let base_path = self.imap_prefix();
-            let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
-            shard_ids.sort_unstable();
-            shard_ids
-                .iter()
-                .filter_map(|&shard_id| {
-                    let entry = shards.get(&shard_id)?;
-                    let data = serialize_inodes_fb2(
-                        METADATA_FORMAT_VERSION,
-                        generation,
-                        entry.shard.inodes.values(),
-                    );
-                    let count = entry.shard.inodes.len();
-                    let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
-                    let path = base_path.child(filename.as_str());
-                    Some((path, Bytes::from(data), shard_id, count))
-                })
-                .collect()
-        };
-
-        // Phase 3: serialize all delta records into a single file per flush.
-        //
-        // Writing N small delta files (one per delta_batch chunk) causes severe
-        // directory inode lock contention when all N parallel puts complete with
-        // renames into the same imap_deltas/ directory.  On local filesystems
-        // this serialises the renames, giving O(N) latency instead of O(1).
-        // Consolidating into one file reduces N renames to 1, cutting flush
-        // latency proportionally to N.
-        //
-        // Bloom-filter granularity is preserved in the filename (OR of all
-        // record blooms).  Readers (apply_external_deltas) already read every
-        // delta file for newer generations, so coarser granularity is fine.
-        //
-        // For very large batches (> MAX_DELTA_SINGLE_FILE records) we fall back
-        // to delta_batch chunking to bound per-file memory and I/O size.
+        // Phases 2+3: pre-serialize touched shards and delta records
+        // concurrently using scoped threads. Shard serialization holds the
+        // shards lock on the current thread while delta serialization runs
+        // on a separate thread (no lock needed).
         const MAX_DELTA_SINGLE_FILE: usize = 50_000;
-        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = if records.is_empty() {
-            vec![]
-        } else if records.len() <= MAX_DELTA_SINGLE_FILE {
-            // Fast path: one delta file for the entire batch.
-            let bloom = records
-                .iter()
-                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
-            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-            let path = self.delta_prefix().child(filename.as_str());
-            let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
-            vec![(path, Bytes::from(data), records.len())]
-        } else {
-            // Large-batch fallback: chunk to keep individual files manageable.
-            let chunk_size = delta_batch.max(1);
-            records
-                .chunks(chunk_size)
-                .filter(|c| !c.is_empty())
-                .map(|chunk_records| {
-                    let bloom = chunk_records
+        let delta_prefix = self.delta_prefix();
+        let imap_prefix = self.imap_prefix();
+
+        #[allow(clippy::type_complexity)]
+        let (shard_writes, delta_writes): (
+            Vec<(ObjectPath, Bytes, u64, usize)>,
+            Vec<(ObjectPath, Bytes, usize)>,
+        ) = std::thread::scope(|scope| {
+            // Spawn delta serialization on a separate thread.
+            let delta_handle = scope.spawn(|| -> Vec<(ObjectPath, Bytes, usize)> {
+                if records.is_empty() {
+                    return vec![];
+                }
+                if records.len() <= MAX_DELTA_SINGLE_FILE {
+                    let bloom = records
                         .iter()
                         .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
                     let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-                    let path = self.delta_prefix().child(filename.as_str());
-                    let data = serialize_inodes_fb2(
-                        METADATA_FORMAT_VERSION,
-                        generation,
-                        chunk_records.iter(),
-                    );
-                    Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+                    let path = delta_prefix.child(filename.as_str());
+                    let data =
+                        serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
+                    vec![(path, Bytes::from(data), records.len())]
+                } else {
+                    let chunk_size = delta_batch.max(1);
+                    records
+                        .chunks(chunk_size)
+                        .filter(|c| !c.is_empty())
+                        .map(|chunk_records| {
+                            let bloom = chunk_records
+                                .iter()
+                                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+                            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+                            let path = delta_prefix.child(filename.as_str());
+                            let data = serialize_inodes_fb2(
+                                METADATA_FORMAT_VERSION,
+                                generation,
+                                chunk_records.iter(),
+                            );
+                            (path, Bytes::from(data), chunk_records.len())
+                        })
+                        .collect()
+                }
+            });
+
+            // Serialize shards under lock (sequential — the delta thread
+            // already runs in parallel with this block).
+            let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
+                let shards = self.shards.lock();
+                let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
+                shard_ids.sort_unstable();
+
+                shard_ids
+                    .iter()
+                    .filter_map(|&shard_id| {
+                        let entry = shards.get(&shard_id)?;
+                        let data = serialize_inodes_fb2(
+                            METADATA_FORMAT_VERSION,
+                            generation,
+                            entry.shard.inodes.values(),
+                        );
+                        let count = entry.shard.inodes.len();
+                        let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
+                        let path = imap_prefix.child(filename.as_str());
+                        Some((path, Bytes::from(data), shard_id, count))
+                    })
+                    .collect()
+            };
+
+            let delta_writes = delta_handle.join().expect("delta serialize thread");
+            (shard_writes, delta_writes)
+        });
 
         // Update last_delta_generation before issuing writes.
         if !delta_writes.is_empty() {
