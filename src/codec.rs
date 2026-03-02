@@ -1,24 +1,14 @@
-use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
-use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::inode::{FileStorage, InlinePayload, InlinePayloadCodec};
-
-pub fn write_flexbuffer<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_flexbuffer_internal(path, value, true)
-}
-
-pub fn write_flexbuffer_unsynced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_flexbuffer_internal(path, value, false)
-}
 
 /// Write pre-serialized bytes atomically via temp-file + rename, without
 /// fsync.  Skips `create_dir_all` — the caller must ensure `parent` exists.
@@ -29,35 +19,6 @@ pub fn write_preserialized_unsynced(path: &Path, parent: &Path, data: &[u8]) -> 
     tmp.persist(path)
         .map(|_| ())
         .with_context(|| format!("persisting temp file to {}", path.display()))
-}
-
-fn write_flexbuffer_internal<T: Serialize>(path: &Path, value: &T, sync_file: bool) -> Result<()> {
-    let parent: PathBuf = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&parent).with_context(|| format!("creating dir {}", parent.display()))?;
-    let data = serialize_flex(value)?;
-    let mut tmp = NamedTempFile::new_in(&parent)
-        .with_context(|| format!("creating temp file in {}", parent.display()))?;
-    tmp.write_all(&data)?;
-    if sync_file {
-        tmp.as_file().sync_all()?;
-    }
-    tmp.persist(path)
-        .map(|_| ())
-        .with_context(|| format!("persisting temp file to {}", path.display()))
-}
-
-pub fn serialize_flex<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = flexbuffers::FlexbufferSerializer::new();
-    value.serialize(&mut serializer)?;
-    Ok(serializer.take_buffer())
-}
-
-pub fn deserialize_flex<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let reader = flexbuffers::Reader::get_root(bytes)?;
-    Ok(T::deserialize(reader)?)
 }
 
 #[derive(Debug, Clone)]

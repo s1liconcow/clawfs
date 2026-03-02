@@ -19,9 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
-use crate::codec::{deserialize_flex, serialize_flex};
 use crate::inode::{InodeKind, InodeRecord};
 use crate::metadata::{build_inode_record_fb, fvt, read_inode_record_fb2};
 use crate::segment::StagedChunk;
@@ -51,7 +49,7 @@ const JOURNAL_FB2_MAGIC: &[u8; 6] = b"OSGJN2";
 //   2(vt=8) len:             u64
 //   3(vt=10) logical_offset: u64
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum JournalPayload {
     None,
     Inline(Vec<u8>),
@@ -63,13 +61,6 @@ pub enum JournalPayload {
 pub struct JournalEntry {
     pub record: InodeRecord,
     pub payload: JournalPayload,
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoredJournalEntry {
-    version: u32,
-    record: InodeRecord,
-    payload: JournalPayload,
 }
 
 // ── WAL state held under the lock ─────────────────────────────────────────
@@ -146,12 +137,7 @@ impl JournalManager {
     /// the WAL to zero bytes (the common case after a complete flush cycle).
     pub fn clear_entry(&self, inode: u64) -> Result<()> {
         let tombstone = InodeRecord::tombstone(inode);
-        let stored = StoredJournalEntry {
-            version: JOURNAL_VERSION,
-            record: tombstone,
-            payload: JournalPayload::None,
-        };
-        let data = serialize_flex(&stored)?;
+        let data = serialize_journal_fb2(&tombstone, &JournalPayload::None);
         let len = data.len() as u32;
 
         let mut state = self.state.lock();
@@ -216,18 +202,9 @@ impl JournalManager {
             let slice = &raw[pos..pos + record_len];
             cursor.seek(SeekFrom::Current(record_len as i64))?;
 
-            // Try FlatBuffer format first, fall back to flexbuffers.
-            let (record, payload) =
-                if let Some((record, payload)) = deserialize_journal_fb2(slice) {
-                    (record, payload)
-                } else if let Ok(stored) = deserialize_flex::<StoredJournalEntry>(slice) {
-                    if stored.version != JOURNAL_VERSION {
-                        continue;
-                    }
-                    (stored.record, stored.payload)
-                } else {
-                    continue; // corrupt record, skip
-                };
+            let Some((record, payload)) = deserialize_journal_fb2(slice) else {
+                continue; // corrupt or unrecognized record, skip
+            };
             if matches!(record.kind, InodeKind::Tombstone) {
                 live.remove(&record.inode);
             } else {
@@ -307,12 +284,7 @@ impl JournalManager {
                 .with_context(|| format!("creating compact WAL {}", tmp_path.display()))?;
             let mut writer = BufWriter::with_capacity(WAL_BUF_BYTES, tmp_file);
             for entry in &live_entries {
-                let stored = StoredJournalEntry {
-                    version: JOURNAL_VERSION,
-                    record: entry.record.clone(),
-                    payload: entry.payload.clone(),
-                };
-                let data = serialize_flex(&stored)?;
+                let data = serialize_journal_fb2(&entry.record, &entry.payload);
                 writer.write_all(&(data.len() as u32).to_le_bytes())?;
                 writer.write_all(&data)?;
             }
@@ -341,10 +313,8 @@ impl JournalManager {
 
 // ── FlatBuffer journal serialization (OSGJN2) ────────────────────────────────
 //
-// Replaces flexbuffers for the write path. Reuses the same InodeRecord
-// FlatBuffer table as the metadata OSGFB2 format. The reader detects the
-// format via a 6-byte magic header and falls back to flexbuffers for legacy
-// WAL entries.
+// Reuses the same InodeRecord FlatBuffer table as the metadata OSGFB2 format.
+// The format is identified by a 6-byte OSGJN2 magic header.
 
 fn build_staged_chunk_fb<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
@@ -439,9 +409,8 @@ fn deserialize_journal_fb2(data: &[u8]) -> Option<(InodeRecord, JournalPayload)>
     let _version = unsafe { doc.get::<u32>(fvt(0), Some(0)) }.unwrap_or(0);
 
     // Read the InodeRecord sub-table.
-    let record_table = unsafe {
-        doc.get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>(fvt(1), None)
-    }?;
+    let record_table =
+        unsafe { doc.get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>(fvt(1), None) }?;
     let record = read_inode_record_fb2(record_table).ok()?;
 
     // Read payload.
