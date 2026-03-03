@@ -141,13 +141,31 @@ CMD=(
   --mount-path "$MOUNT_PATH"
   --store-path "$STORE_PATH"
   --local-cache-path "$LOCAL_CACHE_PATH"
-  --object-provider local
   --state-path "$STATE_PATH"
   --home-prefix "$HOME_PREFIX"
   --metadata-poll-interval-ms 0
   --foreground
   "${EXTRA_FLAGS[@]}"
 )
+
+OBJECT_PROVIDER="${OBJECT_PROVIDER:-local}"
+if [[ "$OBJECT_PROVIDER" == "aws" ]]; then
+  CMD+=(--object-provider aws)
+  if [[ -n "${AWS_ENDPOINT_URL_S3:-}" ]]; then
+    CMD+=(--endpoint "$AWS_ENDPOINT_URL_S3")
+    if [[ "$AWS_ENDPOINT_URL_S3" == http://* ]]; then
+      CMD+=(--aws-allow-http --aws-force-path-style)
+    fi
+  fi
+  if [[ -n "${AWS_REGION:-}" ]]; then
+    CMD+=(--region "$AWS_REGION")
+  fi
+  if [[ ! " ${EXTRA_FLAGS[*]:-} " =~ " --bucket " ]]; then
+      CMD+=(--bucket "${AWS_BUCKET:-osagefs-bucket}")
+  fi
+else
+  CMD+=(--object-provider local)
+fi
 if [[ -n "$PERF_LOG_PATH" ]]; then
   CMD+=(--perf-log "$PERF_LOG_PATH")
   echo "Perf trace -> $PERF_LOG_PATH"

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
@@ -169,15 +169,49 @@ impl SegmentManager {
                     .bucket
                     .clone()
                     .context("--bucket is required for AWS provider")?;
+
                 let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
-                let region = config
+
+                let mut region = config
                     .region
                     .clone()
                     .unwrap_or_else(|| "us-east-1".to_string());
+                if region == "auto" {
+                    region = "us-east-1".to_string();
+                }
                 builder = builder.with_region(&region);
+
                 if let Some(endpoint) = &config.endpoint {
                     builder = builder.with_endpoint(endpoint);
+                    // Custom endpoints typically imply we're NOT on EC2, so bypass IMDS to avoid hangs.
+                    builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
                 }
+
+                if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+                    builder = builder.with_access_key_id(key);
+                }
+                if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+                    builder = builder.with_secret_access_key(secret);
+                }
+
+                if config.aws_allow_http {
+                    builder = builder.with_allow_http(true);
+                    // If no credentials in environment, provide dummy ones to satisfy the client and bypass IMDS lookup
+                    if std::env::var("AWS_ACCESS_KEY_ID").is_err()
+                        && std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+                    {
+                        error!(
+                            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set; using dummy credentials for --aws-allow-http to bypass IMDS"
+                        );
+                        builder = builder
+                            .with_access_key_id("test")
+                            .with_secret_access_key("test");
+                    }
+                }
+                if config.aws_force_path_style {
+                    builder = builder.with_virtual_hosted_style_request(false);
+                }
+
                 let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
                 (store, segment_prefix(&config.object_prefix))
             }
@@ -1292,8 +1326,10 @@ mod tests {
             bucket: None,
             region: None,
             endpoint: None,
-            object_prefix: "".into(),
+            object_prefix: "test".to_string(),
             gcs_service_account: None,
+            aws_allow_http: false,
+            aws_force_path_style: false,
             state_path: root.join("state.bin"),
             foreground: false,
             allow_other: false,

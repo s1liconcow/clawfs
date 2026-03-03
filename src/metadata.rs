@@ -537,6 +537,7 @@ impl MetadataStore {
             negative_cache: Mutex::new(HashMap::new()),
             handle,
         };
+
         store.load_latest_imaps().await?;
         Ok(store)
     }
@@ -1402,15 +1403,48 @@ fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)
                 .bucket
                 .clone()
                 .context("--bucket is required for AWS provider")?;
+
             let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
-            let region = config
+
+            let mut region = config
                 .region
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_string());
+            if region == "auto" {
+                region = "us-east-1".to_string();
+            }
             builder = builder.with_region(&region);
+
             if let Some(endpoint) = &config.endpoint {
                 builder = builder.with_endpoint(endpoint);
+                // Custom endpoints typically imply we're NOT on EC2, so bypass IMDS to avoid hangs.
+                // In object_store 0.12, providing credentials usually suffices, but we force a dummy
+                // IMDS endpoint to be safe if port 0/1 doesn't hang.
+                builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
             }
+
+            if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+                builder = builder.with_access_key_id(key);
+            }
+            if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+                builder = builder.with_secret_access_key(secret);
+            }
+
+            if config.aws_allow_http {
+                builder = builder.with_allow_http(true);
+                // If no credentials in environment, provide dummy ones to satisfy the client and bypass IMDS lookup
+                if std::env::var("AWS_ACCESS_KEY_ID").is_err()
+                    && std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+                {
+                    builder = builder
+                        .with_access_key_id("test")
+                        .with_secret_access_key("test");
+                }
+            }
+            if config.aws_force_path_style {
+                builder = builder.with_virtual_hosted_style_request(false);
+            }
+
             let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
             Ok((store, normalize_prefix(&config.object_prefix)))
         }

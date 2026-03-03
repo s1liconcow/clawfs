@@ -92,6 +92,8 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         endpoint: None,
         object_prefix: String::new(),
         gcs_service_account: None,
+        aws_allow_http: false,
+        aws_force_path_style: false,
         state_path: root.join(state_name),
         foreground: false,
         allow_other: false,

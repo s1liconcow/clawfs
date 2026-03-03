@@ -27,6 +27,8 @@ pub fn perf_config(root: &Path) -> Config {
         endpoint: None,
         object_prefix: String::new(),
         gcs_service_account: None,
+        aws_allow_http: false,
+        aws_force_path_style: false,
         state_path: root.join("state.bin"),
         allow_other: false,
         perf_log: None,

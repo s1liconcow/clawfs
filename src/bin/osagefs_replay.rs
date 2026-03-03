@@ -439,6 +439,8 @@ fn build_config(
         entry_ttl_secs: 10,
         object_prefix: String::new(),
         gcs_service_account: None,
+        aws_allow_http: false,
+        aws_force_path_style: false,
         state_path: state_path.to_path_buf(),
         perf_log: None,
         replay_log: None,

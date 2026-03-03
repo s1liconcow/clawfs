@@ -46,6 +46,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub gcs_service_account: Option<PathBuf>,
 
+    /// Allow HTTP for AWS object provider (useful for local testing).
+    #[arg(long, default_value_t = false)]
+    pub aws_allow_http: bool,
+
+    /// Force path-style access for AWS object provider (e.g. http://host/bucket instead of http://bucket.host).
+    #[arg(long, default_value_t = false)]
+    pub aws_force_path_style: bool,
+
     /// Local state file for client id and allocation tracking.
     #[arg(long, value_name = "PATH")]
     pub state_path: Option<PathBuf>,
@@ -195,6 +203,8 @@ pub struct Config {
     pub endpoint: Option<String>,
     pub object_prefix: String,
     pub gcs_service_account: Option<PathBuf>,
+    pub aws_allow_http: bool,
+    pub aws_force_path_style: bool,
     pub state_path: PathBuf,
     pub perf_log: Option<PathBuf>,
     pub replay_log: Option<PathBuf>,
@@ -258,6 +268,8 @@ impl From<Cli> for Config {
             endpoint: cli.endpoint,
             object_prefix: cli.object_prefix,
             gcs_service_account: cli.gcs_service_account,
+            aws_allow_http: cli.aws_allow_http,
+            aws_force_path_style: cli.aws_force_path_style,
             state_path,
             perf_log: cli.perf_log,
             replay_log: cli.replay_log,
