@@ -1479,3 +1479,258 @@ fn normalize_prefix(user_prefix: &str) -> String {
         trimmed.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: directory children with file-extension names (e.g., `.h`,
+    /// `.c`) must survive a FlatBuffer serialize → deserialize round-trip without
+    /// truncation.  A kernel compile regression showed `uprobes.h` being stored as
+    /// `uprobes` after the OSGFB2 format migration.
+    #[test]
+    fn fb2_round_trip_preserves_directory_children_with_extensions() {
+        let filenames: Vec<&str> = vec![
+            "uprobes.h",
+            "mm.h",
+            "sched.h",
+            "types.h",
+            "kernel.h",
+            "list.h",
+            "rculist.h",
+            "spinlock.h",
+            "mutex.h",
+            "rwsem.h",
+            "completion.h",
+            "wait.h",
+            "pid.h",
+            "cred.h",
+            "signal.h",
+            "resource.h",
+            "securebits.h",
+            "rbtree.h",
+            "rwlock.h",
+            "atomic.h",
+            "page-flags.h",
+            "mmzone.h",
+            "topology.h",
+            "cpumask.h",
+            "percpu.h",
+            "smp.h",
+            "preempt.h",
+            "irqflags.h",
+            "bottom_half.h",
+            "lockdep.h",
+            "Makefile",
+            "Kconfig",
+            ".gitignore",
+            "kvm_host.h",
+            "mapping.o.cmd",
+        ];
+        let mut children = BTreeMap::new();
+        for (i, name) in filenames.iter().enumerate() {
+            children.insert(name.to_string(), 1000 + i as u64);
+        }
+
+        let record = InodeRecord {
+            inode: 42,
+            parent: 1,
+            name: "linux".to_string(),
+            path: "/include/linux".to_string(),
+            kind: InodeKind::Directory {
+                children: Arc::new(children.clone()),
+            },
+            size: 0,
+            mode: 0o40755,
+            uid: 1000,
+            gid: 1000,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 2,
+            rdev: 0,
+            storage: FileStorage::Inline(Vec::new()),
+        };
+
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, 1, std::iter::once(&record));
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (version, generation, records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(version, METADATA_FORMAT_VERSION);
+        assert_eq!(generation, 1);
+        assert_eq!(records.len(), 1);
+
+        let result = &records[0];
+        assert_eq!(result.inode, 42);
+        assert_eq!(result.name, "linux");
+        assert_eq!(result.path, "/include/linux");
+
+        let result_children = result.children().unwrap();
+        assert_eq!(
+            result_children.len(),
+            children.len(),
+            "children count mismatch: expected {} got {}",
+            children.len(),
+            result_children.len()
+        );
+        for (name, &ino) in &children {
+            let got = result_children.get(name);
+            assert_eq!(
+                got,
+                Some(&ino),
+                "child {:?} (ino {}) missing or wrong after round-trip; got {:?}",
+                name,
+                ino,
+                got,
+            );
+        }
+    }
+
+    /// Regression test: inline file data (like `.cmd` dependency files) must
+    /// survive FlatBuffer round-trip without truncation.
+    #[test]
+    fn fb2_round_trip_preserves_inline_file_data() {
+        // Simulate a .cmd dependency file content
+        let cmd_content = b"deps_kernel/dma/mapping.o := \\\n  \
+            kernel/dma/mapping.c \\\n  \
+            include/linux/uprobes.h \\\n  \
+            include/linux/mm.h \\\n  \
+            include/linux/sched.h \\\n  \
+            include/linux/types.h \\\n";
+
+        let record = InodeRecord {
+            inode: 99,
+            parent: 42,
+            name: ".mapping.o.cmd".to_string(),
+            path: "/kernel/dma/.mapping.o.cmd".to_string(),
+            kind: InodeKind::File,
+            size: cmd_content.len() as u64,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 1,
+            rdev: 0,
+            storage: FileStorage::Inline(cmd_content.to_vec()),
+        };
+
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, 1, std::iter::once(&record));
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (_, _, records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(records.len(), 1);
+        let result = &records[0];
+        assert_eq!(result.name, ".mapping.o.cmd");
+        assert_eq!(result.size, cmd_content.len() as u64);
+        match &result.storage {
+            FileStorage::Inline(bytes) => {
+                assert_eq!(
+                    bytes.as_slice(),
+                    cmd_content.as_slice(),
+                    "inline data mismatch after round-trip"
+                );
+            }
+            other => panic!("expected Inline storage, got {:?}", other),
+        }
+    }
+
+    /// Stress test: many records (directories + files) serialized together in
+    /// a single OSGFB2 document must all survive the round-trip.
+    #[test]
+    fn fb2_round_trip_many_records_mixed() {
+        let mut records = Vec::new();
+
+        // A directory with 500 children (simulating a large kernel include dir)
+        let mut children = BTreeMap::new();
+        for i in 0..500u64 {
+            children.insert(format!("header_{i:04}.h"), 2000 + i);
+        }
+        records.push(InodeRecord {
+            inode: 10,
+            parent: 1,
+            name: "linux".to_string(),
+            path: "/include/linux".to_string(),
+            kind: InodeKind::Directory {
+                children: Arc::new(children),
+            },
+            size: 0,
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 2,
+            rdev: 0,
+            storage: FileStorage::Inline(Vec::new()),
+        });
+
+        // 500 file records with inline data
+        for i in 0..500u64 {
+            let content = format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
+            records.push(InodeRecord {
+                inode: 2000 + i,
+                parent: 10,
+                name: format!("header_{i:04}.h"),
+                path: format!("/include/linux/header_{i:04}.h"),
+                kind: InodeKind::File,
+                size: content.len() as u64,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                atime: time::OffsetDateTime::now_utc(),
+                mtime: time::OffsetDateTime::now_utc(),
+                ctime: time::OffsetDateTime::now_utc(),
+                link_count: 1,
+                rdev: 0,
+                storage: FileStorage::Inline(content.into_bytes()),
+            });
+        }
+
+        let data = serialize_inodes_fb2(
+            METADATA_FORMAT_VERSION,
+            1,
+            records.iter(),
+        );
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (_, _, result_records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(result_records.len(), records.len());
+
+        // Verify directory children
+        let dir = &result_records[0];
+        let dir_children = dir.children().unwrap();
+        assert_eq!(dir_children.len(), 500);
+        for i in 0..500u64 {
+            let name = format!("header_{i:04}.h");
+            assert_eq!(
+                dir_children.get(&name),
+                Some(&(2000 + i)),
+                "child {} missing or wrong",
+                name,
+            );
+        }
+
+        // Verify file records
+        for i in 0..500u64 {
+            let file = &result_records[1 + i as usize];
+            let expected_name = format!("header_{i:04}.h");
+            assert_eq!(file.name, expected_name, "file name mismatch at index {}", i);
+            let expected_content =
+                format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
+            match &file.storage {
+                FileStorage::Inline(bytes) => {
+                    assert_eq!(
+                        bytes.as_slice(),
+                        expected_content.as_bytes(),
+                        "inline data mismatch for {}",
+                        expected_name,
+                    );
+                }
+                other => panic!("expected Inline for {}, got {:?}", expected_name, other),
+            }
+        }
+    }
+}

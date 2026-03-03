@@ -3551,3 +3551,311 @@ fn nfs4trace_pattern_preserved_across_flushing_handoff() {
         "log-derived nfs4trace write pattern must preserve exact bytes",
     );
 }
+
+/// Regression test: directory children and file data must survive a full
+/// flush → store → reload cycle (simulating daemon restart).
+///
+/// The fixdep kernel compile regression showed `uprobes.h` being truncated
+/// to `uprobes` when read from persisted metadata.  This test verifies the
+/// complete round-trip through the object store, not just the in-memory cache.
+#[test]
+fn flush_and_reload_preserves_directory_children_and_file_data() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: create files and flush with the first harness.
+    let created_files: Vec<(String, u64, Vec<u8>)>;
+    let linux_ino: u64;
+    {
+        let h1 = TestHarness::with_config(dir.path(), "reload_1.bin", 4096, |cfg| {
+            cfg.disable_journal = true;
+            cfg.inline_compression = true;
+            cfg.inline_threshold = 512;
+        });
+        let fs = &h1.fs;
+
+        let linux_dir = fs.op_mkdir(ROOT_INODE, "linux", 0, 0).unwrap();
+        linux_ino = linux_dir.inode;
+
+        let filenames = [
+            "uprobes.h",
+            "mm.h",
+            "sched.h",
+            "types.h",
+            "page-flags.h",
+            "kvm_host.h",
+            ".mapping.o.cmd",
+            "mapping.o.d",
+            "Makefile",
+            "Kconfig",
+        ];
+
+        let mut files = Vec::new();
+        for &name in &filenames {
+            let (file, _) = fs
+                .op_create_fuse(linux_ino, name, 0, 0, 0o100644, 0o022, 0)
+                .unwrap();
+            let content = format!("/* content of {} */\n", name).into_bytes();
+            fs.op_write(file.inode, 0, &content).unwrap();
+            files.push((name.to_string(), file.inode, content));
+        }
+        created_files = files;
+
+        // Flush to persist everything to the store.
+        fs.flush_pending().unwrap();
+    }
+
+    // Phase 2: create a NEW harness pointing to the same store.
+    // This forces metadata to be loaded from the object store, exercising the
+    // full serialize → store → deserialize path (no warm cache).
+    {
+        let h2 = TestHarness::with_config(dir.path(), "reload_2.bin", 4096, |cfg| {
+            cfg.disable_journal = true;
+            cfg.inline_compression = true;
+            cfg.inline_threshold = 512;
+        });
+        let fs = &h2.fs;
+
+        // Load the directory from the store.
+        let linux_record = h2
+            .runtime
+            .block_on(h2.metadata.get_inode(linux_ino))
+            .unwrap()
+            .expect("linux directory should exist after reload");
+
+        let children = linux_record.children().unwrap();
+        for (name, _, _) in &created_files {
+            assert!(
+                children.contains_key(name),
+                "child {:?} missing from directory after store reload — \
+                 possible name truncation in OSGFB2 serialization",
+                name,
+            );
+        }
+
+        // Verify file content from store.
+        for (name, ino, expected_content) in &created_files {
+            let record = h2
+                .runtime
+                .block_on(h2.metadata.get_inode(*ino))
+                .unwrap()
+                .unwrap_or_else(|| panic!("inode {} ({}) should exist after reload", ino, name));
+
+            assert_eq!(
+                record.name, *name,
+                "file name mismatch for inode {} after store reload",
+                ino,
+            );
+
+            let actual = fs.read_file_bytes(&record).unwrap();
+            assert_eq!(
+                actual, *expected_content,
+                "file {:?} content corrupted after store reload",
+                name,
+            );
+        }
+    }
+}
+
+/// Regression test: kernel compile fixdep failure.
+///
+/// During parallel `make -jN`, the kernel build generates `.d` dependency
+/// files whose content lists include paths like `include/linux/uprobes.h`.
+/// A regression caused filenames or file data to be truncated after flush
+/// (e.g. `uprobes.h` → `uprobes`), making `fixdep` fail with ENOENT.
+///
+/// This test creates a directory tree resembling a kernel source tree,
+/// writes `.d` dependency file content, flushes, and verifies both
+/// directory children names and file data survive the full round-trip
+/// including compression.
+#[test]
+fn kernel_compile_fixdep_regression_file_data_survives_flush() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "fixdep_reg.bin", 4096, |cfg| {
+        cfg.disable_journal = true;
+        cfg.inline_compression = true;
+        cfg.inline_threshold = 512;
+    });
+    let fs = &harness.fs;
+
+    // Create include/linux/ directory
+    let include_dir = fs.op_mkdir(ROOT_INODE, "include", 0, 0).unwrap();
+    let linux_dir = fs.op_mkdir(include_dir.inode, "linux", 0, 0).unwrap();
+
+    // Create header files with extensions
+    let headers = [
+        "uprobes.h",
+        "mm.h",
+        "sched.h",
+        "types.h",
+        "kernel.h",
+        "page-flags.h",
+        "kvm_host.h",
+    ];
+    let mut header_inodes = Vec::new();
+    for &name in &headers {
+        let (file, _) = fs
+            .op_create_fuse(linux_dir.inode, name, 0, 0, 0o100644, 0o022, 0)
+            .unwrap();
+        let content = format!("/* {} */\n#ifndef _HEADER\n#define _HEADER\n#endif\n", name);
+        fs.op_write(file.inode, 0, content.as_bytes()).unwrap();
+        header_inodes.push((name, file.inode));
+    }
+
+    // Create kernel/dma/ directory
+    let kernel_dir = fs.op_mkdir(ROOT_INODE, "kernel", 0, 0).unwrap();
+    let dma_dir = fs.op_mkdir(kernel_dir.inode, "dma", 0, 0).unwrap();
+
+    // Write a .d dependency file (like gcc -MD produces)
+    let dep_content = "kernel/dma/mapping.o: kernel/dma/mapping.c \\\n  \
+        include/linux/uprobes.h \\\n  \
+        include/linux/mm.h \\\n  \
+        include/linux/sched.h \\\n  \
+        include/linux/types.h \\\n  \
+        include/linux/kernel.h \\\n  \
+        include/linux/page-flags.h \\\n  \
+        include/linux/kvm_host.h\n";
+    let (dep_file, _) = fs
+        .op_create_fuse(dma_dir.inode, ".mapping.o.d", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    fs.op_write(dep_file.inode, 0, dep_content.as_bytes())
+        .unwrap();
+
+    // Flush all pending writes
+    fs.flush_pending().unwrap();
+
+    // Verify directory children after flush
+    let linux_record = fs.load_inode(linux_dir.inode).unwrap();
+    let linux_children = linux_record.children().unwrap();
+    for &name in &headers {
+        assert!(
+            linux_children.contains_key(name),
+            "header file {:?} missing from include/linux/ after flush",
+            name,
+        );
+    }
+
+    // Verify .d file content after flush — this is what fixdep reads
+    let dep_read = fs
+        .op_read(dep_file.inode, 0, dep_content.len() as u32)
+        .unwrap();
+    assert_eq!(
+        dep_read.len(),
+        dep_content.len(),
+        ".d file length mismatch: expected {} got {}",
+        dep_content.len(),
+        dep_read.len(),
+    );
+    assert_eq!(
+        std::str::from_utf8(&dep_read).unwrap(),
+        dep_content,
+        ".d file content corrupted after flush — fixdep would get wrong paths",
+    );
+
+    // Verify header file content after flush
+    for &(name, inode) in &header_inodes {
+        let expected = format!("/* {} */\n#ifndef _HEADER\n#define _HEADER\n#endif\n", name);
+        let actual = fs.op_read(inode, 0, expected.len() as u32).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&actual).unwrap(),
+            expected,
+            "header file {:?} content corrupted after flush",
+            name,
+        );
+    }
+}
+
+/// Regression test: concurrent file creation and flush must preserve all
+/// directory children names including file extensions.
+///
+/// Under `make -jN`, many `.h`, `.c`, `.o`, `.d`, `.cmd` files are created
+/// concurrently while the filesystem flushes metadata. A serialization
+/// regression could cause extension truncation (e.g. `uprobes.h` → `uprobes`).
+#[test]
+fn concurrent_create_flush_preserves_file_extensions() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "ext_flush.bin", 4096, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+        cfg.inline_compression = true;
+    });
+    let fs = &harness.fs;
+
+    let parent = fs.op_mkdir(ROOT_INODE, "linux", 0, 0).unwrap();
+    let parent_ino = parent.inode;
+
+    let num_files = 200;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let created = thread::scope(|scope| {
+        let creator_barrier = barrier.clone();
+        let creator = scope.spawn(move || {
+            let mut files = Vec::new();
+            creator_barrier.wait();
+            for i in 0..num_files {
+                // Mix of extensions to catch truncation bugs
+                let name = match i % 5 {
+                    0 => format!("file_{i:04}.h"),
+                    1 => format!("file_{i:04}.c"),
+                    2 => format!("file_{i:04}.o"),
+                    3 => format!(".file_{i:04}.o.cmd"),
+                    _ => format!("file_{i:04}.o.d"),
+                };
+                let (file, _) = fs
+                    .op_create_fuse(parent_ino, &name, 0, 0, 0o100644, 0o022, 0)
+                    .unwrap();
+                let content = format!("content of {name}\n");
+                fs.op_write(file.inode, 0, content.as_bytes()).unwrap();
+                files.push((name, file.inode));
+            }
+            files
+        });
+
+        let flusher_barrier = barrier.clone();
+        let flusher = scope.spawn(move || {
+            flusher_barrier.wait();
+            for _ in 0..num_files {
+                let _ = fs.flush_pending();
+                std::thread::yield_now();
+            }
+        });
+
+        let result = creator.join().unwrap();
+        flusher.join().unwrap();
+        result
+    });
+
+    // Final flush to commit everything
+    fs.flush_pending().unwrap();
+
+    // Verify ALL file names survive including extensions
+    let parent_record = fs.load_inode(parent_ino).unwrap();
+    let children = parent_record.children().unwrap();
+    for (name, ino) in &created {
+        assert!(
+            children.contains_key(name),
+            "file {:?} (ino {}) missing from directory after concurrent create+flush — \
+             possible extension truncation",
+            name,
+            ino,
+        );
+        // Also verify via lookup (the path fixdep would use)
+        let lookup = fs.op_lookup(parent_ino, name);
+        assert!(
+            lookup.is_ok(),
+            "lookup failed for {:?} after concurrent create+flush",
+            name,
+        );
+    }
+
+    // Verify file content survives flush
+    for (name, ino) in &created {
+        let expected = format!("content of {name}\n");
+        let actual = fs.op_read(*ino, 0, expected.len() as u32).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&actual).unwrap(),
+            expected,
+            "file {:?} content corrupted after concurrent create+flush",
+            name,
+        );
+    }
+}
