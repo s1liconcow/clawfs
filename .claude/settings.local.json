@@ -5,10 +5,10 @@
       "Read(*)",
       "Write(*)",
       "Edit(*)",
-      "Bash(sudo rm:*)",
       "Bash(cargo clean:*)",
       "Bash(OSAGEFS_RUN_PERF=1 cargo test:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:git.kernel.org)"
     ]
   }
 }

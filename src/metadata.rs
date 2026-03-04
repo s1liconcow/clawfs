@@ -1703,7 +1703,8 @@ mod tests {
 
         // 500 file records with inline data
         for i in 0..500u64 {
-            let content = format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
+            let content =
+                format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
             records.push(InodeRecord {
                 inode: 2000 + i,
                 parent: 10,
@@ -1723,11 +1724,7 @@ mod tests {
             });
         }
 
-        let data = serialize_inodes_fb2(
-            METADATA_FORMAT_VERSION,
-            1,
-            records.iter(),
-        );
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, 1, records.iter());
         let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
         let (_, _, result_records) = deserialize_fb2_document(fb_data).unwrap();
 
@@ -1751,7 +1748,11 @@ mod tests {
         for i in 0..500u64 {
             let file = &result_records[1 + i as usize];
             let expected_name = format!("header_{i:04}.h");
-            assert_eq!(file.name, expected_name, "file name mismatch at index {}", i);
+            assert_eq!(
+                file.name, expected_name,
+                "file name mismatch at index {}",
+                i
+            );
             let expected_content =
                 format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
             match &file.storage {
