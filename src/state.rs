@@ -3,11 +3,27 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use flatbuffers::FlatBufferBuilder;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::metadata::fvt;
+
 const CLIENT_STATE_VERSION: u32 = 1;
+
+/// Magic bytes for the FlatBuffer client state format.
+const STATE_FB_MAGIC: &[u8; 6] = b"OSGST2";
+
+// ── FlatBuffer ClientState schema ─────────────────────────────────────────
+//
+// ClientStateFB table:
+//   0(vt=4) version:            u32
+//   1(vt=6) client_id:          string
+//   2(vt=8) inode_next:         u64
+//   3(vt=10) inode_remaining:   u64
+//   4(vt=12) segment_next:      u64
+//   5(vt=14) segment_remaining: u64
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientState {
@@ -30,12 +46,6 @@ impl Default for ClientState {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredClientState {
-    version: u32,
-    state: ClientState,
-}
-
 pub struct ClientStateManager {
     path: PathBuf,
     state: Mutex<ClientState>,
@@ -49,24 +59,14 @@ impl ClientStateManager {
             File::open(&path)
                 .with_context(|| format!("opening client state {}", path.display()))?
                 .read_to_end(&mut buf)?;
-            let stored: StoredClientState =
-                deserialize_flex(&buf).with_context(|| "parsing client state")?;
-            anyhow::ensure!(
-                stored.version == CLIENT_STATE_VERSION,
-                "unsupported client state version {}",
-                stored.version
-            );
-            stored.state
+            deserialize_state_fb(&buf).with_context(|| "parsing client state")?
         } else {
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating client state dir {}", parent.display()))?;
             let state = ClientState::default();
+            let data = serialize_state_fb(&state);
             let mut file = File::create(&path)?;
-            let data = serialize_flex(&StoredClientState {
-                version: CLIENT_STATE_VERSION,
-                state: state.clone(),
-            })?;
             file.write_all(&data)?;
             state
         };
@@ -150,25 +150,67 @@ impl ClientStateManager {
     }
 
     fn persist_locked(&self, state: &ClientState) -> Result<()> {
-        let data = serialize_flex(&StoredClientState {
-            version: CLIENT_STATE_VERSION,
-            state: state.clone(),
-        })?;
+        let data = serialize_state_fb(state);
         let mut file = File::create(&self.path)?;
         file.write_all(&data)?;
         Ok(())
     }
 }
 
-fn serialize_flex<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = flexbuffers::FlexbufferSerializer::new();
-    value.serialize(&mut serializer)?;
-    Ok(serializer.take_buffer())
+fn serialize_state_fb(state: &ClientState) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(256);
+
+    let client_id_wip = fbb.create_string(&state.client_id);
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u32>(fvt(0), CLIENT_STATE_VERSION);
+    fbb.push_slot_always::<flatbuffers::WIPOffset<_>>(fvt(1), client_id_wip);
+    fbb.push_slot_always::<u64>(fvt(2), state.inode_next);
+    fbb.push_slot_always::<u64>(fvt(3), state.inode_remaining);
+    fbb.push_slot_always::<u64>(fvt(4), state.segment_next);
+    fbb.push_slot_always::<u64>(fvt(5), state.segment_remaining);
+    let root = fbb.end_table(start);
+    fbb.finish_minimal(root);
+
+    let fb = fbb.finished_data();
+    let mut out = Vec::with_capacity(STATE_FB_MAGIC.len() + fb.len());
+    out.extend_from_slice(STATE_FB_MAGIC);
+    out.extend_from_slice(fb);
+    out
 }
 
-fn deserialize_flex<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    let reader = flexbuffers::Reader::get_root(bytes)?;
-    Ok(T::deserialize(reader)?)
+fn deserialize_state_fb(data: &[u8]) -> Result<ClientState> {
+    let fb_data = data
+        .strip_prefix(STATE_FB_MAGIC.as_slice())
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported client state encoding (missing OSGST2 magic)")
+        })?;
+
+    // Safety: data was written by our own writer so the schema matches.
+    let doc = unsafe { flatbuffers::root_unchecked::<flatbuffers::Table<'_>>(fb_data) };
+
+    let version = unsafe { doc.get::<u32>(fvt(0), Some(0)) }.unwrap_or(0);
+    anyhow::ensure!(
+        version == CLIENT_STATE_VERSION,
+        "unsupported client state version {}",
+        version
+    );
+
+    let client_id = unsafe { doc.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(1), None) }
+        .unwrap_or("")
+        .to_string();
+    let inode_next = unsafe { doc.get::<u64>(fvt(2), Some(0)) }.unwrap_or(0);
+    let inode_remaining = unsafe { doc.get::<u64>(fvt(3), Some(0)) }.unwrap_or(0);
+    let segment_next = unsafe { doc.get::<u64>(fvt(4), Some(0)) }.unwrap_or(0);
+    let segment_remaining = unsafe { doc.get::<u64>(fvt(5), Some(0)) }.unwrap_or(0);
+
+    Ok(ClientState {
+        client_id,
+        inode_next,
+        inode_remaining,
+        segment_next,
+        segment_remaining,
+    })
 }
 
 #[cfg(test)]

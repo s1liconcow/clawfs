@@ -1,17 +1,40 @@
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use flatbuffers::FlatBufferBuilder;
 use tokio::runtime::Handle;
 
-use crate::codec::{deserialize_flex, write_flexbuffer};
 use crate::config::Config;
 use crate::metadata::MetadataStore;
-use crate::superblock::Superblock;
+use crate::metadata::fvt;
+use crate::superblock::{CleanupLease, CleanupTaskKind, FilesystemState, Superblock};
 
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Magic bytes for the FlatBuffer checkpoint format.
+const CHECKPOINT_FB_MAGIC: &[u8; 6] = b"OSGCP2";
+
+// ── FlatBuffer Checkpoint schema ──────────────────────────────────────────
+//
+// CheckpointFB table:
+//   0(vt=4)  version:          u32
+//   1(vt=6)  created_at_unix:  i64
+//   2(vt=8)  note:             string   (optional)
+//   3(vt=10) sb_generation:    u64
+//   4(vt=12) sb_next_inode:    u64
+//   5(vt=14) sb_next_segment:  u64
+//   6(vt=16) sb_shard_size:    u64
+//   7(vt=18) sb_version:       u32
+//   8(vt=20) sb_state:         u8       (0=Clean, 1=Dirty)
+//   9(vt=22) sb_cleanup_leases: [CleanupLeaseFB]
+//
+// CleanupLeaseFB table:
+//   0(vt=4)  kind:        u8   (0=DeltaCompaction, 1=SegmentCompaction)
+//   1(vt=6)  client_id:   string
+//   2(vt=8)  lease_until:  i64
+
+#[derive(Debug, Clone)]
 pub struct CheckpointData {
     pub version: u32,
     pub created_at_unix: i64,
@@ -54,7 +77,22 @@ pub async fn create_checkpoint(
         }),
         superblock: superblock.clone(),
     };
-    write_flexbuffer(checkpoint_path, &checkpoint)?;
+
+    let data = serialize_checkpoint_fb(&checkpoint);
+    let parent = checkpoint_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&parent)
+        .with_context(|| format!("creating dir {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    tmp.write_all(&data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(checkpoint_path)
+        .map(|_| ())
+        .with_context(|| format!("persisting checkpoint to {}", checkpoint_path.display()))?;
+
     Ok(CheckpointResult {
         generation: superblock.generation,
         next_inode: superblock.next_inode,
@@ -70,7 +108,7 @@ pub async fn restore_checkpoint(
 ) -> Result<CheckpointResult> {
     let bytes = std::fs::read(checkpoint_path)
         .with_context(|| format!("reading checkpoint {}", checkpoint_path.display()))?;
-    let checkpoint: CheckpointData = deserialize_flex(&bytes)
+    let checkpoint = deserialize_checkpoint_fb(&bytes)
         .with_context(|| format!("parsing checkpoint {}", checkpoint_path.display()))?;
     if checkpoint.version != CHECKPOINT_FORMAT_VERSION {
         bail!(
@@ -86,6 +124,139 @@ pub async fn restore_checkpoint(
         next_inode: checkpoint.superblock.next_inode,
         next_segment: checkpoint.superblock.next_segment,
         checkpoint_path: checkpoint_path.display().to_string(),
+    })
+}
+
+// ── FlatBuffer checkpoint serialization ───────────────────────────────────
+
+fn build_cleanup_lease_fb<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    lease: &CleanupLease,
+) -> flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset> {
+    let client_id_wip = fbb.create_string(&lease.client_id);
+    let kind_u8 = match lease.kind {
+        CleanupTaskKind::DeltaCompaction => 0u8,
+        CleanupTaskKind::SegmentCompaction => 1u8,
+    };
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u8>(fvt(0), kind_u8);
+    fbb.push_slot_always::<flatbuffers::WIPOffset<_>>(fvt(1), client_id_wip);
+    fbb.push_slot_always::<i64>(fvt(2), lease.lease_until);
+    fbb.end_table(start)
+}
+
+fn serialize_checkpoint_fb(cp: &CheckpointData) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(512);
+
+    let note_wip = cp.note.as_deref().map(|n| fbb.create_string(n));
+
+    let leases_wip = if !cp.superblock.cleanup_leases.is_empty() {
+        let lease_wips: Vec<flatbuffers::WIPOffset<_>> = cp
+            .superblock
+            .cleanup_leases
+            .iter()
+            .map(|l| build_cleanup_lease_fb(&mut fbb, l))
+            .collect();
+        Some(fbb.create_vector(&lease_wips))
+    } else {
+        None
+    };
+
+    let sb = &cp.superblock;
+    let state_u8 = match sb.state {
+        FilesystemState::Clean => 0u8,
+        FilesystemState::Dirty => 1u8,
+    };
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u32>(fvt(0), cp.version);
+    fbb.push_slot_always::<i64>(fvt(1), cp.created_at_unix);
+    if let Some(wip) = note_wip {
+        fbb.push_slot_always::<flatbuffers::WIPOffset<_>>(fvt(2), wip);
+    }
+    fbb.push_slot_always::<u64>(fvt(3), sb.generation);
+    fbb.push_slot_always::<u64>(fvt(4), sb.next_inode);
+    fbb.push_slot_always::<u64>(fvt(5), sb.next_segment);
+    fbb.push_slot_always::<u64>(fvt(6), sb.shard_size);
+    fbb.push_slot_always::<u32>(fvt(7), sb.version);
+    fbb.push_slot_always::<u8>(fvt(8), state_u8);
+    if let Some(wip) = leases_wip {
+        fbb.push_slot_always::<flatbuffers::WIPOffset<_>>(fvt(9), wip);
+    }
+    let root = fbb.end_table(start);
+    fbb.finish_minimal(root);
+
+    let fb = fbb.finished_data();
+    let mut out = Vec::with_capacity(CHECKPOINT_FB_MAGIC.len() + fb.len());
+    out.extend_from_slice(CHECKPOINT_FB_MAGIC);
+    out.extend_from_slice(fb);
+    out
+}
+
+fn deserialize_checkpoint_fb(data: &[u8]) -> Result<CheckpointData> {
+    let fb_data = data
+        .strip_prefix(CHECKPOINT_FB_MAGIC.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("unsupported checkpoint encoding (missing OSGCP2 magic)"))?;
+
+    let doc = unsafe { flatbuffers::root_unchecked::<flatbuffers::Table<'_>>(fb_data) };
+
+    let version = unsafe { doc.get::<u32>(fvt(0), Some(0)) }.unwrap_or(0);
+    let created_at_unix = unsafe { doc.get::<i64>(fvt(1), Some(0)) }.unwrap_or(0);
+    let note = unsafe { doc.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(2), None) }
+        .map(|s| s.to_string());
+    let generation = unsafe { doc.get::<u64>(fvt(3), Some(0)) }.unwrap_or(0);
+    let next_inode = unsafe { doc.get::<u64>(fvt(4), Some(0)) }.unwrap_or(0);
+    let next_segment = unsafe { doc.get::<u64>(fvt(5), Some(0)) }.unwrap_or(0);
+    let shard_size = unsafe { doc.get::<u64>(fvt(6), Some(0)) }.unwrap_or(0);
+    let sb_version = unsafe { doc.get::<u32>(fvt(7), Some(0)) }.unwrap_or(0);
+    let state_u8 = unsafe { doc.get::<u8>(fvt(8), Some(0)) }.unwrap_or(0);
+    let state = match state_u8 {
+        1 => FilesystemState::Dirty,
+        _ => FilesystemState::Clean,
+    };
+
+    let cleanup_leases = unsafe {
+        doc.get::<flatbuffers::ForwardsUOffset<
+            flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>,
+        >>(fvt(9), None)
+    }
+    .map(|vec| {
+        (0..vec.len())
+            .filter_map(|i| read_cleanup_lease_fb(vec.get(i)))
+            .collect()
+    })
+    .unwrap_or_default();
+
+    Ok(CheckpointData {
+        version,
+        created_at_unix,
+        note,
+        superblock: Superblock {
+            generation,
+            next_inode,
+            next_segment,
+            shard_size,
+            version: sb_version,
+            state,
+            cleanup_leases,
+        },
+    })
+}
+
+fn read_cleanup_lease_fb(t: flatbuffers::Table<'_>) -> Option<CleanupLease> {
+    let kind_u8 = unsafe { t.get::<u8>(fvt(0), Some(0)) }.unwrap_or(0);
+    let kind = match kind_u8 {
+        0 => CleanupTaskKind::DeltaCompaction,
+        1 => CleanupTaskKind::SegmentCompaction,
+        _ => return None,
+    };
+    let client_id =
+        unsafe { t.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(1), None) }?.to_string();
+    let lease_until = unsafe { t.get::<i64>(fvt(2), Some(0)) }.unwrap_or(0);
+    Some(CleanupLease {
+        kind,
+        client_id,
+        lease_until,
     })
 }
 

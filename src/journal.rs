@@ -1,6 +1,6 @@
 //! Append-only write-ahead log (WAL) for crash-safe pending inode tracking.
 //!
-//! Each `persist_entry` call appends a length-prefixed flexbuffer record to a
+//! Each `persist_entry` call appends a length-prefixed FlatBuffer record to a
 //! single WAL file (`journal/wal.bin`) without an individual fsync, reducing
 //! the per-write cost from 4 syscalls (creat+write+rename+close) to a single
 //! buffered `write`.  An explicit `sync_entries` — called only on `fsync()`
@@ -17,11 +17,11 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
-use crate::codec::{deserialize_flex, serialize_flex};
 use crate::inode::{InodeKind, InodeRecord};
+use crate::metadata::{build_inode_record_fb, fvt, read_inode_record_fb2};
 use crate::segment::StagedChunk;
 
 const JOURNAL_VERSION: u32 = 1;
@@ -31,7 +31,25 @@ const WAL_COMPACT_THRESHOLD: usize = 8_192;
 /// BufWriter internal buffer – large enough to batch many small-file entries.
 const WAL_BUF_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Magic bytes for the FlatBuffer journal format (version 2).
+const JOURNAL_FB2_MAGIC: &[u8; 6] = b"OSGJN2";
+
+// ── FlatBuffer Journal Document schema ────────────────────────────────────
+//
+// JournalDocument table:
+//   0(vt=4) version:         u32
+//   1(vt=6) record:          InodeRecord table  (same schema as metadata OSGFB2)
+//   2(vt=8) payload_tag:     u8   (0=None, 1=Inline, 2=StageFile, 3=StageChunks)
+//   3(vt=10) payload_bytes:  [u8] (for Inline variant)
+//   4(vt=12) staged_chunks:  [StagedChunkFB]
+//
+// StagedChunkFB table:
+//   0(vt=4) path:            string
+//   1(vt=6) offset:          u64
+//   2(vt=8) len:             u64
+//   3(vt=10) logical_offset: u64
+
+#[derive(Debug, Clone)]
 pub enum JournalPayload {
     None,
     Inline(Vec<u8>),
@@ -43,23 +61,6 @@ pub enum JournalPayload {
 pub struct JournalEntry {
     pub record: InodeRecord,
     pub payload: JournalPayload,
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoredJournalEntry {
-    version: u32,
-    record: InodeRecord,
-    payload: JournalPayload,
-}
-
-/// Borrow-friendly serialization struct — avoids cloning the InodeRecord
-/// and JournalPayload on every `persist_entry` call.  The flexbuffer wire
-/// format is identical to [`StoredJournalEntry`].
-#[derive(Serialize)]
-struct StoredJournalEntryRef<'a> {
-    version: u32,
-    record: &'a InodeRecord,
-    payload: &'a JournalPayload,
 }
 
 // ── WAL state held under the lock ─────────────────────────────────────────
@@ -106,20 +107,16 @@ impl JournalManager {
     /// arguments so callers can avoid constructing an intermediate
     /// `JournalEntry` (and the associated clone).
     pub fn persist_record(&self, record: &InodeRecord, payload: &JournalPayload) -> Result<()> {
-        let stored = StoredJournalEntryRef {
-            version: JOURNAL_VERSION,
-            record,
-            payload,
-        };
-        let data = serialize_flex(&stored)?;
-        let len = data.len() as u32;
+        // FlatBuffer serialization outside the lock to reduce lock hold time.
+        let buf = serialize_journal_fb2(record, payload);
+        let len = buf.len() as u32;
 
         let mut state = self.state.lock();
         let writer = self.ensure_writer(&mut state)?;
         writer
             .write_all(&len.to_le_bytes())
             .context("writing WAL record length")?;
-        writer.write_all(&data).context("writing WAL record data")?;
+        writer.write_all(&buf).context("writing WAL record data")?;
         state.live_count += 1;
         state.total_records += 1;
         Ok(())
@@ -140,12 +137,7 @@ impl JournalManager {
     /// the WAL to zero bytes (the common case after a complete flush cycle).
     pub fn clear_entry(&self, inode: u64) -> Result<()> {
         let tombstone = InodeRecord::tombstone(inode);
-        let stored = StoredJournalEntry {
-            version: JOURNAL_VERSION,
-            record: tombstone,
-            payload: JournalPayload::None,
-        };
-        let data = serialize_flex(&stored)?;
+        let data = serialize_journal_fb2(&tombstone, &JournalPayload::None);
         let len = data.len() as u32;
 
         let mut state = self.state.lock();
@@ -210,23 +202,13 @@ impl JournalManager {
             let slice = &raw[pos..pos + record_len];
             cursor.seek(SeekFrom::Current(record_len as i64))?;
 
-            let stored: StoredJournalEntry = match deserialize_flex(slice) {
-                Ok(s) => s,
-                Err(_) => continue, // corrupt record, skip
+            let Some((record, payload)) = deserialize_journal_fb2(slice) else {
+                continue; // corrupt or unrecognized record, skip
             };
-            if stored.version != JOURNAL_VERSION {
-                continue;
-            }
-            if matches!(stored.record.kind, InodeKind::Tombstone) {
-                live.remove(&stored.record.inode);
+            if matches!(record.kind, InodeKind::Tombstone) {
+                live.remove(&record.inode);
             } else {
-                live.insert(
-                    stored.record.inode,
-                    JournalEntry {
-                        record: stored.record,
-                        payload: stored.payload,
-                    },
-                );
+                live.insert(record.inode, JournalEntry { record, payload });
             }
         }
 
@@ -302,12 +284,7 @@ impl JournalManager {
                 .with_context(|| format!("creating compact WAL {}", tmp_path.display()))?;
             let mut writer = BufWriter::with_capacity(WAL_BUF_BYTES, tmp_file);
             for entry in &live_entries {
-                let stored = StoredJournalEntry {
-                    version: JOURNAL_VERSION,
-                    record: entry.record.clone(),
-                    payload: entry.payload.clone(),
-                };
-                let data = serialize_flex(&stored)?;
+                let data = serialize_journal_fb2(&entry.record, &entry.payload);
                 writer.write_all(&(data.len() as u32).to_le_bytes())?;
                 writer.write_all(&data)?;
             }
@@ -332,4 +309,148 @@ impl JournalManager {
         dir.sync_all()
             .with_context(|| format!("syncing journal dir {}", self.dir.display()))
     }
+}
+
+// ── FlatBuffer journal serialization (OSGJN2) ────────────────────────────────
+//
+// Reuses the same InodeRecord FlatBuffer table as the metadata OSGFB2 format.
+// The format is identified by a 6-byte OSGJN2 magic header.
+
+fn build_staged_chunk_fb<'fbb>(
+    fbb: &mut FlatBufferBuilder<'fbb>,
+    chunk: &StagedChunk,
+) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
+    let path_str = chunk.path.to_string_lossy();
+    let path_wip = fbb.create_string(&path_str);
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(0), path_wip);
+    fbb.push_slot_always::<u64>(fvt(1), chunk.offset);
+    fbb.push_slot_always::<u64>(fvt(2), chunk.len);
+    fbb.push_slot_always::<u64>(fvt(3), chunk.logical_offset);
+    fbb.end_table(start)
+}
+
+fn serialize_journal_fb2(record: &InodeRecord, payload: &JournalPayload) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(512);
+
+    // Build the inode record (reuses metadata's builder).
+    let record_wip = build_inode_record_fb(&mut fbb, record);
+
+    // Build payload-specific data before start_table().
+    let (payload_tag, payload_bytes_wip, chunks_wip) = match payload {
+        JournalPayload::None => (0u8, None, None),
+        JournalPayload::Inline(bytes) => {
+            let wip = fbb.create_vector(bytes.as_slice());
+            (1u8, Some(wip), None)
+        }
+        JournalPayload::StageFile(chunk) => {
+            let chunk_wip = build_staged_chunk_fb(&mut fbb, chunk);
+            let vec_wip = fbb.create_vector(&[chunk_wip]);
+            (2u8, None, Some(vec_wip))
+        }
+        JournalPayload::StageChunks(chunks) => {
+            let chunk_wips: Vec<WIPOffset<_>> = chunks
+                .iter()
+                .map(|c| build_staged_chunk_fb(&mut fbb, c))
+                .collect();
+            let vec_wip = fbb.create_vector(&chunk_wips);
+            (3u8, None, Some(vec_wip))
+        }
+    };
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u32>(fvt(0), JOURNAL_VERSION);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(1), record_wip);
+    fbb.push_slot_always::<u8>(fvt(2), payload_tag);
+    if let Some(wip) = payload_bytes_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(3), wip);
+    }
+    if let Some(wip) = chunks_wip {
+        fbb.push_slot_always::<WIPOffset<_>>(fvt(4), wip);
+    }
+    let root = fbb.end_table(start);
+    fbb.finish_minimal(root);
+
+    let fb = fbb.finished_data();
+    let mut out = Vec::with_capacity(JOURNAL_FB2_MAGIC.len() + fb.len());
+    out.extend_from_slice(JOURNAL_FB2_MAGIC);
+    out.extend_from_slice(fb);
+    out
+}
+
+// ── FlatBuffer journal deserialization ────────────────────────────────────────
+
+fn read_staged_chunk_fb(t: flatbuffers::Table<'_>) -> Option<StagedChunk> {
+    let path_str = unsafe { t.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(0), None) }?;
+    let offset = unsafe { t.get::<u64>(fvt(1), Some(0)) }.unwrap_or(0);
+    let len = unsafe { t.get::<u64>(fvt(2), Some(0)) }.unwrap_or(0);
+    let logical_offset = unsafe { t.get::<u64>(fvt(3), Some(0)) }.unwrap_or(0);
+    Some(StagedChunk {
+        path: PathBuf::from(path_str),
+        offset,
+        len,
+        logical_offset,
+    })
+}
+
+fn deserialize_journal_fb2(data: &[u8]) -> Option<(InodeRecord, JournalPayload)> {
+    if data.len() < JOURNAL_FB2_MAGIC.len() + 4 {
+        return None;
+    }
+    if &data[..JOURNAL_FB2_MAGIC.len()] != JOURNAL_FB2_MAGIC {
+        return None;
+    }
+    let fb_data = &data[JOURNAL_FB2_MAGIC.len()..];
+
+    // Safety: data was written by our own OSGJN2 writer so the schema matches.
+    let doc = unsafe { flatbuffers::root_unchecked::<flatbuffers::Table<'_>>(fb_data) };
+
+    let _version = unsafe { doc.get::<u32>(fvt(0), Some(0)) }.unwrap_or(0);
+
+    // Read the InodeRecord sub-table.
+    let record_table =
+        unsafe { doc.get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>(fvt(1), None) }?;
+    let record = read_inode_record_fb2(record_table).ok()?;
+
+    // Read payload.
+    let payload_tag = unsafe { doc.get::<u8>(fvt(2), Some(0)) }.unwrap_or(0);
+    let payload = match payload_tag {
+        0 => JournalPayload::None,
+        1 => {
+            let bytes_vec = unsafe {
+                doc.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(3), None)
+            }?;
+            JournalPayload::Inline(bytes_vec.bytes().to_vec())
+        }
+        2 => {
+            // StageFile: single chunk in the chunks vector.
+            let chunks_vec = unsafe {
+                doc.get::<flatbuffers::ForwardsUOffset<
+                    flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>,
+                >>(fvt(4), None)
+            }?;
+            if chunks_vec.is_empty() {
+                return None;
+            }
+            let chunk = read_staged_chunk_fb(chunks_vec.get(0))?;
+            JournalPayload::StageFile(chunk)
+        }
+        3 => {
+            // StageChunks: multiple chunks.
+            let chunks_vec = unsafe {
+                doc.get::<flatbuffers::ForwardsUOffset<
+                    flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<flatbuffers::Table<'_>>>,
+                >>(fvt(4), None)
+            }?;
+            let mut chunks = Vec::with_capacity(chunks_vec.len());
+            for i in 0..chunks_vec.len() {
+                chunks.push(read_staged_chunk_fb(chunks_vec.get(i))?);
+            }
+            JournalPayload::StageChunks(chunks)
+        }
+        _ => return None,
+    };
+
+    Some((record, payload))
 }

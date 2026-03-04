@@ -109,7 +109,7 @@ const METADATA_FB2_MAGIC: &[u8] = b"OSGFB2";
 
 /// VOffset for FlatBuffer table field at zero-based `index`: `(index + 2) * 2`.
 #[inline(always)]
-const fn fvt(index: u16) -> u16 {
+pub(crate) const fn fvt(index: u16) -> u16 {
     (index + 2) * 2
 }
 
@@ -128,7 +128,7 @@ fn build_seg_extent_fb<'fbb>(
     fbb.end_table(start)
 }
 
-fn build_inode_record_fb<'fbb>(
+pub(crate) fn build_inode_record_fb<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
     record: &InodeRecord,
 ) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
@@ -245,7 +245,25 @@ fn serialize_inodes_fb2<'a>(
     records: impl IntoIterator<Item = &'a InodeRecord>,
 ) -> Vec<u8> {
     let records: Vec<&InodeRecord> = records.into_iter().collect();
-    let mut fbb = FlatBufferBuilder::with_capacity(records.len() * 512 + 256);
+    // Estimate capacity based on actual storage sizes to avoid reallocations.
+    // Per record: ~200 bytes fixed overhead (vtable, table, scalar fields,
+    // string length prefixes) + variable-length strings + storage payload.
+    let estimated_cap: usize = records.iter().fold(256, |acc, r| {
+        let storage_bytes = match &r.storage {
+            FileStorage::Inline(bytes) => bytes.len(),
+            FileStorage::InlineEncoded(p) => p.payload.len() + 16,
+            FileStorage::Segments(exts) => exts.len() * 48,
+            FileStorage::LegacySegment(_) => 48,
+        };
+        let children_bytes = match &r.kind {
+            InodeKind::Directory { children } => {
+                children.keys().map(|k| k.len() + 12).sum::<usize>() + children.len() * 8
+            }
+            _ => 0,
+        };
+        acc + 200 + r.name.len() + r.path.len() + storage_bytes + children_bytes
+    });
+    let mut fbb = FlatBufferBuilder::with_capacity(estimated_cap);
 
     let rec_wips: Vec<WIPOffset<_>> = records
         .iter()
@@ -287,7 +305,7 @@ fn read_seg_extent_fb2(t: flatbuffers::Table<'_>) -> SegmentExtent {
     }
 }
 
-fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
+pub(crate) fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
     use flatbuffers::{ForwardsUOffset, Table, Vector};
 
     // Safety: t was produced by our own OSGFB2 writer so the schema matches.
@@ -829,7 +847,9 @@ impl MetadataStore {
             return Ok(());
         }
 
-        // Phase 1: update in-memory caches + shards under lock
+        // Phase 1: update in-memory caches + shards under lock.
+        // Normalize once and share between cache and shard to halve
+        // normalization overhead.
         let mut touched_shard_ids = HashSet::new();
         {
             let mut cache = self.cache.lock();
@@ -837,92 +857,113 @@ impl MetadataStore {
             let mut neg = self.negative_cache.lock();
             for record in records {
                 neg.remove(&record.inode);
-                cache.insert(
-                    record.inode,
-                    CacheEntry::with_generation(record.clone(), generation),
-                );
                 let shard_id = record.shard_index(shard_size);
                 let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
                     shard: InodeShard::new(shard_id),
                     generation,
                 });
-                entry.shard.upsert(record.clone());
                 entry.generation = generation;
                 touched_shard_ids.insert(shard_id);
+                if matches!(record.kind, InodeKind::Tombstone) {
+                    entry.shard.inodes.remove(&record.inode);
+                    cache.insert(
+                        record.inode,
+                        CacheEntry::with_generation(record.clone(), generation),
+                    );
+                } else {
+                    // Normalize once, clone for cache, move into shard.
+                    let mut normalized = record.clone();
+                    normalized.normalize_storage();
+                    let for_cache = normalized.clone();
+                    entry.shard.inodes.insert(normalized.inode, normalized);
+                    cache.insert(
+                        record.inode,
+                        CacheEntry {
+                            record: for_cache,
+                            refreshed: Instant::now(),
+                            generation,
+                        },
+                    );
+                }
             }
         }
 
-        // Phase 2: pre-serialize touched shards
-        let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
-            let shards = self.shards.lock();
-            let base_path = self.imap_prefix();
-            let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
-            shard_ids.sort_unstable();
-            shard_ids
-                .iter()
-                .filter_map(|&shard_id| {
-                    let entry = shards.get(&shard_id)?;
-                    let data = serialize_inodes_fb2(
-                        METADATA_FORMAT_VERSION,
-                        generation,
-                        entry.shard.inodes.values(),
-                    );
-                    let count = entry.shard.inodes.len();
-                    let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
-                    let path = base_path.child(filename.as_str());
-                    Some((path, Bytes::from(data), shard_id, count))
-                })
-                .collect()
-        };
-
-        // Phase 3: serialize all delta records into a single file per flush.
-        //
-        // Writing N small delta files (one per delta_batch chunk) causes severe
-        // directory inode lock contention when all N parallel puts complete with
-        // renames into the same imap_deltas/ directory.  On local filesystems
-        // this serialises the renames, giving O(N) latency instead of O(1).
-        // Consolidating into one file reduces N renames to 1, cutting flush
-        // latency proportionally to N.
-        //
-        // Bloom-filter granularity is preserved in the filename (OR of all
-        // record blooms).  Readers (apply_external_deltas) already read every
-        // delta file for newer generations, so coarser granularity is fine.
-        //
-        // For very large batches (> MAX_DELTA_SINGLE_FILE records) we fall back
-        // to delta_batch chunking to bound per-file memory and I/O size.
+        // Phases 2+3: pre-serialize touched shards and delta records
+        // concurrently using scoped threads. Shard serialization holds the
+        // shards lock on the current thread while delta serialization runs
+        // on a separate thread (no lock needed).
         const MAX_DELTA_SINGLE_FILE: usize = 50_000;
-        let delta_writes: Vec<(ObjectPath, Bytes, usize)> = if records.is_empty() {
-            vec![]
-        } else if records.len() <= MAX_DELTA_SINGLE_FILE {
-            // Fast path: one delta file for the entire batch.
-            let bloom = records
-                .iter()
-                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
-            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-            let path = self.delta_prefix().child(filename.as_str());
-            let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
-            vec![(path, Bytes::from(data), records.len())]
-        } else {
-            // Large-batch fallback: chunk to keep individual files manageable.
-            let chunk_size = delta_batch.max(1);
-            records
-                .chunks(chunk_size)
-                .filter(|c| !c.is_empty())
-                .map(|chunk_records| {
-                    let bloom = chunk_records
+        let delta_prefix = self.delta_prefix();
+        let imap_prefix = self.imap_prefix();
+
+        #[allow(clippy::type_complexity)]
+        let (shard_writes, delta_writes): (
+            Vec<(ObjectPath, Bytes, u64, usize)>,
+            Vec<(ObjectPath, Bytes, usize)>,
+        ) = std::thread::scope(|scope| {
+            // Spawn delta serialization on a separate thread.
+            let delta_handle = scope.spawn(|| -> Vec<(ObjectPath, Bytes, usize)> {
+                if records.is_empty() {
+                    return vec![];
+                }
+                if records.len() <= MAX_DELTA_SINGLE_FILE {
+                    let bloom = records
                         .iter()
                         .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
                     let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
-                    let path = self.delta_prefix().child(filename.as_str());
-                    let data = serialize_inodes_fb2(
-                        METADATA_FORMAT_VERSION,
-                        generation,
-                        chunk_records.iter(),
-                    );
-                    Ok::<_, anyhow::Error>((path, Bytes::from(data), chunk_records.len()))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+                    let path = delta_prefix.child(filename.as_str());
+                    let data =
+                        serialize_inodes_fb2(METADATA_FORMAT_VERSION, generation, records.iter());
+                    vec![(path, Bytes::from(data), records.len())]
+                } else {
+                    let chunk_size = delta_batch.max(1);
+                    records
+                        .chunks(chunk_size)
+                        .filter(|c| !c.is_empty())
+                        .map(|chunk_records| {
+                            let bloom = chunk_records
+                                .iter()
+                                .fold(0u128, |mask, r| mask | bloom_mask(r.inode));
+                            let filename = format!("d_{generation:020}_{:032x}.bin", bloom);
+                            let path = delta_prefix.child(filename.as_str());
+                            let data = serialize_inodes_fb2(
+                                METADATA_FORMAT_VERSION,
+                                generation,
+                                chunk_records.iter(),
+                            );
+                            (path, Bytes::from(data), chunk_records.len())
+                        })
+                        .collect()
+                }
+            });
+
+            // Serialize shards under lock (sequential — the delta thread
+            // already runs in parallel with this block).
+            let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
+                let shards = self.shards.lock();
+                let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
+                shard_ids.sort_unstable();
+
+                shard_ids
+                    .iter()
+                    .filter_map(|&shard_id| {
+                        let entry = shards.get(&shard_id)?;
+                        let data = serialize_inodes_fb2(
+                            METADATA_FORMAT_VERSION,
+                            generation,
+                            entry.shard.inodes.values(),
+                        );
+                        let count = entry.shard.inodes.len();
+                        let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
+                        let path = imap_prefix.child(filename.as_str());
+                        Some((path, Bytes::from(data), shard_id, count))
+                    })
+                    .collect()
+            };
+
+            let delta_writes = delta_handle.join().expect("delta serialize thread");
+            (shard_writes, delta_writes)
+        });
 
         // Update last_delta_generation before issuing writes.
         if !delta_writes.is_empty() {
@@ -1470,5 +1511,260 @@ fn normalize_prefix(user_prefix: &str) -> String {
         String::new()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: directory children with file-extension names (e.g., `.h`,
+    /// `.c`) must survive a FlatBuffer serialize → deserialize round-trip without
+    /// truncation.  A kernel compile regression showed `uprobes.h` being stored as
+    /// `uprobes` after the OSGFB2 format migration.
+    #[test]
+    fn fb2_round_trip_preserves_directory_children_with_extensions() {
+        let filenames: Vec<&str> = vec![
+            "uprobes.h",
+            "mm.h",
+            "sched.h",
+            "types.h",
+            "kernel.h",
+            "list.h",
+            "rculist.h",
+            "spinlock.h",
+            "mutex.h",
+            "rwsem.h",
+            "completion.h",
+            "wait.h",
+            "pid.h",
+            "cred.h",
+            "signal.h",
+            "resource.h",
+            "securebits.h",
+            "rbtree.h",
+            "rwlock.h",
+            "atomic.h",
+            "page-flags.h",
+            "mmzone.h",
+            "topology.h",
+            "cpumask.h",
+            "percpu.h",
+            "smp.h",
+            "preempt.h",
+            "irqflags.h",
+            "bottom_half.h",
+            "lockdep.h",
+            "Makefile",
+            "Kconfig",
+            ".gitignore",
+            "kvm_host.h",
+            "mapping.o.cmd",
+        ];
+        let mut children = BTreeMap::new();
+        for (i, name) in filenames.iter().enumerate() {
+            children.insert(name.to_string(), 1000 + i as u64);
+        }
+
+        let record = InodeRecord {
+            inode: 42,
+            parent: 1,
+            name: "linux".to_string(),
+            path: "/include/linux".to_string(),
+            kind: InodeKind::Directory {
+                children: Arc::new(children.clone()),
+            },
+            size: 0,
+            mode: 0o40755,
+            uid: 1000,
+            gid: 1000,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 2,
+            rdev: 0,
+            storage: FileStorage::Inline(Vec::new()),
+        };
+
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, 1, std::iter::once(&record));
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (version, generation, records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(version, METADATA_FORMAT_VERSION);
+        assert_eq!(generation, 1);
+        assert_eq!(records.len(), 1);
+
+        let result = &records[0];
+        assert_eq!(result.inode, 42);
+        assert_eq!(result.name, "linux");
+        assert_eq!(result.path, "/include/linux");
+
+        let result_children = result.children().unwrap();
+        assert_eq!(
+            result_children.len(),
+            children.len(),
+            "children count mismatch: expected {} got {}",
+            children.len(),
+            result_children.len()
+        );
+        for (name, &ino) in &children {
+            let got = result_children.get(name);
+            assert_eq!(
+                got,
+                Some(&ino),
+                "child {:?} (ino {}) missing or wrong after round-trip; got {:?}",
+                name,
+                ino,
+                got,
+            );
+        }
+    }
+
+    /// Regression test: inline file data (like `.cmd` dependency files) must
+    /// survive FlatBuffer round-trip without truncation.
+    #[test]
+    fn fb2_round_trip_preserves_inline_file_data() {
+        // Simulate a .cmd dependency file content
+        let cmd_content = b"deps_kernel/dma/mapping.o := \\\n  \
+            kernel/dma/mapping.c \\\n  \
+            include/linux/uprobes.h \\\n  \
+            include/linux/mm.h \\\n  \
+            include/linux/sched.h \\\n  \
+            include/linux/types.h \\\n";
+
+        let record = InodeRecord {
+            inode: 99,
+            parent: 42,
+            name: ".mapping.o.cmd".to_string(),
+            path: "/kernel/dma/.mapping.o.cmd".to_string(),
+            kind: InodeKind::File,
+            size: cmd_content.len() as u64,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 1,
+            rdev: 0,
+            storage: FileStorage::Inline(cmd_content.to_vec()),
+        };
+
+        let data = serialize_inodes_fb2(METADATA_FORMAT_VERSION, 1, std::iter::once(&record));
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (_, _, records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(records.len(), 1);
+        let result = &records[0];
+        assert_eq!(result.name, ".mapping.o.cmd");
+        assert_eq!(result.size, cmd_content.len() as u64);
+        match &result.storage {
+            FileStorage::Inline(bytes) => {
+                assert_eq!(
+                    bytes.as_slice(),
+                    cmd_content.as_slice(),
+                    "inline data mismatch after round-trip"
+                );
+            }
+            other => panic!("expected Inline storage, got {:?}", other),
+        }
+    }
+
+    /// Stress test: many records (directories + files) serialized together in
+    /// a single OSGFB2 document must all survive the round-trip.
+    #[test]
+    fn fb2_round_trip_many_records_mixed() {
+        let mut records = Vec::new();
+
+        // A directory with 500 children (simulating a large kernel include dir)
+        let mut children = BTreeMap::new();
+        for i in 0..500u64 {
+            children.insert(format!("header_{i:04}.h"), 2000 + i);
+        }
+        records.push(InodeRecord {
+            inode: 10,
+            parent: 1,
+            name: "linux".to_string(),
+            path: "/include/linux".to_string(),
+            kind: InodeKind::Directory {
+                children: Arc::new(children),
+            },
+            size: 0,
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            atime: time::OffsetDateTime::now_utc(),
+            mtime: time::OffsetDateTime::now_utc(),
+            ctime: time::OffsetDateTime::now_utc(),
+            link_count: 2,
+            rdev: 0,
+            storage: FileStorage::Inline(Vec::new()),
+        });
+
+        // 500 file records with inline data
+        for i in 0..500u64 {
+            let content = format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
+            records.push(InodeRecord {
+                inode: 2000 + i,
+                parent: 10,
+                name: format!("header_{i:04}.h"),
+                path: format!("/include/linux/header_{i:04}.h"),
+                kind: InodeKind::File,
+                size: content.len() as u64,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                atime: time::OffsetDateTime::now_utc(),
+                mtime: time::OffsetDateTime::now_utc(),
+                ctime: time::OffsetDateTime::now_utc(),
+                link_count: 1,
+                rdev: 0,
+                storage: FileStorage::Inline(content.into_bytes()),
+            });
+        }
+
+        let data = serialize_inodes_fb2(
+            METADATA_FORMAT_VERSION,
+            1,
+            records.iter(),
+        );
+        let fb_data = data.strip_prefix(METADATA_FB2_MAGIC).unwrap();
+        let (_, _, result_records) = deserialize_fb2_document(fb_data).unwrap();
+
+        assert_eq!(result_records.len(), records.len());
+
+        // Verify directory children
+        let dir = &result_records[0];
+        let dir_children = dir.children().unwrap();
+        assert_eq!(dir_children.len(), 500);
+        for i in 0..500u64 {
+            let name = format!("header_{i:04}.h");
+            assert_eq!(
+                dir_children.get(&name),
+                Some(&(2000 + i)),
+                "child {} missing or wrong",
+                name,
+            );
+        }
+
+        // Verify file records
+        for i in 0..500u64 {
+            let file = &result_records[1 + i as usize];
+            let expected_name = format!("header_{i:04}.h");
+            assert_eq!(file.name, expected_name, "file name mismatch at index {}", i);
+            let expected_content =
+                format!("/* header_{i:04}.h */\n#ifndef _H_{i}\n#define _H_{i}\n#endif\n");
+            match &file.storage {
+                FileStorage::Inline(bytes) => {
+                    assert_eq!(
+                        bytes.as_slice(),
+                        expected_content.as_bytes(),
+                        "inline data mismatch for {}",
+                        expected_name,
+                    );
+                }
+                other => panic!("expected Inline for {}, got {:?}", expected_name, other),
+            }
+        }
     }
 }
