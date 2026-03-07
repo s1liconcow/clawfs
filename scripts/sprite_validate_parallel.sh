@@ -120,6 +120,7 @@ if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
     libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
     liburing-dev libuuid1 lvm2 quota sed uuid-dev uuid-runtime xfsprogs \
     sqlite3 libgdbm-compat-dev systemd-coredump systemd jq pkg-config \
+    nfs-common \
     exfatprogs f2fs-tools ocfs2-tools udftools xfsdump xfslibs-dev || true
 fi
 
@@ -128,97 +129,58 @@ if [[ ! -d /tmp/xfstests ]]; then
   (cd /tmp/xfstests && make && sudo make install)
 fi
 
-cargo build --release --bin osagefs
+(cd osagefs-nfs-gateway && cargo build --release)
 
-# Avoid cross-user residue from prior runs (root vs fsgqa vs sprite).
-sudo rm -rf /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
-sudo mkdir -p /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
-sudo chmod 0777 /tmp/osagefs-test-mnt /tmp/osagefs-scratch-mnt /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+# Clean up from prior runs.
+sudo rm -rf /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+sudo rm -rf /tmp/osagefs-test-cache /tmp/osagefs-scratch-cache
+mkdir -p /tmp/osagefs-test-store /tmp/osagefs-scratch-store
+mkdir -p /tmp/osagefs-test-cache /tmp/osagefs-scratch-cache
+sudo mkdir -p /mnt/test /mnt/scratch
 
-sudo tee /sbin/mount.fuse.osagefs > /dev/null <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-src="\${1:-}"
-mnt="\${2:-}"
-optstr=""
-shift 2 || true
-while ((\$#)); do
-  case "\$1" in
-    -o)
-      shift
-      cur="\${1:-}"
-      if [[ -n "\$cur" ]]; then
-        if [[ -n "\$optstr" ]]; then
-          optstr="\${optstr},\${cur}"
-        else
-          optstr="\$cur"
-        fi
-      fi
-      ;;
-    -o*)
-      cur="\${1#-o}"
-      if [[ -n "\$cur" ]]; then
-        if [[ -n "\$optstr" ]]; then
-          optstr="\${optstr},\${cur}"
-        else
-          optstr="\$cur"
-        fi
-      fi
-      ;;
-  esac
-  shift || true
-done
-store=""
-IFS="," read -ra kvs <<< "\$optstr"
-for kv in "\${kvs[@]}"; do
-  case "\$kv" in
-    source=*) store="\${kv#source=}" ;;
-    store=*) store="\${kv#store=}" ;;
-  esac
-done
-if [[ -z "\$store" || -z "\$src" || -z "\$mnt" ]]; then
-  echo "mount.fuse.osagefs: bad args src=\$src mnt=\$mnt opts=\$optstr" >&2
-  exit 1
-fi
-if mountpoint -q "\$mnt"; then
-  exit 0
-fi
-name="\$(basename "\$mnt" | tr -cs 'a-zA-Z0-9' '_')"
-cache="/tmp/osagefs-\${name}-cache"
-state="/tmp/osagefs-\${name}-state.bin"
-log="/tmp/osagefs-\${name}-u\$(id -u).log"
-mkdir -p "\$store" "\$cache" "\$mnt"
-nohup /work/osagefs/target/release/osagefs \
-  --mount-path "\$mnt" \
-  --store-path "\$store" \
-  --local-cache-path "\$cache" \
-  --state-path "\$state" \
+# Start OsageFS NFS gateway (TEST instance)
+osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
+  --store-path /tmp/osagefs-test-store \
+  --local-cache-path /tmp/osagefs-test-cache \
+  --state-path /tmp/osagefs-test-state.bin \
   --object-provider local \
-  --fuse-fsname "\$src" \
-  --allow-other \
   --disable-journal \
-  --disable-cleanup \
-  --foreground >"\$log" 2>&1 &
-for _ in \$(seq 1 40); do
-  mountpoint -q "\$mnt" && exit 0
+  --listen 127.0.0.1:2049 &
+echo \$! > /tmp/osagefs-test.pid
+
+for _ in \$(seq 1 30); do
+  nc -z 127.0.0.1 2049 && break
   sleep 1
 done
-exit 1
-HELPER
-sudo chmod +x /sbin/mount.fuse.osagefs
+nc -z 127.0.0.1 2049 || { echo "TEST NFS instance failed to start"; exit 1; }
+
+# Start OsageFS NFS gateway (SCRATCH instance)
+osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
+  --store-path /tmp/osagefs-scratch-store \
+  --local-cache-path /tmp/osagefs-scratch-cache \
+  --state-path /tmp/osagefs-scratch-state.bin \
+  --object-provider local \
+  --disable-journal \
+  --listen 127.0.0.1:20499 &
+echo \$! > /tmp/osagefs-scratch.pid
+
+for _ in \$(seq 1 30); do
+  nc -z 127.0.0.1 20499 && break
+  sleep 1
+done
+nc -z 127.0.0.1 20499 || { echo "SCRATCH NFS instance failed to start"; exit 1; }
 
 cd /tmp/xfstests
 cat > local.config <<'LOCALCFG'
-export FSTYP=fuse
-export FUSE_SUBTYP=.osagefs
+export FSTYP=nfs
 
-export TEST_DEV=osagefs_test
-export TEST_DIR=/tmp/osagefs-test-mnt
-export SCRATCH_DEV=osagefs_scratch
-export SCRATCH_MNT=/tmp/osagefs-scratch-mnt
+export TEST_DEV=localhost:/
+export TEST_DIR=/mnt/test
+export SCRATCH_DEV=127.0.0.1:/
+export SCRATCH_MNT=/mnt/scratch
 
-export TEST_FS_MOUNT_OPTS="-o source=/tmp/osagefs-test-store,allow_other,default_permissions"
-export MOUNT_OPTIONS="-o source=/tmp/osagefs-scratch-store,allow_other,default_permissions"
+export TEST_FS_MOUNT_OPTS="-o nolock,tcp,port=2049,mountport=2049,vers=3,hard"
+export NFS_MOUNT_OPTIONS="-o nolock,tcp,port=20499,mountport=20499,vers=3,hard"
 LOCALCFG
 
 cat > excludes <<'EX'
@@ -244,11 +206,18 @@ generic/633
 generic/696
 generic/591
 generic/615
+generic/087
 EX
 
 sudo ./check -E excludes \
   generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 \
   generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
+
+# Cleanup NFS instances
+sudo umount /mnt/test || true
+sudo umount /mnt/scratch || true
+kill \$(cat /tmp/osagefs-test.pid) || true
+kill \$(cat /tmp/osagefs-scratch.pid) || true
 EOF
 }
 

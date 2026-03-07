@@ -820,6 +820,10 @@ fn build_config(cli: &Cli) -> Config {
         writeback_cache: false,
         fuse_threads: 0,
         allow_other: false,
+        aws_allow_http: false,
+        aws_force_path_style: false,
+        entry_ttl_secs: 5,
+        fuse_fsname: "osagefs".to_string(),
     }
 }
 
