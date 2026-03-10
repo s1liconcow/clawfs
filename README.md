@@ -7,11 +7,11 @@
 > **Linux build validation**: Linux source untar plus kernel build (`make defconfig && make -j`) passes successfully on OsageFS.
 
 OsageFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
-and payloads in a log-structured layout over an object store. Metadata now lives
-directly inside the bucket as immutable inode-map shards (`/imaps/i_<gen>_<shard>`)
-and per-generation delta files (`/imap_deltas/d_<gen>_<bloom>.bin`). Each delta
-filename embeds a hex bloom-filter of the inodes it contains so clients can skip
-irrelevant updates just by listing objects.
+and payloads in a log-structured layout over an object store. Metadata lives in
+the bucket under `metadata/imaps` (immutable shard snapshots) and
+`metadata/imap_deltas` (per-generation inode deltas), while large payloads are
+written to immutable segment objects under `segs/`. Deltas embed a bloom suffix
+in their object name so clients can skip unrelated updates with list-only scans.
 
 ## Comparison matrix
 
@@ -48,22 +48,44 @@ This matrix is for quick positioning against common alternatives.
 | Component | Responsibility |
 |-----------|----------------|
 | Superblock (`metadata/superblock.bin`) | Tracks generation counter, next inode/segment ids, shard geometry, filesystem state (CLEAN/DIRTY) and is updated via a compare-and-swap write. Backup formats are versioned via Flexbuffers so upgrades can be detected. |
-| Metadata store (`/imaps`, `/imap_deltas`) | Shard snapshots (`imaps/i_<gen>_<shard>.bin`) hold the latest inode map per shard, while delta logs (`imap_deltas/d_<gen>_<bloom>.bin`) capture per-generation changes with inline payloads for ≤1 KiB files. Filenames embed a bloom filter so clients can skip unrelated deltas via `list()` alone. |
-| Segment manager (`segs/s_<gen>_<id>` blobs) | Flushes >1 KiB payloads into immutable log segments so the filesystem can be reconstructed from the log alone. |
+| Metadata store (`metadata/imaps`, `metadata/imap_deltas`) | Shard snapshots (`i_<gen>_<shard>.bin`) hold current inode state per shard; delta logs (`d_<gen>_<bloom>.bin`) capture per-generation changes. |
+| Segment manager (`segs/s_<gen>_<id>` blobs) | Serializes staged file payloads into immutable segment objects and serves extent reads with local cache + range-read support. |
+| Local durability layer (`$STORE/journal`, `$STORE/segment_stage`) | Records pending inode state in an append-only WAL and stages large write payload chunks before remote flush. |
 | FUSE client (`OsageFs`) | Implements lookup/stat/read/write/rename/link/etc. while translating requests into log-structured object updates. |
 
-### Superblock + transactions
+### Write path (stage -> flush -> commit)
 
-All metadata mutations take a "generation" snapshot:
+Normal writes are staged first and committed in batched flushes:
 
-1. Stage metadata and file-data mutations locally (inline or in-memory).
-2. On `close()` / `fsync()`, flush dirty files into a single `/segs/s_<gen>_<id>`
-   blob and emit a delta object `/imap_deltas/d_<gen>_<bloom>.bin` containing all
-   touched inode records (with inline payloads if ≤1 KiB). Updated shard
-   snapshots for affected shards are written under `/imaps/i_<gen>_<shard>.bin`.
-3. Update the superblock generation id **once** after the segment + metadata
-   writes succeed using a compare-and-swap write so the commit is atomic even on
-   S3/GCS.
+1. `write()` goes through `op_write` and chooses one of three paths:
+   inline append (`append_file`), full inline stage (`stage_file`), or sparse
+   segment-backed update (`write_large_segments`) for large/partial overwrites.
+2. Pending data is stored per inode in memory as either:
+   inline bytes, or
+   staged segments (`base_extents` + staged chunk overlays).
+3. If journaling is enabled, each staged inode is appended to the local WAL
+   (`$STORE/journal/wal.bin`).
+4. Flush is triggered by explicit `fsync/flush/release` policy, elapsed flush
+   interval, or dirty-byte thresholds.
+5. `flush_pending` drains pending entries, prepares a dirty generation, writes
+   one or more segment objects (batched by size), persists inode shard/delta
+   metadata, then atomically commits the new superblock generation via CAS.
+6. After commit, staged chunks are released and corresponding journal entries
+   are cleared.
+
+### Read path (pending overlay first)
+
+Reads are resolved in this order:
+
+1. If inode data exists in `pending`, serve from staged state.
+2. Else if inode is currently in `flushing`, serve from flushing state.
+3. Else serve committed storage from metadata:
+   inline bytes, or
+   segment extents read from immutable segment objects.
+
+For segment-backed files, reads overlay extents in logical order so newer
+overwrites win on overlap. When segment compression/encryption is disabled, the
+reader uses direct sub-range fetches for lower read amplification.
 
 ### Inodes and shards
 
@@ -82,14 +104,15 @@ superblock. When a local pool runs dry, the client atomically advances the
 superblock counters and records the new high-water mark in `metadata/superblock.bin`.
 
 * Writes smaller than `--inline-threshold` stay inline inside the inode record.
-* All dirty files are combined into a single immutable segment at flush time
-  (path `/segs/s_<generation>_<segment_id>`). Each entry stores the inode, path,
-  and contents so replaying the log reconstructs the tree.
+* Dirty file payloads are serialized into immutable segment objects at flush
+  time (path `segs/s_<generation>_<segment_id>`). A flush may emit multiple
+  segment objects when the staged batch is large.
 * Delta objects inline payloads (≤1 KiB) plus pointers (segment id, offset,
   length) for larger files, keeping metadata compact while still allowing clients
   to reconstruct mutations by replaying deltas. All blobs include a format
   version header, making future migrations safe.
-* `close()` / `fsync()` triggers a flush: log segments are written first,
+* `fsync()` and close-sync (`--fsync-on-close`) trigger inode-scoped flushes:
+  log segments are written first,
   inode-map deltas are applied next, and finally the superblock generation id
   advances once to atomically commit the batch. If staged data exceeds
   `--pending-bytes`, the client flushes eagerly to keep memory bounded.
@@ -144,6 +167,46 @@ into the configured bucket prefix: superblock + metadata JSON live under
 `metadata/`, delta logs under `/imap_deltas/`, and immutable segments under
 `/segs/`. Keep `--state-path` on local storage so each client maintains its own
 `client_id` and id-pool bookkeeping separate from the shared object store.
+
+### Mount Existing Buckets via Source Overlay
+
+OsageFS can mount objects from an existing source bucket while keeping OsageFS
+metadata and write path in a separate overlay backend:
+
+* Source files are discovered lazily on `lookup`/`readdir`.
+* Reads fetch byte ranges directly from the source object store.
+* First write to a source-backed file performs copy-up into OsageFS-managed
+  storage; the source object is not modified.
+
+Use source flags to configure an independent source backend (including separate
+credentials/provider for multi-cloud layouts):
+
+```bash
+cargo run -- \
+  --mount-path /mnt/osage \
+  --object-provider gcs \
+  --bucket my-overlay-bucket \
+  --source-object-provider aws \
+  --source-bucket commoncrawl \
+  --source-prefix crawl-data/CC-MAIN-2025-13/
+```
+
+Additional source options:
+`--source-store-path` (local provider), `--source-region`,
+`--source-endpoint`, `--source-gcs-service-account`,
+`--source-aws-access-key-id`, `--source-aws-secret-access-key`,
+`--source-aws-allow-http`, `--source-aws-force-path-style`.
+
+Quick demo script:
+
+```bash
+OVERLAY_OBJECT_PROVIDER=gcs \
+OVERLAY_BUCKET=my-osagefs-overlay \
+SOURCE_OBJECT_PROVIDER=aws \
+SOURCE_BUCKET=commoncrawl \
+SOURCE_PREFIX=crawl-data/CC-MAIN-2025-13/ \
+scripts/demo_common_crawl_mount.sh
+```
 
 ### Superblock checkpoints and restore
 
@@ -227,12 +290,11 @@ OsageFS keeps NFS-style caches with explicit TTLs:
 3. When deltas mention `SegmentPointer`s, the poller asks the `SegmentManager`
    to prefetch them. Segments are staged and cached locally under
    `$STORE_PATH/segment_cache`, bounded by `--segment-cache-bytes`.
-4. Large writes append to a staging segment file under
-   `$STORE_PATH/segment_stage/stage_*.bin` as soon as `close()` runs so data
-   survives crashes even before the next flush. When a flush succeeds the staged
-   file is uploaded as an immutable segment and a fresh staging file is opened
-   for the next batch. Uploading to S3/GCS only happens when `flush()`/`fsync()`
-   runs (or the flush timer fires), which keeps close() latency low.
+4. Large writes stage payload chunks into files under
+   `$STORE_PATH/segment_stage/stage_*.bin` during write handling. On flush, the
+   active stage file is rotated, staged chunks are serialized into immutable
+   segment objects, and old stage files are deleted after references are
+   released.
 5. Metadata flushes batch up to `--imap-delta-batch` inode records into each
    delta/WAL object and rewrite each shard snapshot at most once per flush. This
    keeps backing-store API calls bounded even when thousands of dentries change
@@ -301,11 +363,13 @@ Set `--fsync-on-close` to `true` when you need the previous semantics (every
 flush, large payloads live on disk inside the staging directory, so the next
 generation commit only needs to upload the buffered segment.
 
-## Future work
+## Status update
 
-1. Replace the local segment directory with a proper S3/GCS backend that uses
-   conditional headers for superblock swaps.
-2. Add background compaction for inode delta logs plus a metadata journal that
-   batches multi-op transactions.
-3. Extend the FUSE surface (e.g., symlink support, extended attributes) and add
-   multi-client reconciliation on mount.
+The previous "Future work" items in this README are now implemented:
+
+1. Object-store backends (local, AWS, GCS) are active, and superblock updates
+   are compare-and-swap based.
+2. Background cleanup includes delta pruning and segment compaction with
+   superblock lease coordination.
+3. Core FUSE/NFS surfaces for read/write/rename/link/symlink and shared-client
+   generation reconciliation are in place.

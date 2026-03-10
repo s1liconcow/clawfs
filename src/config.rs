@@ -46,6 +46,50 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub gcs_service_account: Option<PathBuf>,
 
+    /// Optional source object provider for overlay mounts of existing object data.
+    #[arg(long, value_enum)]
+    pub source_object_provider: Option<ObjectStoreProvider>,
+
+    /// Source bucket name for overlay mounts.
+    #[arg(long)]
+    pub source_bucket: Option<String>,
+
+    /// Prefix within the source bucket to expose.
+    #[arg(long, default_value = "")]
+    pub source_prefix: String,
+
+    /// Local source path (when source provider is local).
+    #[arg(long, value_name = "PATH")]
+    pub source_store_path: Option<PathBuf>,
+
+    /// Region for source AWS-compatible providers.
+    #[arg(long)]
+    pub source_region: Option<String>,
+
+    /// Endpoint for source AWS-compatible providers.
+    #[arg(long)]
+    pub source_endpoint: Option<String>,
+
+    /// Optional Google Cloud service account JSON file for source provider.
+    #[arg(long, value_name = "PATH")]
+    pub source_gcs_service_account: Option<PathBuf>,
+
+    /// Source AWS access key id (separate credentials from overlay store).
+    #[arg(long)]
+    pub source_aws_access_key_id: Option<String>,
+
+    /// Source AWS secret access key (separate credentials from overlay store).
+    #[arg(long)]
+    pub source_aws_secret_access_key: Option<String>,
+
+    /// Allow HTTP for source AWS provider.
+    #[arg(long, default_value_t = false)]
+    pub source_aws_allow_http: bool,
+
+    /// Force path-style access for source AWS provider.
+    #[arg(long, default_value_t = false)]
+    pub source_aws_force_path_style: bool,
+
     /// Allow HTTP for AWS object provider (useful for local testing).
     #[arg(long, default_value_t = false)]
     pub aws_allow_http: bool,
@@ -205,6 +249,7 @@ pub struct Config {
     pub gcs_service_account: Option<PathBuf>,
     pub aws_allow_http: bool,
     pub aws_force_path_style: bool,
+    pub source: Option<SourceStoreConfig>,
     pub state_path: PathBuf,
     pub perf_log: Option<PathBuf>,
     pub replay_log: Option<PathBuf>,
@@ -227,6 +272,21 @@ pub struct Config {
     pub fuse_fsname: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceStoreConfig {
+    pub object_provider: ObjectStoreProvider,
+    pub bucket: Option<String>,
+    pub prefix: String,
+    pub store_path: Option<PathBuf>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub gcs_service_account: Option<PathBuf>,
+    pub aws_access_key_id: Option<String>,
+    pub aws_secret_access_key: Option<String>,
+    pub aws_allow_http: bool,
+    pub aws_force_path_style: bool,
+}
+
 impl From<Cli> for Config {
     fn from(cli: Cli) -> Self {
         let config_root = default_user_config_root();
@@ -243,6 +303,24 @@ impl From<Cli> for Config {
             .local_cache_path
             .clone()
             .unwrap_or_else(|| default_local_cache_path(&config_root));
+        let source = if cli.source_bucket.is_some() || cli.source_store_path.is_some() {
+            Some(SourceStoreConfig {
+                object_provider: cli.source_object_provider.unwrap_or(cli.object_provider),
+                bucket: cli.source_bucket,
+                prefix: cli.source_prefix,
+                store_path: cli.source_store_path,
+                region: cli.source_region,
+                endpoint: cli.source_endpoint,
+                gcs_service_account: cli.source_gcs_service_account,
+                aws_access_key_id: cli.source_aws_access_key_id,
+                aws_secret_access_key: cli.source_aws_secret_access_key,
+                aws_allow_http: cli.source_aws_allow_http,
+                aws_force_path_style: cli.source_aws_force_path_style,
+            })
+        } else {
+            None
+        };
+
         Config {
             mount_path: cli.mount_path,
             store_path,
@@ -270,6 +348,7 @@ impl From<Cli> for Config {
             gcs_service_account: cli.gcs_service_account,
             aws_allow_http: cli.aws_allow_http,
             aws_force_path_style: cli.aws_force_path_style,
+            source,
             state_path,
             perf_log: cli.perf_log,
             replay_log: cli.replay_log,

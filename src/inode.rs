@@ -45,6 +45,17 @@ pub enum FileStorage {
     #[serde(rename = "Segment")]
     LegacySegment(SegmentPointer),
     Segments(Vec<SegmentExtent>),
+    ExternalObject(ExternalObject),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalObject {
+    pub key: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +252,7 @@ impl InodeRecord {
         match &self.storage {
             FileStorage::LegacySegment(ptr) => Some(ptr),
             FileStorage::Segments(extents) => extents.first().map(|ext| &ext.pointer),
+            FileStorage::ExternalObject(_) => None,
             _ => None,
         }
     }
@@ -254,6 +266,7 @@ impl InodeRecord {
     pub fn segment_extents(&self) -> Option<&[SegmentExtent]> {
         match &self.storage {
             FileStorage::Segments(extents) => Some(extents),
+            FileStorage::ExternalObject(_) => None,
             _ => None,
         }
     }

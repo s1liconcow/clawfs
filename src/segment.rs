@@ -1335,6 +1335,7 @@ mod tests {
             gcs_service_account: None,
             aws_allow_http: false,
             aws_force_path_style: false,
+            source: None,
             state_path: root.join("state.bin"),
             foreground: false,
             allow_other: false,

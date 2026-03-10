@@ -21,6 +21,7 @@ use osagefs::metadata::MetadataStore;
 use osagefs::perf::PerfLogger;
 use osagefs::replay::ReplayLogger;
 use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
+use osagefs::source::SourceObjectStore;
 use osagefs::state::ClientStateManager;
 use osagefs::superblock::{CleanupTaskKind, SuperblockManager};
 use tokio::runtime::Handle;
@@ -119,6 +120,13 @@ fn main() -> Result<()> {
                 "metadata_poll_interval_ms": config.metadata_poll_interval_ms,
                 "segment_cache_bytes": config.segment_cache_bytes,
                 "imap_delta_batch": config.imap_delta_batch,
+                "source_enabled": config.source.is_some(),
+                "source_provider": config
+                    .source
+                    .as_ref()
+                    .map(|s| format!("{:?}", s.object_provider).to_lowercase()),
+                "source_bucket": config.source.as_ref().and_then(|s| s.bucket.as_deref()),
+                "source_prefix": config.source.as_ref().map(|s| s.prefix.as_str()),
                 "bootstrap_user": env::var("USER")
                     .or_else(|_| env::var("LOGNAME"))
                     .ok(),
@@ -131,11 +139,17 @@ fn main() -> Result<()> {
     } else {
         Some(Arc::new(JournalManager::new(&config.local_cache_path)?))
     };
+    let source = if let Some(source_cfg) = &config.source {
+        Some(Arc::new(SourceObjectStore::new(source_cfg)?))
+    } else {
+        None
+    };
     let fs = OsageFs::new(
         config.clone(),
         metadata.clone(),
         superblock.clone(),
         segments,
+        source,
         journal,
         handle,
         client_state,
@@ -206,6 +220,13 @@ fn log_boot_config(config: &Config, allow_other: bool) {
             "region": config.region.as_deref(),
             "endpoint": config.endpoint.as_deref(),
             "object_prefix": &config.object_prefix,
+            "source_enabled": config.source.is_some(),
+            "source_provider": config
+                .source
+                .as_ref()
+                .map(|s| format!("{:?}", s.object_provider).to_lowercase()),
+            "source_bucket": config.source.as_ref().and_then(|s| s.bucket.as_deref()),
+            "source_prefix": config.source.as_ref().map(|s| s.prefix.as_str()),
             "gcs_service_account": config
                 .gcs_service_account
                 .as_ref()
@@ -564,7 +585,9 @@ async fn perform_segment_compaction(
                         }
                         out.push((record, pointers, buffer));
                     }
-                    FileStorage::Inline(_) | FileStorage::InlineEncoded(_) => {}
+                    FileStorage::Inline(_)
+                    | FileStorage::InlineEncoded(_)
+                    | FileStorage::ExternalObject(_) => {}
                 }
             }
             Ok(out)

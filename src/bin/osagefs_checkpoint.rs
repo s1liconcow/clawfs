@@ -111,6 +111,7 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,
+        source: None,
         state_path: PathBuf::from("/tmp/osagefs_checkpoint_state"),
         perf_log: None,
         replay_log: None,

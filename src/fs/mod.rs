@@ -34,6 +34,7 @@ use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
 use crate::replay::ReplayLogger;
 use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, StagedChunk};
+use crate::source::{DiscoveredEntry, SourceObjectStore};
 use crate::state::ClientStateManager;
 use crate::superblock::SuperblockManager;
 use log::{debug, error, info};
@@ -59,6 +60,7 @@ pub struct OsageFs {
     metadata: Arc<MetadataStore>,
     superblock: Arc<SuperblockManager>,
     segments: Arc<SegmentManager>,
+    source: Option<Arc<SourceObjectStore>>,
     handle: Handle,
     client_state: Arc<ClientStateManager>,
     active_inodes: Arc<DashMap<u64, Arc<Mutex<ActiveInode>>>>,

@@ -361,6 +361,7 @@ impl OsageDirectFs {
             metadata,
             superblock,
             segments,
+            None,
             journal,
             handle,
             client_state,
@@ -822,6 +823,7 @@ fn build_config(cli: &Cli) -> Config {
         allow_other: false,
         aws_allow_http: false,
         aws_force_path_style: false,
+        source: None,
         entry_ttl_secs: 5,
         fuse_fsname: "osagefs".to_string(),
     }

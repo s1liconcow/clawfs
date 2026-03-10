@@ -8,7 +8,7 @@
 - `scripts/perf_guard.sh` copies Criterion HTML reports from `target/criterion/report` into `bench-artifacts/perf_guard_graphs/<commit5>/` by default. Override with `PERF_GUARD_GRAPH_ROOT` or `PERF_GUARD_GRAPH_DIR`.
 - Hook runs can skip graph artifact copies with `PERF_GUARD_WRITE_GRAPHS=0`. `.githooks/pre-push` uses this to avoid staging large report trees.
 - `.githooks/pre-push` also skips perf guard entirely when the pushed ref updates do not touch filesystem core paths under `src/fs/` plus `src/metadata.rs` and `src/segment.rs`.
-- `.github/workflows/perf-reports-pages.yml` publishes `bench-artifacts/perf_guard_graphs` and creates a root index linking each `<date>-<commit5>/report/index.html`.
+- `.github/workflows/perf-reports-pages.yml` publishes `website/osagefs.org` at the Pages root and copies `bench-artifacts/perf_guard_graphs` to `/perf`, with `/perf/index.html` linking each `<date>-<commit5>/report/index.html`.
 - CI note: Criterion `html_reports` requires native `fontconfig`; keep `pkg-config` and `libfontconfig1-dev` installed in Rust CI jobs that build tests or benches.
 - `segment_sequential_read_throughput` in `benches/perf_local_criterion.rs` must treat `write_batch` output as a logical extent list sorted by `logical_offset`, not a single pointer, because large payloads are chunked into 4 MiB extents.
 

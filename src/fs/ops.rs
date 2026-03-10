@@ -38,14 +38,23 @@ impl OsageFs {
         name: &str,
     ) -> std::result::Result<InodeRecord, i32> {
         if let Some(child) = self.lookup_child_fast_path(parent, name) {
-            return self.load_inode(child?);
+            match child {
+                Ok(ino) => return self.load_inode(ino),
+                Err(code) if code != ENOENT || self.source.is_none() => return Err(code),
+                Err(_) => {}
+            }
         }
         let parent_inode = self.load_inode(parent)?;
-        let child = parent_inode
+        if let Some(child) = parent_inode
             .children()
             .and_then(|children| children.get(name).copied())
-            .ok_or(ENOENT)?;
-        self.load_inode(child)
+        {
+            return self.load_inode(child);
+        }
+        if let Some(imported) = self.maybe_import_source_child(&parent_inode, name)? {
+            return Ok(imported);
+        }
+        Err(ENOENT)
     }
 
     pub(crate) fn op_getattr(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
@@ -53,10 +62,12 @@ impl OsageFs {
     }
 
     pub(crate) fn op_readdir_nfs(&self, ino: u64) -> std::result::Result<Vec<(u64, String)>, i32> {
-        let inode = self.load_inode(ino)?;
+        let mut inode = self.load_inode(ino)?;
         if !inode.is_dir() {
             return Err(ENOTDIR);
         }
+        self.import_source_children_for_dir(&inode)?;
+        inode = self.load_inode(ino)?;
         let mut entries = Vec::new();
         if let Some(children) = inode.children() {
             entries.reserve(children.len());
@@ -71,10 +82,12 @@ impl OsageFs {
         &self,
         ino: u64,
     ) -> std::result::Result<Vec<(u64, FileType, String)>, i32> {
-        let inode = self.load_inode(ino)?;
+        let mut inode = self.load_inode(ino)?;
         if !inode.is_dir() {
             return Err(ENOTDIR);
         }
+        self.import_source_children_for_dir(&inode)?;
+        inode = self.load_inode(ino)?;
         let mut entries = Vec::new();
         entries.push((ino, FileType::Directory, String::from(".")));
         let parent = if ino == ROOT_INODE { ino } else { inode.parent };
@@ -556,6 +569,7 @@ impl OsageFs {
         if record.is_dir() {
             return Err(EISDIR);
         }
+        record = self.copy_up_external_inode_if_needed(record)?;
         let prev_size = record.size;
         let write_end = offset.saturating_add(data.len() as u64);
         if offset == prev_size {
@@ -594,7 +608,7 @@ impl OsageFs {
 
     pub(crate) fn op_open(&self, ino: u64, flags: i32) -> std::result::Result<(), i32> {
         let mut record = self.load_inode(ino)?;
-        if flags & O_TRUNC != 0 && !record.is_dir() && record.size > 0 {
+        if flags & O_TRUNC != 0 && !record.is_dir() {
             record.update_times();
             self.stage_file(record, Vec::new(), None)?;
         }

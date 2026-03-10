@@ -94,6 +94,7 @@ impl OsageFs {
         metadata: Arc<MetadataStore>,
         superblock: Arc<SuperblockManager>,
         segments: Arc<SegmentManager>,
+        source: Option<Arc<SourceObjectStore>>,
         journal: Option<Arc<JournalManager>>,
         handle: Handle,
         client_state: Arc<ClientStateManager>,
@@ -114,6 +115,7 @@ impl OsageFs {
             metadata,
             superblock,
             segments,
+            source,
             handle,
             client_state,
             active_inodes: Arc::new(DashMap::new()),
@@ -455,6 +457,14 @@ impl OsageFs {
             FileStorage::LegacySegment(ptr) => {
                 let bytes = self.segments.read_pointer_arc(ptr)?;
                 Ok(Self::slice_arc_in_range(&bytes, range_start, range_end))
+            }
+            FileStorage::ExternalObject(ext) => {
+                let Some(source) = &self.source else {
+                    anyhow::bail!("source storage is not configured");
+                };
+                let start = range_start.min(ext.size);
+                let end = range_end.min(ext.size);
+                self.block_on(source.read_range(&ext.key, start, end))
             }
             FileStorage::Segments(extents) => {
                 let out_len = (range_end - range_start) as usize;
@@ -1048,6 +1058,168 @@ impl OsageFs {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn maybe_import_source_child(
+        &self,
+        parent: &InodeRecord,
+        name: &str,
+    ) -> std::result::Result<Option<InodeRecord>, i32> {
+        let Some(source) = &self.source else {
+            return Ok(None);
+        };
+        let discovered = self
+            .block_on(source.lookup_child(&parent.path, name))
+            .map_err(|_| EIO)?;
+        let Some(discovered) = discovered else {
+            return Ok(None);
+        };
+
+        let inode = self.allocate_inode_id().map_err(|_| EIO)?;
+        let path = Self::build_child_path(parent, name);
+        let mut child = match discovered {
+            DiscoveredEntry::Directory => InodeRecord::new_directory(
+                inode,
+                parent.inode,
+                name.to_string(),
+                path,
+                parent.uid,
+                parent.gid,
+            ),
+            DiscoveredEntry::File(meta) => {
+                let mut record = InodeRecord::new_file(
+                    inode,
+                    parent.inode,
+                    name.to_string(),
+                    path,
+                    parent.uid,
+                    parent.gid,
+                );
+                record.size = meta.size;
+                if let Some(ts) = meta.last_modified_ns
+                    && let Ok(parsed) = OffsetDateTime::from_unix_timestamp_nanos(ts as i128)
+                {
+                    record.atime = parsed;
+                    record.mtime = parsed;
+                    record.ctime = parsed;
+                }
+                record.storage = FileStorage::ExternalObject(crate::inode::ExternalObject {
+                    key: meta.key,
+                    size: meta.size,
+                    etag: meta.etag,
+                    last_modified_ns: meta.last_modified_ns,
+                });
+                record
+            }
+        };
+        child.update_times();
+        self.stage_inode(child.clone())?;
+        let mut parent_record = parent.clone();
+        self.update_parent_ref(&mut parent_record, name.to_string(), inode)?;
+        Ok(Some(child))
+    }
+
+    pub(crate) fn import_source_children_for_dir(
+        &self,
+        parent: &InodeRecord,
+    ) -> std::result::Result<(), i32> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let discovered = self
+            .block_on(source.list_direct_children(&parent.path))
+            .map_err(|_| EIO)?;
+        if discovered.is_empty() {
+            return Ok(());
+        }
+
+        let mut parent_record = parent.clone();
+        let parent_inode = parent_record.inode;
+        let parent_uid = parent_record.uid;
+        let parent_gid = parent_record.gid;
+        let existing_children: HashSet<String> = parent_record
+            .children()
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default();
+        if !parent_record.is_dir() {
+            return Ok(());
+        }
+        let mut additions: Vec<(String, u64)> = Vec::new();
+        for (name, entry) in discovered {
+            if existing_children.contains(&name)
+                || additions.iter().any(|(existing, _)| existing == &name)
+            {
+                continue;
+            }
+            let inode = self.allocate_inode_id().map_err(|_| EIO)?;
+            let path = Self::build_child_path(parent, &name);
+            let mut child = match entry {
+                DiscoveredEntry::Directory => InodeRecord::new_directory(
+                    inode,
+                    parent_inode,
+                    name.clone(),
+                    path,
+                    parent_uid,
+                    parent_gid,
+                ),
+                DiscoveredEntry::File(meta) => {
+                    let mut record = InodeRecord::new_file(
+                        inode,
+                        parent_inode,
+                        name.clone(),
+                        path,
+                        parent_uid,
+                        parent_gid,
+                    );
+                    record.size = meta.size;
+                    if let Some(ts) = meta.last_modified_ns
+                        && let Ok(parsed) = OffsetDateTime::from_unix_timestamp_nanos(ts as i128)
+                    {
+                        record.atime = parsed;
+                        record.mtime = parsed;
+                        record.ctime = parsed;
+                    }
+                    record.storage = FileStorage::ExternalObject(crate::inode::ExternalObject {
+                        key: meta.key,
+                        size: meta.size,
+                        etag: meta.etag,
+                        last_modified_ns: meta.last_modified_ns,
+                    });
+                    record
+                }
+            };
+            child.update_times();
+            self.stage_inode(child)?;
+            additions.push((name, inode));
+        }
+        if !additions.is_empty() {
+            let Some(children) = parent_record.children_mut() else {
+                return Ok(());
+            };
+            for (name, inode) in additions {
+                children.insert(name, inode);
+            }
+            parent_record.update_times();
+            self.stage_inode(parent_record)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_up_external_inode_if_needed(
+        &self,
+        mut record: InodeRecord,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let ext = match &record.storage {
+            FileStorage::ExternalObject(ext) => ext.clone(),
+            _ => return Ok(record),
+        };
+        let Some(source) = &self.source else {
+            return Err(EIO);
+        };
+        let bytes = self.block_on(source.read_all(&ext.key)).map_err(|_| EIO)?;
+        record.update_times();
+        self.stage_file(record.clone(), bytes, None)?;
+        self.load_inode(record.inode)
     }
 
     pub(crate) fn is_descendant(

@@ -9,5 +9,6 @@ pub mod perf;
 pub mod perf_bench;
 pub mod replay;
 pub mod segment;
+pub mod source;
 pub mod state;
 pub mod superblock;

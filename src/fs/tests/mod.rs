@@ -6,8 +6,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
 
-use crate::config::ObjectStoreProvider;
+use crate::config::{ObjectStoreProvider, SourceStoreConfig};
 use crate::journal::JournalManager;
+use crate::source::SourceObjectStore;
 
 struct TestHarness {
     runtime: tokio::runtime::Runtime,
@@ -51,11 +52,16 @@ impl TestHarness {
                 JournalManager::new(&config.local_cache_path).unwrap(),
             ))
         };
+        let source = config
+            .source
+            .as_ref()
+            .map(|cfg| Arc::new(SourceObjectStore::new(cfg).unwrap()));
         let fs = OsageFs::new(
             config.clone(),
             metadata.clone(),
             superblock,
             segments,
+            source,
             journal,
             runtime.handle().clone(),
             client_state,
@@ -94,6 +100,7 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,
+        source: None,
         state_path: root.join(state_name),
         foreground: false,
         allow_other: false,
@@ -3783,4 +3790,82 @@ fn concurrent_create_flush_preserves_file_extensions() {
             name,
         );
     }
+}
+
+#[test]
+fn source_lookup_and_read_imports_external_object() {
+    let dir = tempdir().unwrap();
+    let source_root = dir.path().join("source");
+    std::fs::create_dir_all(source_root.join("dataset")).unwrap();
+    std::fs::write(source_root.join("dataset/file.txt"), b"hello from source").unwrap();
+
+    let harness = TestHarness::with_config(dir.path(), "source_state", 1024 * 1024, |cfg| {
+        cfg.source = Some(SourceStoreConfig {
+            object_provider: ObjectStoreProvider::Local,
+            bucket: None,
+            prefix: "dataset".to_string(),
+            store_path: Some(source_root.clone()),
+            region: None,
+            endpoint: None,
+            gcs_service_account: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_allow_http: false,
+            aws_force_path_style: false,
+        });
+    });
+    let fs = &harness.fs;
+
+    let record = fs.op_lookup(ROOT_INODE, "file.txt").unwrap();
+    assert!(
+        matches!(record.storage, FileStorage::ExternalObject(_)),
+        "expected source-backed lookup to import external object storage"
+    );
+    let bytes = fs.op_read(record.inode, 0, 64).unwrap();
+    assert_eq!(bytes, b"hello from source");
+}
+
+#[test]
+fn source_write_copies_up_and_does_not_mutate_source_object() {
+    let dir = tempdir().unwrap();
+    let source_root = dir.path().join("source");
+    std::fs::create_dir_all(source_root.join("dataset")).unwrap();
+    std::fs::write(source_root.join("dataset/file.txt"), b"abcdef").unwrap();
+
+    let harness = TestHarness::with_config(dir.path(), "source_copyup_state", 1024 * 1024, |cfg| {
+        cfg.source = Some(SourceStoreConfig {
+            object_provider: ObjectStoreProvider::Local,
+            bucket: None,
+            prefix: "dataset".to_string(),
+            store_path: Some(source_root.clone()),
+            region: None,
+            endpoint: None,
+            gcs_service_account: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_allow_http: false,
+            aws_force_path_style: false,
+        });
+    });
+    let fs = &harness.fs;
+
+    let imported = fs.op_lookup(ROOT_INODE, "file.txt").unwrap();
+    assert!(matches!(imported.storage, FileStorage::ExternalObject(_)));
+
+    fs.op_write(imported.inode, 1, b"ZZ").unwrap();
+    fs.op_flush_inode(imported.inode).unwrap();
+
+    let updated = fs.load_inode(imported.inode).unwrap();
+    assert!(
+        !matches!(updated.storage, FileStorage::ExternalObject(_)),
+        "write should copy-up external object into overlay-managed storage"
+    );
+    let bytes = fs.op_read(imported.inode, 0, 16).unwrap();
+    assert_eq!(bytes, b"aZZdef");
+
+    let source_bytes = std::fs::read(source_root.join("dataset/file.txt")).unwrap();
+    assert_eq!(
+        source_bytes, b"abcdef",
+        "source object must remain unchanged after overlay write"
+    );
 }

@@ -1,4 +1,4 @@
-name: Perf Reports Pages
+name: Website and Perf Pages
 
 on:
   push:
@@ -29,10 +29,20 @@ jobs:
         run: |
           set -euo pipefail
           out_dir="$RUNNER_TEMP/pages-site"
-          mkdir -p "$out_dir/perf_guard_graphs"
+          site_src="website/osagefs.org"
+          perf_out_dir="$out_dir/perf"
 
+          if [[ ! -d "$site_src" ]]; then
+            echo "missing website source directory: $site_src" >&2
+            exit 1
+          fi
+
+          mkdir -p "$out_dir"
+          cp -a "$site_src/." "$out_dir/"
+
+          mkdir -p "$perf_out_dir"
           if [[ -d "bench-artifacts/perf_guard_graphs" ]]; then
-            cp -a "bench-artifacts/perf_guard_graphs/." "$out_dir/perf_guard_graphs/"
+            cp -a "bench-artifacts/perf_guard_graphs/." "$perf_out_dir/"
           fi
 
           touch "$out_dir/.nojekyll"
@@ -41,18 +51,19 @@ jobs:
             echo "<!doctype html>"
             echo "<html><head><meta charset=\"utf-8\"><title>OsageFS Perf Reports</title></head><body>"
             echo "<h1>OsageFS Perf Reports</h1>"
+            echo "<p><a href=\"../\">Back to osagefs.org</a></p>"
             echo "<p>Run folders are date-prefixed for lexical ordering.</p>"
             echo "<ul>"
-            find "$out_dir/perf_guard_graphs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r | while read -r run; do
-              if [[ -f "$out_dir/perf_guard_graphs/$run/report/index.html" ]]; then
-                echo "<li><a href=\"perf_guard_graphs/$run/report/index.html\">$run</a></li>"
+            find "$perf_out_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r | while read -r run; do
+              if [[ -f "$perf_out_dir/$run/report/index.html" ]]; then
+                echo "<li><a href=\"$run/report/index.html\">$run</a></li>"
               else
                 echo "<li>$run (no report/index.html)</li>"
               fi
             done
             echo "</ul>"
             echo "</body></html>"
-          } > "$out_dir/index.html"
+          } > "$perf_out_dir/index.html"
 
           echo "site_dir=$out_dir" >> "$GITHUB_OUTPUT"
 

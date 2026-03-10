@@ -56,7 +56,9 @@ pub fn decode_inline_storage(
     match storage {
         FileStorage::Inline(bytes) => Ok(bytes.clone()),
         FileStorage::InlineEncoded(payload) => decode_inline_payload(payload, encryption_key),
-        FileStorage::LegacySegment(_) | FileStorage::Segments(_) => {
+        FileStorage::LegacySegment(_)
+        | FileStorage::Segments(_)
+        | FileStorage::ExternalObject(_) => {
             anyhow::bail!("decode_inline_storage called for non-inline storage")
         }
     }

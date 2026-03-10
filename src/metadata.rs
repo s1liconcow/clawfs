@@ -21,8 +21,8 @@ use tokio::runtime::Handle;
 
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{
-    FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord, InodeShard,
-    SegmentExtent,
+    ExternalObject, FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord,
+    InodeShard, SegmentExtent,
 };
 use crate::segment::SegmentPointer;
 use crate::superblock::Superblock;
@@ -92,7 +92,7 @@ fn deserialize_metadata<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 //   13(vt=30) ctime_ns:      i64
 //   14(vt=32) link_count:    u32
 //   15(vt=34) rdev:          u32
-//   16(vt=36) storage_tag:   u8   (0=Inline,1=InlineEncoded,2=Segments)
+//   16(vt=36) storage_tag:   u8   (0=Inline,1=InlineEncoded,2=Segments,3=ExternalObject)
 //   17(vt=38) storage_bytes: [u8] (Inline payload OR InlineEncoded.payload)
 //   18(vt=40) storage_codec: u8   (InlineEncoded: 1=Lz4,2=ChaCha,3=Lz4ChaCha)
 //   19(vt=42) storage_orig:  u64  (InlineEncoded original_len; 0 = absent)
@@ -192,6 +192,12 @@ pub(crate) fn build_inode_record_fb<'fbb>(
                 let vec_wip = fbb.create_vector(&ext_wips);
                 (2u8, None, 0u8, 0u64, None, Some(vec_wip))
             }
+            FileStorage::ExternalObject(ext) => {
+                let encoded =
+                    serde_json::to_vec(ext).expect("ExternalObject JSON serialization must work");
+                let bytes_wip = fbb.create_vector(encoded.as_slice());
+                (3u8, Some(bytes_wip), 0u8, 0u64, None, None)
+            }
         };
 
     let atime_ns = record.atime.unix_timestamp() * 1_000_000_000 + record.atime.nanosecond() as i64;
@@ -254,6 +260,7 @@ fn serialize_inodes_fb2<'a>(
             FileStorage::InlineEncoded(p) => p.payload.len() + 16,
             FileStorage::Segments(exts) => exts.len() * 48,
             FileStorage::LegacySegment(_) => 48,
+            FileStorage::ExternalObject(ext) => ext.key.len() + 64,
         };
         let children_bytes = match &r.kind {
             InodeKind::Directory { children } => {
@@ -407,6 +414,15 @@ pub(crate) fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRe
                     .collect(),
             };
             FileStorage::Segments(extents)
+        }
+        3 => {
+            let payload =
+                unsafe { t.get::<ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(17), None) }
+                    .map(|v| v.bytes().to_vec())
+                    .unwrap_or_default();
+            let ext: ExternalObject =
+                serde_json::from_slice(&payload).context("fb2: invalid external object payload")?;
+            FileStorage::ExternalObject(ext)
         }
         v => anyhow::bail!("fb2: unknown storage_tag {v}"),
     };
