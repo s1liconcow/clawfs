@@ -1,0 +1,1 @@
+{"group_id":"perf_local","function_id":"local_segment_batch_throughput","value_str":null,"throughput":{"Bytes":134217728},"full_id":"perf_local/local_segment_batch_throughput","directory_name":"perf_local/local_segment_batch_throughput","title":"perf_local/local_segment_batch_throughput"}
