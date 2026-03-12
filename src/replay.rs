@@ -17,6 +17,8 @@ pub struct ReplayLogger {
     writer: Mutex<GzEncoder<BufWriter<File>>>,
     start: Instant,
     seq: AtomicU64,
+    unflushed: AtomicU64,
+    last_flush: Mutex<Instant>,
 }
 
 impl ReplayLogger {
@@ -31,6 +33,8 @@ impl ReplayLogger {
             writer: Mutex::new(GzEncoder::new(BufWriter::new(file), Compression::default())),
             start: Instant::now(),
             seq: AtomicU64::new(0),
+            unflushed: AtomicU64::new(0),
+            last_flush: Mutex::new(Instant::now()),
         })
     }
 
@@ -60,7 +64,17 @@ impl ReplayLogger {
         });
         let mut guard = self.writer.lock();
         if serde_json::to_writer(&mut *guard, &record).is_ok() && guard.write_all(b"\n").is_ok() {
-            let _ = guard.flush();
+            let unflushed = self.unflushed.fetch_add(1, Ordering::Relaxed);
+            let should_flush = if unflushed >= 64 {
+                true
+            } else {
+                self.last_flush.lock().elapsed() > Duration::from_millis(500)
+            };
+            if should_flush {
+                self.unflushed.store(0, Ordering::Relaxed);
+                *self.last_flush.lock() = Instant::now();
+                let _ = guard.flush();
+            }
         } else {
             log::warn!("failed to write replay log event {layer}/{op}");
         }
@@ -82,5 +96,11 @@ impl ReplayLogger {
         let anchor = now.checked_duration_since(self.start).unwrap_or_default();
         let from_start = now.checked_duration_since(start).unwrap_or_default();
         anchor.checked_sub(from_start).unwrap_or_default()
+    }
+}
+
+impl Drop for ReplayLogger {
+    fn drop(&mut self) {
+        let _ = self.writer.lock().flush();
     }
 }

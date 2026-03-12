@@ -15,7 +15,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
@@ -546,13 +546,13 @@ pub struct MetadataStore {
     store: Arc<dyn ObjectStore>,
     root_prefix: String,
     shard_size: u64,
-    cache: Mutex<HashMap<u64, CacheEntry>>,
+    cache: RwLock<HashMap<u64, CacheEntry>>,
     shards: Mutex<HashMap<u64, ShardEntry>>,
     last_delta_generation: Mutex<u64>,
     log_storage_io: bool,
     /// Short-lived cache of inode numbers known not to exist.  Avoids
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
-    negative_cache: Mutex<HashMap<u64, Instant>>,
+    negative_cache: RwLock<HashMap<u64, Instant>>,
     handle: Handle,
 }
 
@@ -564,11 +564,11 @@ impl MetadataStore {
             store,
             root_prefix: prefix,
             shard_size: config.shard_size,
-            cache: Mutex::new(HashMap::new()),
+            cache: RwLock::new(HashMap::new()),
             shards: Mutex::new(HashMap::new()),
             last_delta_generation: Mutex::new(0),
             log_storage_io: config.log_storage_io,
-            negative_cache: Mutex::new(HashMap::new()),
+            negative_cache: RwLock::new(HashMap::new()),
             handle,
         };
 
@@ -771,7 +771,7 @@ impl MetadataStore {
     /// contexts (e.g. inside flush_pending under flush_lock) where callers
     /// only need extents that were committed by a prior flush.
     pub fn get_cached_inode(&self, inode: u64) -> Option<InodeRecord> {
-        self.cache.lock().get(&inode).map(|e| e.record.clone())
+        self.cache.read().get(&inode).map(|e| e.record.clone())
     }
 
     /// Fast-path child lookup that avoids cloning the parent inode record.
@@ -782,7 +782,7 @@ impl MetadataStore {
         parent: u64,
         name: &str,
     ) -> Option<std::result::Result<u64, i32>> {
-        let cache = self.cache.lock();
+        let cache = self.cache.read();
         let entry = cache.get(&parent)?;
         if matches!(entry.record.kind, InodeKind::Tombstone) {
             return Some(Err(ENOENT));
@@ -802,7 +802,7 @@ impl MetadataStore {
         let ttl = |rec: &InodeRecord| if rec.is_dir() { dir_ttl } else { file_ttl };
 
         // Fast path: positive cache hit.
-        if let Some(entry) = self.cache.lock().get(&inode).cloned() {
+        if let Some(entry) = self.cache.read().get(&inode).cloned() {
             let allowed = ttl(&entry.record);
             if allowed.is_zero() || entry.refreshed.elapsed() <= allowed {
                 return Ok(Some(entry.record));
@@ -811,7 +811,7 @@ impl MetadataStore {
 
         // Negative cache: skip shard load if we recently confirmed ENOENT.
         {
-            let neg = self.negative_cache.lock();
+            let neg = self.negative_cache.read();
             if let Some(&expires) = neg.get(&inode)
                 && Instant::now() < expires
             {
@@ -823,14 +823,14 @@ impl MetadataStore {
 
         let result = self
             .cache
-            .lock()
+            .read()
             .get(&inode)
             .map(|entry| entry.record.clone());
 
         // Populate the negative cache on confirmed ENOENT.
         if result.is_none() {
             self.negative_cache
-                .lock()
+                .write()
                 .insert(inode, Instant::now() + NEGATIVE_CACHE_TTL);
         }
 
@@ -840,6 +840,81 @@ impl MetadataStore {
     pub async fn get_inode(&self, inode: u64) -> Result<Option<InodeRecord>> {
         self.get_inode_with_ttl(inode, Duration::ZERO, Duration::ZERO)
             .await
+    }
+
+    /// Batch-load multiple inodes from the cache, reloading shards as needed
+    /// for any misses. Returns a map of inode number → record for all found
+    /// inodes. Missing inodes (after shard reload) are silently omitted.
+    pub async fn get_inodes_cached_batch(
+        &self,
+        inodes: &[u64],
+        file_ttl: Duration,
+        dir_ttl: Duration,
+    ) -> Result<HashMap<u64, InodeRecord>> {
+        let mut result = HashMap::with_capacity(inodes.len());
+        let mut misses = Vec::new();
+
+        // Phase 1: single read-lock pass to resolve cache hits.
+        {
+            let cache = self.cache.read();
+            let neg = self.negative_cache.read();
+            let now = Instant::now();
+            for &ino in inodes {
+                if let Some(entry) = cache.get(&ino) {
+                    let ttl = if entry.record.is_dir() {
+                        dir_ttl
+                    } else {
+                        file_ttl
+                    };
+                    if ttl.is_zero() || entry.refreshed.elapsed() <= ttl {
+                        result.insert(ino, entry.record.clone());
+                        continue;
+                    }
+                }
+                // Skip if in negative cache.
+                if let Some(&expires) = neg.get(&ino)
+                    && now < expires
+                {
+                    continue;
+                }
+                misses.push(ino);
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 2: group misses by shard and reload each unique shard once.
+        let mut shards_to_reload: HashSet<u64> = HashSet::new();
+        for &ino in &misses {
+            shards_to_reload.insert(shard_for_inode(ino, self.shard_size));
+        }
+        for shard_id in shards_to_reload {
+            self.reload_shard(shard_id).await?;
+        }
+
+        // Phase 3: re-check cache for previously-missed inodes.
+        let mut neg_inserts = Vec::new();
+        {
+            let cache = self.cache.read();
+            for &ino in &misses {
+                if let Some(entry) = cache.get(&ino) {
+                    result.insert(ino, entry.record.clone());
+                } else {
+                    neg_inserts.push(ino);
+                }
+            }
+        }
+        if !neg_inserts.is_empty() {
+            let mut neg = self.negative_cache.write();
+            let expires = Instant::now() + NEGATIVE_CACHE_TTL;
+            for ino in neg_inserts {
+                neg.insert(ino, expires);
+            }
+        }
+
+        Ok(result)
     }
 
     pub async fn persist_inode(
@@ -868,9 +943,9 @@ impl MetadataStore {
         // normalization overhead.
         let mut touched_shard_ids = HashSet::new();
         {
-            let mut cache = self.cache.lock();
+            let mut cache = self.cache.write();
             let mut shards = self.shards.lock();
-            let mut neg = self.negative_cache.lock();
+            let mut neg = self.negative_cache.write();
             for record in records {
                 neg.remove(&record.inode);
                 let shard_id = record.shard_index(shard_size);
@@ -1057,8 +1132,8 @@ impl MetadataStore {
     }
 
     pub async fn remove_inode(&self, inode: u64, generation: u64, shard_size: u64) -> Result<()> {
-        self.cache.lock().remove(&inode);
-        self.negative_cache.lock().remove(&inode);
+        self.cache.write().remove(&inode);
+        self.negative_cache.write().remove(&inode);
         let shard_id = shard_for_inode(inode, shard_size);
         {
             let mut shards = self.shards.lock();
@@ -1171,7 +1246,7 @@ impl MetadataStore {
             loaded_shards.push((shard_id, stored));
         }
 
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         let mut shard_map = self.shards.lock();
         for (shard_id, stored) in loaded_shards {
             let mut shard = InodeShard::new(shard_id);
@@ -1232,9 +1307,9 @@ impl MetadataStore {
                 );
                 for record in stored.records {
                     if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                        self.cache.lock().remove(&record.inode);
+                        self.cache.write().remove(&record.inode);
                     } else {
-                        self.cache.lock().insert(
+                        self.cache.write().insert(
                             record.inode,
                             CacheEntry::with_generation(record.clone(), generation),
                         );
@@ -1355,7 +1430,7 @@ impl MetadataStore {
             for (ino, record) in stored.entries {
                 shard.inodes.insert(ino, record);
             }
-            let mut cache = self.cache.lock();
+            let mut cache = self.cache.write();
             for (ino, record) in &shard.inodes {
                 // Only update the cache if this shard reload is at least as
                 // fresh as the existing entry.  A concurrent

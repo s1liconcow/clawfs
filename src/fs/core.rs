@@ -372,6 +372,68 @@ impl OsageFs {
         Err(ENOENT)
     }
 
+    /// Batch-load multiple inodes. Checks active_inodes first, then fetches
+    /// remaining inodes from the metadata cache in a single batch (one cache
+    /// lock acquisition + grouped shard reloads for misses).
+    pub(crate) fn load_inodes_batch(
+        &self,
+        inos: &[u64],
+    ) -> std::result::Result<HashMap<u64, InodeRecord>, i32> {
+        let mut result = HashMap::with_capacity(inos.len());
+        let mut remaining = Vec::new();
+
+        // Phase 1: resolve from active_inodes (pending/flushing state).
+        for &ino in inos {
+            if let Some(r) = self.load_inode_in_memory(ino) {
+                match r {
+                    Ok(record) => {
+                        result.insert(ino, record);
+                    }
+                    Err(_) => {
+                        // Tombstone or error — skip this inode.
+                    }
+                }
+            } else {
+                remaining.push(ino);
+            }
+        }
+
+        if remaining.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 2: batch-fetch from metadata cache.
+        let fetched = self.block_on(self.metadata.get_inodes_cached_batch(
+            &remaining,
+            self.lookup_cache_ttl,
+            self.dir_cache_ttl,
+        ));
+        match fetched {
+            Ok(map) => {
+                for (ino, record) in map {
+                    result.insert(ino, record);
+                }
+            }
+            Err(err) => {
+                error!("load_inodes_batch metadata error: {:#}", err);
+                return Err(EIO);
+            }
+        }
+
+        // Phase 3: re-check in-memory maps for any remaining misses
+        // (same race-prevention as load_inode's second pass).
+        for &ino in &remaining {
+            if result.contains_key(&ino) {
+                continue;
+            }
+            if let Some(Ok(record)) = self.load_inode_in_memory(ino) {
+                result.insert(ino, record);
+            }
+        }
+
+        Ok(result)
+    }
+
     pub(crate) fn read_file_bytes(&self, record: &InodeRecord) -> Result<Vec<u8>> {
         self.read_file_range_inner(record, 0, record.size)
     }

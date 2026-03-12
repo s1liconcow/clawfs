@@ -93,9 +93,12 @@ impl OsageFs {
         let parent = if ino == ROOT_INODE { ino } else { inode.parent };
         entries.push((parent, FileType::Directory, String::from("..")));
         if let Some(children) = inode.children() {
+            let child_inos: Vec<u64> = children.values().copied().collect();
+            let loaded = self.load_inodes_batch(&child_inos)?;
             for (name, child) in children {
-                let child_inode = self.load_inode(*child)?;
-                entries.push((child_inode.inode, file_type(&child_inode), name.clone()));
+                if let Some(child_inode) = loaded.get(child) {
+                    entries.push((child_inode.inode, file_type(child_inode), name.clone()));
+                }
             }
         }
         Ok(entries)

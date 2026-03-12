@@ -3869,3 +3869,49 @@ fn source_write_copies_up_and_does_not_mutate_source_object() {
         "source object must remain unchanged after overlay write"
     );
 }
+
+#[test]
+fn readdir_batch_large_directory() {
+    let tmp = tempdir().unwrap();
+    let harness = TestHarness::new(tmp.path(), "batch_readdir", 1 << 30);
+    let fs = &harness.fs;
+
+    let child_count = 500;
+    let mut expected_names: HashSet<String> = HashSet::new();
+    for i in 0..child_count {
+        let name = format!("file_{:04}", i);
+        fs.op_create(ROOT_INODE, &name, 1000, 1000).unwrap();
+        expected_names.insert(name);
+    }
+
+    let entries = fs.op_readdir_fuse(ROOT_INODE).unwrap();
+
+    // Should have child_count entries + "." and ".."
+    assert_eq!(
+        entries.len(),
+        child_count + 2,
+        "readdir should return all children plus . and .."
+    );
+
+    // Verify . and ..
+    assert_eq!(entries[0].2, ".");
+    assert_eq!(entries[1].2, "..");
+
+    // Verify all children are present
+    let returned_names: HashSet<String> = entries[2..].iter().map(|e| e.2.clone()).collect();
+    assert_eq!(
+        returned_names, expected_names,
+        "readdir should return all created children"
+    );
+
+    // Verify all entries have valid file types
+    for (ino, ft, name) in &entries[2..] {
+        assert!(*ino > 0, "inode number should be positive for {}", name);
+        assert_eq!(
+            *ft,
+            FileType::RegularFile,
+            "file type should be RegularFile for {}",
+            name
+        );
+    }
+}
