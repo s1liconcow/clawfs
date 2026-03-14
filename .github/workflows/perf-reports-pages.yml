@@ -29,7 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           out_dir="$RUNNER_TEMP/pages-site"
-          site_src="website/osagefs.org"
+          site_src="website/clawfs.dev"
           perf_out_dir="$out_dir/perf"
 
           if [[ ! -d "$site_src" ]]; then
@@ -50,8 +50,8 @@ jobs:
           {
             echo "<!doctype html>"
             echo "<html><head><meta charset=\"utf-8\"><title>OsageFS Perf Reports</title></head><body>"
-            echo "<h1>OsageFS Perf Reports</h1>"
-            echo "<p><a href=\"../\">Back to osagefs.org</a></p>"
+            echo "<h1>ClawFS Perf Reports</h1>"
+            echo "<p><a href=\"../\">Back to clawfs.dev</a></p>"
             echo "<p>Run folders are date-prefixed for lexical ordering.</p>"
             echo "<ul>"
             find "$perf_out_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r | while read -r run; do
