@@ -1,5 +1,6 @@
 /target
 osagefs-nfs-gateway/target
+clawfs-preload/target
 loopback-bench/target
 *.log
 *.jsonl

@@ -33,6 +33,7 @@
         <a href="pricing.html">Pricing</a>
         <a href="#features">Why It Wins</a>
         <a href="#cta">Get Started</a>
+        <a class="nav-signin" href="auth.html">Sign In</a>
       </nav>
     </header>
 
@@ -48,18 +49,22 @@
               alive after the process exits.
             </p>
             <p class="hero-copy">
-              Vector databases are out, filesystems are in. Unleash your Claw with POSIX semantics and near
-              unlimited storage for the agents that need to keep working after the process exits.
+              Give coding agents, research workflows, and automation jobs a real workspace with POSIX semantics,
+              durable state, and storage that follows the work wherever it runs.
             </p>
+            <p class="hero-copy">
+              Mount it with FUSE, serve it over user-mode NFS, or inject it through the preload shared library when
+              your agents want real file APIs without a host mount. One install gives you `clawfs summon`,
+              `clawfs mount`, and `clawfs serve`.
+            </p>
+            <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
             <div class="hero-cta">
-              <a class="btn btn-primary" href="#how">See How It Works</a>
-              <a class="btn btn-secondary" href="getting-started.html">Launch ClawFS</a>
-            </div>
-            <div class="hero-cta">
-              <a class="btn btn-secondary" href="pricing.html">See Pricing</a>
+              <a class="btn btn-primary" href="getting-started.html">Get Started</a>
+              <a class="btn btn-secondary" href="#how">How It Works</a>
             </div>
             <p class="hero-note">
-              Need SSO, KMS/HSM, audit streams, hosted acceleration, or NFSv4? <a href="enterprise.html">See Enterprise</a>.
+              Start in minutes with the CLI, then scale up with team access, cloud storage, and enterprise controls.
+              Need SSO, audit streams, managed acceleration, or advanced deployment support? <a href="enterprise.html">See Enterprise</a>.
             </p>
           </div>
           <figure class="hero-art" aria-label="Animated lobster claw gripping a pulsating data cube">
@@ -84,8 +89,8 @@
             <h3>Summon</h3>
             <p class="price">Single CLI Command</p>
             <ul>
-              <li>Create a named persistent volume when an agent starts</li>
-              <li>Mount it into a VM, container, or remote runner immediately</li>
+              <li>Run `clawfs summon -- codex` and get a default account volume automatically</li>
+              <li>Select a named volume when you want an explicit shared workspace</li>
               <li>Keep dependencies, repos, embeddings, and model artifacts close to execution</li>
               <li>Skip custom bootstrap scripts and fragile cache warmups</li>
             </ul>
@@ -126,7 +131,7 @@
           </article>
           <article class="card">
             <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 11V8a5 5 0 0110 0v3h1a2 2 0 012 2v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6a2 2 0 012-2h1zm2 0h6V8a3 3 0 00-6 0v3z"/></svg></span>Save Context</h3>
-            <p>Do not dump tool calls into context. Dump them to ClawFS and let your Claw rip with grep, files, and real workspace state.</p>
+            <p>Keep large working sets in the filesystem instead of squeezing them into prompts, summaries, or brittle custom memory layers.</p>
           </article>
           <article class="card">
             <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12H4zm4-3h8v-2H8v2zm0-4h8v-2H8v2z"/></svg></span>Shared Handoffs</h3>
@@ -134,7 +139,7 @@
           </article>
           <article class="card">
             <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2l2.5 5.2L20 8l-4 3.9.9 5.6-4.9-2.7-4.9 2.7.9-5.6L4 8l5.5-.8L12 2z"/></svg></span>CLI-First</h3>
-            <p>The product pitch is simple because the interface is simple: one command to create, mount, and return to agent storage.</p>
+            <p>Adopt ClawFS without rebuilding your stack: install the CLI, mount a workspace, and return to it whenever the job resumes.</p>
           </article>
         </div>
       </section>
@@ -280,10 +285,10 @@
       </section>
 
       <section id="cta" class="cta reveal" data-delay="340">
-        <h2>Give every agent a volume it can come back to.</h2>
-        <p>One CLI command to summon it. The same CLI command to return.</p>
+        <h2>Give every agent a workspace it can come back to.</h2>
+        <p>Install the CLI, create your first persistent volume, and reuse the same workspace across runs, machines, and teams.</p>
         <div class="hero-cta">
-          <a class="btn btn-primary" href="pricing.html">Start Free</a>
+          <a class="btn btn-primary" href="auth.html">Start Free</a>
           <a class="btn btn-secondary" href="enterprise.html">Talk Enterprise</a>
         </div>
       </section>

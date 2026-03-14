@@ -49,7 +49,7 @@ jobs:
 
           {
             echo "<!doctype html>"
-            echo "<html><head><meta charset=\"utf-8\"><title>OsageFS Perf Reports</title></head><body>"
+            echo "<html><head><meta charset=\"utf-8\"><title>ClawFS Perf Reports</title></head><body>"
             echo "<h1>ClawFS Perf Reports</h1>"
             echo "<p><a href=\"../\">Back to clawfs.dev</a></p>"
             echo "<p>Run folders are date-prefixed for lexical ordering.</p>"

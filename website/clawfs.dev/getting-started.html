@@ -6,7 +6,7 @@
     <title>Getting Started With ClawFS</title>
     <meta
       name="description"
-      content="Get started with ClawFS across FUSE, NFS, and the planned shared-library path. Learn the launch commands, storage modes, and runtime configuration model."
+      content="Get started with ClawFS across FUSE, NFS, and preload-based runtime integration. Learn the launch paths, storage options, and configuration basics."
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -31,22 +31,69 @@
         <a href="getting-started.html">Getting Started</a>
         <a href="enterprise.html">Enterprise</a>
         <a href="pricing.html">Pricing</a>
+        <a href="index.html#features">Why It Wins</a>
         <a href="index.html#cta">Get Started</a>
+        <a class="nav-signin" href="auth.html">Sign In</a>
       </nav>
     </header>
 
     <main>
       <section class="hero reveal" data-delay="0">
         <p class="eyebrow">Getting Started</p>
-        <h1>Launch ClawFS the Way Your Agents Actually Need It</h1>
+        <h1>Get ClawFS Running in the Environment You Already Use</h1>
         <p class="hero-copy">
-          ClawFS can be introduced at different layers depending on the runtime. The current repo ships concrete FUSE
-          and NFS paths today, and the planned shared-library mode is the path for tighter in-process interception later.
+          The `clawfs` binary is the front door. Use `clawfs summon` for preload-based agent launches,
+          `clawfs mount` for FUSE, and `clawfs serve` for user-mode NFS.
         </p>
+        <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
         <div class="hero-cta">
-          <a class="btn btn-primary" href="#fuse">Start With FUSE</a>
-          <a class="btn btn-secondary" href="#nfs">Use NFS</a>
+          <a class="btn btn-primary" href="#summon">Start With Summon</a>
+          <a class="btn btn-primary" href="#fuse">Mount With FUSE</a>
+          <a class="btn btn-secondary" href="#nfs">Serve With NFS</a>
           <a class="btn btn-secondary" href="#config">Configure Runtime</a>
+        </div>
+      </section>
+
+      <section id="login" class="feature-grid reveal" data-delay="60">
+        <div class="section-title">
+          <p class="eyebrow">Step 1</p>
+          <h2>Create an Account and Connect the CLI</h2>
+        </div>
+        <div class="cards two-up">
+          <article class="card">
+            <h3>Start With the Hosted Experience</h3>
+            <p>For the fastest first run, sign in with email, Google, or GitHub and connect the CLI to your ClawFS account.</p>
+            <div class="code-block"><code>clawfs login
+clawfs whoami</code></div>
+          </article>
+          <article class="card">
+            <h3>What You Get</h3>
+            <ul>
+              <li>Secure sign-in for the web app and CLI</li>
+              <li>A straightforward path to hosted evaluation</li>
+              <li>A reusable identity for your workspaces and volumes</li>
+              <li>A clean upgrade path from trial use to team deployment</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="summon" class="feature-grid reveal" data-delay="70">
+        <div class="section-title">
+          <p class="eyebrow">Default Path</p>
+          <h2>Summon a Volume and Run Your Agent</h2>
+        </div>
+        <div class="cards two-up">
+          <article class="card">
+            <h3>Default Account Volume</h3>
+            <p>`clawfs summon` uses the shared-library path and auto-creates the `default` volume for the current account if you do not choose one.</p>
+            <div class="code-block"><code>clawfs summon -- codex</code></div>
+          </article>
+          <article class="card">
+            <h3>Named Volume + CWD-Relative Prefix</h3>
+            <p>Pass `--volume` when you want to recall a specific workspace and `--path` when you want the intercepted prefix anchored relative to the current directory.</p>
+            <div class="code-block"><code>clawfs summon --volume research-a --path claw -- codex</code></div>
+          </article>
         </div>
       </section>
 
@@ -54,16 +101,18 @@
         <article class="card">
           <h3>Current Shipping Modes</h3>
           <ul>
-            <li>FUSE mount via `clawfs` or `scripts/run_clawfs.sh`</li>
-            <li>User-mode NFS server via `clawfs-nfs-gateway` or `scripts/run_nfs_gateway.sh`</li>
+            <li>`clawfs summon` for preload-based agent launches</li>
+            <li>`clawfs mount` for direct FUSE mounts</li>
+            <li>`clawfs serve` for user-mode NFS</li>
           </ul>
         </article>
         <article class="card">
-          <h3>Planned Mode</h3>
-          <ul>
-            <li>Shared-library path for in-process filesystem interception under configured ClawFS prefixes</li>
-            <li>Best fit for agent launchers that want file APIs without requiring a host mount</li>
-          </ul>
+            <h3>How to Choose</h3>
+            <ul>
+              <li>Use `summon` when the runtime wants file APIs without a host mount</li>
+              <li>Use `mount` when you control the host mountpoint</li>
+              <li>Use `serve` when you want a networked userspace server</li>
+            </ul>
         </article>
       </section>
 
@@ -84,22 +133,14 @@
           </article>
           <article class="card">
             <h3>Quick Start</h3>
-            <div class="code-block"><code>cargo build --release --bin clawfs
-
-./scripts/run_clawfs.sh</code></div>
-            <p class="footnote">Defaults mount to `/tmp/clawfs-mnt` and uses a local backing store under `/tmp/clawfs-store`.</p>
+            <div class="code-block"><code>clawfs mount --path .clawfs</code></div>
+            <p class="footnote">Defaults to the `default` volume and mounts relative to the current working directory unless you override `--volume` or `--path`.</p>
           </article>
         </div>
         <article class="callout">
           <strong>Direct CLI launch</strong><br />
-          Use the binary directly if you want full control over flags:
-          <div class="code-block"><code>cargo run --release --bin clawfs -- \
-  --mount-path /tmp/clawfs-mnt \
-  --store-path /tmp/clawfs-store \
-  --local-cache-path ~/.clawfs/cache \
-  --state-path ~/.clawfs/state/client_state.bin \
-  --object-provider local \
-  --foreground</code></div>
+          The front-door wrapper creates the local store/cache/state layout for the volume, then launches the FUSE path behind the scenes.
+          <div class="code-block"><code>clawfs mount --volume datasets --path /tmp/clawfs-mnt</code></div>
         </article>
       </section>
 
@@ -115,55 +156,46 @@
             <ul>
               <li>Remote workers and VMs</li>
               <li>Containerized runners</li>
-              <li>Cases where you want a network boundary between control plane and client mount</li>
+              <li>Cases where you want a clean network boundary between the server and client mount</li>
             </ul>
           </article>
           <article class="card">
             <h3>Quick Start</h3>
-            <div class="code-block"><code>cargo build --release --manifest-path clawfs-nfs-gateway/Cargo.toml
-
-./scripts/run_nfs_gateway.sh</code></div>
-            <p class="footnote">Default listen address is `0.0.0.0:2049`; the helper can also auto-mount the export locally when the host supports it.</p>
+            <div class="code-block"><code>clawfs serve --listen 127.0.0.1:2049</code></div>
+            <p class="footnote">Defaults to the `default` volume and launches the user-mode NFS gateway for that volume.</p>
           </article>
         </div>
         <article class="callout">
-          <strong>Direct gateway launch</strong><br />
-          If you want to manage the process yourself:
-          <div class="code-block"><code>cargo run --release --manifest-path clawfs-nfs-gateway/Cargo.toml -- \
-  --mount-path /tmp/clawfs-mnt \
-  --store-path /tmp/clawfs-store \
-  --local-cache-path ~/.clawfs/cache \
-  --state-path ~/.clawfs/state/nfs_gateway_state.bin \
-  --listen 0.0.0.0:2049 \
-  --protocol v3</code></div>
+          <strong>Named volume over NFS</strong><br />
+          Use a volume name when you want a stable shared export:
+          <div class="code-block"><code>clawfs serve --volume shared-build --listen 0.0.0.0:2049</code></div>
         </article>
       </section>
 
       <section id="shared-library" class="feature-grid reveal" data-delay="240">
         <div class="section-title">
           <p class="eyebrow">Mode 3</p>
-          <h2>Shared Library: Planned In-Process Path for Agents</h2>
+          <h2>Shared Library: In-Process Filesystem Interception for Agents</h2>
         </div>
         <article class="callout">
-          <strong>Status: planned / not yet shipped in this repo.</strong><br />
-          The intended model is a preloadable shared library that intercepts filesystem calls for configured ClawFS paths
-          and redirects them into ClawFS core logic. This is the direction for agents that want filesystem semantics
-          without requiring a host-level mount.
+          <strong>Status: available for Linux-style preload flows.</strong><br />
+          `clawfs summon` uses the preload shared library automatically. It intercepts filesystem calls for the configured
+          ClawFS prefix and redirects them into ClawFS core logic without requiring a host-level mount.
         </article>
         <div class="cards two-up">
           <article class="card">
-            <h3>Target UX</h3>
-            <div class="code-block"><code>LD_PRELOAD=libclawfs_preload.so \
-CLAWFS_PREFIXES=/claw,/agent-data \
-sprite exec -- my-agent</code></div>
-            <p class="footnote">On macOS the equivalent path would use `DYLD_INSERT_LIBRARIES` where allowed.</p>
+            <h3>Default Launch</h3>
+            <div class="code-block"><code>clawfs summon -- codex</code></div>
+            <div class="code-block"><code>clawfs summon --volume plan-a --path claw -- python3 your_agent.py</code></div>
+            <p class="footnote">The CLI locates the preload library, sets `LD_PRELOAD`, and prepares the volume-specific local store, cache, and state paths for you.</p>
           </article>
           <article class="card">
-            <h3>Why It Exists</h3>
+            <h3>Runtime Configuration</h3>
             <ul>
-              <li>No kernel mount requirement inside the agent runtime</li>
-              <li>Path-transparent use of normal file APIs</li>
-              <li>Better fit for tightly controlled agent launchers</li>
+              <li>`--path` resolves relative to the current working directory by default</li>
+              <li>`--volume` lets you select or create a named workspace explicitly</li>
+              <li>`clawfs login` feeds `CLAWFS_API_TOKEN` into hosted flows when needed</li>
+              <li>The CLI manages `CLAWFS_PREFIXES`, `CLAWFS_STORE_PATH`, `CLAWFS_LOCAL_CACHE_PATH`, and `CLAWFS_STATE_PATH` automatically</li>
             </ul>
           </article>
         </div>
@@ -207,12 +239,12 @@ sprite exec -- my-agent</code></div>
       <section class="feature-grid reveal" data-delay="360">
         <div class="section-title">
           <p class="eyebrow">Hosted + BYOB Modes</p>
-          <h2>Environment-Driven ClawFS Runtime Spec</h2>
+          <h2>Environment-Driven Runtime Configuration</h2>
         </div>
         <div class="cards two-up">
           <article class="card">
-            <h3>Hosted Free Tier Shape</h3>
-            <p>The runtime can be configured by env vars for hosted-free or BYOB issuance flows.</p>
+            <h3>Hosted Evaluation Example</h3>
+            <p>ClawFS can be configured with environment variables for hosted evaluation environments or self-managed deployments.</p>
             <div class="code-block"><code>CLAWFS_STORAGE_MODE=hosted_free
 CLAWFS_OBJECT_PROVIDER=aws
 CLAWFS_BUCKET=clawfs-free
@@ -231,10 +263,11 @@ CLAWFS_AWS_SESSION_TOKEN=...</code></div>
       </section>
 
       <section class="cta reveal" data-delay="420">
-        <h2>Start with the mount path that matches your runtime boundary.</h2>
-        <p>FUSE for direct local mounts, NFS for user-space serving, and shared-library mode for the in-process future.</p>
+        <h2>Start with the integration path that matches your runtime.</h2>
+        <p>Most teams begin with the hosted experience, then adopt FUSE or NFS when they want more direct control over deployment and storage.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="pricing.html">Pick a Plan</a>
+          <a class="btn btn-secondary" href="auth.html">Open Auth Page</a>
           <a class="btn btn-secondary" href="enterprise.html">See Enterprise Controls</a>
         </div>
       </section>

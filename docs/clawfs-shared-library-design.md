@@ -258,7 +258,7 @@ Unsupported operations on redirected paths should fail with a deliberate errno s
 - `mmap` and locking semantics may block some workloads even after v1 ships.
 
 ## Repo Notes
-- Current shipped modes are FUSE and user-mode NFS.
+- Current shipped modes are FUSE, user-mode NFS, and a Linux-first preload shared library under `clawfs-preload/`.
 - `src/clawfs.rs` already provides the shared env/runtime substrate for hosted-free and BYOB storage config.
-- This repo does not yet include the preload library crate or the syscall interception layer.
-- This document is the source of truth for that planned implementation.
+- The preload crate exists today as a Linux-oriented implementation and integration-test surface.
+- This document remains the source of truth for expanding coverage, semantics, and platform support.

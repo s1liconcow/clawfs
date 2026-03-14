@@ -32,43 +32,43 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build OsageFS
+      - name: Build ClawFS
         run: cargo build --release
 
-      - name: Start OsageFS
+      - name: Start ClawFS
         run: |
-          mkdir -p /tmp/osagefs-mnt /tmp/osagefs-store /tmp/osagefs-cache
+          mkdir -p /tmp/clawfs-mnt /tmp/clawfs-store /tmp/clawfs-cache
 
-          ./target/release/osagefs \
-            --mount-path /tmp/osagefs-mnt \
-            --store-path /tmp/osagefs-store \
-            --local-cache-path /tmp/osagefs-cache \
-            --state-path /tmp/osagefs-state.bin \
+          ./target/release/clawfs \
+            --mount-path /tmp/clawfs-mnt \
+            --store-path /tmp/clawfs-store \
+            --local-cache-path /tmp/clawfs-cache \
+            --state-path /tmp/clawfs-state.bin \
             --object-provider local \
             --allow-other \
             --disable-journal \
             --disable-cleanup \
             --foreground &
-          echo $! > /tmp/osagefs.pid
+          echo $! > /tmp/clawfs.pid
 
           # Wait for mount to come up
-          echo "Waiting for OsageFS mount..."
+          echo "Waiting for ClawFS mount..."
           for i in $(seq 1 30); do
-            if mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
-              echo "OsageFS is mounted"
+            if mountpoint -q /tmp/clawfs-mnt 2>/dev/null; then
+              echo "ClawFS is mounted"
               break
             fi
             sleep 1
           done
 
-          if ! mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
-            echo "OsageFS failed to mount"
-            cat /tmp/osagefs.log 2>/dev/null || true
+          if ! mountpoint -q /tmp/clawfs-mnt 2>/dev/null; then
+            echo "ClawFS failed to mount"
+            cat /tmp/clawfs.log 2>/dev/null || true
             exit 1
           fi
 
       - name: Run pjdfstest
-        working-directory: /tmp/osagefs-mnt
+        working-directory: /tmp/clawfs-mnt
         run: |
           mkdir -p pjdfstest_run
           cd pjdfstest_run
@@ -90,8 +90,8 @@ jobs:
         if: always()
         run: |
           cd /tmp
-          if [ -f /tmp/osagefs.pid ]; then
-            kill $(cat /tmp/osagefs.pid) || true
+          if [ -f /tmp/clawfs.pid ]; then
+            kill $(cat /tmp/clawfs.pid) || true
             sleep 2
           fi
-          sudo umount -l /tmp/osagefs-mnt || fusermount -u /tmp/osagefs-mnt || true
+          sudo umount -l /tmp/clawfs-mnt || fusermount -u /tmp/clawfs-mnt || true

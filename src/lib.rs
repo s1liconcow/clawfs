@@ -1,7 +1,9 @@
+pub mod auth;
 pub mod checkpoint;
 pub mod clawfs;
 pub mod codec;
 pub mod config;
+pub mod frontdoor;
 pub mod fs;
 pub mod inode;
 pub mod journal;

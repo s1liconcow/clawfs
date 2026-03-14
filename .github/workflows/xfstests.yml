@@ -41,26 +41,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build OsageFS NFS gateway
+      - name: Build ClawFS NFS gateway
         run: |
-          cd osagefs-nfs-gateway
+          cd clawfs-nfs-gateway
           cargo build --release
 
       - name: Create data directories
         run: |
-          mkdir -p /tmp/osagefs-test-store /tmp/osagefs-scratch-store
-          mkdir -p /tmp/osagefs-test-cache /tmp/osagefs-scratch-cache
+          mkdir -p /tmp/clawfs-test-store /tmp/clawfs-scratch-store
+          mkdir -p /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
 
-      - name: Start OsageFS NFS gateway (TEST instance)
+      - name: Start ClawFS NFS gateway (TEST instance)
         run: |
-          osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
-            --store-path /tmp/osagefs-test-store \
-            --local-cache-path /tmp/osagefs-test-cache \
-            --state-path /tmp/osagefs-test-state.bin \
+          clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+            --store-path /tmp/clawfs-test-store \
+            --local-cache-path /tmp/clawfs-test-cache \
+            --state-path /tmp/clawfs-test-state.bin \
             --object-provider local \
             --disable-journal \
             --listen 127.0.0.1:2049 &
-          echo $! > /tmp/osagefs-test.pid
+          echo $! > /tmp/clawfs-test.pid
 
           echo "Waiting for TEST instance..."
           for i in $(seq 1 30); do
@@ -76,16 +76,16 @@ jobs:
             exit 1
           fi
 
-      - name: Start OsageFS NFS gateway (SCRATCH instance)
+      - name: Start ClawFS NFS gateway (SCRATCH instance)
         run: |
-          osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
-            --store-path /tmp/osagefs-scratch-store \
-            --local-cache-path /tmp/osagefs-scratch-cache \
-            --state-path /tmp/osagefs-scratch-state.bin \
+          clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+            --store-path /tmp/clawfs-scratch-store \
+            --local-cache-path /tmp/clawfs-scratch-cache \
+            --state-path /tmp/clawfs-scratch-state.bin \
             --object-provider local \
             --disable-journal \
             --listen 127.0.0.1:20499 &
-          echo $! > /tmp/osagefs-scratch.pid
+          echo $! > /tmp/clawfs-scratch.pid
 
           echo "Waiting for SCRATCH instance..."
           for i in $(seq 1 30); do
@@ -166,10 +166,10 @@ jobs:
           sudo umount /mnt/test || true
           sudo umount /mnt/scratch || true
 
-          if [ -f /tmp/osagefs-test.pid ]; then
-            kill $(cat /tmp/osagefs-test.pid) || true
+          if [ -f /tmp/clawfs-test.pid ]; then
+            kill $(cat /tmp/clawfs-test.pid) || true
           fi
-          if [ -f /tmp/osagefs-scratch.pid ]; then
-            kill $(cat /tmp/osagefs-scratch.pid) || true
+          if [ -f /tmp/clawfs-scratch.pid ]; then
+            kill $(cat /tmp/clawfs-scratch.pid) || true
           fi
-          pkill -f osagefs-nfs-gateway || true
+          pkill -f clawfs-nfs-gateway || true

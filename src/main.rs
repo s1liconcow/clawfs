@@ -15,6 +15,7 @@ use std::env;
 
 use clawfs::clawfs as clawfs_runtime;
 use clawfs::config::{Cli, Config};
+use clawfs::frontdoor::{self, DispatchAction};
 use clawfs::fs::OsageFs;
 use clawfs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use clawfs::journal::JournalManager;
@@ -53,8 +54,19 @@ Why teams use it:\n\
 Enjoy building on ClawFS.\n";
 
 fn main() -> Result<()> {
+    let args: Vec<_> = env::args_os().collect();
+    match frontdoor::dispatch(&args)? {
+        DispatchAction::Handled => return Ok(()),
+        DispatchAction::Mount(config) => return run_mount(*config),
+        DispatchAction::FallThrough => {}
+    }
+
     let cli = Cli::parse();
-    let mut config: Config = cli.into();
+    let config: Config = cli.into();
+    run_mount(config)
+}
+
+fn run_mount(mut config: Config) -> Result<()> {
     clawfs_runtime::apply_env_runtime_spec(&mut config)?;
     init_logging(config.log_file.as_deref(), config.debug_log)?;
     std::fs::create_dir_all(&config.mount_path)?;

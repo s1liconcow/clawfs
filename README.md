@@ -2,6 +2,8 @@
 
 ## Persistent Volumes for Agents 
 
+> **BETA status**: ClawFS is in BETA and should be used only for non-critical data.
+>
 
 > **POSIX compliance**: ClawFS passes the [pjdfstest](https://github.com/pjd/pjdfstest) POSIX filesystem test suite.
 >
@@ -9,12 +11,32 @@
 >
 > **Linux build validation**: Linux source untar plus kernel build (`make defconfig && make -j`) passes successfully on ClawFS.
 
-ClawFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
-and payloads in a log-structured layout over an object store. Metadata lives in
-the bucket under `metadata/imaps` (immutable shard snapshots) and
+ClawFS is a persistent shared filesystem for agents, but it also works well for
+non-agentic shared-storage workloads such as developer environments, research
+pipelines, and general multi-client file access. ClawFS stores metadata and
+payloads in a log-structured layout over an object store. Metadata lives in the
+bucket under `metadata/imaps` (immutable shard snapshots) and
 `metadata/imap_deltas` (per-generation inode deltas), while large payloads are
 written to immutable segment objects under `segs/`. Deltas embed a bloom suffix
 in their object name so clients can skip unrelated updates with list-only scans.
+
+ClawFS supports access through:
+- FUSE mounts on hosts that can expose a normal filesystem mountpoint
+- user-mode NFS for networked or remote clients
+- a preload shared library for tighter in-process agent integration
+
+The preload/shared-library path is aimed at agent launchers that want normal
+file APIs without requiring a host mount. It currently targets Linux-style
+`LD_PRELOAD` flows.
+
+For the hosted demo/free journey, the intended product flow is:
+- `clawfs login`
+- sign in with email, Google, or GitHub
+- receive and store a `CLAWFS_API_TOKEN`
+- `clawfs summon demo -- <command>`
+
+That auth step exists to tie hosted demo volumes to a real account and reduce
+abuse. Purely local usage does not need the hosted auth path.
 
 ## Comparison matrix
 

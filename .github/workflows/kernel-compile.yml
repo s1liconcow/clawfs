@@ -28,36 +28,36 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build OsageFS
+      - name: Build ClawFS
         run: cargo build --release
 
-      - name: Start OsageFS
+      - name: Start ClawFS
         run: |
-          mkdir -p /tmp/osagefs-mnt /tmp/osagefs-store /tmp/osagefs-cache
+          mkdir -p /tmp/clawfs-mnt /tmp/clawfs-store /tmp/clawfs-cache
 
-          ./target/release/osagefs \
-            --mount-path /tmp/osagefs-mnt \
-            --store-path /tmp/osagefs-store \
-            --local-cache-path /tmp/osagefs-cache \
-            --state-path /tmp/osagefs-state.bin \
+          ./target/release/clawfs \
+            --mount-path /tmp/clawfs-mnt \
+            --store-path /tmp/clawfs-store \
+            --local-cache-path /tmp/clawfs-cache \
+            --state-path /tmp/clawfs-state.bin \
             --object-provider local \
             --allow-other \
             --disable-journal \
             --disable-cleanup \
             --foreground &
-          echo $! > /tmp/osagefs.pid
+          echo $! > /tmp/clawfs.pid
 
-          echo "Waiting for OsageFS mount..."
+          echo "Waiting for ClawFS mount..."
           for i in $(seq 1 30); do
-            if mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
-              echo "OsageFS is mounted"
+            if mountpoint -q /tmp/clawfs-mnt 2>/dev/null; then
+              echo "ClawFS is mounted"
               break
             fi
             sleep 1
           done
 
-          if ! mountpoint -q /tmp/osagefs-mnt 2>/dev/null; then
-            echo "OsageFS failed to mount"
+          if ! mountpoint -q /tmp/clawfs-mnt 2>/dev/null; then
+            echo "ClawFS failed to mount"
             exit 1
           fi
 
@@ -66,14 +66,14 @@ jobs:
 
       - name: Download and extract Linux kernel
         run: |
-          cd /tmp/osagefs-mnt
+          cd /tmp/clawfs-mnt
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
           tar -xf linux-6.11.tar.xz
           rm linux-6.11.tar.xz
 
       - name: Compile kernel
         run: |
-          cd /tmp/osagefs-mnt/linux-6.11
+          cd /tmp/clawfs-mnt/linux-6.11
 
           # Configure with tinyconfig for minimal build
           make tinyconfig
@@ -97,8 +97,8 @@ jobs:
         if: always()
         run: |
           cd /tmp
-          if [ -f /tmp/osagefs.pid ]; then
-            kill $(cat /tmp/osagefs.pid) || true
+          if [ -f /tmp/clawfs.pid ]; then
+            kill $(cat /tmp/clawfs.pid) || true
             sleep 2
           fi
-          sudo umount -l /tmp/osagefs-mnt || fusermount -u /tmp/osagefs-mnt || true
+          sudo umount -l /tmp/clawfs-mnt || fusermount -u /tmp/clawfs-mnt || true

@@ -22,7 +22,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build OsageFS
+      - name: Build ClawFS
         run: cargo build --release
 
       - name: Run stress E2E
