@@ -12,7 +12,7 @@ for arg in "$@"; do
       ;;
     --help|-h)
       cat <<'USAGE'
-Usage: ./scripts/replay_stress.sh [--chaos] [-- <extra osagefs_replay args>]
+Usage: ./scripts/replay_stress.sh [--chaos] [-- <extra clawfs_replay args>]
 
 Environment overrides:
   TRACE_PATH STORE_PATH LOCAL_CACHE_PATH STATE_PATH
@@ -48,9 +48,9 @@ if [[ -z "$TRACE_PATH" || ! -f "$TRACE_PATH" ]]; then
   exit 1
 fi
 
-STORE_PATH="${STORE_PATH:-/tmp/osagefs-replay-store}"
-LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/osagefs-replay-cache}"
-STATE_PATH="${STATE_PATH:-/tmp/osagefs-replay-state.bin}"
+STORE_PATH="${STORE_PATH:-/tmp/clawfs-replay-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-/tmp/clawfs-replay-cache}"
+STATE_PATH="${STATE_PATH:-/tmp/clawfs-replay-state.bin}"
 LAYER="${LAYER:-fuse}"
 ITERATIONS_SET="${ITERATIONS+x}"
 IGNORE_TIMING_SET="${IGNORE_TIMING+x}"
@@ -80,7 +80,7 @@ if [[ "$CHAOS_MODE" == "1" ]]; then
 fi
 
 CMD=(
-  cargo run --release --bin osagefs_replay -- --trace-path "$TRACE_PATH"
+  cargo run --release --bin clawfs_replay -- --trace-path "$TRACE_PATH"
   --store-path "$STORE_PATH"
   --local-cache-path "$LOCAL_CACHE_PATH"
   --state-path "$STATE_PATH"

@@ -17,20 +17,20 @@ fi
 CRITERION_DIR="$TARGET_DIR/criterion"
 CRITERION_REPORT_INDEX="$CRITERION_DIR/report/index.html"
 PERF_GUARD_PROFILE="${PERF_GUARD_PROFILE:-release}" # release|debug
-OSAGEFS_PERF_PROFILE="${OSAGEFS_PERF_PROFILE:-fast}" # fast|balanced|thorough
+CLAWFS_PERF_PROFILE="${CLAWFS_PERF_PROFILE:-fast}" # fast|balanced|thorough
 PERF_GUARD_WRITE_GRAPHS="${PERF_GUARD_WRITE_GRAPHS:-1}"
 
 rm -f "$METRICS_FILE"
 
-echo "[perf-guard] collecting perf metrics (profile=$PERF_GUARD_PROFILE, rigor=$OSAGEFS_PERF_PROFILE)"
+echo "[perf-guard] collecting perf metrics (profile=$PERF_GUARD_PROFILE, rigor=$CLAWFS_PERF_PROFILE)"
 
 (
   cd "$ROOT"
   if [[ "$PERF_GUARD_PROFILE" == "release" ]]; then
-    OSAGEFS_PERF_PROFILE="$OSAGEFS_PERF_PROFILE" OSAGEFS_BENCH_METRICS_FILE="$METRICS_FILE" \
+    CLAWFS_PERF_PROFILE="$CLAWFS_PERF_PROFILE" CLAWFS_BENCH_METRICS_FILE="$METRICS_FILE" \
       cargo bench --bench perf_local_criterion
   else
-    OSAGEFS_PERF_PROFILE="$OSAGEFS_PERF_PROFILE" OSAGEFS_BENCH_METRICS_FILE="$METRICS_FILE" \
+    CLAWFS_PERF_PROFILE="$CLAWFS_PERF_PROFILE" CLAWFS_BENCH_METRICS_FILE="$METRICS_FILE" \
       cargo bench --profile dev --bench perf_local_criterion
   fi
 )

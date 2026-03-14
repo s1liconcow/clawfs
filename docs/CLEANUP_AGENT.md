@@ -1,6 +1,6 @@
 # Cleanup Agent Deployment
 
-OsageFS coordinates background maintenance (delta compaction and segment
+ClawFS coordinates background maintenance (delta compaction and segment
 rewrites) via short leases stored in the superblock. Most clients that are
 physically close to the object store can keep the default cleanup worker
 enabled, but in multi-region deployments you may prefer to run the maintenance
@@ -11,19 +11,19 @@ your bucket.
 ## 1. Disable cleanup on remote clients
 
 All clients accept a `--disable-cleanup` flag (or `Config::disable_cleanup` via
-the library API). When set, OsageFS will skip scheduling background maintenance
+the library API). When set, ClawFS will skip scheduling background maintenance
 and will only service foreground FUSE requests. The leases remain available so a
 separate agent can continue performing compaction.
 
 ```
-osagefs --mount-path /mnt/osage \
+clawfs --mount-path /mnt/osage \
         --store-path /data/osage \
         --disable-cleanup
 ```
 
 ## 2. Build the cleanup agent (WASI/WASM)
 
-Create a lightweight Rust binary that links against `osagefs` and calls the
+Create a lightweight Rust binary that links against `clawfs` and calls the
 existing cleanup helpers (`MetadataStore::prune_deltas`,
 `perform_segment_compaction`). The example below shows the essential
 boilerplate:
@@ -45,10 +45,10 @@ async fn main() -> anyhow::Result<()> {
 Compile it to WASI for portability:
 
 ```
-cargo build --bin osagefs-cleanup-agent --target wasm32-wasi --release
+cargo build --bin clawfs-cleanup-agent --target wasm32-wasi --release
 ```
 
-Upload the resulting `osagefs-cleanup-agent.wasm` to your compute provider of
+Upload the resulting `clawfs-cleanup-agent.wasm` to your compute provider of
 choice:
 
 * **AWS Lambda** – create a Lambda function with `Runtime = provided.al2023`,
@@ -65,7 +65,7 @@ choice:
 Whichever platform you choose, make sure the agent
 
 1. Mounts or otherwise reaches the backing object-store path (e.g., by attaching
-   the same service account credentials used by OsageFS).
+   the same service account credentials used by ClawFS).
 2. Sets `DISABLE_CLEANUP=true` on the user-facing clients so only the agent
    holds maintenance leases.
 3. Runs on a schedule (e.g., Cloudflare cron trigger, AWS EventBridge rule) or as
@@ -80,6 +80,6 @@ Whichever platform you choose, make sure the agent
   Since leases are stored in the superblock, clients can also inspect the `cleanup_leases`
   array to confirm which agent is active.
 
-With this setup, regional clients can mount OsageFS with
+With this setup, regional clients can mount ClawFS with
 `--disable-cleanup` so they never upload maintenance traffic across regions,
 while a small WASI agent runs in-region to keep metadata tidy.

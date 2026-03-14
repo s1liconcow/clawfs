@@ -6,7 +6,7 @@ source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
 TARGET_DIR="$ROOT_DIR/target/release"
-OSAGE_BIN="$TARGET_DIR/osagefs"
+OSAGE_BIN="$TARGET_DIR/clawfs"
 
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"
@@ -24,7 +24,7 @@ usage() {
   cat <<USAGE
 Usage: ${0##*/} [--no_cleanup]
 
-  --no_cleanup   Leave OsageFS mounted and running after the script finishes.
+  --no_cleanup   Leave ClawFS mounted and running after the script finishes.
   --skip_extract Skip tar extraction and reuse linux-\$LINUX_VERSION already in WORKDIR.
   --reuse_tree   Reuse existing mount/store and extracted tree for faster reruns.
 USAGE
@@ -66,7 +66,7 @@ cleanup_mounts() {
     STORE_PATH="$STORE_PATH" \
     LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
     STATE_PATH="$STATE_PATH" \
-    LOG_FILE="$ROOT_DIR/osagefs.log" \
+    LOG_FILE="$ROOT_DIR/clawfs.log" \
     PERF_LOG_PATH="$PERF_LOG_PATH" \
     "$RUN_CLEANUP" >/dev/null 2>&1 || true
   mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH"
@@ -103,7 +103,7 @@ if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/nul
   osage_require_cmd umount
 fi
 if ps -ef | grep -E "[o]sagefs(.| )*--mount-path[[:space:]]+$MOUNT_PATH" >/dev/null 2>&1; then
-  echo "osagefs already running for mount $MOUNT_PATH" >&2
+  echo "clawfs already running for mount $MOUNT_PATH" >&2
   echo "Stop existing daemon first, or use a different MOUNT_PATH." >&2
   exit 1
 fi
@@ -135,7 +135,7 @@ fi
 
 osage_ensure_release_binary "$OSAGE_BIN"
 
-echo "Starting OsageFS..."
+echo "Starting ClawFS..."
 CMD=(
   "$OSAGE_BIN"
   --mount-path "$MOUNT_PATH"
@@ -161,7 +161,7 @@ if [[ "$OBJECT_PROVIDER" == "aws" ]]; then
     CMD+=(--region "$AWS_REGION")
   fi
   if [[ ! " ${EXTRA_FLAGS[*]:-} " =~ " --bucket " ]]; then
-      CMD+=(--bucket "${AWS_BUCKET:-osagefs-bucket}")
+      CMD+=(--bucket "${AWS_BUCKET:-clawfs-bucket}")
   fi
 else
   CMD+=(--object-provider local)
@@ -178,7 +178,7 @@ fi
 OSAGE_PID=$!
 sleep 2
 if ! kill -0 "$OSAGE_PID" >/dev/null 2>&1; then
-  echo "osagefs exited during startup; see log at $ROOT_DIR/osagefs.log" >&2
+  echo "clawfs exited during startup; see log at $ROOT_DIR/clawfs.log" >&2
   exit 1
 fi
 osage_assert_mount_accessible "$MOUNT_PATH"
@@ -217,6 +217,6 @@ if [[ $DO_CLEANUP -eq 1 ]]; then
   kill "$OSAGE_PID" >/dev/null 2>&1 || true
   cleanup_mounts
 else
-  echo "Leaving OsageFS running (PID $OSAGE_PID). Mount available at $MOUNT_PATH"
+  echo "Leaving ClawFS running (PID $OSAGE_PID). Mount available at $MOUNT_PATH"
   echo "To stop it manually: kill $OSAGE_PID && fusermount -u $MOUNT_PATH"
 fi

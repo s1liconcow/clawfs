@@ -4,8 +4,8 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-NFS_LOG_FILE="${NFS_LOG_FILE:-$PWD/osagefs-nfs-gateway.log}"
-NFS_GATEWAY_PID_FILE="${NFS_GATEWAY_PID_FILE:-/tmp/osagefs-nfs-gateway.pid}"
+NFS_LOG_FILE="${NFS_LOG_FILE:-$PWD/clawfs-nfs-gateway.log}"
+NFS_GATEWAY_PID_FILE="${NFS_GATEWAY_PID_FILE:-/tmp/clawfs-nfs-gateway.pid}"
 
 is_mounted() {
   local path="$1"
@@ -57,8 +57,8 @@ kill_pidfile_process() {
   fi
 }
 
-kill_pidfile_process "$NFS_GATEWAY_PID_FILE" "osagefs-nfs-gateway"
-pkill -f osagefs-nfs-gateway 2>/dev/null || true
+kill_pidfile_process "$NFS_GATEWAY_PID_FILE" "clawfs-nfs-gateway"
+pkill -f clawfs-nfs-gateway 2>/dev/null || true
 
 if is_mounted "$MOUNT_PATH"; then
   echo "Unmounting $MOUNT_PATH ..."

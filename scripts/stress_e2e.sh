@@ -4,8 +4,8 @@ set -eEuo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-PID_FILE="${PID_FILE:-/tmp/osagefs-stress.pid}"
-OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_osagefs.sh}"
+PID_FILE="${PID_FILE:-/tmp/clawfs-stress.pid}"
+OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_clawfs.sh}"
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REF_DIR=""
@@ -47,7 +47,7 @@ ensure_daemon_alive() {
   local pid
   pid=$(cat "$PID_FILE")
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "osagefs PID $pid not running during $phase" >&2
+    echo "clawfs PID $pid not running during $phase" >&2
     exit 1
   fi
 }
@@ -74,7 +74,7 @@ cleanup() {
   if [[ -f "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
-      echo "Stopping osagefs PID $PID"
+      echo "Stopping clawfs PID $PID"
       kill "$PID"
       wait "$PID" 2>/dev/null || true
     fi
@@ -100,11 +100,11 @@ fi
 if [[ -s "$PID_FILE" ]]; then
   PID=$(cat "$PID_FILE")
   if ! kill -0 "$PID" 2>/dev/null; then
-    echo "osagefs PID $PID not running" >&2
+    echo "clawfs PID $PID not running" >&2
     exit 1
   fi
 else
-  echo "Warning: PID file $PID_FILE missing; continue if you started osagefs manually."
+  echo "Warning: PID file $PID_FILE missing; continue if you started clawfs manually."
 fi
 
 osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
@@ -167,7 +167,7 @@ run_workload() {
 WORKDIR="$MOUNT_PATH/home/${USER:-$(whoami)}/stress"
 run_workload "$WORKDIR" 1
 
-REF_DIR=$(mktemp -d /tmp/osagefs-stress-ref.XXXXXX)
+REF_DIR=$(mktemp -d /tmp/clawfs-stress-ref.XXXXXX)
 run_workload "$REF_DIR" 0
 
 diff -ruN "$REF_DIR" "$WORKDIR"

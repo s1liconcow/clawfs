@@ -316,7 +316,7 @@ mod tests {
             imap_delta_batch: 32,
             writeback_cache: false,
             fuse_threads: 0,
-            fuse_fsname: "osagefs".to_string(),
+            fuse_fsname: "clawfs".to_string(),
         }
     }
 

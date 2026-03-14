@@ -1,6 +1,6 @@
 # FIO Workloads and Optimization Ideas
 
-This note maps `scripts/fio_workloads.sh` results to likely OsageFS bottlenecks and practical tuning knobs.
+This note maps `scripts/fio_workloads.sh` results to likely ClawFS bottlenecks and practical tuning knobs.
 
 ## Workload intent
 

@@ -4,17 +4,17 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, PlottingBackend, Throughput};
-use osagefs::codec::{InlineCodecConfig, encode_inline_storage};
-use osagefs::inode::{InodeKind, InodeRecord};
-use osagefs::journal::{JournalEntry, JournalManager, JournalPayload};
-use osagefs::metadata::MetadataStore;
-use osagefs::perf_bench::{
+use clawfs::codec::{InlineCodecConfig, encode_inline_storage};
+use clawfs::inode::{InodeKind, InodeRecord};
+use clawfs::journal::{JournalEntry, JournalManager, JournalPayload};
+use clawfs::metadata::MetadataStore;
+use clawfs::perf_bench::{
     PerfStats, generate_incompressible_payload, make_file_record, make_large_directory_record,
     perf_config, summarize_samples,
 };
-use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload};
-use osagefs::superblock::SuperblockManager;
+use clawfs::segment::{SegmentEntry, SegmentManager, SegmentPayload};
+use clawfs::superblock::SuperblockManager;
+use criterion::{Criterion, PlottingBackend, Throughput};
 use serde_json::json;
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
@@ -37,7 +37,7 @@ fn guard_metrics() -> &'static Mutex<GuardMetrics> {
 }
 
 fn perf_profile() -> String {
-    std::env::var("OSAGEFS_PERF_PROFILE").unwrap_or_else(|_| "fast".to_string())
+    std::env::var("CLAWFS_PERF_PROFILE").unwrap_or_else(|_| "fast".to_string())
 }
 
 fn configured_criterion() -> Criterion {
@@ -92,7 +92,7 @@ where
 }
 
 fn write_guard_metrics_if_requested() {
-    let Some(path) = std::env::var_os("OSAGEFS_BENCH_METRICS_FILE") else {
+    let Some(path) = std::env::var_os("CLAWFS_BENCH_METRICS_FILE") else {
         return;
     };
     let metrics = guard_metrics().lock().expect("guard metric mutex");

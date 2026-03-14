@@ -4,9 +4,9 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-OSAGE_BIN="$ROOT_DIR/target/release/osagefs"
+OSAGE_BIN="$ROOT_DIR/target/release/clawfs"
 
-PID_FILE="${PID_FILE:-/tmp/osagefs.pid}"
+PID_FILE="${PID_FILE:-/tmp/clawfs.pid}"
 FOREGROUND="${FOREGROUND:-0}"
 DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
 DEBUG_LOG="${DEBUG_LOG:-0}"
@@ -18,13 +18,13 @@ INLINE_COMPRESSION="${INLINE_COMPRESSION:-true}"
 FUSE_THREADS="${FUSE_THREADS:-4}"
 NO_WRITEBACK_CACHE="${NO_WRITEBACK_CACHE:-0}"
 HEAPTRACK="${HEAPTRACK:-0}"
-HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$ROOT_DIR/heaptrack/heaptrack.osagefs.%p}"
+HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$ROOT_DIR/heaptrack/heaptrack.clawfs.%p}"
 HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
 HEAPTRACK_EXTRA_ARGS="${HEAPTRACK_EXTRA_ARGS:-}"
 
-echo "Ensuring osagefs binary is up to date..."
-(cd "$ROOT_DIR" && cargo build --release --bin osagefs)
-OSAGE_BIN="$(cd "$(dirname "$OSAGE_BIN")" && pwd)/osagefs"
+echo "Ensuring clawfs binary is up to date..."
+(cd "$ROOT_DIR" && cargo build --release --bin clawfs)
+OSAGE_BIN="$(cd "$(dirname "$OSAGE_BIN")" && pwd)/clawfs"
 echo "Using binary: $OSAGE_BIN"
 
 mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH" "$(dirname "$STATE_PATH")"
@@ -67,9 +67,9 @@ if [[ "$OBJECT_PROVIDER" == "aws" ]]; then
   if [[ -n "${AWS_REGION:-}" ]]; then
     CMD+=(--region "$AWS_REGION")
   fi
-  # Check AWS_BUCKET env var, then fallback to osagefs-bucket if not passed in EXTRA_ARGS.
-  if [[ ! " ${OSAGEFS_EXTRA_ARGS:-} " =~ " --bucket " ]]; then
-      _BUCKET="${AWS_BUCKET:-osagefs-bucket}"
+  # Check AWS_BUCKET env var, then fallback to clawfs-bucket if not passed in EXTRA_ARGS.
+  if [[ ! " ${CLAWFS_EXTRA_ARGS:-} " =~ " --bucket " ]]; then
+      _BUCKET="${AWS_BUCKET:-clawfs-bucket}"
       CMD+=(--bucket "$_BUCKET")
   fi
 else
@@ -87,7 +87,7 @@ if [[ "$OBJECT_PROVIDER" == "aws" ]] && [[ -n "${AWS_ENDPOINT_URL_S3:-}" ]]; the
           fi
       done
   fi
-  _BUCKET="${_BUCKET:-osagefs-bucket}"
+  _BUCKET="${_BUCKET:-clawfs-bucket}"
 
 
   echo "Ensuring S3 bucket '$_BUCKET' exists at $AWS_ENDPOINT_URL_S3 ..."
@@ -101,7 +101,7 @@ import os
 import urllib.request
 import sys
 
-bucket = os.environ.get("_BUCKET", "osagefs-bucket")
+bucket = os.environ.get("_BUCKET", "clawfs-bucket")
 endpoint = os.environ.get("AWS_ENDPOINT_URL_S3")
 access_key = os.environ.get("AWS_ACCESS_KEY_ID")
 secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
@@ -157,8 +157,8 @@ if osage_is_true "${WRITEBACK_CACHE:-}"; then
   CMD+=(--writeback-cache)
 fi
 # Allow callers to inject additional CLI flags (e.g. --pending-bytes, --flush-interval-ms).
-if [[ -n "${OSAGEFS_EXTRA_ARGS:-}" ]]; then
-  read -ra _extra <<< "$OSAGEFS_EXTRA_ARGS"
+if [[ -n "${CLAWFS_EXTRA_ARGS:-}" ]]; then
+  read -ra _extra <<< "$CLAWFS_EXTRA_ARGS"
   CMD+=("${_extra[@]}")
 fi
 
@@ -198,4 +198,4 @@ if ! osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"; then
   rm -f "$PID_FILE"
   exit 1
 fi
-echo "osagefs running as PID $PID (log: $LOG_FILE, pid file: $PID_FILE)"
+echo "clawfs running as PID $PID (log: $LOG_FILE, pid file: $PID_FILE)"

@@ -1,4 +1,4 @@
-# OsageFS Sprites
+# ClawFS Sprites
 
 ## Goal
 Privileged execution must happen inside a Fly.io Sprite VM, not locally.
@@ -35,20 +35,20 @@ For multi-sprite setups, append `-${ROLE_SLUG}-${NAME_HASH}`. Suggested role slu
 
 ## Sync Code Into A Sprite
 ```bash
-tar -czf - . | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/osagefs && mkdir -p /work/osagefs && tar -xzf - -C /work/osagefs'
+tar -czf - . | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/clawfs && mkdir -p /work/clawfs && tar -xzf - -C /work/clawfs'
 ```
 
 ## Common Workflows
-- Smoke build: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && cargo build --release && ./target/release/osagefs --help >/dev/null'`
-- E2E: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && ./scripts/stress_e2e.sh'`
-- Fio: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/osagefs && RESULTS_DIR=/work/osagefs/fio-results/compact LOG_FILE=/work/osagefs/osagefs.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl RUNTIME_SEC=5 SEQ_SIZE=64M RAND_SIZE=64M RAND_NUMJOBS=2 RAND_IODEPTH=8 SMALLFILE_COUNT=200 SMALLFILE_NUMJOBS=4 SMALLFILE_SIZE=8k ./scripts/fio_workloads.sh'`
+- Smoke build: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && cargo build --release && ./target/release/clawfs --help >/dev/null'`
+- E2E: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && ./scripts/stress_e2e.sh'`
+- Fio: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && RESULTS_DIR=/work/clawfs/fio-results/compact LOG_FILE=/work/clawfs/clawfs.log PERF_LOG_PATH=/work/clawfs/clawfs-perf.jsonl RUNTIME_SEC=5 SEQ_SIZE=64M RAND_SIZE=64M RAND_NUMJOBS=2 RAND_IODEPTH=8 SMALLFILE_COUNT=200 SMALLFILE_NUMJOBS=4 SMALLFILE_SIZE=8k ./scripts/fio_workloads.sh'`
 
 ## Troubleshooting
 Collect these on failure:
 
 ```bash
-sprite exec -s "$SPRITE_NAME" -- bash -lc 'tail -n 200 /work/osagefs/osagefs.log || true'
-sprite exec -s "$SPRITE_NAME" -- bash -lc 'ps -ef | rg osagefs || true; mount | rg /tmp/osagefs-mnt || true'
+sprite exec -s "$SPRITE_NAME" -- bash -lc 'tail -n 200 /work/clawfs/clawfs.log || true'
+sprite exec -s "$SPRITE_NAME" -- bash -lc 'ps -ef | rg clawfs || true; mount | rg /tmp/clawfs-mnt || true'
 sprite exec -s "$SPRITE_NAME" -- bash -lc 'dmesg | tail -200 || true'
 ```
 

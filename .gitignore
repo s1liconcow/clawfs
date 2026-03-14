@@ -10,3 +10,4 @@ micro-results-*
 pjdfstest_*
 fio-results-*
 scripts/__pycache__
+clawfs-nfs-gateway/target

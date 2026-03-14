@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyze OsageFS perf JSONL logs.
+Analyze ClawFS perf JSONL logs.
 
 Focuses on `flush_pending` by default and reports:
 - basic duration stats
@@ -194,7 +194,7 @@ def show_top_events(events: list[dict[str, Any]], top_n: int) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze OsageFS perf JSONL logs")
+    parser = argparse.ArgumentParser(description="Analyze ClawFS perf JSONL logs")
     parser.add_argument(
         "--log",
         default="perf-log.jsonl",

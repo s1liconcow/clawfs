@@ -10,7 +10,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Thread-safe JSONL logger for capturing perf events emitted by OsageFS.
+/// Thread-safe JSONL logger for capturing perf events emitted by ClawFS.
 pub struct PerfLogger {
     writer: Mutex<BufWriter<File>>,
 }

@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, ValueEnum};
 
-/// CLI configuration for launching OsageFS.
+/// CLI configuration for launching ClawFS.
 #[derive(Parser, Debug)]
-#[command(name = "osagefs", version, about = "OsageFS FUSE client")]
+#[command(name = "clawfs", version, about = "ClawFS FUSE client")]
 pub struct Cli {
     /// Path where the FUSE filesystem should be mounted.
     #[arg(long, value_name = "PATH")]
@@ -14,7 +14,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub store_path: PathBuf,
 
-    /// Path on the local filesystem for client-side caches/journals (defaults to ~/.osagefs/cache).
+    /// Path on the local filesystem for client-side caches/journals (defaults to ~/.clawfs/cache).
     #[arg(long, value_name = "PATH")]
     pub local_cache_path: Option<PathBuf>,
 
@@ -38,7 +38,7 @@ pub struct Cli {
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Prefix within the bucket/object store where OsageFS data is written.
+    /// Prefix within the bucket/object store where ClawFS data is written.
     #[arg(long, default_value = "")]
     pub object_prefix: String,
 
@@ -190,7 +190,7 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub allow_other: bool,
 
-    /// Optional path where structured logs should be written (defaults to osagefs.log).
+    /// Optional path where structured logs should be written (defaults to clawfs.log).
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
@@ -221,7 +221,7 @@ pub struct Cli {
     pub entry_ttl_secs: u64,
 
     /// Filesystem name reported to the kernel mount table.
-    #[arg(long, default_value = "osagefs")]
+    #[arg(long, default_value = "clawfs")]
     pub fuse_fsname: String,
 }
 
@@ -297,7 +297,7 @@ impl From<Cli> for Config {
         let log_file = cli
             .log_file
             .clone()
-            .or_else(|| Some(PathBuf::from("osagefs.log")));
+            .or_else(|| Some(PathBuf::from("clawfs.log")));
         let store_path = cli.store_path;
         let local_cache_path = cli
             .local_cache_path
@@ -369,7 +369,7 @@ impl From<Cli> for Config {
             fuse_threads: cli.fuse_threads,
             entry_ttl_secs: cli.entry_ttl_secs,
             fuse_fsname: if cli.fuse_fsname.trim().is_empty() {
-                "osagefs".to_string()
+                "clawfs".to_string()
             } else {
                 cli.fuse_fsname
             },
@@ -381,7 +381,7 @@ fn default_user_config_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".osagefs")
+        .join(".clawfs")
 }
 
 fn default_state_path(root: &Path) -> PathBuf {
@@ -398,7 +398,7 @@ fn default_fuse_threads() -> usize {
         .unwrap_or(1)
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ObjectStoreProvider {
     Local,
     Aws,

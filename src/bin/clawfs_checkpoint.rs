@@ -4,14 +4,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::runtime::Handle;
 
-use osagefs::checkpoint::{create_checkpoint, restore_checkpoint};
-use osagefs::config::{Config, ObjectStoreProvider};
+use clawfs::checkpoint::{create_checkpoint, restore_checkpoint};
+use clawfs::config::{Config, ObjectStoreProvider};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "osagefs_checkpoint",
+    name = "clawfs_checkpoint",
     version,
-    about = "Create and restore OsageFS superblock checkpoints"
+    about = "Create and restore ClawFS superblock checkpoints"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -88,9 +88,9 @@ async fn main() -> Result<()> {
 
 fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> Config {
     Config {
-        mount_path: PathBuf::from("/tmp/osagefs_checkpoint_mnt"),
+        mount_path: PathBuf::from("/tmp/clawfs_checkpoint_mnt"),
         store_path,
-        local_cache_path: PathBuf::from("/tmp/osagefs_checkpoint_cache"),
+        local_cache_path: PathBuf::from("/tmp/clawfs_checkpoint_cache"),
         log_storage_io,
         inline_threshold: 4096,
         inline_compression: true,
@@ -112,7 +112,7 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         aws_allow_http: false,
         aws_force_path_style: false,
         source: None,
-        state_path: PathBuf::from("/tmp/osagefs_checkpoint_state"),
+        state_path: PathBuf::from("/tmp/clawfs_checkpoint_state"),
         perf_log: None,
         replay_log: None,
         disable_journal: true,
@@ -130,6 +130,6 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         imap_delta_batch: 32,
         writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "osagefs".to_string(),
+        fuse_fsname: "clawfs".to_string(),
     }
 }

@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use lru::LruCache;
 
+use crate::clawfs;
 use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{InlinePayloadCodec, SegmentExtent};
@@ -187,18 +188,21 @@ impl SegmentManager {
                     builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
                 }
 
-                if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+                if let Some(key) = clawfs::aws_access_key_id() {
                     builder = builder.with_access_key_id(key);
                 }
-                if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+                if let Some(secret) = clawfs::aws_secret_access_key() {
                     builder = builder.with_secret_access_key(secret);
+                }
+                if let Some(token) = clawfs::aws_session_token() {
+                    builder = builder.with_token(token);
                 }
 
                 if config.aws_allow_http {
                     builder = builder.with_allow_http(true);
                     // If no credentials in environment, provide dummy ones to satisfy the client and bypass IMDS lookup
-                    if std::env::var("AWS_ACCESS_KEY_ID").is_err()
-                        && std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+                    if clawfs::aws_access_key_id().is_none()
+                        && clawfs::aws_secret_access_key().is_none()
                     {
                         error!(
                             "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set; using dummy credentials for --aws-allow-http to bypass IMDS"
@@ -1355,7 +1359,7 @@ mod tests {
             imap_delta_batch: 32,
             writeback_cache: false,
             fuse_threads: 0,
-            fuse_fsname: "osagefs".into(),
+            fuse_fsname: "clawfs".into(),
             log_storage_io: false,
         }
     }

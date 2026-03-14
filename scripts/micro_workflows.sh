@@ -10,16 +10,16 @@ fi
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-PID_FILE="${PID_FILE:-/tmp/osagefs-micro.pid}"
+PID_FILE="${PID_FILE:-/tmp/clawfs-micro.pid}"
 TRANSPORT="${TRANSPORT:-fuse}" # fuse|nfs
 if [[ "$TRANSPORT" == "nfs" ]]; then
   OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_nfs_gateway.sh}"
 else
-  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_osagefs.sh}"
+  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_clawfs.sh}"
 fi
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/micro-results-$(date +%Y%m%d-%H%M%S)}"
-LOCAL_BASE="${LOCAL_BASE:-/tmp/osagefs-micro-local}"
+LOCAL_BASE="${LOCAL_BASE:-/tmp/clawfs-micro-local}"
 OSAGE_BASE_SUBDIR="${OSAGE_BASE_SUBDIR:-home/${USER:-$(whoami)}/micro}"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
@@ -29,7 +29,7 @@ TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
 # NFS transport knobs
 NFS_LISTEN="${NFS_LISTEN:-0.0.0.0:2049}"
 NFS_MOUNT_PATH="${NFS_MOUNT_PATH:-$MOUNT_PATH}"
-NFS_LOG_FILE="${NFS_LOG_FILE:-$ROOT_DIR/osagefs-nfs-gateway.log}"
+NFS_LOG_FILE="${NFS_LOG_FILE:-$ROOT_DIR/clawfs-nfs-gateway.log}"
 
 # Workload knobs (default to moderate intensity for clearer perf signal)
 SMALLFILE_COUNT="${SMALLFILE_COUNT:-5000}"
@@ -66,7 +66,7 @@ AI_MAX_BATCHES="${AI_MAX_BATCHES:-30}"
 AI_BATCH_SIZE="${AI_BATCH_SIZE:-32}"
 AI_NUM_WORKERS="${AI_NUM_WORKERS:-2}"
 AI_SUBSET_IMAGES="${AI_SUBSET_IMAGES:-4000}"
-AI_DATASET_CACHE_DIR="${AI_DATASET_CACHE_DIR:-/tmp/osagefs-imagenette-cache}"
+AI_DATASET_CACHE_DIR="${AI_DATASET_CACHE_DIR:-/tmp/clawfs-imagenette-cache}"
 
 QUICK_TEST_NAMES=(
   dev_smallfile_burst
@@ -208,7 +208,7 @@ require_tools() {
     ensure_cmd pip3 python3-pip || { echo "Missing dependency: pip3/python3-pip" >&2; exit 1; }
   fi
 
-  # Only required when mounting OsageFS.
+  # Only required when mounting ClawFS.
   if [[ "$MODE" == "both" || "$MODE" == "osage" ]]; then
     if [[ "$TRANSPORT" == "nfs" ]]; then
       # NFS transport needs mount.nfs (nfs-common on Debian/Ubuntu).
@@ -853,10 +853,10 @@ optional_build_probe() {
   local target_dir="$DEV_BUILD_TARGET_DIR"
   local jobs="$DEV_BUILD_CARGO_JOBS"
   local incremental="$DEV_BUILD_INCREMENTAL"
-  if [[ -z "$target_dir" && "$fs_type" == "osagefs" && "$DEV_BUILD_SPRITE_WORKAROUND" == "1" ]]; then
+  if [[ -z "$target_dir" && "$fs_type" == "clawfs" && "$DEV_BUILD_SPRITE_WORKAROUND" == "1" ]]; then
     # rustc mmap's .rmeta files; FUSE mmap semantics are broken and cause SIGBUS.
     # Redirect build artifacts off the FUSE mount regardless of environment.
-    target_dir="/tmp/osagefs-rust-target-shared"
+    target_dir="/tmp/clawfs-rust-target-shared"
   fi
   if [[ -z "$jobs" && "$target_dir" == /tmp/* ]]; then
     jobs=1
@@ -947,12 +947,12 @@ for r in rows:
         bad.append(r)
 
 lines = []
-lines.append("# OsageFS Micro Workflow Results")
+lines.append("# ClawFS Micro Workflow Results")
 lines.append("")
-lines.append("| test | osagefs_s | local_s | local/osagefs |")
+lines.append("| test | clawfs_s | local_s | local/clawfs |")
 lines.append("|---|---:|---:|---:|")
 for test in sorted(by_test):
-    osage = by_test[test].get("osagefs")
+    osage = by_test[test].get("clawfs")
     local = by_test[test].get("local")
     if osage is None and local is None:
         continue
@@ -990,7 +990,7 @@ main() {
   fi
 
   if [[ "$MODE" == "both" || "$MODE" == "osage" ]]; then
-    run_suite_for_fs "osagefs" "$effective_mount/$OSAGE_BASE_SUBDIR"
+    run_suite_for_fs "clawfs" "$effective_mount/$OSAGE_BASE_SUBDIR"
   fi
 
   if [[ "$MODE" == "both" || "$MODE" == "local" ]]; then

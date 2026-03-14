@@ -8,16 +8,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use clawfs::config::{Config, ObjectStoreProvider};
+use clawfs::fs::OsageFs;
+use clawfs::inode::{InodeRecord, ROOT_INODE};
+use clawfs::journal::JournalManager;
+use clawfs::metadata::MetadataStore;
+use clawfs::segment::SegmentManager;
+use clawfs::state::ClientStateManager;
+use clawfs::superblock::SuperblockManager;
 use flate2::read::MultiGzDecoder;
 use libc::ENOENT;
-use osagefs::config::{Config, ObjectStoreProvider};
-use osagefs::fs::OsageFs;
-use osagefs::inode::{InodeRecord, ROOT_INODE};
-use osagefs::journal::JournalManager;
-use osagefs::metadata::MetadataStore;
-use osagefs::segment::SegmentManager;
-use osagefs::state::ClientStateManager;
-use osagefs::superblock::SuperblockManager;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
@@ -25,9 +25,9 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 
 const WELCOME_FILENAME: &str = "WELCOME.txt";
-const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
+const WELCOME_CONTENT: &str = "Welcome to ClawFS!\n\
 \n\
-OsageFS is a log-structured, object-store-backed filesystem designed for fast,\n\
+ClawFS is a log-structured, object-store-backed filesystem designed for fast,\n\
 shared access to large working sets with durable metadata and batched writes.\n\
 \n\
 Great use cases:\n\
@@ -40,11 +40,11 @@ Why teams use it:\n\
 - Batched metadata updates for lower API overhead\n\
 - Local staging, caching, and journal replay for practical durability and speed\n\
 \n\
-Enjoy building on OsageFS.\n";
+Enjoy building on ClawFS.\n";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "osagefs-replay",
+    name = "clawfs-replay",
     version,
     about = "Replay io traces directly through OsageFs API"
 )]
@@ -418,7 +418,7 @@ fn build_config(
     state_path: &Path,
 ) -> Config {
     Config {
-        mount_path: PathBuf::from("/tmp/osagefs-replay-unused-mount"),
+        mount_path: PathBuf::from("/tmp/clawfs-replay-unused-mount"),
         store_path: store_path.to_path_buf(),
         local_cache_path: cache_path.to_path_buf(),
         log_storage_io: false,
@@ -460,7 +460,7 @@ fn build_config(
         imap_delta_batch: effective.imap_delta_batch,
         writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "osagefs".to_string(),
+        fuse_fsname: "clawfs".to_string(),
     }
 }
 
@@ -942,7 +942,7 @@ fn default_user_config_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".osagefs")
+        .join(".clawfs")
 }
 
 async fn ensure_root(

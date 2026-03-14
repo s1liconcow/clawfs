@@ -4,8 +4,8 @@ set -eEuo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-PID_FILE="${PID_FILE:-/tmp/osagefs-fio.pid}"
-OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_osagefs.sh}"
+PID_FILE="${PID_FILE:-/tmp/clawfs-fio.pid}"
+OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_clawfs.sh}"
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 
 DISABLE_JOURNAL="${DISABLE_JOURNAL:-1}"
@@ -24,12 +24,12 @@ SMALLFILE_COUNT="${SMALLFILE_COUNT:-4000}"
 SMALLFILE_SIZE="${SMALLFILE_SIZE:-16k}"
 SMALLFILE_NUMJOBS="${SMALLFILE_NUMJOBS:-8}"
 WORKLOADS="${WORKLOADS:-all}"
- # OsageFS tuning for benchmark workloads.
+ # ClawFS tuning for benchmark workloads.
 PENDING_BYTES="${PENDING_BYTES:-$((1024*1024*128))}"       # 128 MiB — fewer flushes, fewer extents
 FLUSH_INTERVAL_MS="${FLUSH_INTERVAL_MS:-0}"  # Disable for testing
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/fio-results-$(date +%Y%m%d-%H%M%S)}"
 HEAPTRACK="${HEAPTRACK:-0}"
-HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$RESULTS_DIR/heaptrack/heaptrack.osagefs.%p}"
+HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$RESULTS_DIR/heaptrack/heaptrack.clawfs.%p}"
 HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
 HEAPTRACK_EXTRA_ARGS="${HEAPTRACK_EXTRA_ARGS:-}"
 
@@ -101,7 +101,7 @@ if ! osage_is_true "$SKIP_OSAGE"; then
   HEAPTRACK_EXTRA_ARGS="$HEAPTRACK_EXTRA_ARGS" \
   SEGMENT_COMPRESSION=false \
   INLINE_COMPRESSION=false \
-  OSAGEFS_EXTRA_ARGS="--pending-bytes $PENDING_BYTES --flush-interval-ms $FLUSH_INTERVAL_MS" \
+  CLAWFS_EXTRA_ARGS="--pending-bytes $PENDING_BYTES --flush-interval-ms $FLUSH_INTERVAL_MS" \
   OBJECT_PROVIDER="${OBJECT_PROVIDER:-local}" \
   AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
   AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \

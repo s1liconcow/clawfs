@@ -11,8 +11,8 @@ Usage:
   scripts/checkpoint.sh restore
 
 Environment:
-  STORE_PATH        Backing store root (default: /tmp/osagefs-store)
-  MOUNT_PATH        Mount path to check for active mount (default: /tmp/osagefs-mnt)
+  STORE_PATH        Backing store root (default: /tmp/clawfs-store)
+  MOUNT_PATH        Mount path to check for active mount (default: /tmp/clawfs-mnt)
   CHECKPOINT_PATH   Checkpoint file path (default: $STORE_PATH/checkpoints/latest.bin)
   SHARD_SIZE        Metadata shard size for store open (default: 2048)
   LOG_STORAGE_IO    1/true to enable metadata backing IO logs during operation
@@ -39,7 +39,7 @@ CHECKPOINT_PATH="${CHECKPOINT_PATH:-$STORE_PATH/checkpoints/latest.bin}"
 SHARD_SIZE="${SHARD_SIZE:-2048}"
 LOG_STORAGE_IO="${LOG_STORAGE_IO:-0}"
 FORCE="${FORCE:-0}"
-CHECKPOINT_BIN="$ROOT_DIR/target/release/osagefs_checkpoint"
+CHECKPOINT_BIN="$ROOT_DIR/target/release/clawfs_checkpoint"
 
 if ! osage_is_true "$FORCE"; then
   if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$MOUNT_PATH"; then
@@ -49,8 +49,8 @@ if ! osage_is_true "$FORCE"; then
   fi
 
   if ps -ef | rg -q "[o]sagefs.*--store-path[[:space:]]+$STORE_PATH"; then
-    echo "Refusing to run while an osagefs process appears to use STORE_PATH=$STORE_PATH" >&2
-    echo "Stop osagefs first, or set FORCE=1 to bypass." >&2
+    echo "Refusing to run while an clawfs process appears to use STORE_PATH=$STORE_PATH" >&2
+    echo "Stop clawfs first, or set FORCE=1 to bypass." >&2
     exit 1
   fi
 fi

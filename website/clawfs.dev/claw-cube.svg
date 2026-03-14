@@ -1,0 +1,204 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-labelledby="title desc">
+  <title id="title">Lobster mascot carrying a large data cube</title>
+  <desc id="desc">A rounded lobster mascot carries a glowing data cube with a gentle floating animation.</desc>
+  <defs>
+    <linearGradient id="lobsterGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff6d58"/>
+      <stop offset="55%" stop-color="#d84432"/>
+      <stop offset="100%" stop-color="#a52b1f"/>
+    </linearGradient>
+    <linearGradient id="cubeFaceA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fff6d7"/>
+      <stop offset="100%" stop-color="#f1c76d"/>
+    </linearGradient>
+    <linearGradient id="cubeFaceB" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f6d99a"/>
+      <stop offset="100%" stop-color="#d99e3f"/>
+    </linearGradient>
+    <linearGradient id="cubeFaceC" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffe8b1"/>
+      <stop offset="100%" stop-color="#e7b252"/>
+    </linearGradient>
+    <radialGradient id="cubeGlow" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#fff9e3" stop-opacity="1"/>
+      <stop offset="55%" stop-color="#f0be5a" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#f0be5a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20"/>
+    </filter>
+    <style>
+      .orbit {
+        fill: none;
+        stroke: #a36d37;
+        stroke-opacity: 0.18;
+        stroke-width: 5;
+        stroke-dasharray: 10 15;
+      }
+      .cube-outline {
+        fill: none;
+        stroke: #fff4d3;
+        stroke-width: 5;
+        stroke-linejoin: round;
+        stroke-linecap: round;
+      }
+      .cube-grid {
+        fill: none;
+        stroke: #fff2c7;
+        stroke-opacity: 0.55;
+        stroke-width: 3;
+        stroke-linecap: round;
+      }
+      .node {
+        fill: #fff9e5;
+      }
+      .lobster {
+        fill: url(#lobsterGradient);
+      }
+      .appendage {
+        fill: url(#lobsterGradient);
+        stroke: rgba(255, 214, 170, 0.42);
+        stroke-width: 3;
+        stroke-linejoin: round;
+      }
+      .antenna {
+        fill: none;
+        stroke: #ff8b74;
+        stroke-width: 4;
+        stroke-linecap: round;
+      }
+      .eye {
+        fill: #0b0d13;
+      }
+      .eye-glow {
+        fill: #00e5cc;
+      }
+      @keyframes mascotFloat {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-10px); }
+      }
+      @keyframes clawBounceLeft {
+        0%, 100% { transform: rotate(-3deg) translateX(0); }
+        50% { transform: rotate(3deg) translateX(-4px); }
+      }
+      @keyframes clawBounceRight {
+        0%, 100% { transform: rotate(3deg) translateX(0); }
+        50% { transform: rotate(-3deg) translateX(4px); }
+      }
+      @keyframes cubePulse {
+        0%, 100% { transform: scale(0.985); }
+        50% { transform: scale(1.03); }
+      }
+      @keyframes glowPulse {
+        0%, 100% { transform: scale(0.92); opacity: 0.55; }
+        50% { transform: scale(1.14); opacity: 0.95; }
+      }
+      @keyframes antennaWobbleLeft {
+        0%, 100% { transform: rotate(-3deg); }
+        50% { transform: rotate(3deg); }
+      }
+      @keyframes antennaWobbleRight {
+        0%, 100% { transform: rotate(3deg); }
+        50% { transform: rotate(-3deg); }
+      }
+      @keyframes flicker {
+        0%, 100% { opacity: 0.55; }
+        50% { opacity: 1; }
+      }
+      #mascotGroup {
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: mascotFloat 2800ms ease-in-out infinite;
+      }
+      #cubeGroup {
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: cubePulse 2200ms ease-in-out infinite;
+      }
+      #cubeGlowFx {
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: glowPulse 2200ms ease-in-out infinite;
+      }
+      #leftClaw {
+        transform-box: fill-box;
+        transform-origin: 173px 365px;
+        animation: clawBounceLeft 2800ms ease-in-out infinite;
+      }
+      #rightClaw {
+        transform-box: fill-box;
+        transform-origin: 470px 365px;
+        animation: clawBounceRight 2800ms ease-in-out infinite;
+      }
+      #leftAntenna {
+        transform-box: fill-box;
+        transform-origin: 255px 113px;
+        animation: antennaWobbleLeft 2200ms ease-in-out infinite;
+      }
+      #rightAntenna {
+        transform-box: fill-box;
+        transform-origin: 384px 113px;
+        animation: antennaWobbleRight 2200ms ease-in-out infinite;
+      }
+      .n1 { animation: flicker 1200ms ease-in-out infinite; }
+      .n2 { animation: flicker 1450ms ease-in-out infinite 120ms; }
+      .n3 { animation: flicker 1750ms ease-in-out infinite 260ms; }
+      .n4 { animation: flicker 1600ms ease-in-out infinite 380ms; }
+      .n5 { animation: flicker 1500ms ease-in-out infinite 220ms; }
+    </style>
+  </defs>
+
+  <circle cx="330" cy="314" r="170" class="orbit"/>
+  <circle cx="330" cy="314" r="116" class="orbit"/>
+
+  <g id="cubeGlowFx" filter="url(#softGlow)">
+    <circle cx="320" cy="352" r="122" fill="url(#cubeGlow)"/>
+  </g>
+
+  <g id="mascotGroup">
+    <g id="leftAntenna">
+      <path class="antenna" d="M266 126 Q240 88 220 94"/>
+    </g>
+    <g id="rightAntenna">
+      <path class="antenna" d="M374 126 Q400 88 420 94"/>
+    </g>
+
+    <path class="lobster" d="M320 88 C250 88 208 145 208 208 C208 271 249 320 286 337 L286 378 L309 378 L309 346 C309 346 320 350 331 346 L331 378 L354 378 L354 337 C391 320 432 271 432 208 C432 145 390 88 320 88 Z"/>
+
+    <g id="cubeGroup">
+      <polygon points="320,230 432,292 432,422 320,485 208,422 208,292" fill="url(#cubeFaceA)" fill-opacity="0.16"/>
+      <polygon points="320,230 432,292 320,352 208,292" fill="url(#cubeFaceC)" fill-opacity="0.13"/>
+      <polygon points="320,352 432,292 432,422 320,485" fill="url(#cubeFaceB)" fill-opacity="0.16"/>
+      <polygon points="320,352 208,292 208,422 320,485" fill="url(#cubeFaceC)" fill-opacity="0.11"/>
+      <polyline class="cube-outline" points="320,230 432,292 432,422 320,485 208,422 208,292 320,230"/>
+      <polyline class="cube-outline" points="320,352 320,485"/>
+      <polyline class="cube-outline" points="320,352 432,292"/>
+      <polyline class="cube-outline" points="320,352 208,292"/>
+      <line class="cube-grid" x1="264" y1="261" x2="376" y2="322"/>
+      <line class="cube-grid" x1="264" y1="323" x2="376" y2="384"/>
+      <line class="cube-grid" x1="264" y1="261" x2="264" y2="385"/>
+      <line class="cube-grid" x1="320" y1="230" x2="320" y2="485"/>
+      <line class="cube-grid" x1="376" y1="261" x2="376" y2="385"/>
+      <circle class="node n1" cx="320" cy="230" r="8"/>
+      <circle class="node n2" cx="432" cy="292" r="8"/>
+      <circle class="node n3" cx="320" cy="485" r="8"/>
+      <circle class="node n4" cx="208" cy="292" r="8"/>
+      <circle class="node n5" cx="320" cy="352" r="9"/>
+    </g>
+
+    <g id="leftClaw">
+      <path class="appendage" d="M186 334 C146 323 118 336 112 363 C106 392 128 414 160 414 C185 414 206 399 220 374 C229 359 226 345 214 338 C206 333 196 332 186 334 Z"/>
+      <path class="appendage" d="M220 350 C192 349 170 364 164 388 C159 409 175 423 196 423 C223 423 244 399 249 373 C252 358 242 350 220 350 Z"/>
+    </g>
+
+    <g id="rightClaw">
+      <path class="appendage" d="M454 334 C494 323 522 336 528 363 C534 392 512 414 480 414 C455 414 434 399 420 374 C411 359 414 345 426 338 C434 333 444 332 454 334 Z"/>
+      <path class="appendage" d="M420 350 C448 349 470 364 476 388 C481 409 465 423 444 423 C417 423 396 399 391 373 C388 358 398 350 420 350 Z"/>
+    </g>
+
+    <circle class="eye" cx="274" cy="187" r="12"/>
+    <circle class="eye" cx="366" cy="187" r="12"/>
+    <circle class="eye-glow" cx="277" cy="184" r="3"/>
+    <circle class="eye-glow" cx="369" cy="184" r="3"/>
+  </g>
+</svg>

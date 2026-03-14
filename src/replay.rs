@@ -49,7 +49,7 @@ impl ReplayLogger {
     ) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let record = json!({
-            "schema": "osagefs-replay-v1",
+            "schema": "clawfs-replay-v1",
             "seq": seq,
             "ts": OffsetDateTime::now_utc()
                 .format(&Rfc3339)

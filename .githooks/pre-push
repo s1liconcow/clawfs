@@ -4,15 +4,18 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+mapfile -t push_updates
+
 perf_guard_core_paths=(
   "src/fs/"
   "src/metadata.rs"
   "src/segment.rs"
 )
 
-has_filesystem_core_changes() {
+iter_changed_paths() {
   local local_sha remote_sha diff_range changed_path pathspec
-  while read -r _local_ref local_sha _remote_ref remote_sha; do
+  for update in "${push_updates[@]}"; do
+    read -r _local_ref local_sha _remote_ref remote_sha <<<"$update"
     if [[ -z "${local_sha:-}" || -z "${remote_sha:-}" ]]; then
       continue
     fi
@@ -28,20 +31,44 @@ has_filesystem_core_changes() {
       diff_range="$remote_sha..$local_sha"
     fi
 
-    for pathspec in "${perf_guard_core_paths[@]}"; do
-      while read -r changed_path; do
-        if [[ -n "$changed_path" ]]; then
-          return 0
-        fi
-      done < <(git diff --name-only "$diff_range" -- "$pathspec")
+    if [[ $# -eq 0 ]]; then
+      git diff --name-only "$diff_range"
+      continue
+    fi
+
+    for pathspec in "$@"; do
+      git diff --name-only "$diff_range" -- "$pathspec"
     done
   done
+}
 
+has_bench_artifact_changes() {
+  local changed_path
+  while read -r changed_path; do
+    if [[ -n "$changed_path" ]]; then
+      return 0
+    fi
+  done < <(iter_changed_paths "bench-artifacts/")
+  return 1
+}
+
+has_filesystem_core_changes() {
+  local changed_path
+  while read -r changed_path; do
+    if [[ -n "$changed_path" ]]; then
+      return 0
+    fi
+  done < <(iter_changed_paths "${perf_guard_core_paths[@]}")
   return 1
 }
 
 if [[ "${SKIP_PERF_GUARD:-0}" == "1" ]]; then
   echo "[pre-push] SKIP_PERF_GUARD=1 set; skipping perf guard"
+  exit 0
+fi
+
+if has_bench_artifact_changes; then
+  echo "[pre-push] bench-artifacts changes detected in push; skipping perf guard"
   exit 0
 fi
 

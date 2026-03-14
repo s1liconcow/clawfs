@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
-# Shared script helpers for OsageFS shell entrypoints.
+# Shared script helpers for ClawFS shell entrypoints.
 
 osage_set_defaults() {
   local common_dir
   common_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
   ROOT_DIR="${ROOT_DIR:-$(cd -- "$common_dir/.." && pwd)}"
 
-  MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-mnt}"
-  STORE_PATH="${STORE_PATH:-/tmp/osagefs-store}"
-  LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-$HOME/.osagefs/cache}"
-  STATE_PATH="${STATE_PATH:-$HOME/.osagefs/state/client_state.bin}"
-  LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs.log}"
+  MOUNT_PATH="${MOUNT_PATH:-/tmp/clawfs-mnt}"
+  STORE_PATH="${STORE_PATH:-/tmp/clawfs-store}"
+  LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-$HOME/.clawfs/cache}"
+  STATE_PATH="${STATE_PATH:-$HOME/.clawfs/state/client_state.bin}"
+  LOG_FILE="${LOG_FILE:-$ROOT_DIR/clawfs.log}"
   PERF_LOG_PATH="${PERF_LOG_PATH:-}"
 }
 
@@ -37,7 +37,7 @@ osage_require_path() {
 }
 
 osage_ensure_release_binary() {
-  local osage_bin=${1:-"$ROOT_DIR/target/release/osagefs"}
+  local osage_bin=${1:-"$ROOT_DIR/target/release/clawfs"}
   local needs_build=0
 
   if [[ ! -x "$osage_bin" ]]; then
@@ -49,16 +49,16 @@ osage_ensure_release_binary() {
   fi
 
   if [[ $needs_build -eq 1 ]]; then
-    echo "Building osagefs --release ..."
-    (cd "$ROOT_DIR" && cargo build --release --bin osagefs)
+    echo "Building clawfs --release ..."
+    (cd "$ROOT_DIR" && cargo build --release --bin clawfs)
   fi
 }
 
 osage_ensure_release_checkpoint_binary() {
-  local checkpoint_bin=${1:-"$ROOT_DIR/target/release/osagefs_checkpoint"}
+  local checkpoint_bin=${1:-"$ROOT_DIR/target/release/clawfs_checkpoint"}
   if [[ ! -x "$checkpoint_bin" ]]; then
-    echo "Building osagefs_checkpoint --release ..."
-    (cd "$ROOT_DIR" && cargo build --release --bin osagefs_checkpoint)
+    echo "Building clawfs_checkpoint --release ..."
+    (cd "$ROOT_DIR" && cargo build --release --bin clawfs_checkpoint)
   fi
 }
 

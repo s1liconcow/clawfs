@@ -1,7 +1,7 @@
-# OsageFS Project Reference
+# ClawFS Project Reference
 
 ## Project Overview
-- OsageFS is a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
+- ClawFS is a FUSE-based log-structured filesystem that stages writes locally, flushes batched immutable segments (under `/segs/s_<generation>_<segment_id>`) to an object store (local FS, AWS S3, or GCS), and stores metadata as immutable inode-map shards (`/imaps/i_<generation>_<shard>.bin`) plus per-generation delta logs (`/imap_deltas/d_<generation>_<bloom>.bin`).
 - Close-time durability uses a local journal under `$STORE/journal`; disable with `--disable-journal` when benchmarking.
 - Inline threshold (`inline_threshold`): payloads <= threshold stay inline in the delta payload; larger payloads use `SegmentPointer`.
 - Payload transforms: `--inline-compression` and `--segment-compression` default to `true`; `--inline-encryption-key` and `--segment-encryption-key` enable ChaCha20Poly1305 after compression when beneficial.
@@ -11,7 +11,7 @@
 - Metadata and list caches follow NFS-like TTLs. A background poller applies newer generations and prefetches segments. Metadata flushes batch up to `--imap-delta-batch` inodes per delta object.
 - Cleanup uses short leases in the superblock for `DeltaCompaction` and `SegmentCompaction`. Use `--disable-cleanup` when far from the bucket.
 - Each client maintains a local state file (`--state-path`) for `client_id`, inode pool, and segment pool.
-- `osagefs-nfs-gateway/` is a standalone NFSv3 server. NFSv4 is Enterprise-only.
+- `clawfs-nfs-gateway/` is a standalone NFSv3 server. NFSv4 is Enterprise-only.
 
 ## Key Components
 - `src/config.rs`: CLI to `Config` mapping.
@@ -19,7 +19,7 @@
 - `src/replay.rs`: compressed replay logger (`.jsonl.gz`) for FUSE and NFS traces.
 - `src/state.rs`: `ClientStateManager` for per-client pools.
 - `src/metadata.rs`: inode caching, shard snapshots, delta logs, CAS superblock updates. Use `get_cached_inode()` for safe cache-only lookups.
-- `src/checkpoint.rs` and `src/bin/osagefs_checkpoint.rs`: checkpoint and restore utilities for superblock snapshots.
+- `src/checkpoint.rs` and `src/bin/clawfs_checkpoint.rs`: checkpoint and restore utilities for superblock snapshots.
 - `src/segment.rs`: `SegmentManager::write_batch` serializes immutable segments and chunks large payloads into 4 MiB entries when compression is enabled. `read_pointer` serves cache hits or issues range reads.
 - `src/fs/mod.rs`: FS types and constants.
 - `src/fs/core.rs`: inode and path handling.
@@ -28,8 +28,8 @@
 - `src/fs/ops.rs`: shared transport-agnostic FS operations. Add new FS behavior here first.
 - `src/fs/fuse.rs`: FUSE adapter.
 - `src/fs/nfs.rs`: NFS adapter.
-- `src/bin/osagefs_replay.rs`: direct API replayer with brute-force mode (`--iterations N`, `--seed`, chaos knobs).
-- Main scripts: `linux_kernel_perf.sh`, `fio_workloads.sh`, `cleanup.sh`, `stress_e2e.sh`, `micro_workflows.sh`, `checkpoint.sh`, `run_osagefs.sh`, `run_nfs_gateway.sh`, `sprite_validate_parallel.sh`, `common.sh`.
+- `src/bin/clawfs_replay.rs`: direct API replayer with brute-force mode (`--iterations N`, `--seed`, chaos knobs).
+- Main scripts: `linux_kernel_perf.sh`, `fio_workloads.sh`, `cleanup.sh`, `stress_e2e.sh`, `micro_workflows.sh`, `checkpoint.sh`, `run_clawfs.sh`, `run_nfs_gateway.sh`, `sprite_validate_parallel.sh`, `common.sh`.
 
 ## Architecture Decisions
 - Flush uses per-inode `try_lock` for non-blocking draining; contended inodes are skipped for that cycle.

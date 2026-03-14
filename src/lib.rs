@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod clawfs;
 pub mod codec;
 pub mod config;
 pub mod fs;

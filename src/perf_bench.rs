@@ -48,7 +48,7 @@ pub fn perf_config(root: &Path) -> Config {
         imap_delta_batch: 16,
         writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "osagefs".into(),
+        fuse_fsname: "clawfs".into(),
         log_storage_io: false,
     }
 }

@@ -13,17 +13,18 @@ use zerofs_nfsserve::nfs::{
     set_mode3, set_mtime, set_size3, set_uid3, specdata3, writeverf3, NFS3_WRITEVERFSIZE,
 };
 use time::OffsetDateTime;
+use clawfs::clawfs as clawfs_runtime;
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-use osagefs::config::{Config, ObjectStoreProvider};
-use osagefs::fs::OsageFs;
-use osagefs::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
-use osagefs::journal::JournalManager;
-use osagefs::metadata::MetadataStore;
-use osagefs::replay::ReplayLogger;
-use osagefs::segment::SegmentManager;
-use osagefs::state::ClientStateManager;
-use osagefs::superblock::SuperblockManager;
+use clawfs::config::{Config, ObjectStoreProvider};
+use clawfs::fs::OsageFs;
+use clawfs::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
+use clawfs::journal::JournalManager;
+use clawfs::metadata::MetadataStore;
+use clawfs::replay::ReplayLogger;
+use clawfs::segment::SegmentManager;
+use clawfs::state::ClientStateManager;
+use clawfs::superblock::SuperblockManager;
 use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tokio::signal;
@@ -32,13 +33,13 @@ use tracing::info;
 use serde_json::json;
 
 const ROOT_ID: fileid3 = ROOT_INODE;
-const DEFAULT_V4_EXPORT: &str = "/osagefs";
+const DEFAULT_V4_EXPORT: &str = "/clawfs";
 #[allow(dead_code)]
 const DEFAULT_GANESHA_BIN: &str = "ganesha.nfsd";
 const WELCOME_FILENAME: &str = "WELCOME.txt";
-const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
+const WELCOME_CONTENT: &str = "Welcome to ClawFS!\n\
 \n\
-OsageFS is a log-structured, object-store-backed filesystem designed for fast,\n\
+ClawFS is a log-structured, object-store-backed filesystem designed for fast,\n\
 shared access to large working sets with durable metadata and batched writes.\n\
 \n\
 Great use cases:\n\
@@ -51,19 +52,19 @@ Why teams use it:\n\
 - Batched metadata updates for lower API overhead\n\
 - Local staging, caching, and journal replay for practical durability and speed\n\
 \n\
-Enjoy building on OsageFS.\n";
+Enjoy building on ClawFS.\n";
 
 #[derive(Parser, Debug)]
 struct Cli {
     /// Mount path (used for local compatibility and state-path defaults).
-    #[arg(long, value_name = "PATH", default_value = "/tmp/osagefs-mnt")]
+    #[arg(long, value_name = "PATH", default_value = "/tmp/clawfs-mnt")]
     mount_path: PathBuf,
 
-    /// Path for OsageFS object/store data.
-    #[arg(long, value_name = "PATH", default_value = "/tmp/osagefs-store")]
+    /// Path for ClawFS object/store data.
+    #[arg(long, value_name = "PATH", default_value = "/tmp/clawfs-store")]
     store_path: PathBuf,
 
-    /// Path for local cache/journal files used by the direct OsageFS backend.
+    /// Path for local cache/journal files used by the direct ClawFS backend.
     #[arg(long, value_name = "PATH")]
     local_cache_path: Option<PathBuf>,
 
@@ -73,9 +74,9 @@ struct Cli {
 
     /// Deprecated in direct mode; retained for compatibility.
     #[arg(long)]
-    osagefs_binary: Option<PathBuf>,
+    clawfs_binary: Option<PathBuf>,
 
-    /// Object store provider for direct OsageFS backend.
+    /// Object store provider for direct ClawFS backend.
     #[arg(long, value_enum, default_value_t = ObjectStoreProvider::Local)]
     object_provider: ObjectStoreProvider,
 
@@ -91,7 +92,7 @@ struct Cli {
     #[arg(long)]
     endpoint: Option<String>,
 
-    /// Prefix within the bucket/object store for OsageFS.
+    /// Prefix within the bucket/object store for ClawFS.
     #[arg(long, default_value = "")]
     object_prefix: String,
 
@@ -99,7 +100,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     gcs_service_account: Option<PathBuf>,
 
-    /// Optional state path for OsageFS client identity/allocation pools.
+    /// Optional state path for ClawFS client identity/allocation pools.
     #[arg(long, value_name = "PATH")]
     state_path: Option<PathBuf>,
 
@@ -154,7 +155,7 @@ async fn main() -> Result<()> {
     match cli.protocol {
         Protocol::V3 => run_user_mode(cli).await,
         Protocol::V4 => Err(anyhow!(
-            "--protocol v4 is available in OsageFS Enterprise builds only"
+            "--protocol v4 is available in ClawFS Enterprise builds only"
         )),
     }
 }
@@ -167,7 +168,7 @@ fn init_tracing() {
 async fn run_user_mode(cli: Cli) -> Result<()> {
     if cli.use_existing_mount {
         return Err(anyhow!(
-            "--use-existing-mount is not supported with --protocol v3; direct mode serves OsageFS without FUSE"
+            "--use-existing-mount is not supported with --protocol v3; direct mode serves ClawFS without FUSE"
         ));
     }
 
@@ -188,7 +189,7 @@ async fn run_user_mode(cli: Cli) -> Result<()> {
         protocol = "nfs3",
         listen = %cli.listen,
         store = %cli.store_path.display(),
-        "serving direct OsageFS over user-mode NFS"
+        "serving direct ClawFS over user-mode NFS"
     );
 
     tokio::select! {
@@ -236,7 +237,7 @@ async fn run_ganesha(cli: Cli) -> Result<()> {
     let log_path = cli
         .ganesha_log
         .unwrap_or_else(|| export_path.join(".."))
-        .join("osagefs-ganesha.log");
+        .join("clawfs-ganesha.log");
 
     let rendered = render_ganesha_config(&export_path, &cli.pseudo_path, addr.port(), cli.read_only);
     std::fs::write(config_file.path(), rendered).context("failed to write ganesha config")?;
@@ -305,7 +306,7 @@ struct OsageDirectFs {
 
 impl OsageDirectFs {
     async fn new(cli: &Cli) -> Result<Self> {
-        let config = build_config(cli);
+        let config = build_config(cli)?;
         if matches!(config.object_provider, ObjectStoreProvider::Local) {
             std::fs::create_dir_all(&config.store_path)?;
         }
@@ -766,7 +767,7 @@ impl NFSFileSystem for OsageDirectFs {
     }
 }
 
-fn build_config(cli: &Cli) -> Config {
+fn build_config(cli: &Cli) -> Result<Config> {
     let config_root = default_user_config_root();
     let state_path = cli
         .state_path
@@ -777,7 +778,7 @@ fn build_config(cli: &Cli) -> Config {
         .clone()
         .unwrap_or_else(|| config_root.join("cache"));
 
-    Config {
+    let mut config = Config {
         mount_path: cli.mount_path.clone(),
         store_path: cli.store_path.clone(),
         local_cache_path,
@@ -825,15 +826,17 @@ fn build_config(cli: &Cli) -> Config {
         aws_force_path_style: false,
         source: None,
         entry_ttl_secs: 5,
-        fuse_fsname: "osagefs".to_string(),
-    }
+        fuse_fsname: "clawfs".to_string(),
+    };
+    clawfs_runtime::apply_env_runtime_spec(&mut config)?;
+    Ok(config)
 }
 
 fn default_user_config_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".osagefs")
+        .join(".clawfs")
 }
 
 async fn ensure_root(

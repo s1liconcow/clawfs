@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-WORKDIR_REMOTE="${WORKDIR_REMOTE:-/work/osagefs}"
+WORKDIR_REMOTE="${WORKDIR_REMOTE:-/work/clawfs}"
 SYNC_REPO=1
 SKIP_BOOTSTRAP=0
 TASKS_CSV="xfstests,linux,pjdfstest"
@@ -19,7 +19,7 @@ Run validation suites in parallel on dedicated sprites:
 
 Options:
   --tasks <csv>        Comma-separated list: xfstests,linux,pjdfstest
-  --no-sync            Skip tar sync into sprites (assume /work/osagefs is current)
+  --no-sync            Skip tar sync into sprites (assume /work/clawfs is current)
   --skip-bootstrap     Skip apt/bootstrap steps inside sprites
   --log-dir <path>     Local directory for per-task logs
   -h, --help           Show help
@@ -129,24 +129,24 @@ if [[ ! -d /tmp/xfstests ]]; then
   (cd /tmp/xfstests && make && sudo make install)
 fi
 
-(cd osagefs-nfs-gateway && cargo build --release)
+(cd clawfs-nfs-gateway && cargo build --release)
 
 # Clean up from prior runs.
-sudo rm -rf /tmp/osagefs-test-store /tmp/osagefs-scratch-store
-sudo rm -rf /tmp/osagefs-test-cache /tmp/osagefs-scratch-cache
-mkdir -p /tmp/osagefs-test-store /tmp/osagefs-scratch-store
-mkdir -p /tmp/osagefs-test-cache /tmp/osagefs-scratch-cache
+sudo rm -rf /tmp/clawfs-test-store /tmp/clawfs-scratch-store
+sudo rm -rf /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
+mkdir -p /tmp/clawfs-test-store /tmp/clawfs-scratch-store
+mkdir -p /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
 sudo mkdir -p /mnt/test /mnt/scratch
 
-# Start OsageFS NFS gateway (TEST instance)
-osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
-  --store-path /tmp/osagefs-test-store \
-  --local-cache-path /tmp/osagefs-test-cache \
-  --state-path /tmp/osagefs-test-state.bin \
+# Start ClawFS NFS gateway (TEST instance)
+clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+  --store-path /tmp/clawfs-test-store \
+  --local-cache-path /tmp/clawfs-test-cache \
+  --state-path /tmp/clawfs-test-state.bin \
   --object-provider local \
   --disable-journal \
   --listen 127.0.0.1:2049 &
-echo \$! > /tmp/osagefs-test.pid
+echo \$! > /tmp/clawfs-test.pid
 
 for _ in \$(seq 1 30); do
   nc -z 127.0.0.1 2049 && break
@@ -154,15 +154,15 @@ for _ in \$(seq 1 30); do
 done
 nc -z 127.0.0.1 2049 || { echo "TEST NFS instance failed to start"; exit 1; }
 
-# Start OsageFS NFS gateway (SCRATCH instance)
-osagefs-nfs-gateway/target/release/osagefs-nfs-gateway \
-  --store-path /tmp/osagefs-scratch-store \
-  --local-cache-path /tmp/osagefs-scratch-cache \
-  --state-path /tmp/osagefs-scratch-state.bin \
+# Start ClawFS NFS gateway (SCRATCH instance)
+clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+  --store-path /tmp/clawfs-scratch-store \
+  --local-cache-path /tmp/clawfs-scratch-cache \
+  --state-path /tmp/clawfs-scratch-state.bin \
   --object-provider local \
   --disable-journal \
   --listen 127.0.0.1:20499 &
-echo \$! > /tmp/osagefs-scratch.pid
+echo \$! > /tmp/clawfs-scratch.pid
 
 for _ in \$(seq 1 30); do
   nc -z 127.0.0.1 20499 && break
@@ -216,8 +216,8 @@ sudo ./check -E excludes \
 # Cleanup NFS instances
 sudo umount /mnt/test || true
 sudo umount /mnt/scratch || true
-kill \$(cat /tmp/osagefs-test.pid) || true
-kill \$(cat /tmp/osagefs-scratch.pid) || true
+kill \$(cat /tmp/clawfs-test.pid) || true
+kill \$(cat /tmp/clawfs-scratch.pid) || true
 EOF
 }
 
@@ -230,7 +230,7 @@ if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
   sudo apt-get install -y libelf-dev dwarves
 fi
 LOG_FILE='$WORKDIR_REMOTE/linux_build_timings.log' \
-PERF_LOG_PATH='$WORKDIR_REMOTE/osagefs-perf.jsonl' \
+PERF_LOG_PATH='$WORKDIR_REMOTE/clawfs-perf.jsonl' \
 ./scripts/linux_kernel_perf.sh
 EOF
 }
@@ -246,8 +246,8 @@ fi
 if [[ ! -d /tmp/pjdfstest ]]; then
   git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
 fi
-cargo build --release --bin osagefs
-PJDFSTEST_DIR=/tmp/pjdfstest TESTDIR=/tmp/osagefs-mnt JOBS=8 ./scripts/run_pjdfstest.sh
+cargo build --release --bin clawfs
+PJDFSTEST_DIR=/tmp/pjdfstest TESTDIR=/tmp/clawfs-mnt JOBS=8 ./scripts/run_pjdfstest.sh
 EOF
 }
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# profile_daemon.sh — Profile the OsageFS FUSE daemon during a workload.
+# profile_daemon.sh — Profile the ClawFS FUSE daemon during a workload.
 #
-# Starts OsageFS with --perf-log, runs a user-specified workload while
+# Starts ClawFS with --perf-log, runs a user-specified workload while
 # perf-recording the daemon PID, then generates analysis reports.
 #
 # Usage:
@@ -23,7 +23,7 @@ set -euo pipefail
 #   LINUX_TARBALL     path to pre-downloaded linux tarball
 #   LINUX_VERSION     e.g. "6.1" (default)
 #   MAKE_JOBS         parallelism for kernel build (default: nproc)
-#   EXTRA_OSAGEFS_ARGS  extra flags for osagefs daemon
+#   EXTRA_CLAWFS_ARGS  extra flags for clawfs daemon
 #   DEBUG_SYMBOLS     1 to build with CARGO_PROFILE_RELEASE_DEBUG=2 (default: 1)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,12 +44,12 @@ DISABLE_PERF="${DISABLE_PERF:-0}"
 LINUX_VERSION="${LINUX_VERSION:-6.1}"
 LINUX_TARBALL="${LINUX_TARBALL:-/tmp/linux-${LINUX_VERSION}.tar.gz}"
 MAKE_JOBS="${MAKE_JOBS:-$(nproc)}"
-EXTRA_OSAGEFS_ARGS="${EXTRA_OSAGEFS_ARGS:-}"
+EXTRA_CLAWFS_ARGS="${EXTRA_CLAWFS_ARGS:-}"
 DEBUG_SYMBOLS="${DEBUG_SYMBOLS:-1}"
 
 PERF_DATA="$RESULTS_DIR/perf.data"
-PERF_LOG="$RESULTS_DIR/osagefs-perf.jsonl"
-DAEMON_LOG="$RESULTS_DIR/osagefs.log"
+PERF_LOG="$RESULTS_DIR/clawfs-perf.jsonl"
+DAEMON_LOG="$RESULTS_DIR/clawfs.log"
 
 OSAGE_PID=""
 PERF_PID=""
@@ -79,7 +79,7 @@ elapsed_ms() { echo $(( ($1 - $2) / 1000000 )); }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
-log "Building OsageFS"
+log "Building ClawFS"
 if [[ "$DEBUG_SYMBOLS" == "1" ]]; then
   export CARGO_PROFILE_RELEASE_DEBUG=2
 fi
@@ -93,7 +93,7 @@ log "Results will be written to $RESULTS_DIR"
 # Clean previous state
 cd /tmp
 fusermount -u "$MOUNT_PATH" 2>/dev/null || umount -l "$MOUNT_PATH" 2>/dev/null || true
-pkill -f "osagefs.*--mount-path $MOUNT_PATH" 2>/dev/null || true
+pkill -f "clawfs.*--mount-path $MOUNT_PATH" 2>/dev/null || true
 sleep 1
 rm -rf "$MOUNT_PATH" "$STORE_PATH" "${LOCAL_CACHE_PATH}" "${STATE_PATH}"
 mkdir -p "$MOUNT_PATH" "$STORE_PATH"
@@ -105,9 +105,9 @@ fi
 
 # ── Start daemon ───────────────────────────────────────────────────────────────
 
-log "Starting OsageFS daemon"
+log "Starting ClawFS daemon"
 # shellcheck disable=SC2086
-"$ROOT_DIR/target/release/osagefs" \
+"$ROOT_DIR/target/release/clawfs" \
   --mount-path "$MOUNT_PATH" \
   --store-path "$STORE_PATH" \
   --local-cache-path "$LOCAL_CACHE_PATH" \
@@ -117,7 +117,7 @@ log "Starting OsageFS daemon"
   --allow-other \
   --disable-cleanup \
   --foreground \
-  $EXTRA_OSAGEFS_ARGS &
+  $EXTRA_CLAWFS_ARGS &
 OSAGE_PID=$!
 
 for i in $(seq 1 30); do
@@ -225,7 +225,7 @@ fi
 
 # ── Stop daemon ────────────────────────────────────────────────────────────────
 
-log "Stopping OsageFS"
+log "Stopping ClawFS"
 kill "$OSAGE_PID" 2>/dev/null
 wait "$OSAGE_PID" 2>/dev/null || true
 OSAGE_PID=""

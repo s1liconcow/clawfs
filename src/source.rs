@@ -9,6 +9,7 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectError, ObjectStore};
 
+use crate::clawfs;
 use crate::config::{ObjectStoreProvider, SourceStoreConfig};
 
 #[derive(Debug, Clone)]
@@ -64,9 +65,16 @@ impl SourceObjectStore {
                 }
                 if let Some(key) = &config.aws_access_key_id {
                     builder = builder.with_access_key_id(key);
+                } else if let Some(key) = clawfs::aws_access_key_id() {
+                    builder = builder.with_access_key_id(key);
                 }
                 if let Some(secret) = &config.aws_secret_access_key {
                     builder = builder.with_secret_access_key(secret);
+                } else if let Some(secret) = clawfs::aws_secret_access_key() {
+                    builder = builder.with_secret_access_key(secret);
+                }
+                if let Some(token) = clawfs::aws_session_token() {
+                    builder = builder.with_token(token);
                 }
                 if config.aws_allow_http {
                     builder = builder.with_allow_http(true);

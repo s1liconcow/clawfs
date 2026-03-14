@@ -19,6 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
+use crate::clawfs;
 use crate::config::{Config, ObjectStoreProvider};
 use crate::inode::{
     ExternalObject, FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord,
@@ -1555,18 +1556,21 @@ fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)
                 builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
             }
 
-            if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+            if let Some(key) = clawfs::aws_access_key_id() {
                 builder = builder.with_access_key_id(key);
             }
-            if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            if let Some(secret) = clawfs::aws_secret_access_key() {
                 builder = builder.with_secret_access_key(secret);
+            }
+            if let Some(token) = clawfs::aws_session_token() {
+                builder = builder.with_token(token);
             }
 
             if config.aws_allow_http {
                 builder = builder.with_allow_http(true);
                 // If no credentials in environment, provide dummy ones to satisfy the client and bypass IMDS lookup
-                if std::env::var("AWS_ACCESS_KEY_ID").is_err()
-                    && std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+                if clawfs::aws_access_key_id().is_none()
+                    && clawfs::aws_secret_access_key().is_none()
                 {
                     builder = builder
                         .with_access_key_id("test")

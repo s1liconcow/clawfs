@@ -1,12 +1,15 @@
-# OsageFS
+# ClawFS
 
-> **POSIX compliance**: OsageFS passes the [pjdfstest](https://github.com/pjd/pjdfstest) POSIX filesystem test suite.
->
-> **xfstests status**: OsageFS currently passes the xfstests smoke suite we run in CI/sprite (`generic/001,011,023,024,028,029,030,080,084,087,088,095,098`).
->
-> **Linux build validation**: Linux source untar plus kernel build (`make defconfig && make -j`) passes successfully on OsageFS.
+## Persistent Volumes for Agents 
 
-OsageFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
+
+> **POSIX compliance**: ClawFS passes the [pjdfstest](https://github.com/pjd/pjdfstest) POSIX filesystem test suite.
+>
+> **xfstests status**: ClawFS currently passes the xfstests smoke suite we run in CI/sprite (`generic/001,011,023,024,028,029,030,080,084,087,088,095,098`).
+>
+> **Linux build validation**: Linux source untar plus kernel build (`make defconfig && make -j`) passes successfully on ClawFS.
+
+ClawFS is a POSIX-ish shared filesystem that speaks FUSE and stores metadata
 and payloads in a log-structured layout over an object store. Metadata lives in
 the bucket under `metadata/imaps` (immutable shard snapshots) and
 `metadata/imap_deltas` (per-generation inode deltas), while large payloads are
@@ -19,16 +22,16 @@ This matrix is for quick positioning against common alternatives.
 
 | System | Metadata architecture | POSIX / file semantics | Shared multi-writer behavior | Cost + deployment profile |
 |-----------|-----------------------|------------------------|------------------------------|---------------------------|
-| **OsageFS** | Metadata lives in object storage (`/imaps` + `/imap_deltas`) with no external metadata DB | POSIX-ish, with explicit durability/caching knobs and shared-state reconciliation via generations | Designed as a shared filesystem across clients (generation-based metadata + leases) | Self-managed (local, S3, or GCS), infra cost depends on your object store + compute |
+| **ClawFS** | Metadata lives in object storage (`/imaps` + `/imap_deltas`) with no external metadata DB | POSIX-ish, with explicit durability/caching knobs and shared-state reconciliation via generations | Designed as a shared filesystem across clients (generation-based metadata + leases) | Self-managed (local, S3, or GCS), infra cost depends on your object store + compute |
 | **JuiceFS** | Requires a separate metadata engine (Redis/MySQL/PostgreSQL/TiKV/etcd/FoundationDB) in addition to object storage [^juicefs-meta] | Strong POSIX target (JuiceFS publishes POSIX compatibility behavior) [^juicefs-posix] | Shared filesystem, but depends on operating and scaling that metadata engine [^juicefs-meta] | Self-managed OSS, but operational footprint includes object store **plus** metadata service |
 | **Object-mount OSS adapters (s3fs/goofys/gcsfuse/Mountpoint)** | Typically map object keys directly to files (native object format / object APIs) [^s3fs-native] [^mountpoint-posix] | Trade POSIX completeness for object-store alignment and/or throughput: not fully POSIX or explicitly POSIX-ish [^gcsfuse-posix] [^goofys-posix] [^mountpoint-posix] | Same-file multi-writer semantics are limited: e.g., no client coordination or explicit warnings against concurrent same-object writers [^s3fs-multi] [^gcsfuse-concurrency] | Lightweight OSS clients; good for read-heavy/object-native workflows |
 | **Amazon EFS / FSx for Lustre** | Managed AWS file services [^efs-overview] [^fsx-overview] | Strong POSIX/NFS semantics (FSx for Lustre explicitly POSIX-compliant) [^fsx-overview] | Shared multi-client file systems by design | AWS-only managed services with recurring charges across storage, throughput/IOPS, requests, backups, and transfer depending on tier/configuration [^efs-pricing] [^fsx-pricing] |
 
-### Why OsageFS in this landscape
+### Why ClawFS in this landscape
 
-1. Unlike JuiceFS, OsageFS does not require a separate metadata database tier.
-2. Unlike most object-mount adapters, OsageFS is built as a shared filesystem first (not just object-key projection).
-3. Unlike EFS/FSx, OsageFS is not tied to a single cloud vendor's managed filesystem SKU and pricing model.
+1. Unlike JuiceFS, ClawFS does not require a separate metadata database tier.
+2. Unlike most object-mount adapters, ClawFS is built as a shared filesystem first (not just object-key projection).
+3. Unlike EFS/FSx, ClawFS is not tied to a single cloud vendor's managed filesystem SKU and pricing model.
 
 [^juicefs-meta]: JuiceFS metadata docs: https://juicefs.com/docs/community/databases_for_metadata/
 [^juicefs-posix]: JuiceFS POSIX compatibility: https://juicefs.com/docs/community/posix_compatibility/
@@ -116,10 +119,10 @@ superblock counters and records the new high-water mark in `metadata/superblock.
   inode-map deltas are applied next, and finally the superblock generation id
   advances once to atomically commit the batch. If staged data exceeds
   `--pending-bytes`, the client flushes eagerly to keep memory bounded.
-* On mount, OsageFS ensures a writable home tree (`--home-prefix`, default
+* On mount, ClawFS ensures a writable home tree (`--home-prefix`, default
   `/home/<user>`), so you always have a place to untar/build even if the bucket
   was previously populated by root-only metadata.
-* Each client keeps a local `.osagefs_state.bin` (configurable via
+* Each client keeps a local `~/.clawfs/state/client_state.bin` (configurable via
   `--state-path`) that records its `client_id` and remaining pre-allocated inode /
   segment ranges so we never need cross-client coordination for id pools. The
   state file also carries a format version to ease upgrades.
@@ -142,14 +145,14 @@ superblock counters and records the new high-water mark in `metadata/superblock.
 
 ```bash
 cargo run -- \
-  --mount-path /mnt/osage \
-  --store-path /var/tmp/osagefs \
+  --mount-path /mnt/claw \
+  --store-path /var/tmp/clawfs \
   --object-provider local \
   --inline-threshold 1024 \
   --shard-size 2048 \
   --inode-batch 128 \
   --segment-batch 256 \
-  --state-path ~/.osagefs_state.bin \
+  --state-path ~/.clawfs/state/client_state.bin \
   --flush-interval-ms 500 \
   --lookup-cache-ttl-ms 5000 \
   --dir-cache-ttl-ms 5000 \
@@ -162,7 +165,7 @@ By default the filesystem runs in the background with `AllowRoot` and
 `AutoUnmount` enabled. Pass `--foreground` to keep the FUSE session attached to
 STDERR for easier debugging. To target a real S3-compatible backend, supply
 `--object-provider aws` (or `gcs`) with `--bucket`, plus `--region`/`--endpoint`
-for AWS or `--gcs-service-account` for Google Cloud. OsageFS writes everything
+for AWS or `--gcs-service-account` for Google Cloud. ClawFS writes everything
 into the configured bucket prefix: superblock + metadata JSON live under
 `metadata/`, delta logs under `/imap_deltas/`, and immutable segments under
 `/segs/`. Keep `--state-path` on local storage so each client maintains its own
@@ -170,12 +173,12 @@ into the configured bucket prefix: superblock + metadata JSON live under
 
 ### Mount Existing Buckets via Source Overlay
 
-OsageFS can mount objects from an existing source bucket while keeping OsageFS
+ClawFS can mount objects from an existing source bucket while keeping ClawFS
 metadata and write path in a separate overlay backend:
 
 * Source files are discovered lazily on `lookup`/`readdir`.
 * Reads fetch byte ranges directly from the source object store.
-* First write to a source-backed file performs copy-up into OsageFS-managed
+* First write to a source-backed file performs copy-up into ClawFS-managed
   storage; the source object is not modified.
 
 Use source flags to configure an independent source backend (including separate
@@ -201,7 +204,7 @@ Quick demo script:
 
 ```bash
 OVERLAY_OBJECT_PROVIDER=gcs \
-OVERLAY_BUCKET=my-osagefs-overlay \
+OVERLAY_BUCKET=my-clawfs-overlay \
 SOURCE_OBJECT_PROVIDER=aws \
 SOURCE_BUCKET=commoncrawl \
 SOURCE_PREFIX=crawl-data/CC-MAIN-2025-13/ \
@@ -216,18 +219,18 @@ checkpoint and restore by saving/restoring only the superblock state.
 Create a checkpoint file:
 
 ```bash
-cargo run --bin osagefs_checkpoint -- create \
-  --store-path /tmp/osagefs-store \
-  --checkpoint-path /tmp/osagefs-store-checkpoint.bin \
+cargo run --bin clawfs_checkpoint -- create \
+  --store-path /tmp/clawfs-store \
+  --checkpoint-path /tmp/clawfs-store-checkpoint.bin \
   --note "before migration"
 ```
 
 Restore a checkpoint:
 
 ```bash
-cargo run --bin osagefs_checkpoint -- restore \
-  --store-path /tmp/osagefs-store \
-  --checkpoint-path /tmp/osagefs-store-checkpoint.bin
+cargo run --bin clawfs_checkpoint -- restore \
+  --store-path /tmp/clawfs-store \
+  --checkpoint-path /tmp/clawfs-store-checkpoint.bin
 ```
 
 Restore resets `metadata/superblock.bin` to the checkpointed generation and
@@ -241,19 +244,19 @@ scripts/checkpoint.sh restore
 ```
 
 The helper enforces offline safety by default (no mounted filesystem at
-`$MOUNT_PATH`, no active `osagefs` process for `$STORE_PATH`) unless you set
+`$MOUNT_PATH`, no active `clawfs` process for `$STORE_PATH`) unless you set
 `FORCE=1`.
 
 ### Performance logging
 
-Pass `--perf-log /path/to/osagefs-perf.jsonl` to emit structured JSONL timing
+Pass `--perf-log /path/to/clawfs-perf.jsonl` to emit structured JSONL timing
 records. Every staged write produces a `stage_file` entry with the inode id,
 payload size, total staged bytes, and whether it triggered an automatic flush.
 Each flush generates a `flush_pending` record summarizing how many files were
 persisted inline vs. segments, total bytes, individual durations for segment
 uploads / metadata persistence / superblock commits, and the next target
 generation. The log is append-only, so you can leave it enabled during perf
-tests (e.g. `./scripts/run_osagefs.sh`, which now defaults to `$ROOT/osagefs-perf.jsonl`; set `PERF_LOG_PATH=` to disable).
+tests (e.g. `./scripts/run_clawfs.sh`, which now defaults to `$ROOT/clawfs-perf.jsonl`; set `PERF_LOG_PATH=` to disable).
 
 The Linux kernel perf harness (`scripts/linux_kernel_perf.sh`) enables perf
 logging by default via `$PERF_LOG_PATH` (set it to an empty string to disable).
@@ -261,7 +264,7 @@ logging by default via `$PERF_LOG_PATH` (set it to an empty string to disable).
 For local microbenchmarks and regression tracking, use Criterion:
 
 ```bash
-OSAGEFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion
+CLAWFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion
 scripts/perf_guard.sh
 ```
 
@@ -272,14 +275,14 @@ data before the mount finishes. For benchmarking you can pass
 
 ### Daemon logging
 
-`--log-file` defaults to `osagefs.log` (next to the binary) so every mount
+`--log-file` defaults to `clawfs.log` (next to the binary) so every mount
 mirrors stderr logs to disk. Pass `--debug-log` when you also want to force the
 log level to DEBUG; otherwise the daemon sticks to the `RUST_LOG`/INFO default
 even while writing the file.
 
 ### Metadata & segment caching
 
-OsageFS keeps NFS-style caches with explicit TTLs:
+ClawFS keeps NFS-style caches with explicit TTLs:
 
 1. `--lookup-cache-ttl-ms` and `--dir-cache-ttl-ms` govern how long cached attrs
    and directory entries remain valid. Expired entries trigger a shard reload
@@ -326,15 +329,15 @@ behalf.
 
 ### NFS gateway
 
-Run `osagefs-nfs-gateway` when you want to export OsageFS over NFS without
-running a FUSE mount. The default `--protocol v3` backend talks to OsageFS
+Run `clawfs-nfs-gateway` when you want to export ClawFS over NFS without
+running a FUSE mount. The default `--protocol v3` backend talks to ClawFS
 metadata/segments directly and serves them over NFS. It uses the
 [`nfsserve`](https://github.com/xetdata/nfsserve) user-mode NFSv3 server so it
 works with the Windows built-in client. Example:
 
 ```
-cargo run --manifest-path osagefs-nfs-gateway/Cargo.toml -- \
-  --store-path /tmp/osagefs-store \
+cargo run --manifest-path clawfs-nfs-gateway/Cargo.toml -- \
+  --store-path /tmp/clawfs-store \
   --listen 0.0.0.0:2049
 ```
 
@@ -351,7 +354,7 @@ deploy a tiny agent next to the bucket so cross-region traffic stays minimal.
 ### Durability knobs
 
 New workloads (especially tar/make) create many tiny files; syncing each close
-is overkill. By default OsageFS now batches closes and only forces a flush when:
+is overkill. By default ClawFS now batches closes and only forces a flush when:
 
 1. `--pending-bytes` is exceeded (same as before), or
 2. `--flush-interval-ms` (default 500 ms) has elapsed since the last flush and a

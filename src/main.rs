@@ -13,17 +13,18 @@ use log::{LevelFilter, info, warn};
 use serde_json::json;
 use std::env;
 
-use osagefs::config::{Cli, Config};
-use osagefs::fs::OsageFs;
-use osagefs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
-use osagefs::journal::JournalManager;
-use osagefs::metadata::MetadataStore;
-use osagefs::perf::PerfLogger;
-use osagefs::replay::ReplayLogger;
-use osagefs::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
-use osagefs::source::SourceObjectStore;
-use osagefs::state::ClientStateManager;
-use osagefs::superblock::{CleanupTaskKind, SuperblockManager};
+use clawfs::clawfs as clawfs_runtime;
+use clawfs::config::{Cli, Config};
+use clawfs::fs::OsageFs;
+use clawfs::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
+use clawfs::journal::JournalManager;
+use clawfs::metadata::MetadataStore;
+use clawfs::perf::PerfLogger;
+use clawfs::replay::ReplayLogger;
+use clawfs::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
+use clawfs::source::SourceObjectStore;
+use clawfs::state::ClientStateManager;
+use clawfs::superblock::{CleanupTaskKind, SuperblockManager};
 use tokio::runtime::Handle;
 use tokio::task;
 use tokio::time::sleep;
@@ -34,9 +35,9 @@ const SEGMENT_COMPACT_BATCH: usize = 8;
 const SEGMENT_COMPACT_LAG: u64 = 3;
 type SegmentCompactionEntry = (InodeRecord, Vec<SegmentPointer>, Vec<u8>);
 const WELCOME_FILENAME: &str = "WELCOME.txt";
-const WELCOME_CONTENT: &str = "Welcome to OsageFS!\n\
+const WELCOME_CONTENT: &str = "Welcome to ClawFS!\n\
 \n\
-OsageFS is a log-structured, object-store-backed filesystem designed for fast,\n\
+ClawFS is a log-structured, object-store-backed filesystem designed for fast,\n\
 shared access to large working sets with durable metadata and batched writes.\n\
 \n\
 Great use cases:\n\
@@ -49,11 +50,12 @@ Why teams use it:\n\
 - Batched metadata updates for lower API overhead\n\
 - Local staging, caching, and journal replay for practical durability and speed\n\
 \n\
-Enjoy building on OsageFS.\n";
+Enjoy building on ClawFS.\n";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config: Config = cli.into();
+    let mut config: Config = cli.into();
+    clawfs_runtime::apply_env_runtime_spec(&mut config)?;
     init_logging(config.log_file.as_deref(), config.debug_log)?;
     std::fs::create_dir_all(&config.mount_path)?;
 
@@ -170,7 +172,7 @@ fn main() -> Result<()> {
         true
     } else {
         // Backward-compatible fallback for existing scripts.
-        std::env::var("OSAGEFS_ALLOW_OTHER")
+        std::env::var("CLAWFS_ALLOW_OTHER")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
     };
@@ -186,7 +188,7 @@ fn main() -> Result<()> {
     }
     let fuse_threads = config.fuse_threads;
     info!(
-        "Mounting OsageFS at {} (fuse_threads={}, writeback_cache={})",
+        "Mounting ClawFS at {} (fuse_threads={}, writeback_cache={})",
         config.mount_path.display(),
         fuse_threads,
         config.writeback_cache,

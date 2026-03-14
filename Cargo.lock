@@ -315,6 +315,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
+name = "clawfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chacha20poly1305",
+ "clap",
+ "criterion",
+ "dashmap",
+ "env_logger",
+ "flatbuffers",
+ "flate2",
+ "fuser",
+ "futures",
+ "libc",
+ "log",
+ "lru",
+ "lz4_flex",
+ "object_store",
+ "parking_lot",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,38 +1354,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "osagefs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chacha20poly1305",
- "clap",
- "criterion",
- "dashmap",
- "env_logger",
- "flatbuffers",
- "flate2",
- "fuser",
- "futures",
- "libc",
- "log",
- "lru",
- "lz4_flex",
- "object_store",
- "parking_lot",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "uuid",
-]
 
 [[package]]
 name = "page_size"

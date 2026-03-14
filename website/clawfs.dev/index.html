@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawFS | On-Demand Persistent Volumes for Agents</title>
+    <meta
+      name="description"
+      content="ClawFS gives agents persistent volumes on demand. Summon a durable workspace in a single CLI command, keep state across runs, and mount the same data anywhere."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="glow glow-a" aria-hidden="true"></div>
+    <div class="glow glow-b" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="#top">
+        <span class="brand-mark">CLAW</span>
+        <span class="brand-sub">FS</span>
+      </a>
+      <nav>
+        <a href="#how">How It Works</a>
+        <a href="getting-started.html">Getting Started</a>
+        <a href="enterprise.html">Enterprise</a>
+        <a href="pricing.html">Pricing</a>
+        <a href="#features">Why It Wins</a>
+        <a href="#cta">Get Started</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero reveal" data-delay="0">
+        <div class="hero-layout">
+          <div class="hero-body">
+            <p class="eyebrow">Persistent Agent Volumes</p>
+            <h1>Summon Shared Storage for Agents in One CLI Command</h1>
+            <p class="hero-copy">
+              ClawFS turns disposable agent runtimes into stateful workers. One command provisions a persistent
+              volume, mounts it into your agent environment, and keeps tools, repos, checkpoints, and outputs
+              alive after the process exits.
+            </p>
+            <p class="hero-copy">
+              Vector databases are out, filesystems are in. Unleash your Claw with POSIX semantics and near
+              unlimited storage for the agents that need to keep working after the process exits.
+            </p>
+            <div class="hero-cta">
+              <a class="btn btn-primary" href="#how">See How It Works</a>
+              <a class="btn btn-secondary" href="getting-started.html">Launch ClawFS</a>
+            </div>
+            <div class="hero-cta">
+              <a class="btn btn-secondary" href="pricing.html">See Pricing</a>
+            </div>
+            <p class="hero-note">
+              Need SSO, KMS/HSM, audit streams, hosted acceleration, or NFSv4? <a href="enterprise.html">See Enterprise</a>.
+            </p>
+          </div>
+          <figure class="hero-art" aria-label="Animated lobster claw gripping a pulsating data cube">
+            <img src="claw-cube.svg" alt="Lobster claw gripping a pulsating data cube" />
+          </figure>
+        </div>
+        <ul class="hero-metrics">
+          <li><strong>1 Command</strong><span>Provision + mount</span></li>
+          <li><strong>Persistent</strong><span>State across runs</span></li>
+          <li><strong>Shared</strong><span>Reuse across agents</span></li>
+          <li><strong>Portable</strong><span>Move across clouds</span></li>
+        </ul>
+      </section>
+
+      <section id="how" class="editions reveal" data-delay="120">
+        <div class="section-title">
+          <p class="eyebrow">Operator Flow</p>
+          <h2>From Blank Runtime to Reusable Workspace</h2>
+        </div>
+        <div class="cards two-up">
+          <article class="card oss">
+            <h3>Summon</h3>
+            <p class="price">Single CLI Command</p>
+            <ul>
+              <li>Create a named persistent volume when an agent starts</li>
+              <li>Mount it into a VM, container, or remote runner immediately</li>
+              <li>Keep dependencies, repos, embeddings, and model artifacts close to execution</li>
+              <li>Skip custom bootstrap scripts and fragile cache warmups</li>
+            </ul>
+            <a class="btn btn-primary" href="#features">Why It Wins</a>
+          </article>
+
+          <article class="card enterprise">
+            <h3>Recall</h3>
+            <p class="price">Same Volume, Later</p>
+            <ul>
+              <li>Reconnect the same volume on the next run or from another worker</li>
+              <li>Preserve agent memory, outputs, and tool state without rebuilding context</li>
+              <li>Share a durable namespace between cooperating agents</li>
+              <li>Checkpoint, restore, or hand off work without copying data around</li>
+            </ul>
+            <a class="btn btn-secondary" href="#comparison">Why it beats ephemeral disks</a>
+          </article>
+        </div>
+      </section>
+
+      <section id="features" class="feature-grid reveal" data-delay="200">
+        <div class="section-title">
+          <p class="eyebrow">Why ClawFS</p>
+          <h2>Built for Agent Loops, Not Human Login Sessions</h2>
+        </div>
+        <div class="cards three-up icon-cards">
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-3z"/></svg></span>Persistent Memory</h3>
+            <p>Agents keep filesystem state between invocations, so long-running work survives crashes, restarts, and rescheduling.</p>
+          </article>
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h16v10H4zM2 17h20v2H2zM7 8h3v4H7zM12 8h5v1h-5zM12 11h4v1h-4z"/></svg></span>Fast Boot</h3>
+            <p>Mount existing state instead of rebuilding toolchains, recloning repos, or rehydrating caches every time a worker starts.</p>
+          </article>
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h18M12 3a9 9 0 100 18 9 9 0 000-18z"/></svg></span>Anywhere Access</h3>
+            <p>Run on-prem or across cloud environments while keeping a single durable volume identity for the agent.</p>
+          </article>
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 11V8a5 5 0 0110 0v3h1a2 2 0 012 2v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6a2 2 0 012-2h1zm2 0h6V8a3 3 0 00-6 0v3z"/></svg></span>Save Context</h3>
+            <p>Do not dump tool calls into context. Dump them to ClawFS and let your Claw rip with grep, files, and real workspace state.</p>
+          </article>
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12H4zm4-3h8v-2H8v2zm0-4h8v-2H8v2z"/></svg></span>Shared Handoffs</h3>
+            <p>Multiple agents can attach to the same namespace for review, continuation, or specialization without export/import glue.</p>
+          </article>
+          <article class="card">
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2l2.5 5.2L20 8l-4 3.9.9 5.6-4.9-2.7-4.9 2.7.9-5.6L4 8l5.5-.8L12 2z"/></svg></span>CLI-First</h3>
+            <p>The product pitch is simple because the interface is simple: one command to create, mount, and return to agent storage.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="platforms" class="feature-grid reveal" data-delay="230">
+        <div class="section-title">
+          <p class="eyebrow">Good Fit</p>
+          <h2>Where Persistent Agent Volumes Matter Most</h2>
+        </div>
+        <div class="cards three-up">
+          <article class="card">
+            <h3>Coding Agents</h3>
+            <p>Keep repos, build outputs, package caches, and branch state across task sessions.</p>
+          </article>
+          <article class="card">
+            <h3>Research Agents</h3>
+            <p>Preserve scraped corpora, experiment artifacts, notebooks, and checkpoints across iterative runs.</p>
+          </article>
+          <article class="card">
+            <h3>Workflow Swarms</h3>
+            <p>Let planner, executor, and reviewer agents share one durable workspace instead of passing tarballs around.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="use-cases" class="feature-grid reveal" data-delay="240">
+        <div class="section-title">
+          <p class="eyebrow">What Changes</p>
+          <h2>Stop Rebuilding State on Every Run</h2>
+        </div>
+        <div class="cards three-up">
+          <article class="card">
+            <h3>No More Cold Starts</h3>
+            <p>Agents mount warm volumes with existing tools and data instead of spending minutes reconstructing context.</p>
+          </article>
+          <article class="card">
+            <h3>Recoverable Sessions</h3>
+            <p>If a worker disappears, the volume does not. Resume from the same filesystem state on a fresh runtime.</p>
+          </article>
+          <article class="card">
+            <h3>Natural Handoffs</h3>
+            <p>Escalate work to a stronger model or human operator by reattaching the exact workspace, not a summary of it.</p>
+          </article>
+          <article class="card">
+            <h3>Lower Infra Waste</h3>
+            <p>Cut repeated downloads, cache rebuilds, and duplicated scratch disks across fleets of short-lived workers.</p>
+          </article>
+          <article class="card">
+            <h3>Portable Execution</h3>
+            <p>Keep the data model stable while moving agents between laptop, VM, Kubernetes job, or hosted runner.</p>
+          </article>
+          <article class="card">
+            <h3>Filesystem Semantics</h3>
+            <p>Use a real mount point and real files, which fits existing tools better than bespoke memory APIs.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="comparison" class="comparison reveal" data-delay="250">
+        <div class="section-title">
+          <p class="eyebrow">Comparison Matrix</p>
+          <h2>How ClawFS Stacks Up for Agent Workloads</h2>
+        </div>
+        <div class="matrix-wrap">
+          <table class="matrix" aria-label="ClawFS comparison table">
+            <thead>
+              <tr>
+                <th>Capability</th>
+                <th>ClawFS</th>
+                <th>Ephemeral VM Disk</th>
+                <th>Object Store Buckets</th>
+                <th>Managed NFS</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Single-command volume summon</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Partial</td>
+              </tr>
+              <tr>
+                <td>Persistent state across agent runs</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Native filesystem mount semantics</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Easy handoff between agents</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>Partial</td>
+                <td>Partial</td>
+              </tr>
+              <tr>
+                <td>Portable across clouds and local runners</td>
+                <td>Yes</td>
+                <td>Limited</td>
+                <td>Yes</td>
+                <td>Limited</td>
+              </tr>
+              <tr>
+                <td>Checkpointing and restore path</td>
+                <td>Yes</td>
+                <td>Limited</td>
+                <td>Partial</td>
+                <td>Provider tooling</td>
+              </tr>
+              <tr>
+                <td>Best fit</td>
+                <td>Persistent agent workspaces</td>
+                <td>Disposable single-run jobs</td>
+                <td>Artifact blobs and archives</td>
+                <td>Traditional shared app storage</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="matrix-note">
+            ClawFS is aimed at agent runtime continuity: durable mounted state without adding a separate data handoff system.
+          </p>
+        </div>
+      </section>
+
+      <section id="pricing" class="cta reveal" data-delay="280">
+        <h2>Persistent Volumes for Agent Fleets, Not Storage Tax Theater</h2>
+        <p>
+          ClawFS gives operators one durable substrate for summonable agents. Keep storage in your own environment,
+          attach it when needed, and stop paying the cold-start penalty of rebuilding state from zero.
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="pricing.html">Compare Plans</a>
+          <a class="btn btn-secondary" href="enterprise.html">Enterprise Features</a>
+        </div>
+      </section>
+
+      <section id="cta" class="cta reveal" data-delay="340">
+        <h2>Give every agent a volume it can come back to.</h2>
+        <p>One CLI command to summon it. The same CLI command to return.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="pricing.html">Start Free</a>
+          <a class="btn btn-secondary" href="enterprise.html">Talk Enterprise</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>© <span id="year"></span> ClawFS</p>
+      <p>Persistent volumes for agent runtimes</p>
+    </footer>
+
+    <script src="main.js"></script>
+  </body>
+</html>

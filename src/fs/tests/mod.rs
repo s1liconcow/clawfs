@@ -120,7 +120,7 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         imap_delta_batch: 32,
         writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "osagefs".into(),
+        fuse_fsname: "clawfs".into(),
         log_storage_io: false,
     }
 }
@@ -238,8 +238,8 @@ fn make_symlink(inode: u64, name: &str, target: &str) -> InodeRecord {
 
 #[test]
 fn perf_lookup_hot_cached() {
-    if env::var("OSAGEFS_RUN_PERF").is_err() {
-        eprintln!("skipping perf_lookup_hot_cached; set OSAGEFS_RUN_PERF=1 to enable");
+    if env::var("CLAWFS_RUN_PERF").is_err() {
+        eprintln!("skipping perf_lookup_hot_cached; set CLAWFS_RUN_PERF=1 to enable");
         return;
     }
     let temp = tempdir().unwrap();
@@ -566,8 +566,8 @@ fn adaptive_append_meets_perf_target_with_journal_and_interval() {
 
 #[test]
 fn untar_style_perf_mixture() {
-    if env::var("OSAGEFS_RUN_PERF").is_err() {
-        eprintln!("skipping untar_style_perf_mixture; set OSAGEFS_RUN_PERF=1 to enable");
+    if env::var("CLAWFS_RUN_PERF").is_err() {
+        eprintln!("skipping untar_style_perf_mixture; set CLAWFS_RUN_PERF=1 to enable");
         return;
     }
     let dir = tempdir().unwrap();
@@ -3309,7 +3309,7 @@ fn append_while_flushing_uses_flushing_data_len_not_stale_record_size() {
 }
 
 /// Replays the observed out-of-order `nfs4trace.o` write pattern from
-/// osagefs.log and verifies byte-exact results across a flushing handoff.
+/// clawfs.log and verifies byte-exact results across a flushing handoff.
 #[test]
 fn nfs4trace_pattern_preserved_across_flushing_handoff() {
     let dir = tempdir().unwrap();

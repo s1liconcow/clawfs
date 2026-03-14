@@ -27,7 +27,7 @@ Options:
   --create-checkpoint           Create checkpoint after successful run
   --comment <text>              Comment for created checkpoint
   --mode <fast|cold>            fast => add --reuse_tree, cold => full run (default: fast)
-  --no-sync                     Skip tar sync; assume /work/osagefs already updated
+  --no-sync                     Skip tar sync; assume /work/clawfs already updated
   -h, --help                    Show this help
 
 Examples:
@@ -150,10 +150,10 @@ if [[ $SYNC_REPO -eq 1 ]]; then
   tar \
     --exclude='.git' \
     --exclude='target' \
-    --exclude='osagefs.log' \
-    --exclude='osagefs-perf.jsonl' \
+    --exclude='clawfs.log' \
+    --exclude='clawfs-perf.jsonl' \
     -czf - . \
-    | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/osagefs && mkdir -p /work/osagefs && tar -xzf - -C /work/osagefs'
+    | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/clawfs && mkdir -p /work/clawfs && tar -xzf - -C /work/clawfs'
 fi
 
 REMOTE_ARGS=("${PERF_ARGS[@]}")
@@ -162,7 +162,7 @@ if [[ "$MODE" == "fast" ]]; then
 fi
 
 printf -v REMOTE_ARG_STR "%q " "${REMOTE_ARGS[@]}"
-REMOTE_CMD="cd /work/osagefs && LOG_FILE=/work/osagefs/linux_build_timings.log PERF_LOG_PATH=/work/osagefs/osagefs-perf.jsonl ./scripts/linux_kernel_perf.sh ${REMOTE_ARG_STR}"
+REMOTE_CMD="cd /work/clawfs && LOG_FILE=/work/clawfs/linux_build_timings.log PERF_LOG_PATH=/work/clawfs/clawfs-perf.jsonl ./scripts/linux_kernel_perf.sh ${REMOTE_ARG_STR}"
 
 echo "Running perf on sprite '$SPRITE_NAME' (mode=$MODE)..."
 sprite exec -s "$SPRITE_NAME" -- bash -lc "$REMOTE_CMD"

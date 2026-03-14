@@ -4,21 +4,21 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-MOUNT_PATH="${MOUNT_PATH:-/tmp/osagefs-commoncrawl-mnt}"
-STORE_PATH="${STORE_PATH:-/tmp/osagefs-overlay-store}"
-LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-$HOME/.osagefs/commoncrawl-cache}"
-STATE_PATH="${STATE_PATH:-$HOME/.osagefs/state/commoncrawl-client-state.bin}"
-LOG_FILE="${LOG_FILE:-$ROOT_DIR/osagefs-commoncrawl.log}"
-PID_FILE="${PID_FILE:-/tmp/osagefs-commoncrawl.pid}"
+MOUNT_PATH="${MOUNT_PATH:-/tmp/clawfs-commoncrawl-mnt}"
+STORE_PATH="${STORE_PATH:-/tmp/clawfs-overlay-store}"
+LOCAL_CACHE_PATH="${LOCAL_CACHE_PATH:-$HOME/.clawfs/commoncrawl-cache}"
+STATE_PATH="${STATE_PATH:-$HOME/.clawfs/state/commoncrawl-client-state.bin}"
+LOG_FILE="${LOG_FILE:-$ROOT_DIR/clawfs-commoncrawl.log}"
+PID_FILE="${PID_FILE:-/tmp/clawfs-commoncrawl.pid}"
 FOREGROUND="${FOREGROUND:-0}"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-15}"
 
-# Overlay backend (OsageFS-owned metadata + write path)
+# Overlay backend (ClawFS-owned metadata + write path)
 OVERLAY_OBJECT_PROVIDER="${OVERLAY_OBJECT_PROVIDER:-local}"
 OVERLAY_BUCKET="${OVERLAY_BUCKET:-}"
 OVERLAY_REGION="${OVERLAY_REGION:-}"
 OVERLAY_ENDPOINT="${OVERLAY_ENDPOINT:-}"
-OVERLAY_PREFIX="${OVERLAY_PREFIX:-osagefs-overlay/commoncrawl-demo}"
+OVERLAY_PREFIX="${OVERLAY_PREFIX:-clawfs-overlay/commoncrawl-demo}"
 OVERLAY_GCS_SERVICE_ACCOUNT="${OVERLAY_GCS_SERVICE_ACCOUNT:-}"
 OVERLAY_AWS_ALLOW_HTTP="${OVERLAY_AWS_ALLOW_HTTP:-0}"
 OVERLAY_AWS_FORCE_PATH_STYLE="${OVERLAY_AWS_FORCE_PATH_STYLE:-0}"
@@ -37,7 +37,7 @@ SOURCE_AWS_ALLOW_HTTP="${SOURCE_AWS_ALLOW_HTTP:-0}"
 SOURCE_AWS_FORCE_PATH_STYLE="${SOURCE_AWS_FORCE_PATH_STYLE:-0}"
 
 osage_ensure_release_binary
-OSAGE_BIN="$ROOT_DIR/target/release/osagefs"
+OSAGE_BIN="$ROOT_DIR/target/release/clawfs"
 osage_require_path "$OSAGE_BIN"
 
 mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH" "$(dirname "$STATE_PATH")"
@@ -116,8 +116,8 @@ case "$SOURCE_OBJECT_PROVIDER" in
     ;;
 esac
 
-if [[ -n "${OSAGEFS_EXTRA_ARGS:-}" ]]; then
-  read -ra _extra <<< "$OSAGEFS_EXTRA_ARGS"
+if [[ -n "${CLAWFS_EXTRA_ARGS:-}" ]]; then
+  read -ra _extra <<< "$CLAWFS_EXTRA_ARGS"
   CMD+=("${_extra[@]}")
 fi
 

@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawFS Pricing | Free, Pro, and Enterprise</title>
+    <meta
+      name="description"
+      content="ClawFS pricing for free/demo, pro, and enterprise plans. Start with hosted demo storage, move to BYOB for production, and add enterprise controls when needed."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="glow glow-a" aria-hidden="true"></div>
+    <div class="glow glow-b" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="index.html">
+        <span class="brand-mark">CLAW</span>
+        <span class="brand-sub">FS</span>
+      </a>
+      <nav>
+        <a href="index.html#how">How It Works</a>
+        <a href="getting-started.html">Getting Started</a>
+        <a href="enterprise.html">Enterprise</a>
+        <a href="pricing.html">Pricing</a>
+        <a href="index.html#cta">Get Started</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero reveal" data-delay="0">
+        <p class="eyebrow">Pricing</p>
+        <h1>Start Cheap. Keep Storage in Your Bucket. Upgrade Controls When the Fleet Demands It.</h1>
+        <p class="hero-copy">
+          The pricing model is simple on purpose. Free gets you a tiny hosted demo path. Pro moves you to bring-your-own
+          storage and real team usage. Enterprise adds governance, cryptography, audit, and operational controls.
+        </p>
+        <p class="hero-copy">
+          Hosted demo storage is included only on the free tier. Pro and Enterprise are built around BYOB so the storage
+          bill stays in your cloud account instead of becoming a hidden platform markup.
+        </p>
+      </section>
+
+      <section class="feature-grid reveal" data-delay="100">
+        <div class="section-title">
+          <p class="eyebrow">Plans</p>
+          <h2>Three Tiers, Clear Upgrade Path</h2>
+        </div>
+        <div class="cards three-up">
+          <article class="card plan-card oss">
+            <span class="plan-badge">Free / Demo</span>
+            <div class="plan-price">
+              <strong>$0</strong>
+              <span>for evals</span>
+            </div>
+            <p class="plan-kicker">Best for trying the CLI, testing the summon flow, and showing persistent volumes to a small team.</p>
+            <ul>
+              <li>1 hosted demo volume</li>
+              <li>5 GB included hosted storage</li>
+              <li>7-day retention window</li>
+              <li>Checkpoint and restore basics</li>
+              <li>Community support</li>
+            </ul>
+            <p class="footnote">Hosted demo storage is intentionally capped and non-SLA.</p>
+            <a class="btn btn-primary" href="index.html#cta">Start Free</a>
+          </article>
+
+          <article class="card plan-card featured enterprise">
+            <span class="plan-badge">Pro</span>
+            <div class="plan-price">
+              <strong>$49</strong>
+              <span>per builder / month</span>
+            </div>
+            <p class="plan-kicker">Best for small teams running real agents against their own object storage without enterprise overhead.</p>
+            <ul>
+              <li>Bring-your-own bucket or prefix</li>
+              <li>Unlimited team volumes</li>
+              <li>Shared agent handoffs and checkpoints</li>
+              <li>Email support</li>
+              <li>No storage markup on BYOB usage</li>
+            </ul>
+            <p class="footnote">Storage and cloud requests are billed directly by your provider.</p>
+            <a class="btn btn-primary" href="mailto:hello@clawfs.dev">Talk to Us</a>
+          </article>
+
+          <article class="card plan-card">
+            <span class="plan-badge">Enterprise</span>
+            <div class="plan-price">
+              <strong>Custom</strong>
+              <span>annual contract</span>
+            </div>
+            <p class="plan-kicker">Best for platform teams that need identity, policy, cryptographic controls, compliance, and fleet management.</p>
+            <ul>
+              <li>OIDC/SAML with centralized policy</li>
+              <li>KMS/HSM integration</li>
+              <li>Hosted accelerator and maintenance offload</li>
+              <li>NFSv4, web UI, API, and audit streams</li>
+              <li>Priority support and onboarding</li>
+            </ul>
+            <p class="footnote">Designed for regulated workloads, multi-tenant fleets, and production rollouts.</p>
+            <a class="btn btn-secondary" href="enterprise.html">See Enterprise</a>
+          </article>
+        </div>
+      </section>
+
+      <section class="comparison reveal" data-delay="180">
+        <div class="section-title">
+          <p class="eyebrow">What Changes By Plan</p>
+          <h2>Feature Comparison</h2>
+        </div>
+        <div class="matrix-wrap">
+          <table class="matrix" aria-label="ClawFS pricing comparison table">
+            <thead>
+              <tr>
+                <th>Capability</th>
+                <th>Free / Demo</th>
+                <th>Pro</th>
+                <th>Enterprise</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Hosted starter storage</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>No</td>
+              </tr>
+              <tr>
+                <td>Bring-your-own bucket</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Shared persistent agent volumes</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Checkpoint and restore</td>
+                <td>Basic</td>
+                <td>Yes</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>OIDC/SAML + policy controls</td>
+                <td>No</td>
+                <td>Limited</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>KMS/HSM integration</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Hosted accelerator</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes</td>
+              </tr>
+              <tr>
+                <td>Support level</td>
+                <td>Community</td>
+                <td>Email</td>
+                <td>Priority</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="matrix-note">
+            Pro and Enterprise are priced around software and control-plane value. Storage remains in your own cloud account.
+          </p>
+        </div>
+      </section>
+
+      <section class="cards two-up reveal" data-delay="260">
+        <article class="card">
+          <h3>Why Free Exists</h3>
+          <p>
+            Teams should be able to feel the product before wiring buckets, IAM, or internal approvals. Free is deliberately
+            small and time-limited so the first experience is one command, not a procurement process.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Why Pro Is BYOB</h3>
+          <p>
+            Once you move past a demo, the cleanest model is to keep object storage in your environment. That keeps cloud
+            permissions straightforward and avoids turning ClawFS into a storage reseller.
+          </p>
+        </article>
+      </section>
+
+      <section class="cta reveal" data-delay="320">
+        <h2>Start on free. Move to Pro when the volumes matter. Add Enterprise when policy shows up.</h2>
+        <p>The product story stays simple even as the controls get more serious.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="index.html#cta">Start Free</a>
+          <a class="btn btn-secondary" href="mailto:enterprise@clawfs.dev">Contact Sales</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>© <span id="year"></span> ClawFS</p>
+      <p>Free demo, BYOB Pro, and enterprise controls for persistent agent storage</p>
+    </footer>
+
+    <script src="main.js"></script>
+  </body>
+</html>
