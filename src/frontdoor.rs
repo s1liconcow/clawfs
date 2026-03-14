@@ -9,12 +9,72 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 
 use crate::auth::{
-    AuthProfile, LoginArgs, WhoamiArgs, clear_profile, load_profile, resolved_api_token,
+    API_BASE_URL_ENV, AuthProfile, LoginArgs, WhoamiArgs, clear_profile, load_profile,
     store_profile, user_config_root,
 };
 use crate::config::{Cli, Config};
 
 const DEFAULT_VOLUME: &str = "default";
+const DEFAULT_PREFIX: &str = "clawfs";
+const DEFAULT_CLAWFS_APP_URL: &str = "https://app.clawfs.dev";
+const CLAWFS_API_ENV: &str = "CLAWFS_API";
+
+/// Configuration returned by the ClawFS API for summon
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SummonApiConfig {
+    /// Object store provider (s3, gcs, etc.)
+    provider: String,
+    /// Bucket name
+    bucket: String,
+    /// Region for the bucket
+    #[serde(default)]
+    region: Option<String>,
+    /// Endpoint URL (for S3-compatible stores)
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// AWS-style access key ID
+    #[serde(default)]
+    access_key_id: Option<String>,
+    /// AWS-style secret access key
+    #[serde(default)]
+    secret_access_key: Option<String>,
+    /// Storage mode (byob_free, byob_paid, hosted)
+    #[serde(default)]
+    storage_mode: Option<String>,
+}
+
+/// Fetches summon configuration from the ClawFS API
+async fn fetch_summon_config(
+    api_base_url: &str,
+    api_token: &str,
+    volume: &str,
+) -> anyhow::Result<SummonApiConfig> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/volumes/{}/summon-config", api_base_url, volume);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .context("failed to contact ClawFS API")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(no response body)".to_string());
+        anyhow::bail!("ClawFS API returned error {}: {}", status, text);
+    }
+
+    let config: SummonApiConfig = response
+        .json()
+        .await
+        .context("failed to parse ClawFS API response")?;
+
+    Ok(config)
+}
 
 pub enum DispatchAction {
     FallThrough,
@@ -24,16 +84,16 @@ pub enum DispatchAction {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "clawfs summon",
+    name = "clawfs up",
     about = "Run a command with ClawFS preload enabled"
 )]
-struct SummonArgs {
+struct UpArgs {
     /// Logical volume name; auto-created under the current account config root.
     #[arg(long, default_value = DEFAULT_VOLUME)]
     volume: String,
 
     /// Prefix path to intercept, relative to the current working directory by default.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, default_value = DEFAULT_PREFIX, value_name = "PATH")]
     path: Option<PathBuf>,
 
     /// Command to run inside the summoned volume.
@@ -133,10 +193,10 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             print_whoami(whoami)?;
             Ok(DispatchAction::Handled)
         }
-        "summon" => {
-            let parse_args = subcommand_args("clawfs summon", args);
-            let summon = SummonArgs::parse_from(parse_args);
-            run_summon(summon)?;
+        "up" => {
+            let parse_args = subcommand_args("clawfs up", args);
+            let up = UpArgs::parse_from(parse_args);
+            run_up(up)?;
             Ok(DispatchAction::Handled)
         }
         "mount" => {
@@ -161,8 +221,8 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             println!();
             Ok(DispatchAction::Handled)
         }
-        "help" if args.get(2).and_then(|value| value.to_str()) == Some("summon") => {
-            SummonArgs::command().print_help()?;
+        "help" if args.get(2).and_then(|value| value.to_str()) == Some("up") => {
+            UpArgs::command().print_help()?;
             println!();
             Ok(DispatchAction::Handled)
         }
@@ -209,11 +269,31 @@ fn build_mount_config(args: MountArgs) -> Result<Config> {
     Ok(cli.into())
 }
 
-fn run_summon(args: SummonArgs) -> Result<()> {
+fn run_up(args: UpArgs) -> Result<()> {
     let volume_paths = volume_paths(&args.volume)?;
     volume_paths.ensure_dirs()?;
     let prefix_path = resolve_prefix_path(args.path)?;
     let preload_lib = resolve_preload_library()?;
+
+    // Get API base URL from env var or use default
+    let api_base_url = env::var(CLAWFS_API_ENV)
+        .or_else(|_| env::var(API_BASE_URL_ENV))
+        .unwrap_or_else(|_| DEFAULT_CLAWFS_APP_URL.to_string());
+
+    // Get API token
+    let api_token = if let Ok(token) = env::var("CLAWFS_API_TOKEN") {
+        token
+    } else if let Some(profile) = load_profile()? {
+        profile.api_token
+    } else {
+        bail!("No API token found. Run `clawfs login` first or set CLAWFS_API_TOKEN");
+    };
+
+    // Fetch summon configuration from the API
+    let config = tokio::runtime::Runtime::new()
+        .context("failed to create async runtime")?
+        .block_on(fetch_summon_config(&api_base_url, &api_token, &args.volume))
+        .context("failed to fetch summon configuration")?;
 
     let mut command = Command::new(&args.command[0]);
     command.args(args.command.iter().skip(1));
@@ -234,14 +314,34 @@ fn run_summon(args: SummonArgs) -> Result<()> {
     command.env("CLAWFS_LOCAL_CACHE_PATH", &volume_paths.cache_path);
     command.env("CLAWFS_STATE_PATH", &volume_paths.preload_state_path);
     command.env("CLAWFS_VOLUME", sanitize_volume_name(&args.volume)?);
-    command.env("CLAWFS_OBJECT_PROVIDER", "local");
-    command.env("CLAWFS_STORAGE_MODE", "byob_paid");
 
-    if env::var_os("CLAWFS_API_TOKEN").is_none()
-        && let Some(token) = resolved_api_token()?
-    {
-        command.env("CLAWFS_API_TOKEN", token);
+    // Set object provider from API config
+    let provider = match config.provider.as_str() {
+        "s3" | "aws" => "aws",
+        "gcs" | "gcp" | "google" => "gcs",
+        _ => "local",
+    };
+    command.env("CLAWFS_OBJECT_PROVIDER", provider);
+    command.env("CLAWFS_BUCKET", &config.bucket);
+    if let Some(region) = config.region {
+        command.env("CLAWFS_REGION", region);
     }
+    if let Some(endpoint) = config.endpoint {
+        command.env("CLAWFS_ENDPOINT", endpoint);
+    }
+    if let Some(access_key_id) = config.access_key_id {
+        command.env("AWS_ACCESS_KEY_ID", access_key_id);
+    }
+    if let Some(secret_access_key) = config.secret_access_key {
+        command.env("AWS_SECRET_ACCESS_KEY", secret_access_key);
+    }
+
+    // Set storage mode from API config
+    let storage_mode = config.storage_mode.as_deref().unwrap_or("byob_paid");
+    command.env("CLAWFS_STORAGE_MODE", storage_mode);
+
+    // Always set the API token for the child process
+    command.env("CLAWFS_API_TOKEN", api_token);
 
     Err(command.exec().into())
 }
