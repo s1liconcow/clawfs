@@ -74,8 +74,8 @@ jobs:
           cp target/release/clawfs_replay "$DIST/"
           cp target/release/clawfs-nfs-gateway "$DIST/"
 
-          if [[ -f clawfs-preload/target/release/libclawfs_preload.so ]]; then
-            cp clawfs-preload/target/release/libclawfs_preload.so "$DIST/"
+          if [[ "${{ steps.preload-check.outputs.present }}" == "true" ]]; then
+            cp target/release/libclawfs_preload.so "$DIST/"
           fi
 
           cp README.md "$DIST/"

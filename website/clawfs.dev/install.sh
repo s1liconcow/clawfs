@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${CLAWFS_RELEASE_REPO:-clawfs/clawfs}"
+REPO="${CLAWFS_RELEASE_REPO:-s1liconcow/clawfs}"
 VERSION="${CLAWFS_INSTALL_VERSION:-latest}"
 INSTALL_ROOT="${CLAWFS_INSTALL_ROOT:-$HOME/.local}"
 BIN_DIR="${CLAWFS_INSTALL_BIN_DIR:-$INSTALL_ROOT/bin}"
