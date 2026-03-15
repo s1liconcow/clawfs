@@ -38,9 +38,12 @@ struct SummonApiConfig {
     /// AWS-style secret access key
     #[serde(default)]
     secret_access_key: Option<String>,
-    /// Storage mode (byob_free, byob_paid, hosted)
+    /// Storage mode (hosted_free, byob_paid)
     #[serde(default)]
     storage_mode: Option<String>,
+    /// Object prefix within the bucket
+    #[serde(default)]
+    object_prefix: Option<String>,
 }
 
 /// Fetches summon configuration from the ClawFS API
@@ -334,6 +337,9 @@ fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(secret_access_key) = config.secret_access_key {
         command.env("AWS_SECRET_ACCESS_KEY", secret_access_key);
+    }
+    if let Some(object_prefix) = config.object_prefix {
+        command.env("CLAWFS_OBJECT_PREFIX", object_prefix);
     }
 
     // Set storage mode from API config

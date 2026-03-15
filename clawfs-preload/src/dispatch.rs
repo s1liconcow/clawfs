@@ -226,6 +226,7 @@ pub fn dispatch_mkdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
         return Err(libc::EEXIST);
     }
     rt.fs.nfs_mkdir(parent_ino, &basename, uid, gid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -236,7 +237,11 @@ pub fn dispatch_unlink(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
     if basename.is_empty() {
         return Err(libc::EISDIR);
     }
-    rt.fs.nfs_remove_file(parent_ino, &basename, uid)
+    log::trace!("dispatch_unlink(inner={inner:?})");
+    rt.fs.nfs_remove_file(parent_ino, &basename, uid)?;
+    let result = rt.fs.nfs_flush();
+    log::trace!("dispatch_unlink flush -> {result:?}");
+    result
 }
 
 /// Dispatch `rmdir`.
@@ -246,7 +251,8 @@ pub fn dispatch_rmdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
     if basename.is_empty() {
         return Err(libc::EBUSY); // can't rmdir "/"
     }
-    rt.fs.nfs_remove_dir(parent_ino, &basename, uid)
+    rt.fs.nfs_remove_dir(parent_ino, &basename, uid)?;
+    rt.fs.nfs_flush()
 }
 
 /// Dispatch `rename`.
@@ -258,7 +264,8 @@ pub fn dispatch_rename(rt: &ClawfsRuntime, old_inner: &str, new_inner: &str) -> 
         return Err(libc::EINVAL);
     }
     rt.fs
-        .nfs_rename(old_parent, &old_name, new_parent, &new_name, 0, uid)
+        .nfs_rename(old_parent, &old_name, new_parent, &new_name, 0, uid)?;
+    rt.fs.nfs_flush()
 }
 
 /// Dispatch `pread` — read at explicit offset without updating fd offset.

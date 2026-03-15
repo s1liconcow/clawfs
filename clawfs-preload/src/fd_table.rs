@@ -81,19 +81,22 @@ impl FdTable {
 
     /// Check whether the given fd is a synthetic ClawFS fd.
     pub fn is_clawfs_fd(&self, fd: i32) -> bool {
-        fd >= FD_BASE && self.map.contains_key(&fd)
+        self.map.contains_key(&fd)
     }
 
     /// Duplicate an existing fd to a new synthetic fd (for `dup`).
     /// The new fd shares the same `Arc<FdEntry>` (same offset).
     pub fn dup(&self, old_fd: i32) -> Option<i32> {
         let entry = self.get(old_fd)?;
-        let new_fd = {
-            let mut next = self.next_fd.lock();
-            let fd = *next;
-            *next = next.wrapping_add(1);
-            fd
-        };
+        let new_fd = self.next_synthetic_fd(FD_BASE);
+        self.map.insert(new_fd, entry);
+        Some(new_fd)
+    }
+
+    /// Duplicate an existing fd to the lowest free descriptor number >= `min_fd`.
+    pub fn dup_min(&self, old_fd: i32, min_fd: i32) -> Option<i32> {
+        let entry = self.get(old_fd)?;
+        let new_fd = self.next_synthetic_fd(min_fd.max(0));
         self.map.insert(new_fd, entry);
         Some(new_fd)
     }
@@ -107,6 +110,22 @@ impl FdTable {
         self.map.remove(&new_fd);
         self.map.insert(new_fd, entry);
         Some(new_fd)
+    }
+
+    fn next_synthetic_fd(&self, min_fd: i32) -> i32 {
+        let mut next = self.next_fd.lock();
+        let mut candidate = if min_fd >= FD_BASE {
+            (*next).max(min_fd)
+        } else {
+            min_fd
+        };
+        while self.map.contains_key(&candidate) {
+            candidate = candidate.wrapping_add(1);
+        }
+        if candidate >= FD_BASE {
+            *next = candidate.wrapping_add(1);
+        }
+        candidate
     }
 }
 

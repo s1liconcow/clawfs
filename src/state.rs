@@ -1,5 +1,6 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,12 +49,14 @@ impl Default for ClientState {
 
 pub struct ClientStateManager {
     path: PathBuf,
+    lock_path: PathBuf,
     state: Mutex<ClientState>,
 }
 
 impl ClientStateManager {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let lock_path = path.with_extension("lock");
         let state = if path.exists() {
             let mut buf = Vec::new();
             File::open(&path)
@@ -72,6 +75,7 @@ impl ClientStateManager {
         };
         Ok(Self {
             path,
+            lock_path,
             state: Mutex::new(state),
         })
     }
@@ -151,9 +155,34 @@ impl ClientStateManager {
 
     fn persist_locked(&self, state: &ClientState) -> Result<()> {
         let data = serialize_state_fb(state);
-        let mut file = File::create(&self.path)?;
-        file.write_all(&data)?;
+        let _lock = self.lock_file()?;
+        let tmp_path = self.path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &self.path)?;
         Ok(())
+    }
+
+    fn lock_file(&self) -> Result<File> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)
+            .with_context(|| format!("opening client state lock {}", self.lock_path.display()))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(anyhow::anyhow!(
+                "locking client state {} failed: {}",
+                self.lock_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(file)
     }
 }
 

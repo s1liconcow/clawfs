@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use clawfs::config::{Config, ObjectStoreProvider};
 use clawfs::fs::OsageFs;
-use clawfs::inode::{InodeRecord, ROOT_INODE};
+use clawfs::inode::{FileStorage, InodeRecord, ROOT_INODE};
 use clawfs::journal::JournalManager;
 use clawfs::metadata::MetadataStore;
 use clawfs::replay::ReplayLogger;
@@ -97,7 +97,9 @@ impl ClawfsRuntime {
             state_path: state_path.clone(),
             perf_log: None,
             replay_log: None,
-            disable_journal: false,
+            // Preload sessions are short-lived and often span many processes.
+            // Avoid shared journal coordination in the hot path by default.
+            disable_journal: true,
             fsync_on_close: false,
             flush_interval_ms: 5000,
             disable_cleanup: true,
@@ -216,6 +218,8 @@ impl ClawfsRuntime {
 
         let _ = CLAWFS_RUNTIME.set(runtime);
 
+        crate::inotify::spawn_poller();
+
         // Register fork poison handler.
         unsafe {
             libc::pthread_atfork(None, None, Some(post_fork_child));
@@ -241,6 +245,24 @@ fn default_config_root() -> PathBuf {
 fn default_cache_root() -> PathBuf {
     default_config_root()
 }
+
+const WELCOME_FILENAME: &str = "WELCOME.txt";
+const WELCOME_CONTENT: &str = "Welcome to ClawFS!\n\
+\n\
+ClawFS is a log-structured, object-store-backed filesystem designed for fast,\n\
+shared access to large working sets with durable metadata and batched writes.\n\
+\n\
+Great use cases:\n\
+- AI training data and model artifacts shared across multiple machines\n\
+- Shared home directories for teams, labs, or ephemeral compute nodes\n\
+- High-throughput team access to large binaries, build outputs, and datasets\n\
+\n\
+Why teams use it:\n\
+- Immutable segment writes for efficient object-store IO\n\
+- Batched metadata updates for lower API overhead\n\
+- Local staging, caching, and journal replay for practical durability and speed\n\
+\n\
+Enjoy building on ClawFS.\n";
 
 /// Ensure the root inode exists, creating it if needed.
 async fn ensure_root(
@@ -283,6 +305,64 @@ async fn ensure_root(
         gid,
     );
     root.mode = desired_mode;
+    if let Err(err) = metadata
+        .persist_inode(&root, generation, config.shard_size)
+        .await
+    {
+        superblock.abort_generation(generation);
+        return Err(err);
+    }
+    superblock.commit_generation(generation).await?;
+    ensure_welcome_file(metadata, superblock, config, uid, gid).await?;
+    Ok(())
+}
+
+async fn ensure_welcome_file(
+    metadata: Arc<MetadataStore>,
+    superblock: Arc<SuperblockManager>,
+    config: &Config,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    let mut root = metadata
+        .get_inode(ROOT_INODE)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing root inode {}", ROOT_INODE))?;
+    if root
+        .children()
+        .map(|children| children.contains_key(WELCOME_FILENAME))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let new_inode = superblock.reserve_inodes(1).await?;
+    let snapshot = superblock.prepare_dirty_generation()?;
+    let generation = snapshot.generation;
+
+    let mut welcome = InodeRecord::new_file(
+        new_inode,
+        ROOT_INODE,
+        WELCOME_FILENAME.to_string(),
+        format!("/{}", WELCOME_FILENAME),
+        uid,
+        gid,
+    );
+    let bytes = WELCOME_CONTENT.as_bytes().to_vec();
+    welcome.size = bytes.len() as u64;
+    welcome.storage = FileStorage::Inline(bytes);
+    welcome.mode = 0o100644;
+
+    if let Err(err) = metadata
+        .persist_inode(&welcome, generation, config.shard_size)
+        .await
+    {
+        superblock.abort_generation(generation);
+        return Err(err);
+    }
+    if let Some(children) = root.children_mut() {
+        children.insert(WELCOME_FILENAME.to_string(), new_inode);
+    }
     if let Err(err) = metadata
         .persist_inode(&root, generation, config.shard_size)
         .await

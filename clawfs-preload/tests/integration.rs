@@ -5,40 +5,100 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn preload_lib_path() -> PathBuf {
-    // The cdylib is built at target/debug/libclawfs_preload.so (when run via cargo test).
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("libclawfs_preload.so");
-    if !path.exists() {
-        // Fallback: try the deps directory.
-        path = std::env::current_exe()
+    let exe = std::env::current_exe().unwrap();
+    let candidates = [
+        exe.parent().unwrap().join("libclawfs_preload.so"),
+        exe.parent()
             .unwrap()
             .parent()
             .unwrap()
-            .to_path_buf();
-        path.push("libclawfs_preload.so");
+            .join("libclawfs_preload.so"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join("libclawfs_preload.so"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join("debug")
+            .join("libclawfs_preload.so"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
     }
+    panic!("libclawfs_preload.so not found. Build with `cargo build --manifest-path clawfs-preload/Cargo.toml` first.");
+}
+
+struct TestEnv {
+    _tmp: tempfile::TempDir,
+    store_path: PathBuf,
+    cache_path: PathBuf,
+    state_path: PathBuf,
+    prefix: String,
+    lib: PathBuf,
+}
+
+impl TestEnv {
+    fn new(prefix: &str) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        Self {
+            _tmp: tmp,
+            store_path: root.join("store"),
+            cache_path: root.join("cache"),
+            state_path: root.join("state").join("preload_state.bin"),
+            prefix: prefix.to_string(),
+            lib: preload_lib_path(),
+        }
+    }
+
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env("LD_PRELOAD", &self.lib)
+            .env("CLAWFS_PREFIXES", &self.prefix)
+            .env("CLAWFS_STORE_PATH", &self.store_path)
+            .env("CLAWFS_LOCAL_CACHE_PATH", &self.cache_path)
+            .env("CLAWFS_STATE_PATH", &self.state_path)
+            .env("CLAWFS_STORAGE_MODE", "byob_paid")
+            .env("CLAWFS_OBJECT_PROVIDER", "local")
+            .env("RUST_LOG", "error");
+        command
+    }
+}
+
+fn read_file_via_preload(env: &TestEnv, path: &str) -> Vec<u8> {
+    let script = r#"
+import os, sys
+with open(sys.argv[1], "rb") as f:
+    sys.stdout.buffer.write(f.read())
+"#;
+
+    let output = env
+        .command("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .output()
+        .expect("failed to run python3");
+
     assert!(
-        path.exists(),
-        "libclawfs_preload.so not found at {path:?}. Build with `cargo build` first."
+        output.status.success(),
+        "python read failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    path
+
+    output.stdout
 }
 
 #[test]
 fn preload_basic_file_io() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store_path = tmp.path().join("store");
-    let cache_path = tmp.path().join("cache");
-    let state_path = tmp.path().join("state").join("preload_state.bin");
-    let prefix = "/clawfs-test-prefix";
-
-    let lib = preload_lib_path();
+    let env = TestEnv::new("/clawfs-test-prefix");
+    let prefix = &env.prefix;
 
     // Write a small Python script that exercises basic file I/O under the prefix.
     // We use Python because it's universally available and uses libc under the hood.
@@ -186,17 +246,10 @@ print("PRELOAD_TEST_PASSED")
 "#
     );
 
-    let output = Command::new("python3")
+    let output = env
+        .command("python3")
         .arg("-c")
         .arg(&script)
-        .env("LD_PRELOAD", &lib)
-        .env("CLAWFS_PREFIXES", prefix)
-        .env("CLAWFS_STORE_PATH", &store_path)
-        .env("CLAWFS_LOCAL_CACHE_PATH", &cache_path)
-        .env("CLAWFS_STATE_PATH", &state_path)
-        .env("CLAWFS_STORAGE_MODE", "byob_paid")
-        .env("CLAWFS_OBJECT_PROVIDER", "local")
-        .env("RUST_LOG", "info")
         .output()
         .expect("failed to run python3");
 
@@ -214,4 +267,149 @@ print("PRELOAD_TEST_PASSED")
         stdout.contains("PRELOAD_TEST_PASSED"),
         "Test marker not found in stdout.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+#[test]
+fn preload_bash_redirection_writes_file() {
+    let env = TestEnv::new("/clawfs-shell-prefix");
+    let path = format!("{}/testing", env.prefix);
+
+    let output = env
+        .command("bash")
+        .arg("-lc")
+        .arg(format!("echo one > {path}"))
+        .output()
+        .expect("failed to run bash");
+
+    assert!(
+        output.status.success(),
+        "bash redirect failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "redirected output leaked to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let data = read_file_via_preload(&env, &path);
+    assert_eq!(data, b"one\n");
+}
+
+#[test]
+fn preload_bash_append_redirection_preserves_contents() {
+    let env = TestEnv::new("/clawfs-shell-append-prefix");
+    let path = format!("{}/append.txt", env.prefix);
+
+    let output = env
+        .command("bash")
+        .arg("-lc")
+        .arg(format!("echo one > {path}; echo two >> {path}"))
+        .output()
+        .expect("failed to run bash");
+
+    assert!(
+        output.status.success(),
+        "bash append redirect failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "redirected append leaked to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let data = read_file_via_preload(&env, &path);
+    assert_eq!(data, b"one\ntwo\n");
+}
+
+#[test]
+fn preload_rm_persists_unlink_across_processes() {
+    let env = TestEnv::new("/clawfs-rm-prefix");
+    let path = format!("{}/testing", env.prefix);
+
+    let create = env
+        .command("bash")
+        .arg("-lc")
+        .arg(format!("echo test > {path}"))
+        .output()
+        .expect("failed to create test file");
+    assert!(
+        create.status.success(),
+        "create failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        create.status,
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let remove = env
+        .command("rm")
+        .arg(&path)
+        .output()
+        .expect("failed to run rm");
+    assert!(
+        remove.status.success(),
+        "rm failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        remove.status,
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let stat = env
+        .command("python3")
+        .arg("-c")
+        .arg("import os, sys; sys.exit(0 if os.path.exists(sys.argv[1]) else 1)")
+        .arg(&path)
+        .status()
+        .expect("failed to stat removed file");
+    assert_eq!(stat.code(), Some(1), "file still exists after rm");
+}
+
+#[test]
+fn preload_relative_rm_from_host_cwd_succeeds() {
+    let host_root = tempfile::tempdir().unwrap();
+    let host_cwd = host_root.path().to_path_buf();
+    let env = TestEnv::new(host_cwd.join("clawfs").to_str().unwrap());
+
+    let create = env
+        .command("bash")
+        .current_dir(&host_cwd)
+        .arg("-lc")
+        .arg("echo test > clawfs/testing")
+        .output()
+        .expect("failed to create relative test file");
+    assert!(
+        create.status.success(),
+        "relative create failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        create.status,
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let remove = env
+        .command("rm")
+        .current_dir(&host_cwd)
+        .arg("clawfs/testing")
+        .output()
+        .expect("failed to run relative rm");
+    assert!(
+        remove.status.success(),
+        "relative rm failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        remove.status,
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let stat = env
+        .command("python3")
+        .current_dir(&host_cwd)
+        .arg("-c")
+        .arg("import os, sys; sys.exit(0 if os.path.exists('clawfs/testing') else 1)")
+        .status()
+        .expect("failed to stat relative removed file");
+    assert_eq!(stat.code(), Some(1), "relative file still exists after rm");
 }

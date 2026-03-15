@@ -574,6 +574,10 @@ impl MetadataStore {
         };
 
         store.load_latest_imaps().await?;
+        // A fresh process can observe a shard generation that lags behind
+        // recently committed deltas. Replay those deltas immediately so
+        // short-lived preload sessions see the latest namespace changes.
+        let _ = store.apply_external_deltas_async().await?;
         Ok(store)
     }
 
@@ -1273,55 +1277,51 @@ impl MetadataStore {
         Ok(())
     }
 
+    async fn apply_external_deltas_async(&self) -> Result<Vec<InodeRecord>> {
+        let mut newest = *self.last_delta_generation.lock();
+        let mut files = Vec::new();
+        let prefix = self.delta_prefix();
+
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            let meta = item?;
+            let name = meta.location.filename().unwrap_or_default();
+            if let Some(generation) = parse_delta_filename(name)
+                && generation > newest
+            {
+                files.push((generation, meta.location));
+            }
+        }
+
+        files.sort_by_key(|(generation, _)| *generation);
+        let mut updated_records = Vec::new();
+        for (generation, path) in files {
+            let bytes = self.store.get(&path).await?.bytes().await?;
+            let stored: StoredDelta = deserialize_delta(&bytes)?;
+            anyhow::ensure!(
+                stored.version == METADATA_FORMAT_VERSION,
+                "unsupported delta version {}",
+                stored.version
+            );
+            for record in stored.records {
+                if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
+                    self.cache.write().remove(&record.inode);
+                } else {
+                    self.cache.write().insert(
+                        record.inode,
+                        CacheEntry::with_generation(record.clone(), generation),
+                    );
+                    updated_records.push(record.clone());
+                }
+            }
+            newest = newest.max(generation);
+        }
+        *self.last_delta_generation.lock() = newest;
+        Ok(updated_records)
+    }
+
     pub fn apply_external_deltas(&self) -> Result<Vec<InodeRecord>> {
-        // This needs to be async or blocking. Since we are in a non-async method
-        // that's often called from blocking context (or we need to change signature),
-        // we use the handle to block.
-        // However, `spawn_metadata_poller` calls this inside `spawn_blocking`.
-        // So we can use `self.handle.block_on`.
-
-        self.handle.block_on(async {
-            let mut newest = *self.last_delta_generation.lock();
-            let mut files = Vec::new();
-            let prefix = self.delta_prefix();
-
-            let mut stream = self.store.list(Some(&prefix));
-            while let Some(item) = stream.next().await {
-                let meta = item?;
-                let name = meta.location.filename().unwrap_or_default();
-                if let Some(generation) = parse_delta_filename(name)
-                    && generation > newest
-                {
-                    files.push((generation, meta.location));
-                }
-            }
-
-            files.sort_by_key(|(generation, _)| *generation);
-            let mut updated_records = Vec::new();
-            for (generation, path) in files {
-                let bytes = self.store.get(&path).await?.bytes().await?;
-                let stored: StoredDelta = deserialize_delta(&bytes)?;
-                anyhow::ensure!(
-                    stored.version == METADATA_FORMAT_VERSION,
-                    "unsupported delta version {}",
-                    stored.version
-                );
-                for record in stored.records {
-                    if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                        self.cache.write().remove(&record.inode);
-                    } else {
-                        self.cache.write().insert(
-                            record.inode,
-                            CacheEntry::with_generation(record.clone(), generation),
-                        );
-                        updated_records.push(record.clone());
-                    }
-                }
-                newest = newest.max(generation);
-            }
-            *self.last_delta_generation.lock() = newest;
-            Ok(updated_records)
-        })
+        self.handle.block_on(self.apply_external_deltas_async())
     }
 
     pub fn delta_file_count(&self) -> Result<usize> {
@@ -1612,6 +1612,58 @@ fn normalize_prefix(user_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+
+    use crate::config::{Config, ObjectStoreProvider};
+
+    fn test_config(root: &std::path::Path) -> Config {
+        Config {
+            mount_path: root.join("mnt"),
+            store_path: root.join("store"),
+            local_cache_path: root.join("cache"),
+            inline_threshold: 512,
+            inline_compression: true,
+            inline_encryption_key: None,
+            segment_compression: true,
+            segment_encryption_key: None,
+            shard_size: 64,
+            inode_batch: 8,
+            segment_batch: 8,
+            pending_bytes: 8 * 1024 * 1024,
+            entry_ttl_secs: 5,
+            object_provider: ObjectStoreProvider::Local,
+            bucket: None,
+            region: None,
+            endpoint: None,
+            object_prefix: String::new(),
+            gcs_service_account: None,
+            aws_allow_http: false,
+            aws_force_path_style: false,
+            source: None,
+            state_path: root.join("state.bin"),
+            foreground: false,
+            allow_other: false,
+            home_prefix: "/home".into(),
+            perf_log: None,
+            replay_log: None,
+            disable_journal: true,
+            fsync_on_close: false,
+            flush_interval_ms: 0,
+            disable_cleanup: true,
+            lookup_cache_ttl_ms: 0,
+            dir_cache_ttl_ms: 0,
+            metadata_poll_interval_ms: 0,
+            segment_cache_bytes: 0,
+            log_file: None,
+            debug_log: false,
+            imap_delta_batch: 32,
+            writeback_cache: false,
+            fuse_threads: 0,
+            fuse_fsname: "clawfs".into(),
+            log_storage_io: false,
+        }
+    }
 
     /// Regression test: directory children with file-extension names (e.g., `.h`,
     /// `.c`) must survive a FlatBuffer serialize → deserialize round-trip without
@@ -1861,6 +1913,52 @@ mod tests {
                 }
                 other => panic!("expected Inline for {}, got {:?}", expected_name, other),
             }
+        }
+    }
+
+    #[test]
+    fn new_store_replays_deltas_newer_than_latest_visible_shard() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let runtime = Runtime::new().unwrap();
+
+        let inode_v1 = InodeRecord::new_file(
+            42,
+            1,
+            "file.txt".to_string(),
+            "/file.txt".to_string(),
+            1000,
+            1000,
+        );
+        let mut inode_v2 = inode_v1.clone();
+        inode_v2.size = 5;
+        inode_v2.storage = FileStorage::Inline(b"hello".to_vec());
+
+        runtime.block_on(async {
+            let metadata = MetadataStore::new(&config, runtime.handle().clone())
+                .await
+                .unwrap();
+            metadata
+                .persist_inode(&inode_v1, 1, config.shard_size)
+                .await
+                .unwrap();
+            metadata
+                .write_delta_ref(2, &[inode_v2.clone()])
+                .await
+                .unwrap();
+        });
+
+        let reloaded = runtime
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+            .unwrap();
+        let stored = runtime
+            .block_on(reloaded.get_inode(42))
+            .unwrap()
+            .expect("inode should exist after replaying newer delta");
+        assert_eq!(stored.size, 5);
+        match stored.storage {
+            FileStorage::Inline(bytes) => assert_eq!(bytes, b"hello".to_vec()),
+            other => panic!("expected inline storage after delta replay, got {other:?}"),
         }
     }
 }

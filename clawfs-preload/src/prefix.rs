@@ -58,6 +58,18 @@ impl PrefixRouter {
     pub fn is_empty(&self) -> bool {
         self.prefixes.is_empty()
     }
+
+    /// Reconstruct the full external path for an inner volume path.
+    /// Uses the first (most-specific) configured prefix.
+    pub fn full_path(&self, inner: &str) -> Option<String> {
+        let prefix = self.prefixes.first()?;
+        let prefix_str = prefix.to_str()?;
+        if inner == "/" || inner.is_empty() {
+            Some(prefix_str.to_string())
+        } else {
+            Some(format!("{}{}", prefix_str.trim_end_matches('/'), inner))
+        }
+    }
 }
 
 /// Normalize a path: resolve `.` and `..` lexically, collapse repeated `/`.

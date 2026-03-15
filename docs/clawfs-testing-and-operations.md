@@ -2,6 +2,7 @@
 
 ## Validation And Benchmarking
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
+- The repo root is a Cargo workspace; `cargo build --release` from the root builds both `clawfs` and `clawfs-preload`, which is required for `clawfs up`.
 - Local performance suite: `CLAWFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`.
 - `CLAWFS_PERF_PROFILE=fast` in `benches/perf_local_criterion.rs` keeps `sample_size=20` and increases `measurement_time` to 13s to avoid Criterion sample warnings on slower hosts.
 - Perf guard uses `scripts/perf_guard.sh` together with `CLAWFS_BENCH_METRICS_FILE`, which is emitted as JSONL by `benches/perf_local_criterion.rs`.

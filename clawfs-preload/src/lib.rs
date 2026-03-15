@@ -2,6 +2,7 @@ mod cwd;
 mod dispatch;
 mod errno;
 mod fd_table;
+mod inotify;
 mod intercept;
 mod prefix;
 mod runtime;

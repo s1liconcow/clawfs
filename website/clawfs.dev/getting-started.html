@@ -1,284 +1,377 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Getting Started With ClawFS</title>
-    <meta
-      name="description"
-      content="Get started with ClawFS across FUSE, NFS, and preload-based runtime integration. Learn the launch paths, storage options, and configuration basics."
-    />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <div class="bg-grid" aria-hidden="true"></div>
-    <div class="glow glow-a" aria-hidden="true"></div>
-    <div class="glow glow-b" aria-hidden="true"></div>
 
-    <header class="site-header">
-      <a class="brand" href="index.html">
-        <span class="brand-mark">CLAW</span>
-        <span class="brand-sub">FS</span>
-      </a>
-      <nav>
-        <a href="index.html#how">How It Works</a>
-        <a href="getting-started.html">Getting Started</a>
-        <a href="enterprise.html">Enterprise</a>
-        <a href="pricing.html">Pricing</a>
-        <a href="index.html#features">Why It Wins</a>
-        <a href="index.html#cta">Get Started</a>
-        <a class="nav-signin" href="auth.html">Sign In</a>
-      </nav>
-    </header>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Getting Started With ClawFS</title>
+  <meta name="description"
+    content="Get started with ClawFS across FUSE, NFS, and preload-based runtime integration. Learn the launch paths, storage options, and configuration basics." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
 
-    <main>
-      <section class="hero reveal" data-delay="0">
-        <p class="eyebrow">Getting Started</p>
-        <h1>Get ClawFS Running in the Environment You Already Use</h1>
-        <p class="hero-copy">
-          The `clawfs` binary is the front door. Use `clawfs up` for preload-based agent launches,
-          `clawfs mount` for FUSE, and `clawfs serve` for user-mode NFS.
-        </p>
-        <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
-        <div class="hero-cta">
-          <a class="btn btn-primary" href="#up">Start With Up</a>
-          <a class="btn btn-primary" href="#fuse">Mount With FUSE</a>
-          <a class="btn btn-secondary" href="#nfs">Serve With NFS</a>
-          <a class="btn btn-secondary" href="#config">Configure Runtime</a>
-        </div>
-      </section>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
 
-      <section id="login" class="feature-grid reveal" data-delay="60">
-        <div class="section-title">
-          <p class="eyebrow">Step 1</p>
-          <h2>Create an Account and Connect the CLI</h2>
-        </div>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>Start With the Hosted Experience</h3>
-            <p>For the fastest first run, sign in with email, Google, or GitHub and connect the CLI to your ClawFS account.</p>
-            <div class="code-block"><code>clawfs login
-clawfs whoami</code></div>
-          </article>
-          <article class="card">
-            <h3>What You Get</h3>
-            <ul>
-              <li>Secure sign-in for the web app and CLI</li>
-              <li>A straightforward path to hosted evaluation</li>
-              <li>A reusable identity for your workspaces and volumes</li>
-              <li>A clean upgrade path from trial use to team deployment</li>
-            </ul>
-          </article>
-        </div>
-      </section>
+  <header class="site-header">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">CLAW</span>
+      <span class="brand-sub">FS</span>
+    </a>
+    <nav>
+      <a href="index.html#how">How It Works</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="enterprise.html">Enterprise</a>
+      <a href="pricing.html">Pricing</a>
+      <a href="index.html#features">Why It Wins</a>
+      <a href="index.html#cta">Get Started</a>
+      <a class="nav-signin" href="https://app.clawfs.dev">Sign In</a>
+    </nav>
+  </header>
 
-      <section id="up" class="feature-grid reveal" data-delay="70">
-        <div class="section-title">
-          <p class="eyebrow">Default Path</p>
-          <h2>Summon a Volume and Run Your Agent</h2>
-        </div>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>Default Account Volume</h3>
-            <p>`clawfs up` uses the shared-library path and auto-creates the `default` volume for the current account if you do not choose one.</p>
-            <div class="code-block"><code>clawfs up -- codex</code></div>
-          </article>
-          <article class="card">
-            <h3>Named Volume + CWD-Relative Prefix</h3>
-            <p>Pass `--volume` when you want to recall a specific workspace and `--path` when you want the intercepted prefix anchored relative to the current directory.</p>
-            <div class="code-block"><code>clawfs up --volume research-a --path claw -- codex</code></div>
-            <p class="footnote">Default prefix is <code>clawfs</code> relative to the current working directory if no <code>--path</code> is specified.</p>
-          </article>
-        </div>
-      </section>
+  <main>
+    <section class="hero reveal" data-delay="0">
+      <p class="eyebrow">Getting Started</p>
+      <h1>Get ClawFS Running in the Environment You Already Use</h1>
+      <p class="hero-copy">
+        The `clawfs` binary is the front door. Use `clawfs up` for preload-based agent launches,
+        `clawfs mount` for FUSE, and `clawfs serve` for user-mode NFS.
+      </p>
+      <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#up">Start it Up</a>
+        <a class="btn btn-primary" href="#fuse">Mount With FUSE</a>
+        <a class="btn btn-secondary" href="#nfs">Serve With NFS</a>
+        <a class="btn btn-secondary" href="#config">Configure Runtime</a>
+      </div>
+    </section>
 
-      <section class="cards two-up reveal" data-delay="80">
+    <section id="login" class="feature-grid reveal" data-delay="60">
+      <div class="section-title">
+        <p class="eyebrow">Step 1</p>
+        <h2>Create an Account and Connect the CLI</h2>
+      </div>
+      <div class="cards two-up">
         <article class="card">
-          <h3>Current Shipping Modes</h3>
+          <h3>Start With the Hosted Experience</h3>
+          <p>For the fastest first run, sign in with email, Google, or GitHub and connect the CLI to your ClawFS
+            account.</p>
+          <div class="code-block"><code>clawfs login
+clawfs whoami</code></div>
+        </article>
+        <article class="card">
+          <h3>What You Get</h3>
           <ul>
-            <li>`clawfs up` for preload-based agent launches</li>
-            <li>`clawfs mount` for direct FUSE mounts</li>
-            <li>`clawfs serve` for user-mode NFS</li>
+            <li>Secure sign-in for the web app and CLI</li>
+            <li>A straightforward path to hosted evaluation</li>
+            <li>A reusable identity for your workspaces and volumes</li>
+            <li>A clean upgrade path from trial use to team deployment</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="up" class="feature-grid reveal" data-delay="70">
+      <div class="section-title">
+        <p class="eyebrow">Default Path</p>
+        <h2>Summon a Volume and Run Your Agent</h2>
+      </div>
+      <div class="cards two-up">
+        <article class="card">
+          <h3>Default Account Volume</h3>
+          <p>`clawfs up` uses the shared-library path and auto-creates the `default` volume for the current account if
+            you do not choose one.</p>
+          <div class="code-block"><code>clawfs up -- claude</code></div>
+        </article>
+        <article class="card">
+          <h3>Named Volume + CWD-Relative Prefix</h3>
+          <p>Pass `--volume` when you want to recall a specific workspace and `--path` when you want the intercepted
+            prefix anchored relative to the current directory.</p>
+          <div class="code-block"><code>clawfs up --volume research-a --path claw -- claude</code></div>
+          <p class="footnote">Default prefix is <code>clawfs</code> relative to the current working directory if no
+            <code>--path</code> is specified.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="cards two-up reveal" data-delay="80">
+      <article class="card">
+        <h3>Current Shipping Modes</h3>
+        <ul>
+          <li>`clawfs up` for preload-based agent launches</li>
+          <li>`clawfs mount` for direct FUSE mounts</li>
+          <li>`clawfs serve` for user-mode NFS</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>How to Choose</h3>
+        <ul>
+          <li>Use `up` when the runtime wants file APIs without a host mount. <b>Note: </b>This doesn't work with statically linked binaries.  Use FUSE or NFS in those cases.</li>
+          <li>Use `mount` when you control the host mountpoint</li>
+          <li>Use `serve` when you want a networked userspace server</li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="reveal" data-delay="100">
+      <article class="callout"
+        style="background: linear-gradient(180deg, rgba(255, 250, 244, 0.98), rgba(246, 231, 209, 0.95));">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem;">
+          <h3 style="margin: 0;">📋 AGENTS.md Snippet — Copy & Paste</h3>
+          <button
+            onclick="navigator.clipboard.writeText(document.getElementById('agents-md-snippet').innerText); this.innerText='Copied!'; setTimeout(() => this.innerText='Copy', 2000);"
+            style="padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid var(--line); background: rgba(255, 252, 247, 0.9); cursor: pointer; font-size: 0.85rem; font-weight: 600;">Copy</button>
+        </div>
+        <p style="margin-bottom: 1rem; color: var(--ink-soft);">
+          Add this to your project's <code>AGENTS.md</code> to inform agents about the shared storage:
+        </p>
+        <pre id="agents-md-snippet"
+          style="background: rgba(39, 23, 17, 0.98); color: #f8e7d2; padding: 1rem; border-radius: 12px; overflow-x: auto; font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; line-height: 1.6; margin: 0; white-space: pre-wrap; word-wrap: break-word;"># ClawFS Shared Directory Guide
+
+## /clawfs - Shared Collaboration Directory
+
+When using ClawFS, the path `/clawfs` (or your configured prefix) represents a **shared persistent workspace** that persists across agent sessions and enables collaboration between agents.
+
+### What is /clawfs?
+
+`/clawfs` is a shared directory where agents can:
+- Store files that persist across restarts and sessions
+- Share data and checkpoints with other agents
+- Collaborate on tasks using a common filesystem namespace
+- Read and write files as if they were on a local filesystem
+
+### How It Works
+
+By default, ClawFS uses the prefix `clawfs` relative to the current working directory. This means:
+- `./clawfs/` in your working directory is intercepted and redirected to ClawFS
+- All file operations within this directory are persisted and synchronized
+- Multiple agents can access the same volume simultaneously
+
+### Usage Examples
+
+```bash
+# Using up (default path is 'clawfs')
+clawfs up -- your-agent
+
+# Using with an explicit volume and path
+clawfs up --volume agent_mail --path agent_mail -- your-agent
+
+# Accessing via code (no SDK requrired!):
+with open('/clawfs/shared-data.json', 'w') as f:
+    json.dump(results, f)
+
+# Accessing manually:
+clawfs up -- cat clawfs/WELCOME.txt
+
+# Interactive Shell
+clawfs up -- bash
+```
+
+### Configuration
+
+You can customize the prefix path:
+- `--path clawfs` (relative to current directory - default)
+- `--path /tmp/clawfs-mnt` (absolute path)
+
+You can easily select or create a new named volume:
+- `--volume demo` 
+
+see `--help` for the full list of configuration options.
+
+### Collaboration Model
+
+ClawFS enables multi-agent collaboration through:
+- **Shared volumes** accessed by name (`--volume team-project`)
+- **Persistent storage** that survives agent restarts
+- **Concurrent access** with automatic synchronization
+- **Checkpoints** for saving and restoring filesystem state
+
+---
+
+For more information, see https://clawfs.dev</pre>
+      </article>
+    </section>
+
+    <section id="fuse" class="feature-grid reveal" data-delay="120">
+      <div class="section-title">
+        <p class="eyebrow">Mode 1</p>
+        <h2>FUSE: Mount ClawFS Directly on the Host</h2>
+      </div>
+      <div class="cards two-up">
+        <article class="card">
+          <h3>When to Use It</h3>
+          <p>Use FUSE when the agent or developer environment wants a real mount point and the host can support it.</p>
+          <ul>
+            <li>Local development</li>
+            <li>Single-node agent runners</li>
+            <li>Workflows that expect POSIX paths directly on the host</li>
           </ul>
         </article>
         <article class="card">
-            <h3>How to Choose</h3>
-            <ul>
-              <li>Use `up` when the runtime wants file APIs without a host mount</li>
-              <li>Use `mount` when you control the host mountpoint</li>
-              <li>Use `serve` when you want a networked userspace server</li>
-            </ul>
+          <h3>Quick Start</h3>
+          <div class="code-block"><code>clawfs mount --path .clawfs</code></div>
+          <p class="footnote">Defaults to the `default` volume and mounts relative to the current working directory
+            unless you override `--volume` or `--path`.</p>
         </article>
-      </section>
+      </div>
+      <article class="callout">
+        <strong>Direct CLI launch</strong><br />
+        The front-door wrapper creates the local store/cache/state layout for the volume, then launches the FUSE path
+        behind the scenes.
+        <div class="code-block"><code>clawfs mount --volume datasets --path /tmp/clawfs-mnt</code></div>
+      </article>
+    </section>
 
-      <section id="fuse" class="feature-grid reveal" data-delay="120">
-        <div class="section-title">
-          <p class="eyebrow">Mode 1</p>
-          <h2>FUSE: Mount ClawFS Directly on the Host</h2>
-        </div>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>When to Use It</h3>
-            <p>Use FUSE when the agent or developer environment wants a real mount point and the host can support it.</p>
-            <ul>
-              <li>Local development</li>
-              <li>Single-node agent runners</li>
-              <li>Workflows that expect POSIX paths directly on the host</li>
-            </ul>
-          </article>
-          <article class="card">
-            <h3>Quick Start</h3>
-            <div class="code-block"><code>clawfs mount --path .clawfs</code></div>
-            <p class="footnote">Defaults to the `default` volume and mounts relative to the current working directory unless you override `--volume` or `--path`.</p>
-          </article>
-        </div>
-        <article class="callout">
-          <strong>Direct CLI launch</strong><br />
-          The front-door wrapper creates the local store/cache/state layout for the volume, then launches the FUSE path behind the scenes.
-          <div class="code-block"><code>clawfs mount --volume datasets --path /tmp/clawfs-mnt</code></div>
+    <section id="nfs" class="feature-grid reveal" data-delay="180">
+      <div class="section-title">
+        <p class="eyebrow">Mode 2</p>
+        <h2>NFS: Serve ClawFS Over User-Mode NFS</h2>
+      </div>
+      <div class="cards two-up">
+        <article class="card">
+          <h3>When to Use It</h3>
+          <p>Use NFS when you want ClawFS running as a user-space server and the client side can mount NFS or connect
+            from another runtime.</p>
+          <ul>
+            <li>Remote workers and VMs</li>
+            <li>Containerized runners</li>
+            <li>Cases where you want a clean network boundary between the server and client mount</li>
+          </ul>
         </article>
-      </section>
-
-      <section id="nfs" class="feature-grid reveal" data-delay="180">
-        <div class="section-title">
-          <p class="eyebrow">Mode 2</p>
-          <h2>NFS: Serve ClawFS Over User-Mode NFS</h2>
-        </div>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>When to Use It</h3>
-            <p>Use NFS when you want ClawFS running as a user-space server and the client side can mount NFS or connect from another runtime.</p>
-            <ul>
-              <li>Remote workers and VMs</li>
-              <li>Containerized runners</li>
-              <li>Cases where you want a clean network boundary between the server and client mount</li>
-            </ul>
-          </article>
-          <article class="card">
-            <h3>Quick Start</h3>
-            <div class="code-block"><code>clawfs serve --listen 127.0.0.1:2049</code></div>
-            <p class="footnote">Defaults to the `default` volume and launches the user-mode NFS gateway for that volume.</p>
-          </article>
-        </div>
-        <article class="callout">
-          <strong>Named volume over NFS</strong><br />
-          Use a volume name when you want a stable shared export:
-          <div class="code-block"><code>clawfs serve --volume shared-build --listen 0.0.0.0:2049</code></div>
+        <article class="card">
+          <h3>Quick Start</h3>
+          <div class="code-block"><code>clawfs serve --listen 127.0.0.1:2049</code></div>
+          <p class="footnote">Defaults to the `default` volume and launches the user-mode NFS gateway for that volume.
+          </p>
         </article>
-      </section>
+      </div>
+      <article class="callout">
+        <strong>Named volume over NFS</strong><br />
+        Use a volume name when you want a stable shared export:
+        <div class="code-block"><code>clawfs serve --volume shared-build --listen 0.0.0.0:2049</code></div>
+      </article>
+    </section>
 
-      <section id="shared-library" class="feature-grid reveal" data-delay="240">
-        <div class="section-title">
-          <p class="eyebrow">Mode 3</p>
-          <h2>Shared Library: In-Process Filesystem Interception for Agents</h2>
-        </div>
-        <article class="callout">
-          <strong>Status: available for Linux-style preload flows.</strong><br />
-          `clawfs up` uses the preload shared library automatically. It intercepts filesystem calls for the configured
-          ClawFS prefix and redirects them into ClawFS core logic without requiring a host-level mount.
+    <section id="shared-library" class="feature-grid reveal" data-delay="240">
+      <div class="section-title">
+        <p class="eyebrow">Mode 3</p>
+        <h2>Shared Library: In-Process Filesystem Interception for Agents</h2>
+      </div>
+      <article class="callout">
+        <strong>Status: available for Linux-style preload flows.</strong><br />
+        `clawfs up` uses the preload shared library automatically. It intercepts filesystem calls for the configured
+        ClawFS prefix and redirects them into ClawFS core logic without requiring a host-level mount.
+      </article>
+      <div class="cards two-up">
+        <article class="card">
+          <h3>Default Launch</h3>
+          <div class="code-block"><code>clawfs up -- claude</code></div>
+          <div class="code-block"><code>clawfs up --volume plan-a --path claw -- python3 your_agent.py</code></div>
+          <p class="footnote">The CLI locates the preload library, sets `LD_PRELOAD`, and prepares the volume-specific
+            local store, cache, and state paths for you.</p>
         </article>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>Default Launch</h3>
-            <div class="code-block"><code>clawfs up -- codex</code></div>
-            <div class="code-block"><code>clawfs up --volume plan-a --path claw -- python3 your_agent.py</code></div>
-            <p class="footnote">The CLI locates the preload library, sets `LD_PRELOAD`, and prepares the volume-specific local store, cache, and state paths for you.</p>
-          </article>
-          <article class="card">
-            <h3>Runtime Configuration</h3>
-            <ul>
-              <li>`--path` defaults to <code>clawfs</code> (relative to current working directory)</li>
-              <li>`--volume` lets you select or create a named workspace explicitly</li>
-              <li>`clawfs login` feeds `CLAWFS_API_TOKEN` into hosted flows when needed</li>
-              <li>The CLI manages `CLAWFS_PREFIXES`, `CLAWFS_STORE_PATH`, `CLAWFS_LOCAL_CACHE_PATH`, and `CLAWFS_STATE_PATH` automatically</li>
-            </ul>
-          </article>
-        </div>
-      </section>
+        <article class="card">
+          <h3>Runtime Configuration</h3>
+          <ul>
+            <li>`--path` defaults to <code>clawfs</code> (relative to current working directory)</li>
+            <li>`--volume` lets you select or create a named workspace explicitly</li>
+            <li>`clawfs login` feeds `CLAWFS_API_TOKEN` into hosted flows when needed</li>
+            <li>The CLI manages `CLAWFS_PREFIXES`, `CLAWFS_STORE_PATH`, `CLAWFS_LOCAL_CACHE_PATH`, and
+              `CLAWFS_STATE_PATH` automatically</li>
+          </ul>
+        </article>
+      </div>
+    </section>
 
-      <section id="config" class="feature-grid reveal" data-delay="300">
-        <div class="section-title">
-          <p class="eyebrow">Configuration</p>
-          <h2>Configure Storage, Credentials, and Runtime Behavior</h2>
-        </div>
-        <div class="cards three-up">
-          <article class="card">
-            <h3>Storage Provider</h3>
-            <p>Use `--object-provider local|aws|gcs`, then set the backing location with bucket, region, endpoint, and prefix controls.</p>
-            <div class="code-block"><code>--object-provider aws
+    <section id="config" class="feature-grid reveal" data-delay="300">
+      <div class="section-title">
+        <p class="eyebrow">Configuration</p>
+        <h2>Configure Storage, Credentials, and Runtime Behavior</h2>
+      </div>
+      <div class="cards three-up">
+        <article class="card">
+          <h3>Storage Provider (<b>Pro only</b>)</h3>
+          <p>Use `--object-provider local|aws|gcs`, then set the backing location with bucket, region, endpoint, and
+            prefix controls.</p>
+          <div class="code-block"><code>--object-provider aws
 --bucket my-clawfs-bucket
 --region us-west-2
 --endpoint https://s3.amazonaws.com
 --object-prefix agents/team-a</code></div>
-          </article>
-          <article class="card">
-            <h3>Client State + Cache</h3>
-            <p>Each client keeps local cache and identity state. Override these when you want isolated runners or explicit paths.</p>
-            <div class="code-block"><code>--local-cache-path ~/.clawfs/cache
+        </article>
+        <article class="card">
+          <h3>Client State + Cache</h3>
+          <p>Each client keeps local cache and identity state. Override these when you want isolated runners or explicit
+            paths.</p>
+          <div class="code-block"><code>--local-cache-path ~/.clawfs/cache
 --state-path ~/.clawfs/state/client_state.bin
 --segment-cache-bytes 536870912
 --pending-bytes 268435456</code></div>
-          </article>
-          <article class="card">
-            <h3>Durability + Performance</h3>
-            <p>ClawFS exposes the main durability and cache knobs directly on the CLI instead of hiding them in a daemon config file.</p>
-            <div class="code-block"><code>--disable-journal
+        </article>
+        <article class="card">
+          <h3>Durability + Performance</h3>
+          <p>ClawFS exposes the main durability and cache knobs directly on the CLI instead of hiding them in a daemon
+            config file.</p>
+          <div class="code-block"><code>--disable-journal
 --fsync-on-close
 --flush-interval-ms 5000
 --lookup-cache-ttl-ms 5000
 --dir-cache-ttl-ms 5000</code></div>
-          </article>
-        </div>
-      </section>
+        </article>
+      </div>
+    </section>
 
-      <section class="feature-grid reveal" data-delay="360">
-        <div class="section-title">
-          <p class="eyebrow">Hosted + BYOB Modes</p>
-          <h2>Environment-Driven Runtime Configuration</h2>
-        </div>
-        <div class="cards two-up">
-          <article class="card">
-            <h3>Hosted Evaluation Example</h3>
-            <p>ClawFS can be configured with environment variables for hosted evaluation environments or self-managed deployments.</p>
-            <div class="code-block"><code>CLAWFS_STORAGE_MODE=hosted_free
+    <section class="feature-grid reveal" data-delay="360">
+      <div class="section-title">
+        <p class="eyebrow">Hosted + BYOB Modes</p>
+        <h2>Environment-Driven Runtime Configuration</h2>
+      </div>
+      <div class="cards two-up">
+        <article class="card">
+          <h3>Hosted Evaluation Example</h3>
+          <p>ClawFS can be configured with environment variables for hosted evaluation environments or self-managed
+            deployments.</p>
+          <div class="code-block"><code>CLAWFS_STORAGE_MODE=hosted_free
 CLAWFS_OBJECT_PROVIDER=aws
 CLAWFS_BUCKET=clawfs-free
 CLAWFS_OBJECT_PREFIX=free/account-a/volume-1
 CLAWFS_MAX_PENDING_BYTES=268435456
 CLAWFS_MAX_SEGMENT_CACHE_BYTES=536870912</code></div>
-          </article>
-          <article class="card">
-            <h3>Scoped Credentials</h3>
-            <p>For AWS-compatible object stores, ClawFS can consume scoped runtime credentials directly from env.</p>
-            <div class="code-block"><code>CLAWFS_AWS_ACCESS_KEY_ID=...
+        </article>
+        <article class="card">
+          <h3>Scoped Credentials</h3>
+          <p>For AWS-compatible object stores, ClawFS can consume scoped runtime credentials directly from env.</p>
+          <div class="code-block"><code>CLAWFS_AWS_ACCESS_KEY_ID=...
 CLAWFS_AWS_SECRET_ACCESS_KEY=...
 CLAWFS_AWS_SESSION_TOKEN=...</code></div>
-          </article>
-        </div>
-      </section>
+        </article>
+      </div>
+    </section>
 
-      <section class="cta reveal" data-delay="420">
-        <h2>Start with the integration path that matches your runtime.</h2>
-        <p>Most teams begin with the hosted experience, then adopt FUSE or NFS when they want more direct control over deployment and storage.</p>
-        <div class="hero-cta">
-          <a class="btn btn-primary" href="pricing.html">Pick a Plan</a>
-          <a class="btn btn-secondary" href="auth.html">Open Auth Page</a>
-          <a class="btn btn-secondary" href="enterprise.html">See Enterprise Controls</a>
-        </div>
-      </section>
-    </main>
+    <section class="cta reveal" data-delay="420">
+      <h2>Start with the integration path that matches your runtime.</h2>
+      <p>Most teams begin with the hosted experience, then adopt FUSE or NFS when they want more direct control over
+        deployment and storage.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="pricing.html">Pick a Plan</a>
+        <a class="btn btn-secondary" href="enterprise.html">See Enterprise Controls</a>
+      </div>
+    </section>
+  </main>
 
-    <footer class="site-footer">
-      <p>© <span id="year"></span> ClawFS</p>
-      <p>Launch modes, runtime config, and storage setup for persistent agent volumes</p>
-    </footer>
+  <footer class="site-footer">
+    <p>© <span id="year"></span> ClawFS</p>
+    <p>Launch modes, runtime config, and storage setup for persistent agent volumes</p>
+  </footer>
 
-    <script src="main.js"></script>
-  </body>
+  <script src="main.js"></script>
+</body>
+
 </html>

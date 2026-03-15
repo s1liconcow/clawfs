@@ -702,6 +702,45 @@ fn journal_replay_flushes_staged_entries() {
 }
 
 #[test]
+fn journal_restart_does_not_resurrect_unlinked_file() {
+    let dir = tempdir().unwrap();
+
+    {
+        let harness =
+            TestHarness::with_config(dir.path(), "journal_unlink_a.bin", 8 * 1024 * 1024, |cfg| {
+                cfg.disable_journal = false;
+                cfg.lookup_cache_ttl_ms = 0;
+                cfg.dir_cache_ttl_ms = 0;
+            });
+        let fs = &harness.fs;
+        let victim = fs.op_create(ROOT_INODE, "victim.txt", 1000, 1000).unwrap();
+        fs.op_write(victim.inode, 0, b"payload").unwrap();
+        fs.flush_pending().unwrap();
+        fs.op_remove_file(ROOT_INODE, "victim.txt", 1000).unwrap();
+        fs.flush_pending().unwrap();
+        assert_eq!(fs.op_lookup(ROOT_INODE, "victim.txt").unwrap_err(), ENOENT);
+    }
+
+    {
+        let harness =
+            TestHarness::with_config(dir.path(), "journal_unlink_b.bin", 8 * 1024 * 1024, |cfg| {
+                cfg.disable_journal = false;
+                cfg.lookup_cache_ttl_ms = 0;
+                cfg.dir_cache_ttl_ms = 0;
+            });
+        let replayed = harness.fs.replay_journal().unwrap();
+        assert_eq!(
+            replayed, 0,
+            "stale journal entries were replayed after unlink"
+        );
+        assert_eq!(
+            harness.fs.op_lookup(ROOT_INODE, "victim.txt").unwrap_err(),
+            ENOENT
+        );
+    }
+}
+
+#[test]
 fn adaptive_large_append_keeps_data_pending_with_journal() {
     let dir = tempdir().unwrap();
     let harness =
@@ -1770,6 +1809,49 @@ fn unlink_last_link_keeps_open_inode_readable_and_writable() {
     fs.op_write(ino, payload.len() as u64, b"++").unwrap();
     let read_back2 = fs.op_read(ino, 0, (payload.len() + 2) as u32).unwrap();
     assert_eq!(read_back2, b"Hello, World!++");
+}
+
+#[test]
+fn unlink_persists_across_fresh_metadata_store() {
+    let dir = tempdir().unwrap();
+
+    {
+        let h1 = TestHarness::with_config(dir.path(), "unlink_reload_1.bin", 4096, |cfg| {
+            cfg.disable_journal = true;
+            cfg.lookup_cache_ttl_ms = 0;
+            cfg.dir_cache_ttl_ms = 0;
+        });
+        let fs = &h1.fs;
+
+        let victim = fs.op_create(ROOT_INODE, "victim.txt", 1000, 1000).unwrap();
+        fs.op_write(victim.inode, 0, b"payload").unwrap();
+        fs.flush_pending().unwrap();
+
+        fs.op_remove_file(ROOT_INODE, "victim.txt", 1000).unwrap();
+        fs.flush_pending().unwrap();
+        assert_eq!(fs.op_lookup(ROOT_INODE, "victim.txt").unwrap_err(), ENOENT);
+    }
+
+    {
+        let h2 = TestHarness::with_config(dir.path(), "unlink_reload_2.bin", 4096, |cfg| {
+            cfg.disable_journal = true;
+            cfg.lookup_cache_ttl_ms = 0;
+            cfg.dir_cache_ttl_ms = 0;
+        });
+        let fs = &h2.fs;
+
+        assert_eq!(fs.op_lookup(ROOT_INODE, "victim.txt").unwrap_err(), ENOENT);
+        let root = h2
+            .runtime
+            .block_on(h2.metadata.get_inode(ROOT_INODE))
+            .unwrap()
+            .expect("root inode must exist");
+        let children = root.children().unwrap();
+        assert!(
+            !children.contains_key("victim.txt"),
+            "fresh metadata store still lists victim.txt after unlink flush"
+        );
+    }
 }
 
 #[test]

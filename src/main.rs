@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use clap::Parser;
 use env_logger::Env;
 use fuser::MountOption;
 use log::{LevelFilter, info, warn};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 
@@ -71,6 +72,36 @@ fn run_mount(mut config: Config) -> Result<()> {
     init_logging(config.log_file.as_deref(), config.debug_log)?;
     std::fs::create_dir_all(&config.mount_path)?;
 
+    // If a control-plane API token and URL are set, provision scoped
+    // storage credentials for this volume before mounting.
+    let has_control_plane_creds =
+        if let Some(creds) = provision_credentials_from_control_plane(&config.state_path)? {
+            // SAFETY: called before any threads are spawned.
+            unsafe {
+                env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+                env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+            }
+            if config.bucket.is_none() {
+                config.bucket = Some(creds.bucket);
+            }
+            if config.endpoint.is_none() {
+                config.endpoint = Some(creds.endpoint);
+            }
+            if config.region.is_none() {
+                config.region = Some(creds.region);
+            }
+            if config.object_prefix.is_empty() {
+                config.object_prefix = creds.prefix;
+            }
+            info!(
+                "Provisioned storage credentials from control plane (key={}...)",
+                &creds.access_key_id[..creds.access_key_id.len().min(12)]
+            );
+            true
+        } else {
+            false
+        };
+
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
     let metadata = Arc::new(runtime.block_on(MetadataStore::new(&config, handle.clone()))?);
@@ -89,6 +120,11 @@ fn run_mount(mut config: Config) -> Result<()> {
             poll_interval,
         );
     }
+    // Spawn background credential refresh if using control plane credentials.
+    if has_control_plane_creds {
+        spawn_credential_refresh_loop(&handle, config.state_path.clone());
+    }
+
     let client_state = Arc::new(ClientStateManager::load(&config.state_path)?);
     let superblock_snapshot = superblock.snapshot();
     client_state.reconcile_with_minimums(
@@ -662,6 +698,220 @@ async fn perform_segment_compaction(
         task::spawn_blocking(move || segs.delete_segment(generation, seg_id)).await??;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlPlaneCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    bucket: String,
+    endpoint: String,
+    region: String,
+    prefix: String,
+    /// ISO 8601 timestamp from the control plane (e.g. "2026-03-14T12:00:00+00:00").
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// Buffer before expiry at which we consider credentials stale (5 minutes).
+const CREDENTIAL_REFRESH_BUFFER_SECS: i64 = 300;
+
+/// How often the background refresh loop checks expiry (60 seconds).
+const CREDENTIAL_REFRESH_POLL_SECS: u64 = 60;
+
+fn credential_cache_path(state_path: &Path) -> PathBuf {
+    state_path.join("credentials.json")
+}
+
+fn load_cached_credentials(state_path: &Path) -> Option<ControlPlaneCredentials> {
+    let path = credential_cache_path(state_path);
+    let data = std::fs::read_to_string(&path).ok()?;
+    let creds: ControlPlaneCredentials = serde_json::from_str(&data).ok()?;
+    if credentials_still_valid(&creds) {
+        Some(creds)
+    } else {
+        info!("Cached credentials expired or expiring soon, will refresh");
+        None
+    }
+}
+
+fn save_cached_credentials(state_path: &Path, creds: &ControlPlaneCredentials) {
+    let path = credential_cache_path(state_path);
+    if let Ok(data) = serde_json::to_string_pretty(creds)
+        && let Err(err) = std::fs::write(&path, &data)
+    {
+        warn!("Failed to cache credentials to {}: {err}", path.display());
+    }
+}
+
+fn credentials_still_valid(creds: &ControlPlaneCredentials) -> bool {
+    let Some(ref expires_str) = creds.expires_at else {
+        // No expiry means they don't expire (or server didn't send it) — treat as valid.
+        return true;
+    };
+    // Parse ISO 8601 with timezone offset.
+    let Ok(expires) =
+        time::OffsetDateTime::parse(expires_str, &time::format_description::well_known::Rfc3339)
+    else {
+        warn!(
+            "Could not parse expires_at '{}', treating as expired",
+            expires_str
+        );
+        return false;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let remaining = expires - now;
+    remaining.whole_seconds() > CREDENTIAL_REFRESH_BUFFER_SECS
+}
+
+/// Fetch fresh credentials from the control plane API.
+fn fetch_credentials_from_api(
+    api_url: &str,
+    api_token: &str,
+    volume_slug: &str,
+) -> Result<ControlPlaneCredentials> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let resp = client
+        .post(format!(
+            "{}/api/volumes/by-slug/{}/credentials",
+            api_url, volume_slug
+        ))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!(
+            "control plane credential request failed ({}): {}",
+            status,
+            body
+        );
+    }
+
+    let body: serde_json::Value = resp.json()?;
+    Ok(ControlPlaneCredentials {
+        access_key_id: body["access_key_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing access_key_id in response"))?
+            .to_string(),
+        secret_access_key: body["secret_access_key"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing secret_access_key in response"))?
+            .to_string(),
+        bucket: body["bucket"].as_str().unwrap_or_default().to_string(),
+        endpoint: body["endpoint"].as_str().unwrap_or_default().to_string(),
+        region: body["region"].as_str().unwrap_or("auto").to_string(),
+        prefix: body["prefix"].as_str().unwrap_or_default().to_string(),
+        expires_at: body["expires_at"].as_str().map(|s| s.to_string()),
+    })
+}
+
+/// If CLAWFS_API_TOKEN and CLAWFS_API_URL are set, provision scoped storage
+/// credentials for the volume identified by CLAWFS_VOLUME_SLUG. Uses a local
+/// cache file in state_path and only calls the API when credentials are missing
+/// or about to expire.
+fn provision_credentials_from_control_plane(
+    state_path: &Path,
+) -> Result<Option<ControlPlaneCredentials>> {
+    let api_url = match env::var("CLAWFS_API_URL").ok().filter(|v| !v.is_empty()) {
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None => return Ok(None),
+    };
+    let api_token = env::var("CLAWFS_API_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("CLAWFS_API_URL is set but CLAWFS_API_TOKEN is missing"))?;
+    let volume_slug = env::var("CLAWFS_VOLUME_SLUG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("CLAWFS_API_URL is set but CLAWFS_VOLUME_SLUG is missing")
+        })?;
+
+    // Try cached credentials first.
+    if let Some(cached) = load_cached_credentials(state_path) {
+        info!(
+            "Using cached credentials (key={}..., expires={:?})",
+            &cached.access_key_id[..cached.access_key_id.len().min(12)],
+            cached.expires_at,
+        );
+        return Ok(Some(cached));
+    }
+
+    info!(
+        "Requesting credentials from control plane for volume '{}'",
+        volume_slug
+    );
+    let creds = fetch_credentials_from_api(&api_url, &api_token, &volume_slug)?;
+    save_cached_credentials(state_path, &creds);
+    Ok(Some(creds))
+}
+
+/// Spawns a background task that refreshes control-plane credentials before
+/// they expire. Updates the env vars and the local cache file in-place.
+fn spawn_credential_refresh_loop(handle: &Handle, state_path: PathBuf) {
+    let api_url = match env::var("CLAWFS_API_URL").ok().filter(|v| !v.is_empty()) {
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None => return,
+    };
+    let api_token = match env::var("CLAWFS_API_TOKEN").ok().filter(|v| !v.is_empty()) {
+        Some(t) => t,
+        None => return,
+    };
+    let volume_slug = match env::var("CLAWFS_VOLUME_SLUG")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(s) => s,
+        None => return,
+    };
+
+    handle.spawn(async move {
+        loop {
+            sleep(Duration::from_secs(CREDENTIAL_REFRESH_POLL_SECS)).await;
+
+            // Check if cached credentials are still valid with the buffer.
+            if load_cached_credentials(&state_path)
+                .is_some_and(|cached| credentials_still_valid(&cached))
+            {
+                continue;
+            }
+
+            info!("Credential refresh: fetching new credentials from control plane");
+            let url = api_url.clone();
+            let token = api_token.clone();
+            let slug = volume_slug.clone();
+            let sp = state_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                fetch_credentials_from_api(&url, &token, &slug).inspect(|creds| {
+                    save_cached_credentials(&sp, creds);
+                })
+            })
+            .await;
+
+            match result {
+                Ok(Ok(creds)) => {
+                    // SAFETY: env::set_var is technically unsafe in multi-threaded contexts,
+                    // but the object_store crate reads these lazily and this is the standard
+                    // way to rotate AWS credentials for the AWS SDK model.
+                    unsafe {
+                        env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+                        env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+                    }
+                    info!(
+                        "Credential refresh: updated (key={}..., expires={:?})",
+                        &creds.access_key_id[..creds.access_key_id.len().min(12)],
+                        creds.expires_at,
+                    );
+                }
+                Ok(Err(err)) => warn!("Credential refresh failed: {err}"),
+                Err(err) => warn!("Credential refresh task panicked: {err}"),
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ClawFS | On-Demand Persistent Volumes for Agents</title>
+    <title>ClawFS | On-Demand Persistent Shared Volumes for Agents</title>
     <meta
       name="description"
       content="ClawFS gives agents persistent volumes on demand. Summon a durable workspace in a single CLI command, keep state across runs, and mount the same data anywhere."
@@ -33,7 +33,7 @@
         <a href="pricing.html">Pricing</a>
         <a href="#features">Why It Wins</a>
         <a href="#cta">Get Started</a>
-        <a class="nav-signin" href="auth.html">Sign In</a>
+        <a class="nav-signin" href="https://app.clawfs.dev">Sign In</a>
       </nav>
     </header>
 
@@ -42,7 +42,7 @@
         <div class="hero-layout">
           <div class="hero-body">
             <p class="eyebrow">Persistent Agent Volumes</p>
-            <h1>Summon Shared Storage for Agents in One CLI Command</h1>
+            <h1>Shared Storage for Agents</h1>
             <p class="hero-copy">
               ClawFS turns disposable agent runtimes into stateful workers. One command provisions a persistent
               volume, mounts it into your agent environment, and keeps tools, repos, checkpoints, and outputs
@@ -55,7 +55,7 @@
             <p class="hero-copy">
               Mount it with FUSE, serve it over user-mode NFS, or inject it through the preload shared library when
               your agents want real file APIs without a host mount. One install gives you `clawfs up`,
-              `clawfs mount`, and `clawfs serve`.
+              `clawfs mount` for FUSE, and `clawfs serve` for NFS.
             </p>
             <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
             <div class="hero-cta">
@@ -86,10 +86,10 @@
         </div>
         <div class="cards two-up">
           <article class="card oss">
-            <h3>Summon</h3>
+            <h3>Up</h3>
             <p class="price">Single CLI Command</p>
             <ul>
-              <li>Run `clawfs up -- codex` and get a default account volume automatically</li>
+              <li>Run `clawfs up -- claude` and get a default account volume automatically</li>
               <li>Select a named volume when you want an explicit shared workspace</li>
               <li>Keep dependencies, repos, embeddings, and model artifacts close to execution</li>
               <li>Skip custom bootstrap scripts and fragile cache warmups</li>

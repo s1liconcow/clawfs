@@ -9,11 +9,15 @@
 
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
 use crate::dispatch;
 use crate::errno::set_errno;
+use crate::fd_table::FdEntry;
 use crate::runtime::ClawfsRuntime;
+use dashmap::DashMap;
 
 // ---------------------------------------------------------------------------
 // Reentrancy guard
@@ -24,6 +28,8 @@ thread_local! {
 }
 
 struct ReentrancyGuard;
+
+static FD_PROXY_THREADS: OnceLock<DashMap<i32, std::thread::JoinHandle<()>>> = OnceLock::new();
 
 impl ReentrancyGuard {
     /// Try to enter the guard. Returns `Some(ReentrancyGuard)` if we're not
@@ -110,6 +116,71 @@ real_fn!(
     get_real_write,
     "write",
     unsafe extern "C" fn(i32, *const libc::c_void, libc::size_t) -> libc::ssize_t
+);
+real_fn!(
+    REAL___WRITE_PTR,
+    get_real___write,
+    "__write",
+    unsafe extern "C" fn(i32, *const libc::c_void, libc::size_t) -> libc::ssize_t
+);
+real_fn!(
+    REAL___WRITE_NOCANCEL_PTR,
+    get_real___write_nocancel,
+    "__write_nocancel",
+    unsafe extern "C" fn(i32, *const libc::c_void, libc::size_t) -> libc::ssize_t
+);
+real_fn!(
+    REAL_WRITEV_PTR,
+    get_real_writev,
+    "writev",
+    unsafe extern "C" fn(i32, *const libc::iovec, libc::c_int) -> libc::ssize_t
+);
+real_fn!(
+    REAL_FFLUSH_PTR,
+    get_real_fflush,
+    "fflush",
+    unsafe extern "C" fn(*mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_FWRITE_PTR,
+    get_real_fwrite,
+    "fwrite",
+    unsafe extern "C" fn(
+        *const libc::c_void,
+        libc::size_t,
+        libc::size_t,
+        *mut libc::FILE,
+    ) -> libc::size_t
+);
+real_fn!(
+    REAL_FPUTS_PTR,
+    get_real_fputs,
+    "fputs",
+    unsafe extern "C" fn(*const libc::c_char, *mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_FPUTC_PTR,
+    get_real_fputc,
+    "fputc",
+    unsafe extern "C" fn(i32, *mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_PUTC_PTR,
+    get_real_putc,
+    "putc",
+    unsafe extern "C" fn(i32, *mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_PUTCHAR_PTR,
+    get_real_putchar,
+    "putchar",
+    unsafe extern "C" fn(i32) -> i32
+);
+real_fn!(
+    REAL_PUTS_PTR,
+    get_real_puts,
+    "puts",
+    unsafe extern "C" fn(*const libc::c_char) -> i32
 );
 real_fn!(
     REAL_LSEEK_PTR,
@@ -300,6 +371,17 @@ real_fn!(
     unsafe extern "C" fn(*const libc::c_char, *mut libc::c_char, libc::size_t) -> libc::ssize_t
 );
 real_fn!(
+    REAL_READLINKAT_PTR,
+    get_real_readlinkat,
+    "readlinkat",
+    unsafe extern "C" fn(
+        i32,
+        *const libc::c_char,
+        *mut libc::c_char,
+        libc::size_t,
+    ) -> libc::ssize_t
+);
+real_fn!(
     REAL_CHDIR_PTR,
     get_real_chdir,
     "chdir",
@@ -377,6 +459,12 @@ real_fn!(
     "ftruncate64",
     unsafe extern "C" fn(i32, libc::off64_t) -> i32
 );
+real_fn!(
+    REAL_STATX_PTR,
+    get_real_statx,
+    "statx",
+    unsafe extern "C" fn(i32, *const libc::c_char, i32, libc::c_uint, *mut libc::statx) -> i32
+);
 
 // ioctl/fcntl: defined as fixed-arg (3 params) — ABI-compatible with variadic
 // on x86_64 since the calling convention passes args in registers regardless.
@@ -398,6 +486,30 @@ real_fn!(
     "fcntl64",
     unsafe extern "C" fn(i32, libc::c_int, libc::c_int) -> i32
 );
+real_fn!(
+    REAL_INOTIFY_INIT_PTR,
+    get_real_inotify_init,
+    "inotify_init",
+    unsafe extern "C" fn() -> i32
+);
+real_fn!(
+    REAL_INOTIFY_INIT1_PTR,
+    get_real_inotify_init1,
+    "inotify_init1",
+    unsafe extern "C" fn(i32) -> i32
+);
+real_fn!(
+    REAL_INOTIFY_ADD_WATCH_PTR,
+    get_real_inotify_add_watch,
+    "inotify_add_watch",
+    unsafe extern "C" fn(i32, *const libc::c_char, u32) -> i32
+);
+real_fn!(
+    REAL_INOTIFY_RM_WATCH_PTR,
+    get_real_inotify_rm_watch,
+    "inotify_rm_watch",
+    unsafe extern "C" fn(i32, i32) -> i32
+);
 
 // ---------------------------------------------------------------------------
 // Helper: extract path string from C pointer
@@ -413,10 +525,210 @@ fn c_path_to_str(path: *const libc::c_char) -> Option<String> {
         .map(String::from)
 }
 
+fn dispatch_write_fd(
+    rt: &ClawfsRuntime,
+    fd: i32,
+    buf: *const libc::c_void,
+    count: libc::size_t,
+    hook_name: &str,
+) -> Option<libc::ssize_t> {
+    if fd_proxy_threads().contains_key(&fd) {
+        return None;
+    }
+    let entry = rt.fd_table.get(fd)?;
+    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
+    let result = dispatch::dispatch_write(rt, &entry, slice);
+    if fd <= libc::STDERR_FILENO {
+        log::trace!("{hook_name}(clawfs remapped fd={fd}, count={count}) -> {result:?}");
+    }
+    Some(match result {
+        Ok(n) => {
+            if fd <= libc::STDERR_FILENO {
+                let _ = rt.fs.nfs_flush();
+            }
+            n as libc::ssize_t
+        }
+        Err(e) => set_errno(e) as libc::ssize_t,
+    })
+}
+
+fn dispatch_writev_fd(
+    rt: &ClawfsRuntime,
+    fd: i32,
+    iov: *const libc::iovec,
+    iovcnt: libc::c_int,
+    hook_name: &str,
+) -> Option<libc::ssize_t> {
+    if fd_proxy_threads().contains_key(&fd) {
+        return None;
+    }
+    let entry = rt.fd_table.get(fd)?;
+    if iovcnt < 0 {
+        return Some(set_errno(libc::EINVAL) as libc::ssize_t);
+    }
+    let iovecs = unsafe { std::slice::from_raw_parts(iov, iovcnt as usize) };
+    let total_len = match iovecs
+        .iter()
+        .try_fold(0usize, |acc, part| acc.checked_add(part.iov_len))
+    {
+        Some(total) => total,
+        None => return Some(set_errno(libc::EINVAL) as libc::ssize_t),
+    };
+    let mut combined = Vec::with_capacity(total_len);
+    for part in iovecs {
+        let slice = unsafe { std::slice::from_raw_parts(part.iov_base as *const u8, part.iov_len) };
+        combined.extend_from_slice(slice);
+    }
+    let result = dispatch::dispatch_write(rt, &entry, &combined);
+    if fd <= libc::STDERR_FILENO {
+        log::trace!("{hook_name}(clawfs remapped fd={fd}, iovcnt={iovcnt}, total={total_len}) -> {result:?}");
+    }
+    Some(match result {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => set_errno(e) as libc::ssize_t,
+    })
+}
+
+fn dispatch_stdio_write(rt: &ClawfsRuntime, stream: *mut libc::FILE, data: &[u8]) -> Option<usize> {
+    let fd = unsafe { libc::fileno(stream) };
+    if fd_proxy_threads().contains_key(&fd) {
+        return None;
+    }
+    let entry = rt.fd_table.get(fd)?;
+    match dispatch::dispatch_write(rt, &entry, data) {
+        Ok(written) => {
+            if fd <= libc::STDERR_FILENO {
+                log::trace!("stdio write(clawfs remapped fd={fd}, count={})", data.len());
+                let _ = rt.fs.nfs_flush();
+            }
+            Some(written)
+        }
+        Err(e) => {
+            set_errno(e);
+            None
+        }
+    }
+}
+
+fn fd_proxy_threads() -> &'static DashMap<i32, std::thread::JoinHandle<()>> {
+    FD_PROXY_THREADS.get_or_init(DashMap::new)
+}
+
+fn get_stdio_stream(fd: i32) -> Option<*mut libc::FILE> {
+    let symbol = match fd {
+        libc::STDOUT_FILENO => "stdout",
+        libc::STDERR_FILENO => "stderr",
+        libc::STDIN_FILENO => "stdin",
+        _ => return None,
+    };
+    let sym = CString::new(symbol).ok()?;
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { *(ptr as *mut *mut libc::FILE) })
+}
+
+fn install_fd_proxy(
+    rt: &'static ClawfsRuntime,
+    newfd: i32,
+    entry: std::sync::Arc<FdEntry>,
+    cloexec: bool,
+) -> Result<(), i32> {
+    log::trace!("install_fd_proxy(fd={newfd}, cloexec={cloexec})");
+    let mut pipe_fds = [0; 2];
+    let pipe_flags = if cloexec { libc::O_CLOEXEC } else { 0 };
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), pipe_flags) } != 0 {
+        return Err(unsafe { *libc::__errno_location() });
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+
+    if unsafe { get_real_dup2()(write_fd, newfd) } < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        unsafe {
+            get_real_close()(read_fd);
+            get_real_close()(write_fd);
+        }
+        return Err(errno);
+    }
+    unsafe {
+        get_real_close()(write_fd);
+    }
+    if cloexec {
+        unsafe {
+            get_real_fcntl()(newfd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+
+    let handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe {
+                get_real_read()(
+                    read_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            log::trace!("fd_proxy(fd={newfd}) drained {} bytes", n);
+            let write_result = dispatch::dispatch_write(rt, &entry, &buf[..n as usize]);
+            log::trace!("fd_proxy(fd={newfd}) dispatch_write -> {write_result:?}");
+            let flush_result = rt.fs.nfs_flush();
+            log::trace!("fd_proxy(fd={newfd}) flush -> {flush_result:?}");
+        }
+        fd_proxy_threads().remove(&newfd);
+        let flush_result = rt.fs.nfs_flush();
+        log::trace!("fd_proxy(fd={newfd}) final flush -> {flush_result:?}");
+        unsafe {
+            get_real_close()(read_fd);
+        }
+    });
+    if let Some((_, old_handle)) = fd_proxy_threads().remove(&newfd) {
+        let _ = old_handle.join();
+    }
+    fd_proxy_threads().insert(newfd, handle);
+    Ok(())
+}
+
+fn cleanup_fd_proxy(fd: i32) {
+    if let Some((_, handle)) = fd_proxy_threads().remove(&fd) {
+        log::trace!("cleanup_fd_proxy(fd={fd})");
+        unsafe {
+            get_real_close()(fd);
+        }
+        let _ = handle.join();
+    }
+}
+
 /// Try to handle a path-based operation through ClawFS. Returns `None` if
 /// the path doesn't match any ClawFS prefix (caller should fall through to real libc).
 fn try_classify(rt: &ClawfsRuntime, path: &str) -> Option<String> {
-    rt.prefix_router.classify(path).map(|cp| cp.inner)
+    if path.starts_with('/') {
+        let result = rt.prefix_router.classify(path).map(|cp| cp.inner);
+        log::trace!("classify abs {:?} -> {:?}", path, result);
+        result
+    } else {
+        // Relative path: resolve against the real process cwd first.
+        let abs = std::env::current_dir().ok()?.join(path);
+        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+        log::trace!("classify rel {:?} (-> {:?}) -> {:?}", path, abs, result);
+        result
+    }
+}
+
+fn host_path_for_dirfd(dirfd: i32) -> Option<PathBuf> {
+    let proc_fd_path = format!("/proc/self/fd/{dirfd}");
+    let target = std::fs::read_link(proc_fd_path).ok()?;
+    let metadata = std::fs::metadata(&target).ok()?;
+    if metadata.is_dir() {
+        Some(target)
+    } else {
+        None
+    }
 }
 
 /// Resolve a path that may be relative to a dirfd (for `*at` family).
@@ -425,19 +737,46 @@ fn resolve_at_path(rt: &ClawfsRuntime, dirfd: i32, path: &str) -> Option<String>
     if path.starts_with('/') {
         return try_classify(rt, path);
     }
-    // Relative path with AT_FDCWD: resolve against virtual cwd.
+    // Relative path with AT_FDCWD: resolve against virtual or real cwd.
     if dirfd == libc::AT_FDCWD {
-        let (_, inner_cwd, _) = rt.cwd.get_clawfs()?;
-        let inner = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
-        return Some(inner);
+        if let Some((_, inner_cwd, _)) = rt.cwd.get_clawfs() {
+            let inner = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
+            log::trace!(
+                "resolve_at AT_FDCWD (virtual cwd) {:?} -> {:?}",
+                path,
+                inner
+            );
+            return Some(inner);
+        }
+        // Cwd is on the host: resolve against the real process cwd then classify.
+        let abs = std::env::current_dir().ok()?.join(path);
+        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+        log::trace!("resolve_at AT_FDCWD (host cwd) {:?} -> {:?}", path, result);
+        return result;
     }
     // Relative path with a ClawFS dirfd: resolve using the fd's inner_path.
     let entry = rt.fd_table.get(dirfd)?;
-    if !entry.is_dir {
-        return None;
+    if entry.is_dir {
+        let inner = format!("{}/{}", entry.inner_path.trim_end_matches('/'), path);
+        log::trace!("resolve_at dirfd={} {:?} -> {:?}", dirfd, path, inner);
+        return Some(inner);
     }
-    let inner = format!("{}/{}", entry.inner_path.trim_end_matches('/'), path);
-    Some(inner)
+    log::trace!(
+        "resolve_at dirfd={} {:?}: dirfd is not a ClawFS directory",
+        dirfd,
+        path
+    );
+    None.or_else(|| {
+        let abs = host_path_for_dirfd(dirfd)?.join(path);
+        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+        log::trace!(
+            "resolve_at dirfd={} (host dirfd) {:?} -> {:?}",
+            dirfd,
+            path,
+            result
+        );
+        result
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +791,9 @@ pub unsafe extern "C" fn open(path: *const libc::c_char, flags: i32, mode: libc:
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_open(rt, &inner, flags, mode) {
+                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
+                    log::trace!("open({:?}) -> {:?}", path_str, result);
+                    return match result {
                         Ok(fd) => fd,
                         Err(e) => set_errno(e) as i32,
                     };
@@ -471,7 +812,9 @@ pub unsafe extern "C" fn open64(path: *const libc::c_char, flags: i32, mode: lib
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_open(rt, &inner, flags, mode) {
+                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
+                    log::trace!("open64({:?}) -> {:?}", path_str, result);
+                    return match result {
                         Ok(fd) => fd,
                         Err(e) => set_errno(e) as i32,
                     };
@@ -495,7 +838,9 @@ pub unsafe extern "C" fn openat(
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_open(rt, &inner, flags, mode) {
+                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
+                    log::trace!("openat(dirfd={}, {:?}) -> {:?}", dirfd, path_str, result);
+                    return match result {
                         Ok(fd) => fd,
                         Err(e) => set_errno(e) as i32,
                     };
@@ -513,10 +858,21 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if rt.fd_table.is_clawfs_fd(fd) {
+                log::trace!("close(clawfs fd={})", fd);
+                if fd_proxy_threads().contains_key(&fd) {
+                    rt.fd_table.remove(fd);
+                    cleanup_fd_proxy(fd);
+                    return 0;
+                }
                 return match dispatch::dispatch_close(rt, fd) {
                     Ok(()) => 0,
                     Err(e) => set_errno(e) as i32,
                 };
+            }
+            // Close the write end of the pipe when the inotify read end is closed.
+            if let Some(write_fd) = crate::inotify::close_instance(fd) {
+                unsafe { get_real_close()(write_fd) };
+                // Fall through to also close the read end (fd itself).
             }
         }
     }
@@ -535,7 +891,14 @@ pub unsafe extern "C" fn read(
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(entry) = rt.fd_table.get(fd) {
                 let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count) };
-                return match dispatch::dispatch_read(rt, &entry, slice) {
+                let result = dispatch::dispatch_read(rt, &entry, slice);
+                log::trace!(
+                    "read(clawfs fd={}, count={}) -> {:?}",
+                    fd,
+                    count,
+                    result.as_ref().map(|n| *n).map_err(|e| *e)
+                );
+                return match result {
                     Ok(n) => n as libc::ssize_t,
                     Err(e) => set_errno(e) as libc::ssize_t,
                 };
@@ -555,12 +918,8 @@ pub unsafe extern "C" fn write(
 ) -> libc::ssize_t {
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
-            if let Some(entry) = rt.fd_table.get(fd) {
-                let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
-                return match dispatch::dispatch_write(rt, &entry, slice) {
-                    Ok(n) => n as libc::ssize_t,
-                    Err(e) => set_errno(e) as libc::ssize_t,
-                };
+            if let Some(result) = dispatch_write_fd(rt, fd, buf, count, "write") {
+                return result;
             }
         }
     }
@@ -570,11 +929,193 @@ pub unsafe extern "C" fn write(
 /// # Safety
 /// Called by the dynamic linker as a libc function replacement.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn __write(
+    fd: i32,
+    buf: *const libc::c_void,
+    count: libc::size_t,
+) -> libc::ssize_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(result) = dispatch_write_fd(rt, fd, buf, count, "__write") {
+                return result;
+            }
+        }
+    }
+    unsafe { get_real___write()(fd, buf, count) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __write_nocancel(
+    fd: i32,
+    buf: *const libc::c_void,
+    count: libc::size_t,
+) -> libc::ssize_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(result) = dispatch_write_fd(rt, fd, buf, count, "__write_nocancel") {
+                return result;
+            }
+        }
+    }
+    unsafe { get_real___write_nocancel()(fd, buf, count) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn writev(
+    fd: i32,
+    iov: *const libc::iovec,
+    iovcnt: libc::c_int,
+) -> libc::ssize_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(result) = dispatch_writev_fd(rt, fd, iov, iovcnt, "writev") {
+                return result;
+            }
+        }
+    }
+    unsafe { get_real_writev()(fd, iov, iovcnt) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fwrite(
+    ptr: *const libc::c_void,
+    size: libc::size_t,
+    nmemb: libc::size_t,
+    stream: *mut libc::FILE,
+) -> libc::size_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let total = size.saturating_mul(nmemb);
+            let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
+            if let Some(written) = dispatch_stdio_write(rt, stream, data) {
+                return if size == 0 { nmemb } else { written / size };
+            }
+        }
+    }
+    unsafe { get_real_fwrite()(ptr, size, nmemb, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fputs(s: *const libc::c_char, stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let cstr = unsafe { CStr::from_ptr(s) };
+            if dispatch_stdio_write(rt, stream, cstr.to_bytes()).is_some() {
+                return 1;
+            }
+        }
+    }
+    unsafe { get_real_fputs()(s, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fputc(c: i32, stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let byte = [c as u8];
+            if dispatch_stdio_write(rt, stream, &byte).is_some() {
+                return c;
+            }
+        }
+    }
+    unsafe { get_real_fputc()(c, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn putc(c: i32, stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let byte = [c as u8];
+            if dispatch_stdio_write(rt, stream, &byte).is_some() {
+                return c;
+            }
+        }
+    }
+    unsafe { get_real_putc()(c, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn putchar(c: i32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let byte = [c as u8];
+            if dispatch_write_fd(
+                rt,
+                libc::STDOUT_FILENO,
+                byte.as_ptr() as *const libc::c_void,
+                byte.len(),
+                "putchar",
+            )
+            .is_some()
+            {
+                return c;
+            }
+        }
+    }
+    unsafe { get_real_putchar()(c) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puts(s: *const libc::c_char) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let cstr = unsafe { CStr::from_ptr(s) };
+            if dispatch_write_fd(
+                rt,
+                libc::STDOUT_FILENO,
+                cstr.to_bytes().as_ptr() as *const libc::c_void,
+                cstr.to_bytes().len(),
+                "puts",
+            )
+            .is_some()
+                && dispatch_write_fd(
+                    rt,
+                    libc::STDOUT_FILENO,
+                    b"\n".as_ptr() as *const libc::c_void,
+                    1,
+                    "puts",
+                )
+                .is_some()
+            {
+                return 1;
+            }
+        }
+    }
+    unsafe { get_real_puts()(s) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lseek(fd: i32, offset: libc::off_t, whence: i32) -> libc::off_t {
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(entry) = rt.fd_table.get(fd) {
-                return match dispatch::dispatch_lseek(rt, &entry, offset, whence) {
+                let result = dispatch::dispatch_lseek(rt, &entry, offset, whence);
+                log::trace!(
+                    "lseek(clawfs fd={}, offset={}, whence={}) -> {:?}",
+                    fd,
+                    offset,
+                    whence,
+                    result
+                );
+                return match result {
                     Ok(pos) => pos as libc::off_t,
                     Err(e) => set_errno(e) as libc::off_t,
                 };
@@ -591,7 +1132,15 @@ pub unsafe extern "C" fn lseek64(fd: i32, offset: libc::off64_t, whence: i32) ->
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(entry) = rt.fd_table.get(fd) {
-                return match dispatch::dispatch_lseek(rt, &entry, offset, whence) {
+                let result = dispatch::dispatch_lseek(rt, &entry, offset, whence);
+                log::trace!(
+                    "lseek64(clawfs fd={}, offset={}, whence={}) -> {:?}",
+                    fd,
+                    offset,
+                    whence,
+                    result
+                );
+                return match result {
                     Ok(pos) => pos as libc::off64_t,
                     Err(e) => set_errno(e) as libc::off64_t,
                 };
@@ -659,10 +1208,14 @@ pub unsafe extern "C" fn fstat(fd: i32, buf: *mut libc::stat) -> i32 {
             if let Some(entry) = rt.fd_table.get(fd) {
                 return match dispatch::dispatch_fstat(rt, &entry) {
                     Ok(st) => {
+                        log::trace!("fstat(clawfs fd={}) -> size={}", fd, st.st_size);
                         unsafe { *buf = st };
                         0
                     }
-                    Err(e) => set_errno(e) as i32,
+                    Err(e) => {
+                        log::trace!("fstat(clawfs fd={}) -> err={}", fd, e);
+                        set_errno(e) as i32
+                    }
                 };
             }
         }
@@ -1196,14 +1749,39 @@ pub unsafe extern "C" fn dup2(oldfd: i32, newfd: i32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if rt.fd_table.is_clawfs_fd(oldfd) {
+                log::trace!("dup2(clawfs fd={oldfd} -> fd={newfd})");
+                cleanup_fd_proxy(newfd);
                 return match rt.fd_table.dup_to(oldfd, newfd) {
-                    Some(fd) => fd,
+                    Some(fd) => {
+                        if let Some(entry) = rt.fd_table.get(fd) {
+                            if entry.flags & (libc::O_WRONLY | libc::O_RDWR) != 0
+                                && !entry.is_dir
+                                && install_fd_proxy(rt, fd, entry, false).is_err()
+                            {
+                                rt.fd_table.remove(fd);
+                                return set_errno(libc::EBADF) as i32;
+                            }
+                        }
+                        fd
+                    }
                     None => set_errno(libc::EBADF) as i32,
                 };
             }
             // If newfd is a ClawFS fd but oldfd isn't, close the ClawFS fd first.
             if rt.fd_table.is_clawfs_fd(newfd) {
-                rt.fd_table.remove(newfd);
+                log::trace!("dup2(host fd={oldfd} -> clawfs fd={newfd}), finalizing clawfs fd");
+                if fd_proxy_threads().contains_key(&newfd) {
+                    if let Some(stream) = get_stdio_stream(newfd) {
+                        unsafe {
+                            let _ = get_real_fflush()(stream);
+                        }
+                    }
+                    rt.fd_table.remove(newfd);
+                    cleanup_fd_proxy(newfd);
+                } else {
+                    let result = dispatch::dispatch_close(rt, newfd);
+                    log::trace!("dispatch_close(clawfs fd={newfd}) -> {result:?}");
+                }
             }
         }
     }
@@ -1220,13 +1798,39 @@ pub unsafe extern "C" fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
                 if oldfd == newfd {
                     return set_errno(libc::EINVAL) as i32;
                 }
+                log::trace!("dup3(clawfs fd={oldfd} -> fd={newfd}, flags={flags})");
+                cleanup_fd_proxy(newfd);
                 return match rt.fd_table.dup_to(oldfd, newfd) {
-                    Some(fd) => fd,
+                    Some(fd) => {
+                        if let Some(entry) = rt.fd_table.get(fd) {
+                            if entry.flags & (libc::O_WRONLY | libc::O_RDWR) != 0
+                                && !entry.is_dir
+                                && install_fd_proxy(rt, fd, entry, flags & libc::O_CLOEXEC != 0)
+                                    .is_err()
+                            {
+                                rt.fd_table.remove(fd);
+                                return set_errno(libc::EBADF) as i32;
+                            }
+                        }
+                        fd
+                    }
                     None => set_errno(libc::EBADF) as i32,
                 };
             }
             if rt.fd_table.is_clawfs_fd(newfd) {
-                rt.fd_table.remove(newfd);
+                log::trace!("dup3(host fd={oldfd} -> clawfs fd={newfd}), finalizing clawfs fd");
+                if fd_proxy_threads().contains_key(&newfd) {
+                    if let Some(stream) = get_stdio_stream(newfd) {
+                        unsafe {
+                            let _ = get_real_fflush()(stream);
+                        }
+                    }
+                    rt.fd_table.remove(newfd);
+                    cleanup_fd_proxy(newfd);
+                } else {
+                    let result = dispatch::dispatch_close(rt, newfd);
+                    log::trace!("dispatch_close(clawfs fd={newfd}) -> {result:?}");
+                }
             }
         }
     }
@@ -1236,6 +1840,32 @@ pub unsafe extern "C" fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
 // ---------------------------------------------------------------------------
 // Phase 2: symlink/readlink
 // ---------------------------------------------------------------------------
+
+/// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` and return the fd number.
+fn parse_proc_fd_path(path: &str) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let after_slash = if let Some(r) = rest.strip_prefix("self/fd/") {
+        r
+    } else {
+        let slash = rest.find('/')?;
+        rest[slash + 1..].strip_prefix("fd/")?
+    };
+    // Only a bare integer — no trailing components.
+    if after_slash.is_empty() || after_slash.contains('/') {
+        return None;
+    }
+    after_slash.parse().ok()
+}
+
+/// Write a string into a C char buffer, returning the byte count (capped at bufsiz).
+fn write_str_to_buf(s: &str, buf: *mut libc::c_char, bufsiz: libc::size_t) -> libc::ssize_t {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(bufsiz);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+    }
+    n as libc::ssize_t
+}
 
 /// # Safety
 /// Called by the dynamic linker as a libc function replacement.
@@ -1272,6 +1902,21 @@ pub unsafe extern "C" fn readlink(
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
+                // /proc/self/fd/<N> — return the full external path for ClawFS fds.
+                if let Some(fd) = parse_proc_fd_path(&path_str) {
+                    if let Some(entry) = rt.fd_table.get(fd) {
+                        if let Some(full) = rt.prefix_router.full_path(&entry.inner_path) {
+                            log::trace!(
+                                "readlink({:?}) -> {:?} (clawfs fd={})",
+                                path_str,
+                                full,
+                                fd
+                            );
+                            return write_str_to_buf(&full, buf, bufsiz);
+                        }
+                    }
+                }
+                // ClawFS symlinks.
                 if let Some(inner) = try_classify(rt, &path_str) {
                     return match dispatch::dispatch_readlink(rt, &inner) {
                         Ok(target) => {
@@ -1288,6 +1933,52 @@ pub unsafe extern "C" fn readlink(
         }
     }
     unsafe { get_real_readlink()(path, buf, bufsiz) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn readlinkat(
+    dirfd: i32,
+    path: *const libc::c_char,
+    buf: *mut libc::c_char,
+    bufsiz: libc::size_t,
+) -> libc::ssize_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                // /proc/self/fd/<N> — always absolute, dirfd is irrelevant.
+                if let Some(fd) = parse_proc_fd_path(&path_str) {
+                    if let Some(entry) = rt.fd_table.get(fd) {
+                        if let Some(full) = rt.prefix_router.full_path(&entry.inner_path) {
+                            log::trace!(
+                                "readlinkat({}, {:?}) -> {:?} (clawfs fd={})",
+                                dirfd,
+                                path_str,
+                                full,
+                                fd
+                            );
+                            return write_str_to_buf(&full, buf, bufsiz);
+                        }
+                    }
+                }
+                // ClawFS symlinks.
+                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
+                    return match dispatch::dispatch_readlink(rt, &inner) {
+                        Ok(target) => {
+                            let n = target.len().min(bufsiz);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n);
+                            }
+                            n as libc::ssize_t
+                        }
+                        Err(e) => set_errno(e) as libc::ssize_t,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_readlinkat()(dirfd, path, buf, bufsiz) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +2334,7 @@ const FIONCLEX: libc::c_ulong = 0x5450;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ioctl(fd: i32, request: libc::c_ulong, arg: libc::c_ulong) -> i32 {
     // For synthetic fds, handle FIOCLEX/FIONCLEX (close-on-exec) as no-ops.
-    if (request == FIOCLEX || request == FIONCLEX) && fd >= 10_000_000 {
+    if request == FIOCLEX || request == FIONCLEX {
         if let Some(rt) = ClawfsRuntime::get() {
             if rt.fd_table.is_clawfs_fd(fd) {
                 return 0;
@@ -1654,25 +2345,39 @@ pub unsafe extern "C" fn ioctl(fd: i32, request: libc::c_ulong, arg: libc::c_ulo
 }
 
 /// Shared fcntl logic for synthetic fds. Returns `Some(result)` if handled.
-fn do_fcntl_synthetic(fd: i32, cmd: libc::c_int) -> Option<i32> {
-    if fd < 10_000_000 {
-        return None;
-    }
+fn do_fcntl_synthetic(fd: i32, cmd: libc::c_int, arg: libc::c_int) -> Option<i32> {
     let rt = ClawfsRuntime::get()?;
     if !rt.fd_table.is_clawfs_fd(fd) {
         return None;
     }
-    Some(match cmd {
+    let result = match cmd {
         libc::F_GETFD => libc::FD_CLOEXEC,
         libc::F_SETFD => 0,
         libc::F_GETFL => rt.fd_table.get(fd).map_or(0, |e| e.flags),
         libc::F_SETFL => 0,
-        libc::F_DUPFD | libc::F_DUPFD_CLOEXEC => match rt.fd_table.dup(fd) {
-            Some(new_fd) => new_fd,
-            None => set_errno(libc::EBADF) as i32,
+        libc::F_DUPFD | libc::F_DUPFD_CLOEXEC => match rt.fd_table.dup_min(fd, arg) {
+            Some(new_fd) => {
+                if let Some(entry) = rt.fd_table.get(new_fd) {
+                    if entry.flags & (libc::O_WRONLY | libc::O_RDWR) != 0
+                        && !entry.is_dir
+                        && install_fd_proxy(rt, new_fd, entry, cmd == libc::F_DUPFD_CLOEXEC)
+                            .is_err()
+                    {
+                        rt.fd_table.remove(new_fd);
+                        set_errno(libc::EBADF) as i32
+                    } else {
+                        new_fd
+                    }
+                } else {
+                    set_errno(libc::EBADF) as i32
+                }
+            }
+            None => set_errno(libc::EINVAL) as i32,
         },
         _ => set_errno(libc::EINVAL) as i32,
-    })
+    };
+    log::trace!("fcntl(clawfs fd={fd}, cmd={cmd}, arg={arg}) -> {result}");
+    Some(result)
 }
 
 /// # Safety
@@ -1680,7 +2385,7 @@ fn do_fcntl_synthetic(fd: i32, cmd: libc::c_int) -> Option<i32> {
 /// Defined as 3 fixed args — ABI-compatible with variadic on x86_64.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcntl(fd: i32, cmd: libc::c_int, arg: libc::c_int) -> i32 {
-    if let Some(result) = do_fcntl_synthetic(fd, cmd) {
+    if let Some(result) = do_fcntl_synthetic(fd, cmd, arg) {
         return result;
     }
     unsafe { get_real_fcntl()(fd, cmd, arg) }
@@ -1690,8 +2395,175 @@ pub unsafe extern "C" fn fcntl(fd: i32, cmd: libc::c_int, arg: libc::c_int) -> i
 /// Called by the dynamic linker as a libc function replacement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcntl64(fd: i32, cmd: libc::c_int, arg: libc::c_int) -> i32 {
-    if let Some(result) = do_fcntl_synthetic(fd, cmd) {
+    if let Some(result) = do_fcntl_synthetic(fd, cmd, arg) {
         return result;
     }
     unsafe { get_real_fcntl64()(fd, cmd, arg) }
+}
+
+// ---------------------------------------------------------------------------
+// inotify interception
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_init() -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if ClawfsRuntime::get().is_some() {
+            let fd = crate::inotify::create(0);
+            if fd >= 0 {
+                log::debug!("inotify_init() -> fake fd={fd}");
+                return fd;
+            }
+        }
+    }
+    unsafe { get_real_inotify_init()() }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_init1(flags: i32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if ClawfsRuntime::get().is_some() {
+            let fd = crate::inotify::create(flags);
+            if fd >= 0 {
+                log::debug!("inotify_init1(flags={flags:#x}) -> fake fd={fd}");
+                return fd;
+            }
+        }
+    }
+    unsafe { get_real_inotify_init1()(flags) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if crate::inotify::is_inotify_fd(fd) {
+                if let Some(path_str) = c_path_to_str(path) {
+                    if let Some(inner) = try_classify(rt, &path_str) {
+                        return match dispatch::resolve_path(rt, &inner) {
+                            Ok((_, inode, _)) => {
+                                let wd = crate::inotify::add_watch(fd, inode, mask);
+                                if wd < 0 {
+                                    set_errno(-wd) as i32
+                                } else {
+                                    wd
+                                }
+                            }
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
+                    // Path not in ClawFS but fd is our fake pipe — can't forward to
+                    // the kernel, so report the path as not found.
+                    return set_errno(libc::ENOENT) as i32;
+                }
+            }
+        }
+    }
+    unsafe { get_real_inotify_add_watch()(fd, path, mask) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_rm_watch(fd: i32, wd: i32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if ClawfsRuntime::get().is_some() && crate::inotify::is_inotify_fd(fd) {
+            return if crate::inotify::rm_watch(fd, wd) {
+                0
+            } else {
+                set_errno(libc::EINVAL) as i32
+            };
+        }
+    }
+    unsafe { get_real_inotify_rm_watch()(fd, wd) }
+}
+
+// ---------------------------------------------------------------------------
+// statx — used by modern ls (glibc 2.28+) and other tools
+// ---------------------------------------------------------------------------
+
+/// Populate a `statx` buffer from the simpler `libc::stat` struct.
+fn stat_to_statx(st: &libc::stat, mask: libc::c_uint, out: *mut libc::statx) {
+    // STATX_BASIC_STATS = 0x7ff covers all the classic stat fields.
+    const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+    unsafe {
+        let sx = &mut *out;
+        *sx = std::mem::zeroed();
+        sx.stx_mask = STATX_BASIC_STATS & mask;
+        sx.stx_blksize = st.st_blksize as u32;
+        sx.stx_nlink = st.st_nlink as u32;
+        sx.stx_uid = st.st_uid;
+        sx.stx_gid = st.st_gid;
+        sx.stx_mode = st.st_mode as u16;
+        sx.stx_ino = st.st_ino;
+        sx.stx_size = st.st_size as u64;
+        sx.stx_blocks = st.st_blocks as u64;
+        sx.stx_atime.tv_sec = st.st_atime;
+        sx.stx_atime.tv_nsec = st.st_atime_nsec as u32;
+        sx.stx_mtime.tv_sec = st.st_mtime;
+        sx.stx_mtime.tv_nsec = st.st_mtime_nsec as u32;
+        sx.stx_ctime.tv_sec = st.st_ctime;
+        sx.stx_ctime.tv_nsec = st.st_ctime_nsec as u32;
+        // Device numbers from st_rdev / st_dev using Linux makedev encoding.
+        sx.stx_rdev_major = ((st.st_rdev >> 8) & 0xfff) as u32;
+        sx.stx_rdev_minor = ((st.st_rdev & 0xff) | ((st.st_rdev >> 12) & !0xff)) as u32;
+        sx.stx_dev_major = ((st.st_dev >> 8) & 0xfff) as u32;
+        sx.stx_dev_minor = ((st.st_dev & 0xff) | ((st.st_dev >> 12) & !0xff)) as u32;
+    }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn statx(
+    dirfd: i32,
+    path: *const libc::c_char,
+    flags: i32,
+    mask: libc::c_uint,
+    statxbuf: *mut libc::statx,
+) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                // AT_EMPTY_PATH with an empty path: stat the fd itself.
+                if path_str.is_empty() && (flags & libc::AT_EMPTY_PATH != 0) {
+                    if let Some(entry) = rt.fd_table.get(dirfd) {
+                        return match dispatch::dispatch_fstat(rt, &entry) {
+                            Ok(st) => {
+                                log::trace!(
+                                    "statx(AT_EMPTY_PATH clawfs fd={}) -> size={}",
+                                    dirfd,
+                                    st.st_size
+                                );
+                                stat_to_statx(&st, mask, statxbuf);
+                                0
+                            }
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
+                } else if !path_str.is_empty() {
+                    if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
+                        return match dispatch::dispatch_stat(rt, &inner) {
+                            Ok(st) => {
+                                log::trace!("statx({:?}) -> size={}", path_str, st.st_size);
+                                stat_to_statx(&st, mask, statxbuf);
+                                0
+                            }
+                            Err(e) => {
+                                log::trace!("statx({:?}) -> err={}", path_str, e);
+                                set_errno(e) as i32
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+    unsafe { get_real_statx()(dirfd, path, flags, mask, statxbuf) }
 }
