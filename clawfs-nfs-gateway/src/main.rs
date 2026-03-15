@@ -6,16 +6,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::{ArgAction, Parser, ValueEnum};
-use tokio_util::sync::CancellationToken;
-use zerofs_nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, set_atime, set_gid3,
-    set_mode3, set_mtime, set_size3, set_uid3, specdata3, writeverf3, NFS3_WRITEVERFSIZE,
-};
-use time::OffsetDateTime;
 use clawfs::clawfs as clawfs_runtime;
-use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use clawfs::config::{Config, ObjectStoreProvider};
 use clawfs::fs::OsageFs;
 use clawfs::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
@@ -25,12 +16,22 @@ use clawfs::replay::ReplayLogger;
 use clawfs::segment::SegmentManager;
 use clawfs::state::ClientStateManager;
 use clawfs::superblock::SuperblockManager;
+use serde_json::json;
 use tempfile::NamedTempFile;
+use time::OffsetDateTime;
 use tokio::process::Command;
 use tokio::signal;
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
-use serde_json::json;
+use zerofs_nfsserve::nfs::{
+    fattr3, fileid3, filename3, fsinfo3, fsstat3, ftype3, nfspath3, nfsstat3, nfstime3,
+    post_op_attr, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
+    specdata3, writeverf3, FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK,
+    NFS3_WRITEVERFSIZE,
+};
+use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 const ROOT_ID: fileid3 = ROOT_INODE;
 const DEFAULT_V4_EXPORT: &str = "/clawfs";
@@ -239,7 +240,8 @@ async fn run_ganesha(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| export_path.join(".."))
         .join("clawfs-ganesha.log");
 
-    let rendered = render_ganesha_config(&export_path, &cli.pseudo_path, addr.port(), cli.read_only);
+    let rendered =
+        render_ganesha_config(&export_path, &cli.pseudo_path, addr.port(), cli.read_only);
     std::fs::write(config_file.path(), rendered).context("failed to write ganesha config")?;
 
     info!(
@@ -313,12 +315,9 @@ impl OsageDirectFs {
         std::fs::create_dir_all(&config.local_cache_path)?;
 
         let handle = tokio::runtime::Handle::current();
-        let metadata = Arc::new(
-            MetadataStore::new(&config, handle.clone()).await?,
-        );
-        let superblock = Arc::new(
-            SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?,
-        );
+        let metadata = Arc::new(MetadataStore::new(&config, handle.clone()).await?);
+        let superblock =
+            Arc::new(SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?);
         ensure_root(metadata.clone(), superblock.clone(), &config).await?;
 
         let segments = Arc::new(SegmentManager::new(&config, handle.clone())?);
@@ -378,7 +377,10 @@ impl OsageDirectFs {
             info!(target: "gateway", replayed, "replayed journal entries before serving NFS");
         }
 
-        Ok(Self { read_only: cli.read_only, fs })
+        Ok(Self {
+            read_only: cli.read_only,
+            fs,
+        })
     }
 
     async fn call<T, F>(&self, op: F) -> Result<T, nfsstat3>
@@ -497,7 +499,8 @@ impl NFSFileSystem for OsageDirectFs {
     ) -> Result<fattr3, nfsstat3> {
         self.ensure_writable()?;
         let payload = data.to_vec();
-        self.call(move |fs| fs.nfs_write(id, offset, &payload)).await?;
+        self.call(move |fs| fs.nfs_write(id, offset, &payload))
+            .await?;
         let inode = self.call(move |fs| fs.nfs_getattr(id)).await?;
         Ok(inode_to_fattr(&inode))
     }
@@ -519,7 +522,9 @@ impl NFSFileSystem for OsageDirectFs {
             set_gid3::gid(v) => v,
             set_gid3::Void => auth.gid,
         };
-        let inode = self.call(move |fs| fs.nfs_create(dirid, &name, uid, gid)).await?;
+        let inode = self
+            .call(move |fs| fs.nfs_create(dirid, &name, uid, gid))
+            .await?;
         let mode = match attr.mode {
             set_mode3::mode(v) => Some(v),
             set_mode3::Void => None,
@@ -529,7 +534,9 @@ impl NFSFileSystem for OsageDirectFs {
             set_size3::Void => None,
         };
         let inode = self
-            .call(move |fs| fs.nfs_setattr(inode.inode, mode, Some(uid), Some(gid), size, None, None))
+            .call(move |fs| {
+                fs.nfs_setattr(inode.inode, mode, Some(uid), Some(gid), size, None, None)
+            })
             .await?;
         Ok((inode.inode, inode_to_fattr(&inode)))
     }
@@ -540,7 +547,9 @@ impl NFSFileSystem for OsageDirectFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let (id, _) = self.create(auth, dirid, filename, sattr3::default()).await?;
+        let (id, _) = self
+            .create(auth, dirid, filename, sattr3::default())
+            .await?;
         Ok(id)
     }
 
@@ -566,7 +575,17 @@ impl NFSFileSystem for OsageDirectFs {
             .await?;
         if let set_mode3::mode(mode) = attrs.mode {
             let inode = self
-                .call(move |fs| fs.nfs_setattr(inode.inode, Some(mode), Some(uid), Some(gid), None, None, None))
+                .call(move |fs| {
+                    fs.nfs_setattr(
+                        inode.inode,
+                        Some(mode),
+                        Some(uid),
+                        Some(gid),
+                        None,
+                        None,
+                        None,
+                    )
+                })
                 .await?;
             return Ok((inode.inode, inode_to_fattr(&inode)));
         }
@@ -582,11 +601,15 @@ impl NFSFileSystem for OsageDirectFs {
         self.ensure_writable()?;
         let name = filename_to_name(filename)?;
         let lookup_name = name.clone();
-        let child = self.call(move |fs| fs.nfs_lookup(dirid, &lookup_name)).await?;
+        let child = self
+            .call(move |fs| fs.nfs_lookup(dirid, &lookup_name))
+            .await?;
         if child.is_dir() {
-            self.call(move |fs| fs.nfs_remove_dir(dirid, &name, 0)).await?;
+            self.call(move |fs| fs.nfs_remove_dir(dirid, &name, 0))
+                .await?;
         } else {
-            self.call(move |fs| fs.nfs_remove_file(dirid, &name, 0)).await?;
+            self.call(move |fs| fs.nfs_remove_file(dirid, &name, 0))
+                .await?;
         }
         Ok(())
     }
