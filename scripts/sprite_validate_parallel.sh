@@ -139,7 +139,7 @@ mkdir -p /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
 sudo mkdir -p /mnt/test /mnt/scratch
 
 # Start ClawFS NFS gateway (TEST instance)
-clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+target/release/clawfs-nfs-gateway \
   --store-path /tmp/clawfs-test-store \
   --local-cache-path /tmp/clawfs-test-cache \
   --state-path /tmp/clawfs-test-state.bin \
@@ -155,7 +155,7 @@ done
 nc -z 127.0.0.1 2049 || { echo "TEST NFS instance failed to start"; exit 1; }
 
 # Start ClawFS NFS gateway (SCRATCH instance)
-clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+target/release/clawfs-nfs-gateway \
   --store-path /tmp/clawfs-scratch-store \
   --local-cache-path /tmp/clawfs-scratch-cache \
   --state-path /tmp/clawfs-scratch-state.bin \

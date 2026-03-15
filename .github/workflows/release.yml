@@ -72,7 +72,7 @@ jobs:
           cp target/release/clawfs "$DIST/"
           cp target/release/clawfs_checkpoint "$DIST/"
           cp target/release/clawfs_replay "$DIST/"
-          cp clawfs-nfs-gateway/target/release/clawfs-nfs-gateway "$DIST/"
+          cp target/release/clawfs-nfs-gateway "$DIST/"
 
           if [[ -f clawfs-preload/target/release/libclawfs_preload.so ]]; then
             cp clawfs-preload/target/release/libclawfs_preload.so "$DIST/"

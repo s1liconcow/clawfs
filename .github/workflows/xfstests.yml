@@ -53,7 +53,7 @@ jobs:
 
       - name: Start ClawFS NFS gateway (TEST instance)
         run: |
-          clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+          target/release/clawfs-nfs-gateway \
             --store-path /tmp/clawfs-test-store \
             --local-cache-path /tmp/clawfs-test-cache \
             --state-path /tmp/clawfs-test-state.bin \
@@ -78,7 +78,7 @@ jobs:
 
       - name: Start ClawFS NFS gateway (SCRATCH instance)
         run: |
-          clawfs-nfs-gateway/target/release/clawfs-nfs-gateway \
+          target/release/clawfs-nfs-gateway \
             --store-path /tmp/clawfs-scratch-store \
             --local-cache-path /tmp/clawfs-scratch-cache \
             --state-path /tmp/clawfs-scratch-state.bin \

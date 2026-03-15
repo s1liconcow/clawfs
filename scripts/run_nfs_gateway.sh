@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "$0")/.." && pwd)
 GATEWAY_MANIFEST="$ROOT_DIR/clawfs-nfs-gateway/Cargo.toml"
-GATEWAY_BIN="$ROOT_DIR/clawfs-nfs-gateway/target/release/clawfs-nfs-gateway"
+GATEWAY_BIN="$ROOT_DIR/target/release/clawfs-nfs-gateway"
 
 MOUNT_PATH="${MOUNT_PATH:-/tmp/clawfs-mnt}"
 STORE_PATH="${STORE_PATH:-/tmp/clawfs-store}"
