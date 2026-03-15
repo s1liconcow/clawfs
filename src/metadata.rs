@@ -1273,7 +1273,10 @@ impl MetadataStore {
                 },
             );
         }
-        *self.last_delta_generation.lock() = max_generation;
+        // Do not advance `last_delta_generation` here. Shards can be at
+        // different generations, so a global max can cause startup replay to
+        // skip valid deltas for lagging shards.
+        *self.last_delta_generation.lock() = 0;
         Ok(())
     }
 
@@ -1286,9 +1289,7 @@ impl MetadataStore {
         while let Some(item) = stream.next().await {
             let meta = item?;
             let name = meta.location.filename().unwrap_or_default();
-            if let Some(generation) = parse_delta_filename(name)
-                && generation > newest
-            {
+            if let Some(generation) = parse_delta_filename(name) {
                 files.push((generation, meta.location));
             }
         }
@@ -1296,6 +1297,9 @@ impl MetadataStore {
         files.sort_by_key(|(generation, _)| *generation);
         let mut updated_records = Vec::new();
         for (generation, path) in files {
+            if generation <= newest {
+                continue;
+            }
             let bytes = self.store.get(&path).await?.bytes().await?;
             let stored: StoredDelta = deserialize_delta(&bytes)?;
             anyhow::ensure!(
@@ -1305,13 +1309,28 @@ impl MetadataStore {
             );
             for record in stored.records {
                 if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                    self.cache.write().remove(&record.inode);
+                    let mut cache = self.cache.write();
+                    let dominated = cache
+                        .get(&record.inode)
+                        .map(|existing| existing.generation > generation)
+                        .unwrap_or(false);
+                    if !dominated {
+                        cache.remove(&record.inode);
+                        self.negative_cache.write().remove(&record.inode);
+                    }
                 } else {
-                    self.cache.write().insert(
-                        record.inode,
-                        CacheEntry::with_generation(record.clone(), generation),
-                    );
-                    updated_records.push(record.clone());
+                    let mut cache = self.cache.write();
+                    let dominated = cache
+                        .get(&record.inode)
+                        .map(|existing| existing.generation > generation)
+                        .unwrap_or(false);
+                    if !dominated {
+                        cache.insert(
+                            record.inode,
+                            CacheEntry::with_generation(record.clone(), generation),
+                        );
+                        updated_records.push(record.clone());
+                    }
                 }
             }
             newest = newest.max(generation);
@@ -1959,6 +1978,84 @@ mod tests {
         match stored.storage {
             FileStorage::Inline(bytes) => assert_eq!(bytes, b"hello".to_vec()),
             other => panic!("expected inline storage after delta replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_store_replays_lagging_shard_deltas_without_downgrading_newer_shards() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let runtime = Runtime::new().unwrap();
+
+        let inode_lagging_v1 = InodeRecord::new_file(
+            42,
+            1,
+            "lagging.h".to_string(),
+            "/lagging.h".to_string(),
+            1000,
+            1000,
+        );
+        let mut inode_lagging_v3 = inode_lagging_v1.clone();
+        inode_lagging_v3.size = 5;
+        inode_lagging_v3.storage = FileStorage::Inline(b"hello".to_vec());
+
+        let inode_newer_v5 = InodeRecord::new_file(
+            128,
+            1,
+            "newer.h".to_string(),
+            "/newer.h".to_string(),
+            1000,
+            1000,
+        );
+        let mut inode_newer_v2 = inode_newer_v5.clone();
+        inode_newer_v2.size = 3;
+        inode_newer_v2.storage = FileStorage::Inline(b"old".to_vec());
+        let mut inode_newer_v5 = inode_newer_v5;
+        inode_newer_v5.size = 7;
+        inode_newer_v5.storage = FileStorage::Inline(b"newest!".to_vec());
+
+        runtime.block_on(async {
+            let metadata = MetadataStore::new(&config, runtime.handle().clone())
+                .await
+                .unwrap();
+            metadata
+                .persist_inode(&inode_lagging_v1, 1, config.shard_size)
+                .await
+                .unwrap();
+            metadata
+                .write_delta_ref(2, &[inode_newer_v2])
+                .await
+                .unwrap();
+            metadata
+                .write_delta_ref(3, &[inode_lagging_v3.clone()])
+                .await
+                .unwrap();
+            metadata
+                .persist_inode(&inode_newer_v5, 5, config.shard_size)
+                .await
+                .unwrap();
+        });
+
+        let reloaded = runtime
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+            .unwrap();
+
+        let lagging = runtime
+            .block_on(reloaded.get_inode(42))
+            .unwrap()
+            .expect("lagging inode should exist after replay");
+        match lagging.storage {
+            FileStorage::Inline(bytes) => assert_eq!(bytes, b"hello".to_vec()),
+            other => panic!("expected inline storage after replay, got {other:?}"),
+        }
+
+        let newer = runtime
+            .block_on(reloaded.get_inode(128))
+            .unwrap()
+            .expect("newer inode should exist after reload");
+        match newer.storage {
+            FileStorage::Inline(bytes) => assert_eq!(bytes, b"newest!".to_vec()),
+            other => panic!("expected inline storage from newest shard, got {other:?}"),
         }
     }
 }
