@@ -16,3 +16,4 @@ pub mod segment;
 pub mod source;
 pub mod state;
 pub mod superblock;
+pub mod telemetry;

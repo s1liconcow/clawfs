@@ -100,6 +100,8 @@ impl OsageFs {
         client_state: Arc<ClientStateManager>,
         perf: Option<Arc<PerfLogger>>,
         replay: Option<Arc<ReplayLogger>>,
+        telemetry: Option<Arc<TelemetryClient>>,
+        telemetry_session_id: Option<String>,
     ) -> Self {
         let fsync_on_close = config.fsync_on_close;
         let flush_interval = if config.flush_interval_ms == 0 {
@@ -123,6 +125,9 @@ impl OsageFs {
             pending_bytes: Arc::new(AtomicU64::new(0)),
             perf,
             replay,
+            telemetry,
+            telemetry_session_id,
+            mount_ready_emitted: Arc::new(AtomicBool::new(false)),
             fsync_on_close,
             flush_interval,
             last_flush: Arc::new(AtomicU64::new(epoch_millis_now())),

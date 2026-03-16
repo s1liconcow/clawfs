@@ -26,6 +26,7 @@ pub fn perf_config(root: &Path) -> Config {
         region: None,
         endpoint: None,
         object_prefix: String::new(),
+        telemetry_object_prefix: None,
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,

@@ -4,6 +4,8 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
@@ -15,11 +17,38 @@ use crate::auth::{
 use crate::clawfs::STORAGE_MODE_ENV;
 use crate::config::{Cli, Config, ObjectStoreProvider};
 use crate::launch::HostedControlPlane;
+use crate::telemetry::{set_telemetry_enabled, telemetry_status};
 
 const DEFAULT_VOLUME: &str = "default";
 const DEFAULT_PREFIX: &str = "clawfs";
 const DEFAULT_CLAWFS_APP_URL: &str = "https://app.clawfs.dev";
 const CLAWFS_API_ENV: &str = "CLAWFS_API";
+const CLI_LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CLI_LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CliLoginStartResponse {
+    login_url: String,
+    poll_url: String,
+    poll_interval_seconds: u64,
+    expires_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum CliLoginPollResponse {
+    Pending {
+        #[allow(dead_code)]
+        expires_at: String,
+    },
+    Complete {
+        api_token: String,
+        api_base_url: String,
+        email: Option<String>,
+        account_id: Option<String>,
+        provider: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SummonApiConfig {
@@ -37,6 +66,8 @@ struct SummonApiConfig {
     storage_mode: Option<String>,
     #[serde(default)]
     object_prefix: Option<String>,
+    #[serde(default)]
+    telemetry_object_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +80,7 @@ struct HostedVolumeConfig {
     secret_access_key: Option<String>,
     storage_mode: Option<String>,
     object_prefix: Option<String>,
+    telemetry_object_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,17 +214,16 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
     match command {
         "login" => {
             let parse_args = subcommand_args("clawfs login", args);
-            let profile = AuthProfile::from_login(LoginArgs::parse_from(parse_args))?;
-            let path = store_profile(&profile)?;
-            println!(
-                "stored API token for {} at {}",
-                profile
-                    .email
-                    .as_deref()
-                    .or(profile.account_id.as_deref())
-                    .unwrap_or("this ClawFS account"),
-                path.display()
-            );
+            let login = LoginArgs::parse_from(parse_args);
+            let result = if login.api_token.is_some() {
+                AuthProfile::from_login(login)
+            } else {
+                run_browser_login(login)
+            };
+            match result {
+                Ok(profile) => print_stored_profile(&profile)?,
+                Err(err) => return Err(err),
+            }
             Ok(DispatchAction::Handled)
         }
         "logout" => {
@@ -208,6 +239,10 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             let parse_args = subcommand_args("clawfs whoami", args);
             let whoami = WhoamiArgs::parse_from(parse_args);
             print_whoami(whoami)?;
+            Ok(DispatchAction::Handled)
+        }
+        "telemetry" => {
+            handle_telemetry_command(args)?;
             Ok(DispatchAction::Handled)
         }
         "up" => {
@@ -231,11 +266,16 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("login") => {
             LoginArgs::command().print_help()?;
             println!();
+            println!("Without `--api-token`, this prints a sign-in URL and waits for completion.");
             Ok(DispatchAction::Handled)
         }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("whoami") => {
             WhoamiArgs::command().print_help()?;
             println!();
+            Ok(DispatchAction::Handled)
+        }
+        "help" if args.get(2).and_then(|value| value.to_str()) == Some("telemetry") => {
+            print_telemetry_help();
             Ok(DispatchAction::Handled)
         }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("up") => {
@@ -274,6 +314,7 @@ pub fn print_general_help() {
     println!("  clawfs login");
     println!("  clawfs logout");
     println!("  clawfs whoami");
+    println!("  clawfs telemetry [status|enable|disable]");
     println!("  clawfs up -- [command...]");
     println!("  clawfs mount");
     println!("  clawfs serve");
@@ -313,9 +354,11 @@ fn build_mount_invocation(args: MountArgs) -> Result<HostedMountInvocation> {
         cli_args.push(OsString::from("--foreground"));
     }
     let cli = Cli::parse_from(cli_args);
+    let mut config: Config = cli.into();
+    config.telemetry_object_prefix = hosted.config.telemetry_object_prefix.clone();
 
     Ok(HostedMountInvocation {
-        config: cli.into(),
+        config,
         hosted: HostedControlPlane {
             api_url: hosted.api_base_url,
             api_token: hosted.api_token,
@@ -447,14 +490,22 @@ fn resolve_hosted_volume(volume: &str) -> Result<HostedVolume> {
             secret_access_key: summon.secret_access_key,
             storage_mode: summon.storage_mode,
             object_prefix: summon.object_prefix,
+            telemetry_object_prefix: summon.telemetry_object_prefix,
         },
     })
 }
 
 fn resolve_api_base_url() -> String {
-    env::var(CLAWFS_API_ENV)
-        .or_else(|_| env::var(API_BASE_URL_ENV))
-        .unwrap_or_else(|_| DEFAULT_CLAWFS_APP_URL.to_string())
+    if let Ok(value) = env::var(CLAWFS_API_ENV) {
+        return value;
+    }
+    if let Ok(value) = env::var(API_BASE_URL_ENV) {
+        return value;
+    }
+    if let Ok(Some(profile)) = load_profile() {
+        return profile.api_base_url;
+    }
+    DEFAULT_CLAWFS_APP_URL.to_string()
 }
 
 fn resolve_api_token() -> Result<String> {
@@ -539,9 +590,206 @@ fn print_whoami(args: WhoamiArgs) -> Result<()> {
         );
     } else {
         println!("authenticated: no");
-        println!("Run `clawfs login` after you receive a ClawFS API token.");
+        println!("Run `clawfs login` to sign in.");
     }
     Ok(())
+}
+
+fn run_browser_login(args: LoginArgs) -> Result<AuthProfile> {
+    let api_base_url = normalize_browser_api_base(args.api_base_url)?;
+    let start = start_cli_login(&api_base_url, &args.label)?;
+
+    println!("Open this link to sign in to ClawFS:");
+    println!("{}", start.login_url);
+    println!(
+        "Waiting for authentication to complete (expires at {}).",
+        start.expires_at
+    );
+
+    let server_poll_interval = Duration::from_secs(start.poll_interval_seconds.max(1));
+    poll_cli_login(
+        &start.poll_url,
+        &api_base_url,
+        server_poll_interval.max(CLI_LOGIN_POLL_INTERVAL),
+    )
+}
+
+fn start_cli_login(api_base_url: &str, label: &str) -> Result<CliLoginStartResponse> {
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/api/cli-login/start", api_base_url);
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "label": label }))
+        .send()
+        .with_context(|| format!("failed to contact {}", url))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response
+            .text()
+            .unwrap_or_else(|_| "(no response body)".to_string());
+        bail!("failed to start browser login ({}): {}", status, text);
+    }
+
+    response
+        .json()
+        .context("failed to parse CLI login start response")
+}
+
+fn poll_cli_login(
+    poll_url: &str,
+    api_base_url: &str,
+    poll_interval: Duration,
+) -> Result<AuthProfile> {
+    let client = reqwest::blocking::Client::new();
+    let deadline = Instant::now() + CLI_LOGIN_TIMEOUT;
+
+    loop {
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for browser login to complete");
+        }
+
+        let response = client
+            .get(poll_url)
+            .send()
+            .with_context(|| format!("failed to poll {}", poll_url))?;
+
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            thread::sleep(poll_interval);
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response
+                .text()
+                .unwrap_or_else(|_| "(no response body)".to_string());
+            bail!("browser login failed ({}): {}", status, text);
+        }
+
+        match response
+            .json::<CliLoginPollResponse>()
+            .context("failed to parse CLI login poll response")?
+        {
+            CliLoginPollResponse::Pending { expires_at: _ } => {
+                thread::sleep(poll_interval);
+            }
+            CliLoginPollResponse::Complete {
+                api_token,
+                api_base_url: returned_api_base_url,
+                email,
+                account_id,
+                provider,
+            } => {
+                let profile = AuthProfile {
+                    api_token,
+                    api_base_url: if returned_api_base_url.trim().is_empty() {
+                        api_base_url.to_string()
+                    } else {
+                        returned_api_base_url
+                    },
+                    account_id,
+                    email,
+                    provider: provider.and_then(parse_auth_provider),
+                };
+                return Ok(profile);
+            }
+        }
+    }
+}
+
+fn print_stored_profile(profile: &AuthProfile) -> Result<()> {
+    let path = store_profile(profile)?;
+    println!(
+        "stored API token for {} at {}",
+        profile
+            .email
+            .as_deref()
+            .or(profile.account_id.as_deref())
+            .unwrap_or("this ClawFS account"),
+        path.display()
+    );
+    println!("Telemetry is enabled by default. Run `clawfs telemetry disable` to opt out.");
+    Ok(())
+}
+
+fn normalize_browser_api_base(api_base_url: String) -> Result<String> {
+    let trimmed = api_base_url.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        bail!("API base URL cannot be empty");
+    }
+    Ok(trimmed)
+}
+
+fn parse_auth_provider(value: String) -> Option<crate::auth::AuthProvider> {
+    match value.as_str() {
+        "email" => Some(crate::auth::AuthProvider::Email),
+        "google" => Some(crate::auth::AuthProvider::Google),
+        "github" => Some(crate::auth::AuthProvider::Github),
+        _ => None,
+    }
+}
+
+fn handle_telemetry_command(args: &[OsString]) -> Result<()> {
+    match args.get(2).and_then(|value| value.to_str()) {
+        None | Some("status") => {
+            let status = telemetry_status()?;
+            println!(
+                "telemetry: {}",
+                if status.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("config: {}", status.config_path.display());
+            println!(
+                "config_present: {}",
+                if status.config_exists { "yes" } else { "no" }
+            );
+            if let Some(client_id) = status.client_id {
+                println!("client_id: {client_id}");
+            }
+            if let Some(env_override) = status.env_override {
+                println!(
+                    "env_override: {}",
+                    if env_override { "enabled" } else { "disabled" }
+                );
+            }
+            Ok(())
+        }
+        Some("enable") => {
+            let status = set_telemetry_enabled(true)?;
+            println!(
+                "telemetry enabled (config: {}, client_id: {})",
+                status.config_path.display(),
+                status.client_id.unwrap_or_else(|| "unknown".to_string())
+            );
+            Ok(())
+        }
+        Some("disable") => {
+            let status = set_telemetry_enabled(false)?;
+            println!(
+                "telemetry disabled (config: {}, client_id: {})",
+                status.config_path.display(),
+                status.client_id.unwrap_or_else(|| "unknown".to_string())
+            );
+            Ok(())
+        }
+        Some("help") | Some("--help") | Some("-h") => {
+            print_telemetry_help();
+            Ok(())
+        }
+        Some(other) => {
+            bail!("unknown telemetry subcommand {other:?}; expected status, enable, or disable")
+        }
+    }
+}
+
+fn print_telemetry_help() {
+    println!("Usage: clawfs telemetry [status|enable|disable]");
+    println!();
+    println!("Inspect or update the local ClawFS telemetry preference.");
 }
 
 fn subcommand_args(name: &str, args: &[OsString]) -> Vec<OsString> {

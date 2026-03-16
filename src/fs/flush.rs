@@ -747,6 +747,9 @@ impl OsageFs {
         errno: Option<i32>,
         mut details: serde_json::Value,
     ) {
+        if let (Some(errno), Some(telemetry)) = (errno, &self.telemetry) {
+            telemetry.emit_errno_sampled(layer, op, errno);
+        }
         let (Some(logger), Some(started)) = (&self.replay, start) else {
             return;
         };

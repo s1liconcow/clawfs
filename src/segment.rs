@@ -1336,6 +1336,7 @@ mod tests {
             region: None,
             endpoint: None,
             object_prefix: "test".to_string(),
+            telemetry_object_prefix: None,
             gcs_service_account: None,
             aws_allow_http: false,
             aws_force_path_style: false,

@@ -19,6 +19,7 @@ use std::os::unix::process::CommandExt;
 use tokio::runtime::Handle;
 use tokio::task;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::clawfs as clawfs_runtime;
 use crate::config::Config;
@@ -32,6 +33,7 @@ use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointe
 use crate::source::SourceObjectStore;
 use crate::state::ClientStateManager;
 use crate::superblock::{CleanupTaskKind, SuperblockManager};
+use crate::telemetry::{TelemetryClient, set_panic_context};
 
 const DELTA_COMPACT_THRESHOLD: usize = 128;
 const DELTA_COMPACT_KEEP: usize = 32;
@@ -150,6 +152,23 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
     } else {
         false
     };
+    let telemetry = TelemetryClient::from_config(&config)?;
+    let telemetry_session_id = telemetry.as_ref().map(|_| Uuid::new_v4().to_string());
+    if let Some(client) = &telemetry {
+        set_panic_context(
+            Some(client.destination()),
+            "mount_runtime",
+            telemetry_session_id.clone(),
+        );
+        client.emit(
+            "runtime.session_start",
+            telemetry_session_id.as_deref(),
+            json!({
+                "volume": hosted.as_ref().map(|value| value.volume_slug.clone()),
+                "mode": "fuse",
+            }),
+        );
+    }
 
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
@@ -169,8 +188,14 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
             poll_interval,
         );
     }
-    if has_control_plane_creds && let Some(hosted) = hosted {
-        spawn_credential_refresh_loop(&handle, config.state_path.clone(), hosted);
+    if has_control_plane_creds && let Some(hosted) = hosted.clone() {
+        spawn_credential_refresh_loop(
+            &handle,
+            config.state_path.clone(),
+            hosted,
+            telemetry.clone(),
+            telemetry_session_id.clone(),
+        );
     }
 
     let client_state = Arc::new(ClientStateManager::load(&config.state_path)?);
@@ -253,6 +278,8 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
         client_state,
         perf_logger.clone(),
         replay_logger.clone(),
+        telemetry.clone(),
+        telemetry_session_id.clone(),
     );
 
     let replayed = fs.replay_journal()?;
@@ -287,17 +314,35 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
         fuse_threads,
         config.writeback_cache,
     );
-    if fuse_threads > 0 {
+    let mount_result = if fuse_threads > 0 {
         let mut session = fuser::Session::new(fs, &config.mount_path, &options)?;
-        session.run_multithreaded(fuse_threads)?;
+        session.run_multithreaded(fuse_threads)
     } else {
-        fuser::mount2(fs, &config.mount_path, &options)?;
+        fuser::mount2(fs, &config.mount_path, &options)
+    };
+    if let Err(err) = mount_result {
+        if let Some(client) = &telemetry {
+            client.destination().emit_blocking(
+                "command.mount_failure",
+                telemetry_session_id.as_deref(),
+                json!({ "error": sanitize_error(err.to_string()) }),
+            );
+        }
+        return Err(err.into());
     }
 
     runtime.block_on(async {
         superblock.mark_clean().await.ok();
         metadata.shutdown().await.ok();
     });
+    if let Some(client) = &telemetry {
+        client.destination().emit_blocking(
+            "runtime.session_stop_clean",
+            telemetry_session_id.as_deref(),
+            json!({ "mode": "fuse" }),
+        );
+    }
+    set_panic_context(None, "mount_runtime", None);
     Ok(())
 }
 
@@ -1004,7 +1049,13 @@ fn provision_credentials_from_control_plane(
     Ok(Some(creds))
 }
 
-fn spawn_credential_refresh_loop(handle: &Handle, state_path: PathBuf, hosted: HostedControlPlane) {
+fn spawn_credential_refresh_loop(
+    handle: &Handle,
+    state_path: PathBuf,
+    hosted: HostedControlPlane,
+    telemetry: Option<Arc<TelemetryClient>>,
+    session_id: Option<String>,
+) {
     handle.spawn(async move {
         loop {
             sleep(Duration::from_secs(CREDENTIAL_REFRESH_POLL_SECS)).await;
@@ -1018,8 +1069,10 @@ fn spawn_credential_refresh_loop(handle: &Handle, state_path: PathBuf, hosted: H
             info!("Credential refresh: fetching new credentials from control plane");
             let state_path = state_path.clone();
             let hosted = hosted.clone();
+            let refresh_volume_slug = hosted.volume_slug.clone();
+            let refresh_hosted = hosted.clone();
             let result = tokio::task::spawn_blocking(move || {
-                fetch_credentials_from_api(&hosted).inspect(|creds| {
+                fetch_credentials_from_api(&refresh_hosted).inspect(|creds| {
                     save_cached_credentials(&state_path, creds);
                 })
             })
@@ -1031,15 +1084,51 @@ fn spawn_credential_refresh_loop(handle: &Handle, state_path: PathBuf, hosted: H
                         env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
                         env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
                     }
+                    if let Some(client) = &telemetry {
+                        client.emit(
+                            "control_plane.credential_refresh_success",
+                            session_id.as_deref(),
+                            json!({ "volume": refresh_volume_slug.clone() }),
+                        );
+                    }
                     info!(
                         "Credential refresh: updated (key={}..., expires={:?})",
                         &creds.access_key_id[..creds.access_key_id.len().min(12)],
                         creds.expires_at,
                     );
                 }
-                Ok(Err(err)) => warn!("Credential refresh failed: {err}"),
-                Err(err) => warn!("Credential refresh task panicked: {err}"),
+                Ok(Err(err)) => {
+                    if let Some(client) = &telemetry {
+                        client.emit(
+                            "control_plane.credential_refresh_failure",
+                            session_id.as_deref(),
+                            json!({
+                                "volume": refresh_volume_slug.clone(),
+                                "error": sanitize_error(err.to_string()),
+                            }),
+                        );
+                    }
+                    warn!("Credential refresh failed: {err}");
+                }
+                Err(err) => {
+                    if let Some(client) = &telemetry {
+                        client.emit(
+                            "control_plane.credential_refresh_failure",
+                            session_id.as_deref(),
+                            json!({
+                                "volume": refresh_volume_slug.clone(),
+                                "error": sanitize_error(err.to_string()),
+                            }),
+                        );
+                    }
+                    warn!("Credential refresh task panicked: {err}");
+                }
             }
         }
     });
+}
+
+fn sanitize_error(error: String) -> String {
+    let first_line = error.lines().next().unwrap_or("unknown error").trim();
+    first_line.chars().take(160).collect()
 }

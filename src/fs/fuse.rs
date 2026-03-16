@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl OsageFs {
     // FUSE create semantics differ from nfs_create: O_CREAT without O_EXCL should open
@@ -35,6 +36,15 @@ impl Filesystem for OsageFs {
         let _ = config.set_congestion_threshold(768);
         if self.config.writeback_cache {
             let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
+        }
+        if !self.mount_ready_emitted.swap(true, Ordering::AcqRel)
+            && let Some(telemetry) = &self.telemetry
+        {
+            telemetry.emit(
+                "command.mount_ready",
+                self.telemetry_session_id.as_deref(),
+                json!({ "mode": "fuse" }),
+            );
         }
         Ok(())
     }

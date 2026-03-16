@@ -67,6 +67,8 @@ impl TestHarness {
             client_state,
             None,
             None,
+            None,
+            None,
         );
         Self {
             runtime,
@@ -97,6 +99,7 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         region: None,
         endpoint: None,
         object_prefix: String::new(),
+        telemetry_object_prefix: None,
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,

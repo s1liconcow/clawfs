@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const API_TOKEN_ENV: &str = "CLAWFS_API_TOKEN";
 pub const API_BASE_URL_ENV: &str = "CLAWFS_API_BASE_URL";
 
-const DEFAULT_API_BASE_URL: &str = "https://api.clawfs.dev";
+const DEFAULT_API_BASE_URL: &str = "https://app.clawfs.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -35,12 +35,17 @@ pub struct AuthProfile {
 #[derive(Debug, Parser)]
 pub struct LoginArgs {
     /// API token issued by the ClawFS hosted auth service.
+    /// If omitted, `clawfs login` starts a browser-based sign-in flow.
     #[arg(long, env = API_TOKEN_ENV)]
     pub api_token: Option<String>,
 
     /// Hosted ClawFS API base URL.
     #[arg(long, env = API_BASE_URL_ENV, default_value = DEFAULT_API_BASE_URL)]
     pub api_base_url: String,
+
+    /// Label to assign to the generated API token during browser login.
+    #[arg(long, default_value = "cli")]
+    pub label: String,
 
     /// Optional account id to store alongside the token.
     #[arg(long)]
@@ -66,7 +71,7 @@ impl AuthProfile {
     pub fn from_login(args: LoginArgs) -> Result<Self> {
         let api_token = match args.api_token {
             Some(token) => normalize_token(token)?,
-            None => prompt_for_token()?,
+            None => bail!("API token is required for manual login"),
         };
         let api_base_url = normalize_api_base_url(args.api_base_url)?;
         Ok(Self {
@@ -147,16 +152,6 @@ pub fn user_config_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(".clawfs"));
     }
     bail!("could not determine a ClawFS config directory; set HOME or XDG_CONFIG_HOME")
-}
-
-fn prompt_for_token() -> Result<String> {
-    eprint!("ClawFS API token: ");
-    io::stderr().flush().context("flushing token prompt")?;
-    let mut token = String::new();
-    io::stdin()
-        .read_line(&mut token)
-        .context("reading API token from stdin")?;
-    normalize_token(token)
 }
 
 fn normalize_token(token: String) -> Result<String> {

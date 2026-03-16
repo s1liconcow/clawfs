@@ -37,6 +37,7 @@ use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, StagedChunk};
 use crate::source::{DiscoveredEntry, SourceObjectStore};
 use crate::state::ClientStateManager;
 use crate::superblock::SuperblockManager;
+use crate::telemetry::TelemetryClient;
 use log::{debug, error, info};
 use serde_json::json;
 
@@ -68,6 +69,9 @@ pub struct OsageFs {
     pending_bytes: Arc<AtomicU64>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
+    telemetry: Option<Arc<TelemetryClient>>,
+    telemetry_session_id: Option<String>,
+    mount_ready_emitted: Arc<AtomicBool>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
     last_flush: Arc<AtomicU64>,

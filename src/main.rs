@@ -4,8 +4,10 @@ use anyhow::{Result, bail};
 
 use clawfs::frontdoor::{self, DispatchAction};
 use clawfs::launch;
+use clawfs::telemetry::install_panic_hook;
 
 fn main() -> Result<()> {
+    install_panic_hook();
     let args: Vec<_> = env::args_os().collect();
     match frontdoor::dispatch(&args)? {
         DispatchAction::Handled => Ok(()),

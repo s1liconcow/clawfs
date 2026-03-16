@@ -108,6 +108,7 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         region: None,
         endpoint: None,
         object_prefix: String::new(),
+        telemetry_object_prefix: None,
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,

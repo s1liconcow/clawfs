@@ -438,6 +438,7 @@ fn build_config(
         endpoint: None,
         entry_ttl_secs: 10,
         object_prefix: String::new(),
+        telemetry_object_prefix: None,
         gcs_service_account: None,
         aws_allow_http: false,
         aws_force_path_style: false,
@@ -502,6 +503,8 @@ fn run_iteration(
         None::<Arc<JournalManager>>,
         handle,
         client_state,
+        None,
+        None,
         None,
         None,
     );
