@@ -352,6 +352,36 @@ real_fn!(
     unsafe extern "C" fn(i32) -> i32
 );
 real_fn!(
+    REAL_UTIME_PTR,
+    get_real_utime,
+    "utime",
+    unsafe extern "C" fn(*const libc::c_char, *const libc::utimbuf) -> i32
+);
+real_fn!(
+    REAL_UTIMES_PTR,
+    get_real_utimes,
+    "utimes",
+    unsafe extern "C" fn(*const libc::c_char, *const libc::timeval) -> i32
+);
+real_fn!(
+    REAL_UTIMENSAT_PTR,
+    get_real_utimensat,
+    "utimensat",
+    unsafe extern "C" fn(i32, *const libc::c_char, *const libc::timespec, i32) -> i32
+);
+real_fn!(
+    REAL_FUTIMENS_PTR,
+    get_real_futimens,
+    "futimens",
+    unsafe extern "C" fn(i32, *const libc::timespec) -> i32
+);
+real_fn!(
+    REAL_LUTIMES_PTR,
+    get_real_lutimes,
+    "lutimes",
+    unsafe extern "C" fn(*const libc::c_char, *const libc::timeval) -> i32
+);
+real_fn!(
     REAL_DUP_PTR,
     get_real_dup,
     "dup",
@@ -3486,4 +3516,117 @@ pub unsafe extern "C" fn statx(
         }
     }
     unsafe { get_real_statx()(dirfd, path, flags, mask, statxbuf) }
+}
+
+// ---------------------------------------------------------------------------
+// utime / utimes / utimensat / futimens / lutimes
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn utime(path: *const libc::c_char, times: *const libc::utimbuf) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                if let Some(inner) = try_classify(rt, &path_str) {
+                    return match dispatch::dispatch_utime(rt, &inner, times) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_utime()(path, times) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn utimes(path: *const libc::c_char, times: *const libc::timeval) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                if let Some(inner) = try_classify(rt, &path_str) {
+                    return match dispatch::dispatch_utimes(rt, &inner, times) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_utimes()(path, times) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lutimes(path: *const libc::c_char, times: *const libc::timeval) -> i32 {
+    // ClawFS doesn't distinguish symlink targets for time operations,
+    // so this behaves the same as utimes.
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                if let Some(inner) = try_classify(rt, &path_str) {
+                    return match dispatch::dispatch_utimes(rt, &inner, times) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_lutimes()(path, times) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn utimensat(
+    dirfd: i32,
+    path: *const libc::c_char,
+    times: *const libc::timespec,
+    flags: i32,
+) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            // Handle AT_EMPTY_PATH + fd case (equivalent to futimens on dirfd).
+            if flags & libc::AT_EMPTY_PATH != 0 {
+                if let Some(entry) = rt.fd_table.get(dirfd) {
+                    return match dispatch::dispatch_futimens(rt, &entry, times) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+            if let Some(path_str) = c_path_to_str(path) {
+                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
+                    return match dispatch::dispatch_utimensat(rt, &inner, times) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_utimensat()(dirfd, path, times, flags) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn futimens(fd: i32, times: *const libc::timespec) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return match dispatch::dispatch_futimens(rt, &entry, times) {
+                    Ok(()) => 0,
+                    Err(e) => set_errno(e) as i32,
+                };
+            }
+        }
+    }
+    unsafe { get_real_futimens()(fd, times) }
 }

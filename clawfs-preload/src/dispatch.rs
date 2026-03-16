@@ -1,4 +1,5 @@
 use clawfs::inode::{InodeRecord, ROOT_INODE};
+use time::OffsetDateTime;
 
 use crate::fd_table::FdEntry;
 use crate::runtime::ClawfsRuntime;
@@ -379,6 +380,110 @@ pub fn dispatch_readdir_fill(rt: &ClawfsRuntime, entry: &FdEntry) -> Result<(), 
         let entries = rt.fs.nfs_readdir_plus(entry.inode)?;
         *dir = Some((entries, 0));
     }
+    Ok(())
+}
+
+/// Convert a `libc::timespec` into an `OffsetDateTime`, respecting UTIME_NOW
+/// and UTIME_OMIT sentinels. Returns `None` when the caller should leave the
+/// field unchanged (UTIME_OMIT or null input).
+fn timespec_to_odt(ts: &libc::timespec) -> Option<OffsetDateTime> {
+    const UTIME_NOW: i64 = (1 << 30) - 1; // 0x3FFF_FFFF
+    const UTIME_OMIT: i64 = (1 << 30) - 2; // 0x3FFF_FFFE
+
+    if ts.tv_nsec == UTIME_OMIT {
+        return None;
+    }
+    if ts.tv_nsec == UTIME_NOW {
+        return Some(OffsetDateTime::now_utc());
+    }
+    OffsetDateTime::from_unix_timestamp_nanos(
+        ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128,
+    )
+    .ok()
+}
+
+/// Dispatch `utimensat` — set atime/mtime on a path.
+pub fn dispatch_utimensat(
+    rt: &ClawfsRuntime,
+    inner: &str,
+    times: *const libc::timespec,
+) -> Result<(), i32> {
+    let (atime, mtime) = if times.is_null() {
+        let now = Some(OffsetDateTime::now_utc());
+        (now, now)
+    } else {
+        let ts = unsafe { std::slice::from_raw_parts(times, 2) };
+        (timespec_to_odt(&ts[0]), timespec_to_odt(&ts[1]))
+    };
+    let (_, target_ino, _) = resolve_path(rt, inner)?;
+    rt.fs
+        .nfs_setattr(target_ino, None, None, None, None, atime, mtime)?;
+    Ok(())
+}
+
+/// Dispatch `futimens` — set atime/mtime on an open fd.
+pub fn dispatch_futimens(
+    rt: &ClawfsRuntime,
+    entry: &FdEntry,
+    times: *const libc::timespec,
+) -> Result<(), i32> {
+    let (atime, mtime) = if times.is_null() {
+        let now = Some(OffsetDateTime::now_utc());
+        (now, now)
+    } else {
+        let ts = unsafe { std::slice::from_raw_parts(times, 2) };
+        (timespec_to_odt(&ts[0]), timespec_to_odt(&ts[1]))
+    };
+    rt.fs
+        .nfs_setattr(entry.inode, None, None, None, None, atime, mtime)?;
+    Ok(())
+}
+
+/// Dispatch `utime` — set atime/mtime from a `libc::utimbuf`.
+pub fn dispatch_utime(
+    rt: &ClawfsRuntime,
+    inner: &str,
+    times: *const libc::utimbuf,
+) -> Result<(), i32> {
+    let (atime, mtime) = if times.is_null() {
+        let now = Some(OffsetDateTime::now_utc());
+        (now, now)
+    } else {
+        let buf = unsafe { &*times };
+        let a = OffsetDateTime::from_unix_timestamp(buf.actime).ok();
+        let m = OffsetDateTime::from_unix_timestamp(buf.modtime).ok();
+        (a, m)
+    };
+    let (_, target_ino, _) = resolve_path(rt, inner)?;
+    rt.fs
+        .nfs_setattr(target_ino, None, None, None, None, atime, mtime)?;
+    Ok(())
+}
+
+/// Dispatch `utimes` — set atime/mtime from a pair of `libc::timeval`.
+pub fn dispatch_utimes(
+    rt: &ClawfsRuntime,
+    inner: &str,
+    times: *const libc::timeval,
+) -> Result<(), i32> {
+    let (atime, mtime) = if times.is_null() {
+        let now = Some(OffsetDateTime::now_utc());
+        (now, now)
+    } else {
+        let tvs = unsafe { std::slice::from_raw_parts(times, 2) };
+        let a = OffsetDateTime::from_unix_timestamp_nanos(
+            tvs[0].tv_sec as i128 * 1_000_000_000 + tvs[0].tv_usec as i128 * 1_000,
+        )
+        .ok();
+        let m = OffsetDateTime::from_unix_timestamp_nanos(
+            tvs[1].tv_sec as i128 * 1_000_000_000 + tvs[1].tv_usec as i128 * 1_000,
+        )
+        .ok();
+        (a, m)
+    };
+    let (_, target_ino, _) = resolve_path(rt, inner)?;
+    rt.fs
+        .nfs_setattr(target_ino, None, None, None, None, atime, mtime)?;
     Ok(())
 }
 

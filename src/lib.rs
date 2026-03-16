@@ -11,6 +11,7 @@ pub mod launch;
 pub mod metadata;
 pub mod perf;
 pub mod perf_bench;
+pub mod refreshable_store;
 pub mod replay;
 pub mod segment;
 pub mod source;

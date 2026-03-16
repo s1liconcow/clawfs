@@ -156,83 +156,16 @@ struct ActiveStage {
 
 impl SegmentManager {
     pub fn new(config: &Config, handle: Handle) -> Result<Self> {
-        let (store, prefix): (Arc<dyn ObjectStore>, String) = match config.object_provider {
-            ObjectStoreProvider::Local => {
-                fs::create_dir_all(&config.store_path).with_context(|| {
-                    format!("creating segment root {}", config.store_path.display())
-                })?;
-                let store = Arc::new(LocalFileSystem::new_with_prefix(config.store_path.clone())?)
-                    as Arc<dyn ObjectStore>;
-                (store, segment_prefix(&config.object_prefix))
-            }
-            ObjectStoreProvider::Aws => {
-                let bucket = config
-                    .bucket
-                    .clone()
-                    .context("--bucket is required for AWS provider")?;
+        let (store, prefix) = create_segment_store(config)?;
+        Self::new_with_store(store, prefix, config, handle)
+    }
 
-                let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
-
-                let mut region = config
-                    .region
-                    .clone()
-                    .unwrap_or_else(|| "us-east-1".to_string());
-                if region == "auto" {
-                    region = "us-east-1".to_string();
-                }
-                builder = builder.with_region(&region);
-
-                if let Some(endpoint) = &config.endpoint {
-                    builder = builder.with_endpoint(endpoint);
-                    // Custom endpoints typically imply we're NOT on EC2, so bypass IMDS to avoid hangs.
-                    builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
-                }
-
-                if let Some(key) = clawfs::aws_access_key_id() {
-                    builder = builder.with_access_key_id(key);
-                }
-                if let Some(secret) = clawfs::aws_secret_access_key() {
-                    builder = builder.with_secret_access_key(secret);
-                }
-                if let Some(token) = clawfs::aws_session_token() {
-                    builder = builder.with_token(token);
-                }
-
-                if config.aws_allow_http {
-                    builder = builder.with_allow_http(true);
-                    // If no credentials in environment, provide dummy ones to satisfy the client and bypass IMDS lookup
-                    if clawfs::aws_access_key_id().is_none()
-                        && clawfs::aws_secret_access_key().is_none()
-                    {
-                        error!(
-                            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set; using dummy credentials for --aws-allow-http to bypass IMDS"
-                        );
-                        builder = builder
-                            .with_access_key_id("test")
-                            .with_secret_access_key("test");
-                    }
-                }
-                if config.aws_force_path_style {
-                    builder = builder.with_virtual_hosted_style_request(false);
-                }
-
-                let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
-                (store, segment_prefix(&config.object_prefix))
-            }
-            ObjectStoreProvider::Gcs => {
-                let bucket = config
-                    .bucket
-                    .clone()
-                    .context("--bucket is required for GCS provider")?;
-                let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&bucket);
-                if let Some(sa_path) = &config.gcs_service_account {
-                    let creds = sa_path.to_string_lossy().into_owned();
-                    builder = builder.with_service_account_path(creds);
-                }
-                let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
-                (store, segment_prefix(&config.object_prefix))
-            }
-        };
+    pub fn new_with_store(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        config: &Config,
+        handle: Handle,
+    ) -> Result<Self> {
         let stage_dir = config.local_cache_path.join("segment_stage");
         let cache_dir = config.local_cache_path.join("segment_cache");
         fs::create_dir_all(&stage_dir)?;
@@ -1229,6 +1162,84 @@ impl ActiveStage {
         self.file.write_all(data)?;
         self.len += data.len() as u64;
         Ok(offset)
+    }
+}
+
+pub(crate) fn create_segment_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
+    match config.object_provider {
+        ObjectStoreProvider::Local => {
+            fs::create_dir_all(&config.store_path).with_context(|| {
+                format!("creating segment root {}", config.store_path.display())
+            })?;
+            let store = Arc::new(LocalFileSystem::new_with_prefix(config.store_path.clone())?)
+                as Arc<dyn ObjectStore>;
+            Ok((store, segment_prefix(&config.object_prefix)))
+        }
+        ObjectStoreProvider::Aws => {
+            let bucket = config
+                .bucket
+                .clone()
+                .context("--bucket is required for AWS provider")?;
+
+            let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
+
+            let mut region = config
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
+            if region == "auto" {
+                region = "us-east-1".to_string();
+            }
+            builder = builder.with_region(&region);
+
+            if let Some(endpoint) = &config.endpoint {
+                builder = builder.with_endpoint(endpoint);
+                builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
+            }
+
+            if let Some(key) = clawfs::aws_access_key_id() {
+                builder = builder.with_access_key_id(key);
+            }
+            if let Some(secret) = clawfs::aws_secret_access_key() {
+                builder = builder.with_secret_access_key(secret);
+            }
+            if let Some(token) = clawfs::aws_session_token() {
+                builder = builder.with_token(token);
+            }
+
+            if config.aws_allow_http {
+                builder = builder.with_allow_http(true);
+                if clawfs::aws_access_key_id().is_none()
+                    && clawfs::aws_secret_access_key().is_none()
+                {
+                    error!(
+                        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set; using dummy credentials for --aws-allow-http to bypass IMDS"
+                    );
+                    builder = builder
+                        .with_access_key_id("test")
+                        .with_secret_access_key("test");
+                }
+            }
+            if config.aws_force_path_style {
+                builder = builder.with_virtual_hosted_style_request(false);
+            }
+
+            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
+            Ok((store, segment_prefix(&config.object_prefix)))
+        }
+        ObjectStoreProvider::Gcs => {
+            let bucket = config
+                .bucket
+                .clone()
+                .context("--bucket is required for GCS provider")?;
+            let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&bucket);
+            if let Some(sa_path) = &config.gcs_service_account {
+                let creds = sa_path.to_string_lossy().into_owned();
+                builder = builder.with_service_account_path(creds);
+            }
+            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
+            Ok((store, segment_prefix(&config.object_prefix)))
+        }
     }
 }
 

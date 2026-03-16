@@ -560,7 +560,15 @@ pub struct MetadataStore {
 impl MetadataStore {
     pub async fn new(config: &Config, handle: Handle) -> Result<Self> {
         let (store, prefix) = create_object_store(config)?;
+        Self::new_with_store(store, prefix, config, handle).await
+    }
 
+    pub async fn new_with_store(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        config: &Config,
+        handle: Handle,
+    ) -> Result<Self> {
         let store = Self {
             store,
             root_prefix: prefix,
@@ -1541,7 +1549,7 @@ impl CacheEntry {
     }
 }
 
-fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
+pub(crate) fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
     match config.object_provider {
         ObjectStoreProvider::Local => {
             std::fs::create_dir_all(&config.store_path)

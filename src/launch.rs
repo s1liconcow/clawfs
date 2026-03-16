@@ -172,13 +172,61 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
 
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
-    let metadata = Arc::new(runtime.block_on(MetadataStore::new(&config, handle.clone()))?);
+
+    let (metadata, segments) = if has_control_plane_creds && let Some(ref hosted) = hosted {
+        use crate::refreshable_store::{RefreshableObjectStore, StoreBuilder};
+
+        // Metadata store — refreshable.
+        let (raw_meta_store, meta_prefix) = crate::metadata::create_object_store(&config)?;
+        let meta_config = config.clone();
+        let meta_builder: StoreBuilder = Arc::new(move || {
+            let (store, _) = crate::metadata::create_object_store(&meta_config)?;
+            Ok(store)
+        });
+        let refreshable_meta = Arc::new(RefreshableObjectStore::new(
+            raw_meta_store,
+            meta_builder,
+            config.state_path.clone(),
+            hosted,
+        )) as Arc<dyn object_store::ObjectStore>;
+        let metadata = Arc::new(runtime.block_on(MetadataStore::new_with_store(
+            refreshable_meta,
+            meta_prefix,
+            &config,
+            handle.clone(),
+        ))?);
+
+        // Segment store — refreshable.
+        let (raw_seg_store, seg_prefix) = crate::segment::create_segment_store(&config)?;
+        let seg_config = config.clone();
+        let seg_builder: StoreBuilder = Arc::new(move || {
+            let (store, _) = crate::segment::create_segment_store(&seg_config)?;
+            Ok(store)
+        });
+        let refreshable_seg = Arc::new(RefreshableObjectStore::new(
+            raw_seg_store,
+            seg_builder,
+            config.state_path.clone(),
+            hosted,
+        )) as Arc<dyn object_store::ObjectStore>;
+        let segments = Arc::new(SegmentManager::new_with_store(
+            refreshable_seg,
+            seg_prefix,
+            &config,
+            handle.clone(),
+        )?);
+
+        (metadata, segments)
+    } else {
+        let metadata = Arc::new(runtime.block_on(MetadataStore::new(&config, handle.clone()))?);
+        let segments = Arc::new(SegmentManager::new(&config, handle.clone())?);
+        (metadata, segments)
+    };
     let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
         metadata.clone(),
         config.shard_size,
     ))?);
     ensure_root(&runtime, metadata.clone(), superblock.clone(), &config)?;
-    let segments = Arc::new(SegmentManager::new(&config, handle.clone())?);
     if config.metadata_poll_interval_ms > 0 {
         let poll_interval = Duration::from_millis(config.metadata_poll_interval_ms);
         spawn_metadata_poller(
@@ -186,15 +234,6 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
             metadata.clone(),
             segments.clone(),
             poll_interval,
-        );
-    }
-    if has_control_plane_creds && let Some(hosted) = hosted.clone() {
-        spawn_credential_refresh_loop(
-            &handle,
-            config.state_path.clone(),
-            hosted,
-            telemetry.clone(),
-            telemetry_session_id.clone(),
         );
     }
 
@@ -924,19 +963,18 @@ async fn perform_segment_compaction(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ControlPlaneCredentials {
-    access_key_id: String,
-    secret_access_key: String,
-    bucket: String,
-    endpoint: String,
-    region: String,
-    prefix: String,
+pub(crate) struct ControlPlaneCredentials {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) bucket: String,
+    pub(crate) endpoint: String,
+    pub(crate) region: String,
+    pub(crate) prefix: String,
     #[serde(default)]
-    expires_at: Option<String>,
+    pub(crate) expires_at: Option<String>,
 }
 
 const CREDENTIAL_REFRESH_BUFFER_SECS: i64 = 300;
-const CREDENTIAL_REFRESH_POLL_SECS: u64 = 60;
 
 fn credential_cache_path(state_path: &Path) -> PathBuf {
     state_path
@@ -957,7 +995,7 @@ fn load_cached_credentials(state_path: &Path) -> Option<ControlPlaneCredentials>
     }
 }
 
-fn save_cached_credentials(state_path: &Path, creds: &ControlPlaneCredentials) {
+pub(crate) fn save_cached_credentials(state_path: &Path, creds: &ControlPlaneCredentials) {
     let path = credential_cache_path(state_path);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -987,7 +1025,9 @@ fn credentials_still_valid(creds: &ControlPlaneCredentials) -> bool {
     remaining.whole_seconds() > CREDENTIAL_REFRESH_BUFFER_SECS
 }
 
-fn fetch_credentials_from_api(hosted: &HostedControlPlane) -> Result<ControlPlaneCredentials> {
+pub(crate) fn fetch_credentials_from_api(
+    hosted: &HostedControlPlane,
+) -> Result<ControlPlaneCredentials> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -1047,85 +1087,6 @@ fn provision_credentials_from_control_plane(
     let creds = fetch_credentials_from_api(hosted)?;
     save_cached_credentials(state_path, &creds);
     Ok(Some(creds))
-}
-
-fn spawn_credential_refresh_loop(
-    handle: &Handle,
-    state_path: PathBuf,
-    hosted: HostedControlPlane,
-    telemetry: Option<Arc<TelemetryClient>>,
-    session_id: Option<String>,
-) {
-    handle.spawn(async move {
-        loop {
-            sleep(Duration::from_secs(CREDENTIAL_REFRESH_POLL_SECS)).await;
-
-            if load_cached_credentials(&state_path)
-                .is_some_and(|cached| credentials_still_valid(&cached))
-            {
-                continue;
-            }
-
-            info!("Credential refresh: fetching new credentials from control plane");
-            let state_path = state_path.clone();
-            let hosted = hosted.clone();
-            let refresh_volume_slug = hosted.volume_slug.clone();
-            let refresh_hosted = hosted.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                fetch_credentials_from_api(&refresh_hosted).inspect(|creds| {
-                    save_cached_credentials(&state_path, creds);
-                })
-            })
-            .await;
-
-            match result {
-                Ok(Ok(creds)) => {
-                    unsafe {
-                        env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-                        env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-                    }
-                    if let Some(client) = &telemetry {
-                        client.emit(
-                            "control_plane.credential_refresh_success",
-                            session_id.as_deref(),
-                            json!({ "volume": refresh_volume_slug.clone() }),
-                        );
-                    }
-                    info!(
-                        "Credential refresh: updated (key={}..., expires={:?})",
-                        &creds.access_key_id[..creds.access_key_id.len().min(12)],
-                        creds.expires_at,
-                    );
-                }
-                Ok(Err(err)) => {
-                    if let Some(client) = &telemetry {
-                        client.emit(
-                            "control_plane.credential_refresh_failure",
-                            session_id.as_deref(),
-                            json!({
-                                "volume": refresh_volume_slug.clone(),
-                                "error": sanitize_error(err.to_string()),
-                            }),
-                        );
-                    }
-                    warn!("Credential refresh failed: {err}");
-                }
-                Err(err) => {
-                    if let Some(client) = &telemetry {
-                        client.emit(
-                            "control_plane.credential_refresh_failure",
-                            session_id.as_deref(),
-                            json!({
-                                "volume": refresh_volume_slug.clone(),
-                                "error": sanitize_error(err.to_string()),
-                            }),
-                        );
-                    }
-                    warn!("Credential refresh task panicked: {err}");
-                }
-            }
-        }
-    });
 }
 
 fn sanitize_error(error: String) -> String {
