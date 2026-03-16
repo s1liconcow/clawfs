@@ -8,8 +8,8 @@ usage() {
   cat <<'EOF'
 Usage: ./ship.sh [VERSION|vVERSION|--major|--minor|--patch]
 
-Without an argument, `./ship.sh` bumps the current Cargo package version by one minor
-release and resets the patch number to zero.
+Without an argument, `./ship.sh` bumps the current Cargo package version by one patch
+release.
 
 Examples:
   ./ship.sh
@@ -79,7 +79,7 @@ target_version() {
   local current=$1
   local arg=${2-}
   case "$arg" in
-    "") bump_version "$current" minor ;;
+    "") bump_version "$current" patch ;;
     --major) bump_version "$current" major ;;
     --minor) bump_version "$current" minor ;;
     --patch) bump_version "$current" patch ;;
