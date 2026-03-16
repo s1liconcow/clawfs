@@ -66,13 +66,13 @@ bump_version() {
 replace_manifest_version() {
   local file=$1
   local version=$2
-  perl -0pi -e 's/(\[package\]\n(?:[^\n]*\n)*?version = ")([^"]+)(")/$1'"$version"'$3/s' "$file"
+  perl -0pi -e 's/(\[package\]\n(?:[^\n]*\n)*?version = ")([^"]+)(")/${1}'"$version"'${3}/s' "$file"
 }
 
 replace_lock_version() {
   local package=$1
   local version=$2
-  perl -0pi -e 's/(name = "'"$package"'"\nversion = ")([^"]+)(")/$1'"$version"'$3/s' Cargo.lock
+  perl -0pi -e 's/(name = "'"$package"'"\nversion = ")([^"]+)(")/${1}'"$version"'${3}/s' Cargo.lock
 }
 
 target_version() {
