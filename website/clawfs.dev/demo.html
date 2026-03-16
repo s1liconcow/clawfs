@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawFS | Interactive Demo</title>
+    <meta
+      name="description"
+      content="See ClawFS in action: eliminate cold starts, survive crashes with checkpoint recovery, and coordinate agents through a shared persistent volume."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      /* ── Demo page styles ─────────────────────────────────────────────── */
+      .demo-hero {
+        text-align: center;
+        padding: 4rem 1rem 2.5rem;
+        max-width: var(--max);
+        margin: 0 auto;
+      }
+      .demo-hero h1 { font-size: clamp(1.8rem, 4vw, 2.8rem); margin: 0.5rem 0 1rem; }
+      .demo-hero p  { color: var(--ink-soft); max-width: 640px; margin: 0 auto; }
+
+      /* Tab bar */
+      .tab-bar {
+        display: flex;
+        gap: 0.5rem;
+        max-width: var(--max);
+        margin: 2rem auto 0;
+        padding: 0 1rem;
+        border-bottom: 2px solid var(--line);
+        overflow-x: auto;
+      }
+      .tab-btn {
+        background: none;
+        border: none;
+        border-bottom: 3px solid transparent;
+        margin-bottom: -2px;
+        padding: 0.75rem 1.2rem;
+        font-family: inherit;
+        font-size: 0.92rem;
+        font-weight: 600;
+        color: var(--ink-soft);
+        cursor: pointer;
+        white-space: nowrap;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      .tab-btn:hover   { color: var(--ink); }
+      .tab-btn.active  { color: var(--accent); border-bottom-color: var(--accent); }
+
+      /* Tab panels */
+      .tab-panel { display: none; }
+      .tab-panel.active { display: block; }
+
+      .demo-section {
+        max-width: var(--max);
+        margin: 0 auto;
+        padding: 2.5rem 1rem 4rem;
+      }
+
+      /* Two-column demo layout */
+      .demo-cols {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        align-items: start;
+      }
+      @media (max-width: 760px) { .demo-cols { grid-template-columns: 1fr; } }
+
+      /* Terminal / output boxes */
+      .term-box {
+        background: #1a1208;
+        border: 1px solid rgba(240,190,90,0.18);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.78rem;
+        color: #e8d5a8;
+        min-height: 220px;
+        overflow-y: auto;
+        max-height: 340px;
+      }
+      .term-box .line { margin: 0.18rem 0; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+      .term-box .dim  { color: #7a6540; }
+      .term-box .ok   { color: #7dd67a; }
+      .term-box .err  { color: #e85c5c; }
+      .term-box .warn { color: #f0be5a; }
+      .term-box .accent { color: #de6c2e; }
+      .term-box .prompt { color: #b63a21; }
+
+      .panel-label {
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--ink-soft);
+        margin-bottom: 0.5rem;
+      }
+      .panel-label span {
+        display: inline-block;
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        margin-right: 0.4rem;
+        vertical-align: middle;
+      }
+      .dot-red    { background: #e85c5c; }
+      .dot-green  { background: #7dd67a; }
+      .dot-yellow { background: #f0be5a; }
+      .dot-orange { background: #de6c2e; }
+
+      /* Section header */
+      .demo-section h2 {
+        font-size: clamp(1.3rem, 3vw, 1.9rem);
+        margin: 0 0 0.5rem;
+      }
+      .demo-section .eyebrow {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--accent-2);
+        margin-bottom: 0.4rem;
+      }
+      .demo-section .sub { color: var(--ink-soft); margin-bottom: 1.8rem; max-width: 640px; }
+
+      /* Archetype picker */
+      .archetype-btns { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+      .arch-btn {
+        background: var(--panel);
+        border: 1.5px solid var(--line);
+        border-radius: 8px;
+        padding: 0.4rem 0.9rem;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.8rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      .arch-btn:hover  { border-color: var(--accent-2); }
+      .arch-btn.active { border-color: var(--accent); background: rgba(182,58,33,0.08); color: var(--accent); }
+
+      /* Stats bar */
+      .stat-row {
+        display: flex;
+        gap: 1.5rem;
+        flex-wrap: wrap;
+        margin: 1.2rem 0;
+      }
+      .stat-box {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 0.7rem 1.1rem;
+        min-width: 110px;
+      }
+      .stat-box .val  { font-size: 1.4rem; font-weight: 700; font-family: "IBM Plex Mono", monospace; }
+      .stat-box .lbl  { font-size: 0.72rem; color: var(--ink-soft); margin-top: 0.1rem; }
+      .stat-box .val.green { color: #3a9e3a; }
+      .stat-box .val.red   { color: var(--accent); }
+
+      /* File tree */
+      .file-tree {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.78rem;
+        min-height: 180px;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+      .file-tree .entry { padding: 0.2rem 0; display: flex; justify-content: space-between; gap: 1rem; }
+      .file-tree .entry:hover { background: rgba(182,58,33,0.05); border-radius: 4px; }
+      .file-tree .fname { color: var(--ink); }
+      .file-tree .fdir  { color: #de6c2e; font-weight: 600; }
+      .file-tree .fsize { color: var(--ink-soft); white-space: nowrap; }
+      .file-tree .fcodec { color: #7dd67a; font-size: 0.7rem; margin-left: 0.4rem; }
+
+      /* Time-saved counter */
+      .time-saved-banner {
+        background: linear-gradient(135deg, rgba(58,158,58,0.12), rgba(61,200,61,0.06));
+        border: 1.5px solid rgba(58,158,58,0.3);
+        border-radius: 12px;
+        padding: 1rem 1.4rem;
+        text-align: center;
+        margin: 1rem 0;
+      }
+      .time-saved-banner .big { font-size: 2rem; font-weight: 800; color: #3a9e3a; font-family: "IBM Plex Mono", monospace; }
+      .time-saved-banner .lbl { font-size: 0.82rem; color: var(--ink-soft); margin-top: 0.2rem; }
+
+      /* Checkpoint timeline */
+      .checkpoint-timeline {
+        display: flex;
+        gap: 0;
+        align-items: center;
+        margin: 1.5rem 0 0.5rem;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+      }
+      .cp-node {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.3rem;
+        cursor: pointer;
+      }
+      .cp-dot {
+        width: 36px; height: 36px;
+        border-radius: 50%;
+        background: var(--panel);
+        border: 2px solid var(--line);
+        display: flex; align-items: center; justify-content: center;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.72rem;
+        font-weight: 600;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      .cp-node.active .cp-dot  { border-color: var(--accent); background: rgba(182,58,33,0.1); color: var(--accent); }
+      .cp-node.locked .cp-dot  { border-color: #3a9e3a; background: rgba(58,158,58,0.1); color: #3a9e3a; }
+      .cp-lbl { font-size: 0.65rem; color: var(--ink-soft); text-align: center; max-width: 64px; line-height: 1.2; }
+      .cp-arrow { color: var(--line); font-size: 1rem; margin: 0 0.1rem; align-self: center; padding-bottom: 1.2rem; }
+
+      /* Pipeline */
+      .pipeline-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+      }
+      @media (max-width: 760px) { .pipeline-grid { grid-template-columns: 1fr; } }
+
+      .agent-card {
+        background: var(--panel);
+        border: 1.5px solid var(--line);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        transition: border-color 0.25s, box-shadow 0.25s;
+      }
+      .agent-card.active {
+        border-color: var(--accent-2);
+        box-shadow: 0 0 0 3px rgba(222,108,46,0.12);
+      }
+      .agent-card.done { border-color: rgba(58,158,58,0.5); }
+      .agent-card h4 {
+        margin: 0 0 0.4rem;
+        font-size: 0.88rem;
+        display: flex; align-items: center; gap: 0.5rem;
+      }
+      .agent-card .agent-icon { font-size: 1rem; }
+      .agent-card p { font-size: 0.78rem; color: var(--ink-soft); margin: 0 0 0.6rem; }
+      .agent-status {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.72rem;
+        color: var(--ink-soft);
+        padding: 0.25rem 0.6rem;
+        background: var(--bg-deep);
+        border-radius: 6px;
+        display: inline-block;
+      }
+      .agent-card.active  .agent-status { color: var(--accent-2); background: rgba(222,108,46,0.1); }
+      .agent-card.done    .agent-status { color: #3a9e3a; background: rgba(58,158,58,0.1); }
+
+      /* Volume indicator */
+      .volume-badge {
+        display: flex; align-items: center; gap: 0.5rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0.5rem 0.9rem;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.75rem;
+        color: var(--ink-soft);
+        margin-bottom: 1.5rem;
+      }
+      .volume-badge .vol-dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: var(--accent-3);
+        box-shadow: 0 0 6px rgba(240,190,90,0.6);
+        flex-shrink: 0;
+      }
+
+      /* Action buttons */
+      .action-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin: 1.5rem 0; }
+      .btn-demo {
+        padding: 0.55rem 1.2rem;
+        border-radius: 8px;
+        font-family: inherit; font-size: 0.88rem; font-weight: 600;
+        cursor: pointer; border: none; transition: opacity 0.15s, transform 0.1s;
+      }
+      .btn-demo:hover { opacity: 0.88; }
+      .btn-demo:active { transform: scale(0.97); }
+      .btn-demo:disabled { opacity: 0.4; cursor: default; transform: none; }
+      .btn-demo.primary  { background: var(--accent); color: #fff; }
+      .btn-demo.secondary { background: var(--panel); border: 1.5px solid var(--line); color: var(--ink); }
+      .btn-demo.danger    { background: #e85c5c; color: #fff; }
+      .btn-demo.success   { background: #3a9e3a; color: #fff; }
+
+      /* Progress bar */
+      .progress-wrap { background: var(--bg-deep); border-radius: 6px; height: 8px; margin: 0.8rem 0; overflow: hidden; }
+      .progress-bar  { height: 100%; border-radius: 6px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.4s ease; }
+
+      /* Log inject selector */
+      .log-selector { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+      .log-chip {
+        background: var(--panel);
+        border: 1.5px solid var(--line);
+        border-radius: 20px;
+        padding: 0.3rem 0.8rem;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.75rem;
+        cursor: pointer;
+        transition: border-color 0.15s;
+      }
+      .log-chip:hover  { border-color: var(--accent-2); }
+      .log-chip.active { border-color: var(--accent); color: var(--accent); background: rgba(182,58,33,0.06); }
+
+      /* WASM loading state */
+      .wasm-loading {
+        text-align: center;
+        padding: 3rem;
+        color: var(--ink-soft);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.85rem;
+      }
+      .wasm-loading .spinner {
+        display: inline-block; width: 20px; height: 20px;
+        border: 2px solid var(--line); border-top-color: var(--accent);
+        border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 0.5rem; vertical-align: middle;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="glow glow-a" aria-hidden="true"></div>
+    <div class="glow glow-b" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="index.html">
+        <span class="brand-mark">CLAW</span>
+        <span class="brand-sub">FS</span>
+      </a>
+      <nav>
+        <a href="index.html#how">How It Works</a>
+        <a href="getting-started.html">Getting Started</a>
+        <a href="demo.html" style="color:var(--accent)">Demo</a>
+        <a href="enterprise.html">Enterprise</a>
+        <a href="pricing.html">Pricing</a>
+        <a class="nav-signin" href="https://app.clawfs.dev">Sign In</a>
+      </nav>
+    </header>
+
+    <main>
+      <div class="demo-hero reveal" data-delay="0">
+        <p class="eyebrow" style="font-family:'IBM Plex Mono',monospace;font-size:.75rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-2)">Interactive Demo</p>
+        <h1>See ClawFS In Action</h1>
+        <p>Three problems every agent operator hits. Watch how a persistent shared volume solves each one — running real ClawFS logic compiled to WebAssembly in your browser.</p>
+      </div>
+
+      <div id="wasm-status" class="wasm-loading" style="display:none">
+        <span class="spinner"></span>Loading ClawFS WebAssembly…
+      </div>
+
+      <div class="tab-bar reveal" data-delay="80">
+        <button class="tab-btn active" data-tab="tab-cold">1 · Cold Start Tax</button>
+        <button class="tab-btn" data-tab="tab-crash">2 · Crash Recovery</button>
+        <button class="tab-btn" data-tab="tab-pipeline">3 · Agent Pipeline</button>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           TAB 1: Cold Start Tax
+      ══════════════════════════════════════════════════════════════════════ -->
+      <div id="tab-cold" class="tab-panel active">
+        <div class="demo-section">
+          <p class="eyebrow">Demo 1</p>
+          <h2>Stop Paying the Cold Start Tax</h2>
+          <p class="sub">Every time a worker spins up from scratch it re-downloads, re-installs, and re-compiles everything. Pick a project type to see how much time your agents are throwing away — and what ClawFS keeps warm.</p>
+
+          <div class="archetype-btns" id="arch-btns">
+            <button class="arch-btn active" data-arch="ml">Python ML</button>
+            <button class="arch-btn" data-arch="node">Node.js App</button>
+            <button class="arch-btn" data-arch="rust">Rust Project</button>
+          </div>
+
+          <div class="demo-cols">
+            <div>
+              <div class="panel-label"><span class="dot-red"></span>Without ClawFS — cold start every run</div>
+              <div class="term-box" id="cold-term"></div>
+              <div class="stat-row" id="cold-stats"></div>
+            </div>
+            <div>
+              <div class="panel-label"><span class="dot-green"></span>With ClawFS — mount warm volume and go</div>
+              <div class="term-box" id="warm-term"></div>
+              <div id="time-saved-banner" class="time-saved-banner" style="display:none">
+                <div class="big" id="time-saved-val">0s</div>
+                <div class="lbl">saved per agent run</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button class="btn-demo primary" id="btn-cold-start">▶ Simulate Cold Start</button>
+            <button class="btn-demo secondary" id="btn-cold-reset" disabled>Reset</button>
+          </div>
+
+          <div>
+            <div class="panel-label" style="margin-top:1.5rem">What ClawFS persists across runs</div>
+            <div class="file-tree" id="cold-filetree"><div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">Run the simulation to see what gets cached…</div></div>
+          </div>
+
+          <div class="stat-row" id="cold-storage-stats" style="margin-top:1rem"></div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           TAB 2: Crash Recovery
+      ══════════════════════════════════════════════════════════════════════ -->
+      <div id="tab-crash" class="tab-panel">
+        <div class="demo-section">
+          <p class="eyebrow">Demo 2</p>
+          <h2>Your Agent's Work Shouldn't Vanish When the Worker Does</h2>
+          <p class="sub">Long-running agents accumulate hours of work. When a worker disappears — preemption, OOM, network loss — that work should survive. Watch what happens with and without ClawFS.</p>
+
+          <div class="demo-cols">
+            <div>
+              <div class="panel-label"><span class="dot-yellow" id="crash-dot"></span><span id="crash-worker-label">Research Agent — running</span></div>
+              <div class="term-box" id="crash-term"></div>
+              <div class="progress-wrap"><div class="progress-bar" id="crash-progress" style="width:0%"></div></div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:var(--ink-soft)" id="crash-progress-label">0 files written · 0 MB accumulated</div>
+            </div>
+            <div>
+              <div class="panel-label"><span class="dot-orange"></span>Volume state (persisted to ClawFS)</div>
+              <div class="file-tree" id="crash-filetree"><div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">No files yet…</div></div>
+              <div class="stat-row" id="crash-stats" style="margin-top:.8rem"></div>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button class="btn-demo primary" id="btn-crash-run">▶ Run Agent</button>
+            <button class="btn-demo danger" id="btn-crash-crash" disabled>☠ Simulate Crash</button>
+            <button class="btn-demo success" id="btn-crash-resume" disabled>↩ Resume from Checkpoint</button>
+            <button class="btn-demo secondary" id="btn-crash-reset" style="display:none">Reset</button>
+          </div>
+
+          <div style="margin-top:1.5rem">
+            <div class="panel-label">Checkpoint Timeline</div>
+            <div class="checkpoint-timeline" id="crash-timeline">
+              <div class="cp-node active" data-gen="0">
+                <div class="cp-dot">0</div>
+                <div class="cp-lbl">empty</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           TAB 3: Agent Pipeline
+      ══════════════════════════════════════════════════════════════════════ -->
+      <div id="tab-pipeline" class="tab-panel">
+        <div class="demo-section">
+          <p class="eyebrow">Demo 3</p>
+          <h2>Shared Volumes as the Backbone of Multi-Agent Pipelines</h2>
+          <p class="sub">Four specialized agents cooperate through a single ClawFS volume — no message queues, no handoff APIs. Files written by one agent are immediately visible to the next. The filesystem IS the coordination layer.</p>
+
+          <div class="volume-badge">
+            <div class="vol-dot"></div>
+            <span>Shared volume: <strong>vol-demo-pipeline</strong></span>
+            <span style="margin-left:auto;opacity:.6" id="pipeline-gen-badge">gen 0 · 0 files</span>
+          </div>
+
+          <div class="log-selector" id="log-selector">
+            <span style="font-size:.8rem;color:var(--ink-soft);align-self:center">Inject log type:</span>
+            <div class="log-chip active" data-log="nginx">nginx access</div>
+            <div class="log-chip" data-log="app">app errors</div>
+            <div class="log-chip" data-log="agent">agent trace</div>
+          </div>
+
+          <div class="pipeline-grid" id="pipeline-agents">
+            <div class="agent-card" id="agent-ingest">
+              <h4><span class="agent-icon">📥</span> Ingest Agent</h4>
+              <p>Watches <code>/logs/</code> for new files, validates and timestamps each entry.</p>
+              <span class="agent-status" id="status-ingest">idle</span>
+            </div>
+            <div class="agent-card" id="agent-analysis">
+              <h4><span class="agent-icon">🔍</span> Analysis Agent</h4>
+              <p>Reads each log, detects error patterns, writes <code>.analysis.json</code> to <code>/analysis/</code>.</p>
+              <span class="agent-status" id="status-analysis">waiting for logs…</span>
+            </div>
+            <div class="agent-card" id="agent-aggregator">
+              <h4><span class="agent-icon">📊</span> Aggregator Agent</h4>
+              <p>Reads all analysis files, computes stats, writes <code>summary.json</code> to <code>/aggregates/</code>.</p>
+              <span class="agent-status" id="status-aggregator">waiting for analysis…</span>
+            </div>
+            <div class="agent-card" id="agent-dashboard">
+              <h4><span class="agent-icon">📈</span> Dashboard Agent</h4>
+              <p>Reads the aggregate, renders an HTML insights report to <code>/dashboard/</code>.</p>
+              <span class="agent-status" id="status-dashboard">waiting for aggregates…</span>
+            </div>
+          </div>
+
+          <div class="action-row" style="margin-top:1.5rem">
+            <button class="btn-demo primary" id="btn-inject-log">+ Inject Log File</button>
+            <button class="btn-demo secondary" id="btn-inject-more" disabled>+ Inject Another</button>
+            <button class="btn-demo secondary" id="btn-pipeline-reset">Reset</button>
+          </div>
+
+          <div style="margin-top:1.5rem">
+            <div class="panel-label">Shared Volume — live file tree</div>
+            <div class="file-tree" id="pipeline-filetree"><div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">Volume is empty. Inject a log file to start the pipeline…</div></div>
+          </div>
+
+          <div class="stat-row" id="pipeline-stats" style="margin-top:1rem"></div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <p>© <span id="year"></span> ClawFS</p>
+      <p>Persistent volumes for agent runtimes</p>
+    </footer>
+
+    <script src="main.js"></script>
+    <script type="module" src="demo.js"></script>
+  </body>
+</html>
