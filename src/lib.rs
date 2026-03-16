@@ -7,6 +7,7 @@ pub mod frontdoor;
 pub mod fs;
 pub mod inode;
 pub mod journal;
+pub mod launch;
 pub mod metadata;
 pub mod perf;
 pub mod perf_bench;

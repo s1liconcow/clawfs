@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-OSAGE_BIN="$ROOT_DIR/target/release/clawfs"
+OSAGE_BIN="$ROOT_DIR/target/release/clawfsd"
 
 PID_FILE="${PID_FILE:-/tmp/clawfs.pid}"
 FOREGROUND="${FOREGROUND:-0}"
@@ -22,9 +22,9 @@ HEAPTRACK_OUTPUT="${HEAPTRACK_OUTPUT:-$ROOT_DIR/heaptrack/heaptrack.clawfs.%p}"
 HEAPTRACK_RAW="${HEAPTRACK_RAW:-0}"
 HEAPTRACK_EXTRA_ARGS="${HEAPTRACK_EXTRA_ARGS:-}"
 
-echo "Ensuring clawfs binary is up to date..."
-(cd "$ROOT_DIR" && cargo build --release --bin clawfs)
-OSAGE_BIN="$(cd "$(dirname "$OSAGE_BIN")" && pwd)/clawfs"
+echo "Ensuring clawfsd binary is up to date..."
+(cd "$ROOT_DIR" && cargo build --release --bin clawfsd)
+OSAGE_BIN="$(cd "$(dirname "$OSAGE_BIN")" && pwd)/clawfsd"
 echo "Using binary: $OSAGE_BIN"
 
 mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH" "$(dirname "$STATE_PATH")"

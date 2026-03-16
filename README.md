@@ -183,9 +183,10 @@ cargo run -- \
   # add --fsync-on-close to force flushes on every release
 ```
 
-By default the filesystem runs in the background with `AllowRoot` and
-`AutoUnmount` enabled. Pass `--foreground` to keep the FUSE session attached to
-STDERR for easier debugging. To target a real S3-compatible backend, supply
+By default the filesystem mounts at `/mnt/clawfs` and runs in the background
+with `AllowRoot` and `AutoUnmount` enabled. Pass `--foreground` to keep the
+FUSE session attached to STDERR for easier debugging. To target a real
+S3-compatible backend, supply
 `--object-provider aws` (or `gcs`) with `--bucket`, plus `--region`/`--endpoint`
 for AWS or `--gcs-service-account` for Google Cloud. ClawFS writes everything
 into the configured bucket prefix: superblock + metadata JSON live under

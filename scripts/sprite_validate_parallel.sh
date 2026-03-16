@@ -246,7 +246,7 @@ fi
 if [[ ! -d /tmp/pjdfstest ]]; then
   git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
 fi
-cargo build --release --bin clawfs
+cargo build --release --bin clawfsd
 PJDFSTEST_DIR=/tmp/pjdfstest TESTDIR=/tmp/clawfs-mnt JOBS=8 ./scripts/run_pjdfstest.sh
 EOF
 }

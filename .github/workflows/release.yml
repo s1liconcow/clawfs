@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y pkg-config libfontconfig1-dev
 
       - name: Build ClawFS binaries
-        run: cargo build --release --bin clawfs --bin clawfs_checkpoint --bin clawfs_replay
+        run: cargo build --release --bin clawfs --bin clawfsd --bin clawfs_checkpoint --bin clawfs_replay
 
       - name: Build NFS gateway
         run: cargo build --release --manifest-path clawfs-nfs-gateway/Cargo.toml
@@ -70,6 +70,7 @@ jobs:
           mkdir -p "$DIST"
 
           cp target/release/clawfs "$DIST/"
+          cp target/release/clawfsd "$DIST/"
           cp target/release/clawfs_checkpoint "$DIST/"
           cp target/release/clawfs_replay "$DIST/"
           cp target/release/clawfs-nfs-gateway "$DIST/"

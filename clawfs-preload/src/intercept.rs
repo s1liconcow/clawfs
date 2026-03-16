@@ -153,6 +153,17 @@ real_fn!(
     ) -> libc::size_t
 );
 real_fn!(
+    REAL_FWRITE_UNLOCKED_PTR,
+    get_real_fwrite_unlocked,
+    "fwrite_unlocked",
+    unsafe extern "C" fn(
+        *const libc::c_void,
+        libc::size_t,
+        libc::size_t,
+        *mut libc::FILE,
+    ) -> libc::size_t
+);
+real_fn!(
     REAL_FPUTS_PTR,
     get_real_fputs,
     "fputs",
@@ -418,6 +429,36 @@ real_fn!(
     unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent64
 );
 real_fn!(
+    REAL_DIRFD_PTR,
+    get_real_dirfd,
+    "dirfd",
+    unsafe extern "C" fn(*mut libc::DIR) -> i32
+);
+real_fn!(
+    REAL_FDOPENDIR_PTR,
+    get_real_fdopendir,
+    "fdopendir",
+    unsafe extern "C" fn(i32) -> *mut libc::DIR
+);
+real_fn!(
+    REAL_SEEKDIR_PTR,
+    get_real_seekdir,
+    "seekdir",
+    unsafe extern "C" fn(*mut libc::DIR, libc::c_long)
+);
+real_fn!(
+    REAL_TELLDIR_PTR,
+    get_real_telldir,
+    "telldir",
+    unsafe extern "C" fn(*mut libc::DIR) -> libc::c_long
+);
+real_fn!(
+    REAL_REWINDDIR_PTR,
+    get_real_rewinddir,
+    "rewinddir",
+    unsafe extern "C" fn(*mut libc::DIR)
+);
+real_fn!(
     REAL_MKDIRAT_PTR,
     get_real_mkdirat,
     "mkdirat",
@@ -466,6 +507,133 @@ real_fn!(
     unsafe extern "C" fn(i32, *const libc::c_char, i32, libc::c_uint, *mut libc::statx) -> i32
 );
 
+// stdio FILE* functions.
+real_fn!(
+    REAL_FOPEN_PTR,
+    get_real_fopen,
+    "fopen",
+    unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::FILE
+);
+real_fn!(
+    REAL_FOPEN64_PTR,
+    get_real_fopen64,
+    "fopen64",
+    unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::FILE
+);
+real_fn!(
+    REAL_FCLOSE_PTR,
+    get_real_fclose,
+    "fclose",
+    unsafe extern "C" fn(*mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_FDOPEN_PTR,
+    get_real_fdopen,
+    "fdopen",
+    unsafe extern "C" fn(i32, *const libc::c_char) -> *mut libc::FILE
+);
+real_fn!(
+    REAL_FREAD_PTR,
+    get_real_fread,
+    "fread",
+    unsafe extern "C" fn(
+        *mut libc::c_void,
+        libc::size_t,
+        libc::size_t,
+        *mut libc::FILE,
+    ) -> libc::size_t
+);
+real_fn!(
+    REAL_FREAD_UNLOCKED_PTR,
+    get_real_fread_unlocked,
+    "fread_unlocked",
+    unsafe extern "C" fn(
+        *mut libc::c_void,
+        libc::size_t,
+        libc::size_t,
+        *mut libc::FILE,
+    ) -> libc::size_t
+);
+real_fn!(
+    REAL_FILENO_UNLOCKED_PTR,
+    get_real_fileno_unlocked,
+    "fileno_unlocked",
+    unsafe extern "C" fn(*mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_FGETS_PTR,
+    get_real_fgets,
+    "fgets",
+    unsafe extern "C" fn(*mut libc::c_char, i32, *mut libc::FILE) -> *mut libc::c_char
+);
+real_fn!(
+    REAL_FGETC_PTR,
+    get_real_fgetc,
+    "fgetc",
+    unsafe extern "C" fn(*mut libc::FILE) -> i32
+);
+real_fn!(
+    REAL_FSEEK_PTR,
+    get_real_fseek,
+    "fseek",
+    unsafe extern "C" fn(*mut libc::FILE, libc::c_long, i32) -> i32
+);
+real_fn!(
+    REAL_FSEEKO_PTR,
+    get_real_fseeko,
+    "fseeko",
+    unsafe extern "C" fn(*mut libc::FILE, libc::off_t, i32) -> i32
+);
+real_fn!(
+    REAL_FSEEKO64_PTR,
+    get_real_fseeko64,
+    "fseeko64",
+    unsafe extern "C" fn(*mut libc::FILE, libc::off64_t, i32) -> i32
+);
+real_fn!(
+    REAL_FTELL_PTR,
+    get_real_ftell,
+    "ftell",
+    unsafe extern "C" fn(*mut libc::FILE) -> libc::c_long
+);
+real_fn!(
+    REAL_FTELLO_PTR,
+    get_real_ftello,
+    "ftello",
+    unsafe extern "C" fn(*mut libc::FILE) -> libc::off_t
+);
+real_fn!(
+    REAL_FTELLO64_PTR,
+    get_real_ftello64,
+    "ftello64",
+    unsafe extern "C" fn(*mut libc::FILE) -> libc::off64_t
+);
+real_fn!(
+    REAL_REWIND_PTR,
+    get_real_rewind,
+    "rewind",
+    unsafe extern "C" fn(*mut libc::FILE)
+);
+real_fn!(
+    REAL_FEOF_PTR,
+    get_real_feof,
+    "feof",
+    unsafe extern "C" fn(*mut libc::FILE) -> i32
+);
+
+// Missing *at-family functions.
+real_fn!(
+    REAL_SYMLINKAT_PTR,
+    get_real_symlinkat,
+    "symlinkat",
+    unsafe extern "C" fn(*const libc::c_char, i32, *const libc::c_char) -> i32
+);
+real_fn!(
+    REAL_FACCESSAT_PTR,
+    get_real_faccessat,
+    "faccessat",
+    unsafe extern "C" fn(i32, *const libc::c_char, i32, i32) -> i32
+);
 // ioctl/fcntl: defined as fixed-arg (3 params) — ABI-compatible with variadic
 // on x86_64 since the calling convention passes args in registers regardless.
 real_fn!(
@@ -590,7 +758,7 @@ fn dispatch_writev_fd(
 }
 
 fn dispatch_stdio_write(rt: &ClawfsRuntime, stream: *mut libc::FILE, data: &[u8]) -> Option<usize> {
-    let fd = unsafe { libc::fileno(stream) };
+    let fd = unsafe { stream_fd(stream) };
     if fd_proxy_threads().contains_key(&fd) {
         return None;
     }
@@ -783,6 +951,36 @@ fn resolve_at_path(rt: &ClawfsRuntime, dirfd: i32, path: &str) -> Option<String>
 // Intercepted functions
 // ---------------------------------------------------------------------------
 
+/// Core `open` logic for ClawFS paths. Returns a real kernel fd (backed by
+/// /dev/null) that is mapped in `fd_table` to the ClawFS FdEntry. This ensures
+/// that programs which pass the fd to unintercepted libc functions (like
+/// `fdopen`) still get a valid kernel fd.
+fn do_open(rt: &ClawfsRuntime, path_str: &str, inner: &str, flags: i32, mode: libc::mode_t) -> i32 {
+    // Create the ClawFS FdEntry via dispatch (returns a synthetic fd).
+    let synth_fd = match dispatch::dispatch_open(rt, inner, flags, mode) {
+        Ok(fd) => fd,
+        Err(e) => return set_errno(e) as i32,
+    };
+    // Get a real kernel fd by opening /dev/null.
+    let devnull = CString::new("/dev/null").unwrap();
+    let kernel_fd = unsafe { get_real_open()(devnull.as_ptr(), libc::O_RDWR, 0) };
+    if kernel_fd < 0 {
+        let _ = dispatch::dispatch_close(rt, synth_fd);
+        return set_errno(libc::ENOMEM) as i32;
+    }
+    // Map the kernel fd to the same ClawFS FdEntry.
+    rt.fd_table.dup_to(synth_fd, kernel_fd);
+    // Remove the synthetic fd — only the kernel fd is used from here on.
+    rt.fd_table.remove(synth_fd);
+    log::trace!(
+        "open({:?}) -> kernel_fd={} (synth was {})",
+        path_str,
+        kernel_fd,
+        synth_fd
+    );
+    kernel_fd
+}
+
 /// # Safety
 /// Called by the dynamic linker as a libc function replacement.
 #[unsafe(no_mangle)]
@@ -791,12 +989,7 @@ pub unsafe extern "C" fn open(path: *const libc::c_char, flags: i32, mode: libc:
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = try_classify(rt, &path_str) {
-                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
-                    log::trace!("open({:?}) -> {:?}", path_str, result);
-                    return match result {
-                        Ok(fd) => fd,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                    return do_open(rt, &path_str, &inner, flags, mode);
                 }
             }
         }
@@ -812,12 +1005,7 @@ pub unsafe extern "C" fn open64(path: *const libc::c_char, flags: i32, mode: lib
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = try_classify(rt, &path_str) {
-                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
-                    log::trace!("open64({:?}) -> {:?}", path_str, result);
-                    return match result {
-                        Ok(fd) => fd,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                    return do_open(rt, &path_str, &inner, flags, mode);
                 }
             }
         }
@@ -838,12 +1026,7 @@ pub unsafe extern "C" fn openat(
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    let result = dispatch::dispatch_open(rt, &inner, flags, mode);
-                    log::trace!("openat(dirfd={}, {:?}) -> {:?}", dirfd, path_str, result);
-                    return match result {
-                        Ok(fd) => fd,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                    return do_open(rt, &path_str, &inner, flags, mode);
                 }
             }
         }
@@ -864,7 +1047,13 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
                     cleanup_fd_proxy(fd);
                     return 0;
                 }
-                return match dispatch::dispatch_close(rt, fd) {
+                let result = dispatch::dispatch_close(rt, fd);
+                // Also close the underlying kernel fd (if it's a real fd).
+                // Synthetic fds (>= FD_BASE) don't have a kernel fd to close.
+                if fd < crate::fd_table::FD_BASE {
+                    unsafe { get_real_close()(fd) };
+                }
+                return match result {
                     Ok(()) => 0,
                     Err(e) => set_errno(e) as i32,
                 };
@@ -999,6 +1188,27 @@ pub unsafe extern "C" fn fwrite(
         }
     }
     unsafe { get_real_fwrite()(ptr, size, nmemb, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fwrite_unlocked(
+    ptr: *const libc::c_void,
+    size: libc::size_t,
+    nmemb: libc::size_t,
+    stream: *mut libc::FILE,
+) -> libc::size_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let total = size.saturating_mul(nmemb);
+            let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
+            if let Some(written) = dispatch_stdio_write(rt, stream, data) {
+                return if size == 0 { nmemb } else { written / size };
+            }
+        }
+    }
+    unsafe { get_real_fwrite_unlocked()(ptr, size, nmemb, stream) }
 }
 
 /// # Safety
@@ -1427,6 +1637,24 @@ pub unsafe extern "C" fn access(path: *const libc::c_char, mode: i32) -> i32 {
 
 /// # Safety
 /// Called by the dynamic linker as a libc function replacement.
+///
+/// `euidaccess` checks permissions using the effective UID/GID.
+/// For ClawFS, we treat it identically to `access`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn euidaccess(path: *const libc::c_char, mode: i32) -> i32 {
+    // Delegate to our access implementation which already handles ClawFS paths.
+    unsafe { access(path, mode) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn eaccess(path: *const libc::c_char, mode: i32) -> i32 {
+    unsafe { access(path, mode) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdir(path: *const libc::c_char, mode: libc::mode_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
@@ -1732,6 +1960,16 @@ pub unsafe extern "C" fn dup(oldfd: i32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
         if let Some(rt) = ClawfsRuntime::get() {
             if rt.fd_table.is_clawfs_fd(oldfd) {
+                if oldfd < crate::fd_table::FD_BASE {
+                    // Kernel fd: dup the real fd, then map the new fd in fd_table.
+                    let new_fd = unsafe { get_real_dup()(oldfd) };
+                    if new_fd < 0 {
+                        return new_fd;
+                    }
+                    rt.fd_table.dup_to(oldfd, new_fd);
+                    return new_fd;
+                }
+                // Synthetic fd: use fd_table.dup (old behavior).
                 return match rt.fd_table.dup(oldfd) {
                     Some(new_fd) => new_fd,
                     None => set_errno(libc::EBADF) as i32,
@@ -1751,6 +1989,13 @@ pub unsafe extern "C" fn dup2(oldfd: i32, newfd: i32) -> i32 {
             if rt.fd_table.is_clawfs_fd(oldfd) {
                 log::trace!("dup2(clawfs fd={oldfd} -> fd={newfd})");
                 cleanup_fd_proxy(newfd);
+                // For kernel fds, also perform the real dup2 so newfd is valid.
+                if oldfd < crate::fd_table::FD_BASE {
+                    let ret = unsafe { get_real_dup2()(oldfd, newfd) };
+                    if ret < 0 {
+                        return ret;
+                    }
+                }
                 return match rt.fd_table.dup_to(oldfd, newfd) {
                     Some(fd) => {
                         if let Some(entry) = rt.fd_table.get(fd) {
@@ -1800,6 +2045,13 @@ pub unsafe extern "C" fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
                 }
                 log::trace!("dup3(clawfs fd={oldfd} -> fd={newfd}, flags={flags})");
                 cleanup_fd_proxy(newfd);
+                // For kernel fds, also perform the real dup3 so newfd is valid.
+                if oldfd < crate::fd_table::FD_BASE {
+                    let ret = unsafe { get_real_dup3()(oldfd, newfd, flags) };
+                    if ret < 0 {
+                        return ret;
+                    }
+                }
                 return match rt.fd_table.dup_to(oldfd, newfd) {
                     Some(fd) => {
                         if let Some(entry) = rt.fd_table.get(fd) {
@@ -2064,6 +2316,14 @@ pub unsafe extern "C" fn opendir(name: *const libc::c_char) -> *mut libc::DIR {
     unsafe { get_real_opendir()(name) }
 }
 
+/// Get the fd from a FILE* without locking the stream.
+/// Uses `fileno_unlocked` to avoid deadlocking when called from `_unlocked`
+/// stdio variants (e.g. `fread_unlocked`) where the caller already holds the
+/// stream lock.
+unsafe fn stream_fd(stream: *mut libc::FILE) -> i32 {
+    unsafe { get_real_fileno_unlocked()(stream) }
+}
+
 fn is_synthetic_dir(dirp: *mut libc::DIR) -> bool {
     let val = dirp as usize;
     // Our synthetic fds start at 10_000_000. Real DIR* pointers are heap
@@ -2091,13 +2351,15 @@ pub unsafe extern "C" fn readdir(dirp: *mut libc::DIR) -> *mut libc::dirent {
                         if *cursor >= entries.len() {
                             return std::ptr::null_mut(); // end of directory
                         }
-                        let (ino, ref name) = entries[*cursor];
+                        let (ino, d_type, ref name) = entries[*cursor];
+                        let off = (*cursor + 1) as i64;
                         *cursor += 1;
                         return READDIR_BUF.with(|buf| {
                             let mut de = buf.borrow_mut();
                             *de = unsafe { std::mem::zeroed() };
                             de.d_ino = ino as libc::ino_t;
-                            de.d_type = libc::DT_UNKNOWN;
+                            de.d_off = off as libc::off_t;
+                            de.d_type = d_type;
                             let name_bytes = name.as_bytes();
                             let n = name_bytes.len().min(255);
                             unsafe {
@@ -2134,13 +2396,15 @@ pub unsafe extern "C" fn readdir64(dirp: *mut libc::DIR) -> *mut libc::dirent64 
                         if *cursor >= entries.len() {
                             return std::ptr::null_mut();
                         }
-                        let (ino, ref name) = entries[*cursor];
+                        let (ino, d_type, ref name) = entries[*cursor];
+                        let off = (*cursor + 1) as i64;
                         *cursor += 1;
                         return READDIR64_BUF.with(|buf| {
                             let mut de = buf.borrow_mut();
                             *de = unsafe { std::mem::zeroed() };
                             de.d_ino = ino as libc::ino64_t;
-                            de.d_type = libc::DT_UNKNOWN;
+                            de.d_off = off as libc::off64_t;
+                            de.d_type = d_type;
                             let name_bytes = name.as_bytes();
                             let n = name_bytes.len().min(255);
                             unsafe {
@@ -2171,13 +2435,649 @@ pub unsafe extern "C" fn closedir(dirp: *mut libc::DIR) -> i32 {
             if let Some(rt) = ClawfsRuntime::get() {
                 let fd = dirp as usize as i32;
                 return match dispatch::dispatch_close(rt, fd) {
-                    Ok(()) => 0,
+                    Ok(()) => {
+                        if fd < crate::fd_table::FD_BASE {
+                            unsafe {
+                                get_real_close()(fd);
+                            }
+                        }
+                        0
+                    }
                     Err(e) => set_errno(e) as i32,
                 };
             }
         }
     }
     unsafe { get_real_closedir()(dirp) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dirfd(dirp: *mut libc::DIR) -> i32 {
+    if is_synthetic_dir(dirp) {
+        return dirp as usize as i32;
+    }
+    unsafe { get_real_dirfd()(dirp) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fdopendir(fd: i32) -> *mut libc::DIR {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if rt.fd_table.is_clawfs_fd(fd) {
+                if let Some(entry) = rt.fd_table.get(fd) {
+                    if !entry.is_dir {
+                        set_errno(libc::ENOTDIR);
+                        return std::ptr::null_mut();
+                    }
+                    let _ = dispatch::dispatch_readdir_fill(rt, &entry);
+                }
+                return fd as usize as *mut libc::DIR;
+            }
+        }
+    }
+    unsafe { get_real_fdopendir()(fd) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn seekdir(dirp: *mut libc::DIR, loc: libc::c_long) {
+    if is_synthetic_dir(dirp) {
+        if let Some(_guard) = ReentrancyGuard::enter() {
+            if let Some(rt) = ClawfsRuntime::get() {
+                let fd = dirp as usize as i32;
+                if let Some(entry) = rt.fd_table.get(fd) {
+                    let mut dir = entry.dir_entries.lock();
+                    if let Some((_, ref mut cursor)) = dir.as_mut() {
+                        *cursor = loc as usize;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    unsafe { get_real_seekdir()(dirp, loc) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn telldir(dirp: *mut libc::DIR) -> libc::c_long {
+    if is_synthetic_dir(dirp) {
+        if let Some(_guard) = ReentrancyGuard::enter() {
+            if let Some(rt) = ClawfsRuntime::get() {
+                let fd = dirp as usize as i32;
+                if let Some(entry) = rt.fd_table.get(fd) {
+                    let dir = entry.dir_entries.lock();
+                    if let Some((_, cursor)) = dir.as_ref() {
+                        return *cursor as libc::c_long;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    unsafe { get_real_telldir()(dirp) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rewinddir(dirp: *mut libc::DIR) {
+    if is_synthetic_dir(dirp) {
+        if let Some(_guard) = ReentrancyGuard::enter() {
+            if let Some(rt) = ClawfsRuntime::get() {
+                let fd = dirp as usize as i32;
+                if let Some(entry) = rt.fd_table.get(fd) {
+                    let mut dir = entry.dir_entries.lock();
+                    if let Some((_, ref mut cursor)) = dir.as_mut() {
+                        *cursor = 0;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    unsafe { get_real_rewinddir()(dirp) }
+}
+
+// ---------------------------------------------------------------------------
+// creat / creat64
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn creat(path: *const libc::c_char, mode: libc::mode_t) -> i32 {
+    // creat() is equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)
+    open(path, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, mode)
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn creat64(path: *const libc::c_char, mode: libc::mode_t) -> i32 {
+    open64(path, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, mode)
+}
+
+// ---------------------------------------------------------------------------
+// faccessat / symlinkat
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faccessat(
+    dirfd: i32,
+    path: *const libc::c_char,
+    mode: i32,
+    _flags: i32,
+) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let Some(path_str) = c_path_to_str(path) {
+                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
+                    return match dispatch::dispatch_access(rt, &inner, mode) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_faccessat()(dirfd, path, mode, _flags) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn symlinkat(
+    target: *const libc::c_char,
+    newdirfd: i32,
+    linkpath: *const libc::c_char,
+) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let (Some(target_str), Some(link_str)) =
+                (c_path_to_str(target), c_path_to_str(linkpath))
+            {
+                if let Some(inner) = resolve_at_path(rt, newdirfd, &link_str) {
+                    return match dispatch::dispatch_symlink(rt, &target_str, &inner) {
+                        Ok(()) => 0,
+                        Err(e) => set_errno(e) as i32,
+                    };
+                }
+            }
+        }
+    }
+    unsafe { get_real_symlinkat()(target, newdirfd, linkpath) }
+}
+
+// ---------------------------------------------------------------------------
+// stdio FILE* interceptions: fopen, fclose, fread, fgets, fgetc, fseek, ftell
+// ---------------------------------------------------------------------------
+//
+// Strategy: fopen() on a ClawFS path opens /dev/null to obtain a real kernel fd,
+// maps that fd to the ClawFS FdEntry in fd_table, then calls real fdopen() on it.
+// All subsequent stdio functions check fileno(stream) against fd_table to decide
+// whether to dispatch to ClawFS or delegate to the real libc implementation.
+// The kernel fd (/dev/null) is never actually read from or written to — every
+// I/O operation is intercepted before reaching the kernel.
+
+/// Parse a C fopen mode string into open() flags.
+fn fopen_mode_to_flags(mode: &str) -> i32 {
+    // Strip 'b' (binary, no effect on Linux), 'e' (O_CLOEXEC), 'x' (O_EXCL).
+    let base: String = mode
+        .chars()
+        .filter(|c| !matches!(c, 'b' | 'e' | 'x'))
+        .collect();
+    let flags = match base.as_str() {
+        "r" => libc::O_RDONLY,
+        "r+" => libc::O_RDWR,
+        "w" => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        "w+" => libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+        "a" => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+        "a+" => libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+        _ => return -1,
+    };
+    let mut extra = 0;
+    if mode.contains('e') {
+        extra |= libc::O_CLOEXEC;
+    }
+    if mode.contains('x') {
+        extra |= libc::O_EXCL;
+    }
+    flags | extra
+}
+
+/// Core fopen implementation shared by fopen and fopen64.
+///
+/// Strategy: open the ClawFS path to get a synthetic fd, then open /dev/null
+/// to get a real kernel fd, map the ClawFS entry onto the kernel fd, and use
+/// `fdopen()` to wrap the kernel fd into a `FILE*`. All subsequent stdio
+/// operations (fread, fwrite, fclose, etc.) call `fileno(stream)` to get the
+/// kernel fd, which we intercept via the fd_table.
+unsafe fn do_fopen(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+    real_fn: unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::FILE,
+) -> *mut libc::FILE {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            if let (Some(path_str), Some(mode_str)) = (c_path_to_str(path), c_path_to_str(mode)) {
+                if let Some(inner) = try_classify(rt, &path_str) {
+                    let flags = fopen_mode_to_flags(&mode_str);
+                    if flags == -1 {
+                        set_errno(libc::EINVAL);
+                        return std::ptr::null_mut();
+                    }
+                    // Open in ClawFS to get a synthetic fd + FdEntry.
+                    let synth_fd = match dispatch::dispatch_open(rt, &inner, flags, 0o644) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            set_errno(e);
+                            return std::ptr::null_mut();
+                        }
+                    };
+                    // Get a real kernel fd by opening /dev/null.
+                    let devnull = CString::new("/dev/null").unwrap();
+                    let kernel_fd = unsafe { get_real_open()(devnull.as_ptr(), libc::O_RDWR, 0) };
+                    if kernel_fd < 0 {
+                        let _ = dispatch::dispatch_close(rt, synth_fd);
+                        return std::ptr::null_mut();
+                    }
+                    // Map the kernel fd to the same FdEntry as synth_fd.
+                    rt.fd_table.dup_to(synth_fd, kernel_fd);
+                    // Remove the synthetic fd — we only need the kernel fd now.
+                    rt.fd_table.remove(synth_fd);
+                    // Use fdopen to wrap the kernel fd into a FILE*.
+                    let mode_cstr = CString::new(mode_str.as_str()).unwrap();
+                    let stream = unsafe { get_real_fdopen()(kernel_fd, mode_cstr.as_ptr()) };
+                    if stream.is_null() {
+                        rt.fd_table.remove(kernel_fd);
+                        unsafe { get_real_close()(kernel_fd) };
+                        return std::ptr::null_mut();
+                    }
+                    log::trace!(
+                        "fopen({:?}, {:?}) -> FILE*(fd={})",
+                        path_str,
+                        mode_str,
+                        unsafe { stream_fd(stream) }
+                    );
+                    return stream;
+                }
+            }
+        }
+    }
+    unsafe { real_fn(path, mode) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fopen(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    unsafe { do_fopen(path, mode, get_real_fopen()) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fopen64(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    unsafe { do_fopen(path, mode, get_real_fopen64()) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+///
+/// Intercept `fdopen` so that programs calling `open()` + `fdopen()` (like
+/// coreutils `sort`) can wrap a synthetic ClawFS fd in a `FILE*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fdopen(fd: i32, mode: *const libc::c_char) -> *mut libc::FILE {
+    // The fd is already a real kernel fd (backed by /dev/null from our open() intercept).
+    // Just wrap it directly — no need for a second fd.
+    let stream = unsafe { get_real_fdopen()(fd, mode) };
+    if !stream.is_null() {
+        // Verify fileno matches what we expect.
+        let actual = unsafe { stream_fd(stream) };
+        if actual != fd {
+            log::warn!("fdopen: fileno mismatch expected={fd} actual={actual}");
+        }
+    }
+    stream
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fclose(stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if fd >= 0 && rt.fd_table.is_clawfs_fd(fd) {
+                log::trace!("fclose(clawfs fd={})", fd);
+                let _ = dispatch::dispatch_close(rt, fd);
+                // Fall through to real fclose to free the FILE struct and close kernel fd.
+            }
+        }
+    }
+    unsafe { get_real_fclose()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fread(
+    ptr: *mut libc::c_void,
+    size: libc::size_t,
+    nmemb: libc::size_t,
+    stream: *mut libc::FILE,
+) -> libc::size_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                let total = size.saturating_mul(nmemb);
+                if total == 0 {
+                    return 0;
+                }
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, total) };
+                return match dispatch::dispatch_read(rt, &entry, buf) {
+                    Ok(0) => {
+                        // EOF: delegate to real fread so glibc sets the
+                        // EOF flag on the stream.
+                        unsafe { get_real_fread()(ptr, size, nmemb, stream) }
+                    }
+                    Ok(n) => {
+                        if size == 0 {
+                            0
+                        } else {
+                            n / size
+                        }
+                    }
+                    Err(e) => {
+                        set_errno(e);
+                        0
+                    }
+                };
+            }
+        }
+    }
+    unsafe { get_real_fread()(ptr, size, nmemb, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fread_unlocked(
+    ptr: *mut libc::c_void,
+    size: libc::size_t,
+    nmemb: libc::size_t,
+    stream: *mut libc::FILE,
+) -> libc::size_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                let total = size.saturating_mul(nmemb);
+                if total == 0 {
+                    return 0;
+                }
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, total) };
+                return match dispatch::dispatch_read(rt, &entry, buf) {
+                    Ok(0) => {
+                        // EOF: delegate to the real fread_unlocked so glibc
+                        // sets the EOF flag on the stream. The underlying fd
+                        // is /dev/null which always returns EOF.
+                        unsafe { get_real_fread_unlocked()(ptr, size, nmemb, stream) }
+                    }
+                    Ok(n) => {
+                        if size == 0 {
+                            0
+                        } else {
+                            n / size
+                        }
+                    }
+                    Err(e) => {
+                        set_errno(e);
+                        0
+                    }
+                };
+            }
+        }
+    }
+    unsafe { get_real_fread_unlocked()(ptr, size, nmemb, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fgets(
+    buf: *mut libc::c_char,
+    size: i32,
+    stream: *mut libc::FILE,
+) -> *mut libc::c_char {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                if size <= 1 {
+                    if size == 1 {
+                        unsafe { *buf = 0 };
+                    }
+                    return if size <= 0 { std::ptr::null_mut() } else { buf };
+                }
+                let max = (size - 1) as usize; // leave room for NUL
+                let mut pos = 0usize;
+                let mut one = [0u8; 1];
+                while pos < max {
+                    match dispatch::dispatch_read(rt, &entry, &mut one) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            unsafe { *buf.add(pos) = one[0] as libc::c_char };
+                            pos += 1;
+                            if one[0] == b'\n' {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if pos == 0 {
+                                set_errno(e);
+                                return std::ptr::null_mut();
+                            }
+                            break;
+                        }
+                    }
+                }
+                if pos == 0 {
+                    return std::ptr::null_mut(); // EOF, nothing read
+                }
+                unsafe { *buf.add(pos) = 0 }; // NUL-terminate
+                return buf;
+            }
+        }
+    }
+    unsafe { get_real_fgets()(buf, size, stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fgetc(stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                let mut one = [0u8; 1];
+                return match dispatch::dispatch_read(rt, &entry, &mut one) {
+                    Ok(0) => libc::EOF,
+                    Ok(_) => one[0] as i32,
+                    Err(e) => {
+                        set_errno(e);
+                        libc::EOF
+                    }
+                };
+            }
+        }
+    }
+    unsafe { get_real_fgetc()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getc_unlocked(stream: *mut libc::FILE) -> i32 {
+    // Same logic as fgetc — the "unlocked" variant just skips the FILE mutex
+    // which is irrelevant since we dispatch to ClawFS directly.
+    fgetc(stream)
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fseek(stream: *mut libc::FILE, offset: libc::c_long, whence: i32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return match dispatch::dispatch_lseek(rt, &entry, offset, whence) {
+                    Ok(_) => 0,
+                    Err(e) => set_errno(e) as i32,
+                };
+            }
+        }
+    }
+    unsafe { get_real_fseek()(stream, offset, whence) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fseeko(stream: *mut libc::FILE, offset: libc::off_t, whence: i32) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return match dispatch::dispatch_lseek(rt, &entry, offset, whence) {
+                    Ok(_) => 0,
+                    Err(e) => set_errno(e) as i32,
+                };
+            }
+        }
+    }
+    unsafe { get_real_fseeko()(stream, offset, whence) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fseeko64(
+    stream: *mut libc::FILE,
+    offset: libc::off64_t,
+    whence: i32,
+) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return match dispatch::dispatch_lseek(rt, &entry, offset, whence) {
+                    Ok(_) => 0,
+                    Err(e) => set_errno(e) as i32,
+                };
+            }
+        }
+    }
+    unsafe { get_real_fseeko64()(stream, offset, whence) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftell(stream: *mut libc::FILE) -> libc::c_long {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return entry.get_offset() as libc::c_long;
+            }
+        }
+    }
+    unsafe { get_real_ftell()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftello(stream: *mut libc::FILE) -> libc::off_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return entry.get_offset() as libc::off_t;
+            }
+        }
+    }
+    unsafe { get_real_ftello()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftello64(stream: *mut libc::FILE) -> libc::off64_t {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                return entry.get_offset() as libc::off64_t;
+            }
+        }
+    }
+    unsafe { get_real_ftello64()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rewind(stream: *mut libc::FILE) {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                entry.set_offset(0);
+                return;
+            }
+        }
+    }
+    unsafe { get_real_rewind()(stream) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn feof(stream: *mut libc::FILE) -> i32 {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { stream_fd(stream) };
+            if let Some(entry) = rt.fd_table.get(fd) {
+                let offset = entry.get_offset();
+                // Check if at or past end of file.
+                if let Ok(record) = rt.fs.nfs_getattr(entry.inode) {
+                    return if offset as u64 >= record.size { 1 } else { 0 };
+                }
+                return 0;
+            }
+        }
+    }
+    unsafe { get_real_feof()(stream) }
 }
 
 // ---------------------------------------------------------------------------
@@ -2197,10 +3097,7 @@ pub unsafe extern "C" fn openat64(
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_open(rt, &inner, flags, mode) {
-                        Ok(fd) => fd,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                    return do_open(rt, &path_str, &inner, flags, mode);
                 }
             }
         }

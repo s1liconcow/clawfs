@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 
 /// Base for synthetic file descriptors. Chosen to be well above any realistic
 /// host fd number while staying within i32 range.
-const FD_BASE: i32 = 10_000_000;
+pub(crate) const FD_BASE: i32 = 10_000_000;
 
 /// State associated with an open ClawFS file descriptor.
 #[allow(dead_code)]
@@ -21,8 +21,9 @@ pub struct FdEntry {
     pub offset: AtomicI64,
     pub is_dir: bool,
     /// Cached readdir results and cursor position for DIR* emulation.
+    /// Each entry is (inode, d_type, name).
     #[allow(clippy::type_complexity)]
-    pub dir_entries: Mutex<Option<(Vec<(u64, String)>, usize)>>,
+    pub dir_entries: Mutex<Option<(Vec<(u64, u8, String)>, usize)>>,
 }
 
 /// Thread-safe table of synthetic file descriptors for ClawFS files.

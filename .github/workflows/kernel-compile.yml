@@ -29,13 +29,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build ClawFS
-        run: cargo build --release
+        run: cargo build --release --bin clawfsd
 
       - name: Start ClawFS
         run: |
           mkdir -p /tmp/clawfs-mnt /tmp/clawfs-store /tmp/clawfs-cache
 
-          ./target/release/clawfs \
+          ./target/release/clawfsd \
             --mount-path /tmp/clawfs-mnt \
             --store-path /tmp/clawfs-store \
             --local-cache-path /tmp/clawfs-cache \

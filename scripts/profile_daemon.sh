@@ -93,7 +93,7 @@ log "Results will be written to $RESULTS_DIR"
 # Clean previous state
 cd /tmp
 fusermount -u "$MOUNT_PATH" 2>/dev/null || umount -l "$MOUNT_PATH" 2>/dev/null || true
-pkill -f "clawfs.*--mount-path $MOUNT_PATH" 2>/dev/null || true
+pkill -f "clawfsd.*--mount-path $MOUNT_PATH" 2>/dev/null || true
 sleep 1
 rm -rf "$MOUNT_PATH" "$STORE_PATH" "${LOCAL_CACHE_PATH}" "${STATE_PATH}"
 mkdir -p "$MOUNT_PATH" "$STORE_PATH"
@@ -107,7 +107,7 @@ fi
 
 log "Starting ClawFS daemon"
 # shellcheck disable=SC2086
-"$ROOT_DIR/target/release/clawfs" \
+"$ROOT_DIR/target/release/clawfsd" \
   --mount-path "$MOUNT_PATH" \
   --store-path "$STORE_PATH" \
   --local-cache-path "$LOCAL_CACHE_PATH" \

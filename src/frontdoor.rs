@@ -12,41 +12,59 @@ use crate::auth::{
     API_BASE_URL_ENV, AuthProfile, LoginArgs, WhoamiArgs, clear_profile, load_profile,
     store_profile, user_config_root,
 };
-use crate::config::{Cli, Config};
+use crate::clawfs::STORAGE_MODE_ENV;
+use crate::config::{Cli, Config, ObjectStoreProvider};
+use crate::launch::HostedControlPlane;
 
 const DEFAULT_VOLUME: &str = "default";
 const DEFAULT_PREFIX: &str = "clawfs";
 const DEFAULT_CLAWFS_APP_URL: &str = "https://app.clawfs.dev";
 const CLAWFS_API_ENV: &str = "CLAWFS_API";
 
-/// Configuration returned by the ClawFS API for summon
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SummonApiConfig {
-    /// Object store provider (s3, gcs, etc.)
     provider: String,
-    /// Bucket name
     bucket: String,
-    /// Region for the bucket
     #[serde(default)]
     region: Option<String>,
-    /// Endpoint URL (for S3-compatible stores)
     #[serde(default)]
     endpoint: Option<String>,
-    /// AWS-style access key ID
     #[serde(default)]
     access_key_id: Option<String>,
-    /// AWS-style secret access key
     #[serde(default)]
     secret_access_key: Option<String>,
-    /// Storage mode (hosted_free, byob_paid)
     #[serde(default)]
     storage_mode: Option<String>,
-    /// Object prefix within the bucket
     #[serde(default)]
     object_prefix: Option<String>,
 }
 
-/// Fetches summon configuration from the ClawFS API
+#[derive(Debug, Clone)]
+struct HostedVolumeConfig {
+    provider: ObjectStoreProvider,
+    bucket: String,
+    region: Option<String>,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    storage_mode: Option<String>,
+    object_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HostedVolume {
+    api_base_url: String,
+    api_token: String,
+    volume_slug: String,
+    config: HostedVolumeConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostedMountInvocation {
+    pub config: Config,
+    pub hosted: HostedControlPlane,
+}
+
 async fn fetch_summon_config(
     api_base_url: &str,
     api_token: &str,
@@ -82,7 +100,7 @@ async fn fetch_summon_config(
 pub enum DispatchAction {
     FallThrough,
     Handled,
-    Mount(Box<Config>),
+    Mount(Box<HostedMountInvocation>),
 }
 
 #[derive(Debug, Parser)]
@@ -91,15 +109,12 @@ pub enum DispatchAction {
     about = "Run a command with ClawFS preload enabled"
 )]
 struct UpArgs {
-    /// Logical volume name; auto-created under the current account config root.
     #[arg(long, default_value = DEFAULT_VOLUME)]
     volume: String,
 
-    /// Prefix path to intercept, relative to the current working directory by default.
     #[arg(long, default_value = DEFAULT_PREFIX, value_name = "PATH")]
     path: Option<PathBuf>,
 
-    /// Command to run inside the summoned volume.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<OsString>,
 }
@@ -107,13 +122,14 @@ struct UpArgs {
 #[derive(Debug, Parser)]
 #[command(name = "clawfs mount", about = "Mount a named ClawFS volume via FUSE")]
 struct MountArgs {
-    /// Logical volume name; auto-created if it does not exist.
     #[arg(long, default_value = DEFAULT_VOLUME)]
     volume: String,
 
-    /// Mount path, relative to the current working directory by default.
     #[arg(long, value_name = "PATH")]
     path: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false)]
+    foreground: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -122,11 +138,9 @@ struct MountArgs {
     about = "Serve a named ClawFS volume over user-mode NFS"
 )]
 struct ServeArgs {
-    /// Logical volume name; auto-created if it does not exist.
     #[arg(long, default_value = DEFAULT_VOLUME)]
     volume: String,
 
-    /// Address for the NFS server to bind to.
     #[arg(long, default_value = "127.0.0.1:2049")]
     listen: String,
 }
@@ -205,8 +219,8 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
         "mount" => {
             let parse_args = subcommand_args("clawfs mount", args);
             let mount = MountArgs::parse_from(parse_args);
-            let config = build_mount_config(mount)?;
-            Ok(DispatchAction::Mount(Box::new(config)))
+            let invocation = build_mount_invocation(mount)?;
+            Ok(DispatchAction::Mount(Box::new(invocation)))
         }
         "serve" => {
             let parse_args = subcommand_args("clawfs serve", args);
@@ -245,18 +259,45 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             println!("Remove the stored ClawFS auth profile from the local config directory.");
             Ok(DispatchAction::Handled)
         }
+        "help" | "--help" | "-h" => {
+            print_general_help();
+            Ok(DispatchAction::Handled)
+        }
         _ => Ok(DispatchAction::FallThrough),
     }
 }
 
-fn build_mount_config(args: MountArgs) -> Result<Config> {
+pub fn print_general_help() {
+    println!("ClawFS customer CLI");
+    println!();
+    println!("Commands:");
+    println!("  clawfs login");
+    println!("  clawfs logout");
+    println!("  clawfs whoami");
+    println!("  clawfs up -- [command...]");
+    println!("  clawfs mount");
+    println!("  clawfs serve");
+    println!();
+    println!("Manual object-store configuration moved to `clawfsd`.");
+}
+
+pub fn manual_cli_hint(args: &[OsString]) -> Option<&'static str> {
+    let first = args.get(1)?.to_str()?;
+    if first.starts_with("--") {
+        return Some("manual storage configuration moved to `clawfsd`");
+    }
+    None
+}
+
+fn build_mount_invocation(args: MountArgs) -> Result<HostedMountInvocation> {
     let volume_paths = volume_paths(&args.volume)?;
     volume_paths.ensure_dirs()?;
     let mount_path = resolve_mount_path(args.path)?;
     fs::create_dir_all(&mount_path)
         .with_context(|| format!("creating mount path {}", mount_path.display()))?;
 
-    let cli = Cli::parse_from([
+    let hosted = resolve_hosted_volume(&args.volume)?;
+    let mut cli_args = vec![
         OsString::from("clawfs"),
         OsString::from("--mount-path"),
         mount_path.as_os_str().to_os_string(),
@@ -266,10 +307,24 @@ fn build_mount_config(args: MountArgs) -> Result<Config> {
         volume_paths.cache_path.as_os_str().to_os_string(),
         OsString::from("--state-path"),
         volume_paths.mount_state_path.as_os_str().to_os_string(),
-        OsString::from("--foreground"),
-    ]);
+    ];
+    append_hosted_storage_args(&mut cli_args, &hosted.config);
+    if args.foreground {
+        cli_args.push(OsString::from("--foreground"));
+    }
+    let cli = Cli::parse_from(cli_args);
 
-    Ok(cli.into())
+    Ok(HostedMountInvocation {
+        config: cli.into(),
+        hosted: HostedControlPlane {
+            api_url: hosted.api_base_url,
+            api_token: hosted.api_token,
+            volume_slug: hosted.volume_slug,
+            access_key_id: hosted.config.access_key_id,
+            secret_access_key: hosted.config.secret_access_key,
+            storage_mode: hosted.config.storage_mode,
+        },
+    })
 }
 
 fn run_up(args: UpArgs) -> Result<()> {
@@ -277,26 +332,7 @@ fn run_up(args: UpArgs) -> Result<()> {
     volume_paths.ensure_dirs()?;
     let prefix_path = resolve_prefix_path(args.path)?;
     let preload_lib = resolve_preload_library()?;
-
-    // Get API base URL from env var or use default
-    let api_base_url = env::var(CLAWFS_API_ENV)
-        .or_else(|_| env::var(API_BASE_URL_ENV))
-        .unwrap_or_else(|_| DEFAULT_CLAWFS_APP_URL.to_string());
-
-    // Get API token
-    let api_token = if let Ok(token) = env::var("CLAWFS_API_TOKEN") {
-        token
-    } else if let Some(profile) = load_profile()? {
-        profile.api_token
-    } else {
-        bail!("No API token found. Run `clawfs login` first or set CLAWFS_API_TOKEN");
-    };
-
-    // Fetch summon configuration from the API
-    let config = tokio::runtime::Runtime::new()
-        .context("failed to create async runtime")?
-        .block_on(fetch_summon_config(&api_base_url, &api_token, &args.volume))
-        .context("failed to fetch summon configuration")?;
+    let hosted = resolve_hosted_volume(&args.volume)?;
 
     let mut command = Command::new(&args.command[0]);
     command.args(args.command.iter().skip(1));
@@ -317,37 +353,32 @@ fn run_up(args: UpArgs) -> Result<()> {
     command.env("CLAWFS_LOCAL_CACHE_PATH", &volume_paths.cache_path);
     command.env("CLAWFS_STATE_PATH", &volume_paths.preload_state_path);
     command.env("CLAWFS_VOLUME", sanitize_volume_name(&args.volume)?);
-
-    // Set object provider from API config
-    let provider = match config.provider.as_str() {
-        "s3" | "aws" => "aws",
-        "gcs" | "gcp" | "google" => "gcs",
-        _ => "local",
-    };
-    command.env("CLAWFS_OBJECT_PROVIDER", provider);
-    command.env("CLAWFS_BUCKET", &config.bucket);
-    if let Some(region) = config.region {
+    command.env(
+        "CLAWFS_OBJECT_PROVIDER",
+        object_provider_name(hosted.config.provider),
+    );
+    command.env("CLAWFS_BUCKET", &hosted.config.bucket);
+    if let Some(region) = hosted.config.region {
         command.env("CLAWFS_REGION", region);
     }
-    if let Some(endpoint) = config.endpoint {
+    if let Some(endpoint) = hosted.config.endpoint {
         command.env("CLAWFS_ENDPOINT", endpoint);
     }
-    if let Some(access_key_id) = config.access_key_id {
+    if let Some(access_key_id) = hosted.config.access_key_id {
         command.env("AWS_ACCESS_KEY_ID", access_key_id);
     }
-    if let Some(secret_access_key) = config.secret_access_key {
+    if let Some(secret_access_key) = hosted.config.secret_access_key {
         command.env("AWS_SECRET_ACCESS_KEY", secret_access_key);
     }
-    if let Some(object_prefix) = config.object_prefix {
+    if let Some(object_prefix) = hosted.config.object_prefix {
         command.env("CLAWFS_OBJECT_PREFIX", object_prefix);
     }
 
-    // Set storage mode from API config
-    let storage_mode = config.storage_mode.as_deref().unwrap_or("byob_paid");
-    command.env("CLAWFS_STORAGE_MODE", storage_mode);
-
-    // Always set the API token for the child process
-    command.env("CLAWFS_API_TOKEN", api_token);
+    command.env(
+        STORAGE_MODE_ENV,
+        hosted.config.storage_mode.as_deref().unwrap_or("byob_paid"),
+    );
+    command.env("CLAWFS_API_TOKEN", hosted.api_token);
 
     Err(command.exec().into())
 }
@@ -356,6 +387,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     let volume_paths = volume_paths(&args.volume)?;
     volume_paths.ensure_dirs()?;
     let gateway = resolve_gateway_binary()?;
+    let hosted = resolve_hosted_volume(&args.volume)?;
 
     let mut command = Command::new(gateway);
     command
@@ -370,9 +402,104 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .arg("--listen")
         .arg(&args.listen)
         .arg("--protocol")
-        .arg("v3");
+        .arg("v3")
+        .arg("--object-provider")
+        .arg(object_provider_name(hosted.config.provider))
+        .arg("--bucket")
+        .arg(&hosted.config.bucket);
+    if let Some(region) = hosted.config.region {
+        command.arg("--region").arg(region);
+    }
+    if let Some(endpoint) = hosted.config.endpoint {
+        command.arg("--endpoint").arg(endpoint);
+    }
+    if let Some(object_prefix) = hosted.config.object_prefix {
+        command.arg("--object-prefix").arg(object_prefix);
+    }
+    if let Some(access_key_id) = hosted.config.access_key_id {
+        command.env("AWS_ACCESS_KEY_ID", access_key_id);
+    }
+    if let Some(secret_access_key) = hosted.config.secret_access_key {
+        command.env("AWS_SECRET_ACCESS_KEY", secret_access_key);
+    }
 
     Err(command.exec().into())
+}
+
+fn resolve_hosted_volume(volume: &str) -> Result<HostedVolume> {
+    let api_base_url = resolve_api_base_url();
+    let api_token = resolve_api_token()?;
+    let summon = tokio::runtime::Runtime::new()
+        .context("failed to create async runtime")?
+        .block_on(fetch_summon_config(&api_base_url, &api_token, volume))
+        .context("failed to fetch summon configuration")?;
+
+    Ok(HostedVolume {
+        api_base_url,
+        api_token,
+        volume_slug: sanitize_volume_name(volume)?,
+        config: HostedVolumeConfig {
+            provider: provider_from_api(&summon.provider),
+            bucket: summon.bucket,
+            region: summon.region,
+            endpoint: summon.endpoint,
+            access_key_id: summon.access_key_id,
+            secret_access_key: summon.secret_access_key,
+            storage_mode: summon.storage_mode,
+            object_prefix: summon.object_prefix,
+        },
+    })
+}
+
+fn resolve_api_base_url() -> String {
+    env::var(CLAWFS_API_ENV)
+        .or_else(|_| env::var(API_BASE_URL_ENV))
+        .unwrap_or_else(|_| DEFAULT_CLAWFS_APP_URL.to_string())
+}
+
+fn resolve_api_token() -> Result<String> {
+    if let Ok(token) = env::var("CLAWFS_API_TOKEN") {
+        return Ok(token);
+    }
+    if let Some(profile) = load_profile()? {
+        return Ok(profile.api_token);
+    }
+    bail!("No API token found. Run `clawfs login` first or set CLAWFS_API_TOKEN");
+}
+
+fn provider_from_api(provider: &str) -> ObjectStoreProvider {
+    match provider {
+        "s3" | "aws" => ObjectStoreProvider::Aws,
+        "gcs" | "gcp" | "google" => ObjectStoreProvider::Gcs,
+        _ => ObjectStoreProvider::Local,
+    }
+}
+
+fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolumeConfig) {
+    args.push(OsString::from("--object-provider"));
+    args.push(OsString::from(object_provider_name(hosted.provider)));
+    args.push(OsString::from("--bucket"));
+    args.push(OsString::from(hosted.bucket.clone()));
+    if let Some(region) = &hosted.region {
+        args.push(OsString::from("--region"));
+        args.push(OsString::from(region));
+    }
+    if let Some(endpoint) = &hosted.endpoint {
+        args.push(OsString::from("--endpoint"));
+        args.push(OsString::from(endpoint));
+    }
+    if let Some(object_prefix) = &hosted.object_prefix {
+        args.push(OsString::from("--object-prefix"));
+        args.push(OsString::from(object_prefix));
+    }
+}
+
+fn object_provider_name(provider: ObjectStoreProvider) -> &'static str {
+    match provider {
+        ObjectStoreProvider::Local => "local",
+        ObjectStoreProvider::Aws => "aws",
+        ObjectStoreProvider::Gcs => "gcs",
+    }
 }
 
 fn print_whoami(args: WhoamiArgs) -> Result<()> {
@@ -438,7 +565,7 @@ fn resolve_mount_path(path: Option<PathBuf>) -> Result<PathBuf> {
     let resolved = match path {
         Some(path) if path.is_absolute() => path,
         Some(path) => cwd.join(path),
-        None => cwd.join(".clawfs"),
+        None => cwd.join(DEFAULT_PREFIX),
     };
     Ok(resolved)
 }
@@ -517,7 +644,12 @@ fn format_candidates(candidates: &[PathBuf]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_mount_path, resolve_prefix_path, sanitize_volume_name};
+    use super::{
+        manual_cli_hint, object_provider_name, provider_from_api, resolve_mount_path,
+        resolve_prefix_path, sanitize_volume_name,
+    };
+    use crate::config::ObjectStoreProvider;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     #[test]
@@ -542,9 +674,29 @@ mod tests {
     }
 
     #[test]
-    fn default_mount_path_is_hidden_dir_in_cwd() {
+    fn default_mount_path_matches_default_prefix() {
         let cwd = std::env::current_dir().expect("cwd");
         let path = resolve_mount_path(None).expect("path");
-        assert_eq!(path, cwd.join(".clawfs"));
+        assert_eq!(path, cwd.join("clawfs"));
+    }
+
+    #[test]
+    fn manual_cli_hint_catches_top_level_flags() {
+        let args = vec![
+            OsString::from("clawfs"),
+            OsString::from("--object-provider"),
+        ];
+        assert_eq!(
+            manual_cli_hint(&args),
+            Some("manual storage configuration moved to `clawfsd`")
+        );
+    }
+
+    #[test]
+    fn provider_aliases_map_to_supported_providers() {
+        assert_eq!(provider_from_api("aws"), ObjectStoreProvider::Aws);
+        assert_eq!(provider_from_api("gcp"), ObjectStoreProvider::Gcs);
+        assert_eq!(provider_from_api("unknown"), ObjectStoreProvider::Local);
+        assert_eq!(object_provider_name(ObjectStoreProvider::Aws), "aws");
     }
 }

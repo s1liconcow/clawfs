@@ -37,7 +37,7 @@ osage_require_path() {
 }
 
 osage_ensure_release_binary() {
-  local osage_bin=${1:-"$ROOT_DIR/target/release/clawfs"}
+  local osage_bin=${1:-"$ROOT_DIR/target/release/clawfsd"}
   local needs_build=0
 
   if [[ ! -x "$osage_bin" ]]; then
@@ -49,8 +49,8 @@ osage_ensure_release_binary() {
   fi
 
   if [[ $needs_build -eq 1 ]]; then
-    echo "Building clawfs --release ..."
-    (cd "$ROOT_DIR" && cargo build --release --bin clawfs)
+    echo "Building clawfsd --release ..."
+    (cd "$ROOT_DIR" && cargo build --release --bin clawfsd)
   fi
 }
 

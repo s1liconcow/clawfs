@@ -350,6 +350,7 @@ pub fn dispatch_symlink(rt: &ClawfsRuntime, target: &str, link_inner: &str) -> R
     }
     rt.fs
         .nfs_symlink(parent_ino, &basename, target.as_bytes().to_vec(), uid, gid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -371,11 +372,11 @@ pub fn dispatch_chdir(rt: &ClawfsRuntime, full_path: &str, inner: &str) -> Resul
     Ok(())
 }
 
-/// Dispatch `readdir` via nfs_readdir, caching results in the FdEntry.
+/// Dispatch `readdir` via nfs_readdir_plus, caching results (with d_type) in the FdEntry.
 pub fn dispatch_readdir_fill(rt: &ClawfsRuntime, entry: &FdEntry) -> Result<(), i32> {
     let mut dir = entry.dir_entries.lock();
     if dir.is_none() {
-        let entries = rt.fs.nfs_readdir(entry.inode)?;
+        let entries = rt.fs.nfs_readdir_plus(entry.inode)?;
         *dir = Some((entries, 0));
     }
     Ok(())

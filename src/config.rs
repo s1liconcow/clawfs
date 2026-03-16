@@ -2,13 +2,16 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, ValueEnum};
 
+/// Default directory name for the FUSE mount point (relative to cwd).
+pub const DEFAULT_MOUNT_DIR: &str = "clawfs-mnt";
+
 /// CLI configuration for launching ClawFS.
 #[derive(Parser, Debug)]
 #[command(name = "clawfs", version, about = "ClawFS FUSE client")]
 pub struct Cli {
     /// Path where the FUSE filesystem should be mounted.
     #[arg(long, value_name = "PATH")]
-    pub mount_path: PathBuf,
+    pub mount_path: Option<PathBuf>,
 
     /// Path on the local filesystem that stands in for the S3-like bucket (local provider only).
     #[arg(long, value_name = "PATH")]
@@ -322,7 +325,11 @@ impl From<Cli> for Config {
         };
 
         Config {
-            mount_path: cli.mount_path,
+            mount_path: cli.mount_path.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(DEFAULT_MOUNT_DIR)
+            }),
             store_path,
             local_cache_path,
             log_storage_io: cli.log_storage_io,

@@ -37,7 +37,7 @@ SOURCE_AWS_ALLOW_HTTP="${SOURCE_AWS_ALLOW_HTTP:-0}"
 SOURCE_AWS_FORCE_PATH_STYLE="${SOURCE_AWS_FORCE_PATH_STYLE:-0}"
 
 osage_ensure_release_binary
-OSAGE_BIN="$ROOT_DIR/target/release/clawfs"
+OSAGE_BIN="$ROOT_DIR/target/release/clawfsd"
 osage_require_path "$OSAGE_BIN"
 
 mkdir -p "$MOUNT_PATH" "$STORE_PATH" "$LOCAL_CACHE_PATH" "$(dirname "$STATE_PATH")"

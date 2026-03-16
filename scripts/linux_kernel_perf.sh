@@ -6,7 +6,7 @@ source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
 TARGET_DIR="$ROOT_DIR/target/release"
-OSAGE_BIN="$TARGET_DIR/clawfs"
+OSAGE_BIN="$TARGET_DIR/clawfsd"
 
 CACHE_DIR="${LINUX_CACHE:-$HOME/.cache/linux-tarballs}"
 LOG_FILE="${LOG_FILE:-$ROOT_DIR/linux_build_timings.log}"

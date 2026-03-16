@@ -35,7 +35,43 @@ impl OsageFs {
             "readdir",
             replay,
             result.as_ref().err().copied(),
-            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |entries| entries.len()) }),
+            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e| e.len()) }),
+        );
+        result
+    }
+
+    /// Like `nfs_readdir` but includes `d_type` (DT_* constant) for each entry.
+    /// Uses the FUSE readdir path which batch-loads inodes to determine file types.
+    pub fn nfs_readdir_plus(&self, ino: u64) -> std::result::Result<Vec<(u64, u8, String)>, i32> {
+        use fuser::FileType;
+
+        let replay = self.replay_start();
+        let result = self.op_readdir_fuse(ino).map(|entries| {
+            entries
+                .into_iter()
+                // Filter out "." and ".." — the preload layer cannot resolve ".."
+                // above the volume root, and the old nfs_readdir never included them.
+                .filter(|(_, _, name)| name != "." && name != "..")
+                .map(|(ino, ft, name)| {
+                    let dt = match ft {
+                        FileType::RegularFile => libc::DT_REG,
+                        FileType::Directory => libc::DT_DIR,
+                        FileType::Symlink => libc::DT_LNK,
+                        FileType::BlockDevice => libc::DT_BLK,
+                        FileType::CharDevice => libc::DT_CHR,
+                        FileType::NamedPipe => libc::DT_FIFO,
+                        FileType::Socket => libc::DT_SOCK,
+                    };
+                    (ino, dt, name)
+                })
+                .collect()
+        });
+        self.log_replay(
+            "nfs",
+            "readdir_plus",
+            replay,
+            result.as_ref().err().copied(),
+            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e: &Vec<(u64, u8, String)>| e.len()) }),
         );
         result
     }
