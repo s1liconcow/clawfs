@@ -2264,12 +2264,17 @@ pub unsafe extern "C" fn chdir(path: *const libc::c_char) -> i32 {
                         .full_path(&inner)
                         .unwrap_or_else(|| path_str.to_string());
                     return match dispatch::dispatch_chdir(rt, &full, &inner) {
-                        Ok(()) => 0,
+                        Ok(()) => {
+                            // Propagate virtual CWD to child processes via env var.
+                            std::env::set_var("CLAWFS_VIRTUAL_CWD", format!("{}\n{}", full, inner));
+                            0
+                        }
                         Err(e) => set_errno(e) as i32,
                     };
                 }
                 // Changing to a host path — reset virtual cwd.
                 rt.cwd.set_host();
+                std::env::remove_var("CLAWFS_VIRTUAL_CWD");
             }
         }
     }

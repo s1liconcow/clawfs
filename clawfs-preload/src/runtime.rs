@@ -196,6 +196,16 @@ impl ClawfsRuntime {
             libc::pthread_atfork(None, None, Some(post_fork_child));
         }
 
+        // Restore virtual CWD from parent process (propagated via env var across fork+exec).
+        if let Ok(val) = std::env::var("CLAWFS_VIRTUAL_CWD") {
+            if let Some((full, inner)) = val.split_once('\n') {
+                if let Some(rt) = ClawfsRuntime::get() {
+                    let _ = crate::dispatch::dispatch_chdir(rt, full, inner);
+                    log::trace!("restored virtual CWD from env: full={full:?} inner={inner:?}");
+                }
+            }
+        }
+
         log::info!("clawfs-preload: initialized with prefixes={prefixes}");
         Ok(true)
     }
