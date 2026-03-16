@@ -1312,56 +1312,33 @@ fn codec_from_u8(raw: u8) -> Result<InlinePayloadCodec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ObjectStoreProvider};
+    use crate::config::Config;
     use std::path::Path;
     use tempfile::tempdir;
 
     fn build_config(root: &Path) -> Config {
         Config {
-            mount_path: root.join("mnt"),
-            store_path: root.join("data"),
-            local_cache_path: root.join("cache"),
             inline_threshold: 1024,
-            inline_compression: true,
-            inline_encryption_key: None,
-            segment_compression: true,
-            segment_encryption_key: None,
             shard_size: 1024,
             inode_batch: 16,
             segment_batch: 32,
             pending_bytes: 1024 * 1024,
             entry_ttl_secs: 5,
-            object_provider: ObjectStoreProvider::Local,
-            bucket: None,
-            region: None,
-            endpoint: None,
             object_prefix: "test".to_string(),
-            telemetry_object_prefix: None,
-            gcs_service_account: None,
-            aws_allow_http: false,
-            aws_force_path_style: false,
-            source: None,
-            state_path: root.join("state.bin"),
-            foreground: false,
-            allow_other: false,
             home_prefix: "/home".into(),
-            perf_log: None,
-            replay_log: None,
-            disable_journal: false,
-            fsync_on_close: false,
             flush_interval_ms: 0,
-            disable_cleanup: false,
             lookup_cache_ttl_ms: 0,
             dir_cache_ttl_ms: 0,
             metadata_poll_interval_ms: 0,
             segment_cache_bytes: 0,
-            log_file: None,
-            debug_log: false,
             imap_delta_batch: 32,
-            writeback_cache: false,
             fuse_threads: 0,
-            fuse_fsname: "clawfs".into(),
-            log_storage_io: false,
+            ..Config::with_paths(
+                root.join("mnt"),
+                root.join("data"),
+                root.join("cache"),
+                root.join("state.bin"),
+            )
         }
     }
 

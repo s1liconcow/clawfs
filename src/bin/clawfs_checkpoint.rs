@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use tokio::runtime::Handle;
 
 use clawfs::checkpoint::{create_checkpoint, restore_checkpoint};
-use clawfs::config::{Config, ObjectStoreProvider};
+use clawfs::config::Config;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -88,49 +88,27 @@ async fn main() -> Result<()> {
 
 fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> Config {
     Config {
-        mount_path: PathBuf::from("/tmp/clawfs_checkpoint_mnt"),
-        store_path,
-        local_cache_path: PathBuf::from("/tmp/clawfs_checkpoint_cache"),
         log_storage_io,
         inline_threshold: 4096,
-        inline_compression: true,
-        inline_encryption_key: None,
-        segment_compression: true,
-        segment_encryption_key: None,
         shard_size,
         inode_batch: 128,
         segment_batch: 128,
         pending_bytes: 1024 * 1024,
         entry_ttl_secs: 10,
-        home_prefix: "/home".to_string(),
-        object_provider: ObjectStoreProvider::Local,
-        bucket: None,
-        region: None,
-        endpoint: None,
-        object_prefix: String::new(),
-        telemetry_object_prefix: None,
-        gcs_service_account: None,
-        aws_allow_http: false,
-        aws_force_path_style: false,
-        source: None,
-        state_path: PathBuf::from("/tmp/clawfs_checkpoint_state"),
-        perf_log: None,
-        replay_log: None,
         disable_journal: true,
-        fsync_on_close: false,
         flush_interval_ms: 0,
         disable_cleanup: true,
         lookup_cache_ttl_ms: 0,
         dir_cache_ttl_ms: 0,
         metadata_poll_interval_ms: 0,
         segment_cache_bytes: 0,
-        foreground: false,
-        allow_other: false,
-        log_file: None,
-        debug_log: false,
         imap_delta_batch: 32,
-        writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "clawfs".to_string(),
+        ..Config::with_paths(
+            PathBuf::from("/tmp/clawfs_checkpoint_mnt"),
+            store_path,
+            PathBuf::from("/tmp/clawfs_checkpoint_cache"),
+            PathBuf::from("/tmp/clawfs_checkpoint_state"),
+        )
     }
 }

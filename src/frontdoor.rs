@@ -135,6 +135,8 @@ pub enum DispatchAction {
     Mount(Box<HostedMountInvocation>),
 }
 
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "clawfs up",
@@ -212,6 +214,10 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
     };
 
     match command {
+        "version" | "--version" | "-V" => {
+            print_version();
+            Ok(DispatchAction::Handled)
+        }
         "login" => {
             let parse_args = subcommand_args("clawfs login", args);
             let login = LoginArgs::parse_from(parse_args);
@@ -293,6 +299,10 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             println!();
             Ok(DispatchAction::Handled)
         }
+        "help" if args.get(2).and_then(|value| value.to_str()) == Some("version") => {
+            print_version_help();
+            Ok(DispatchAction::Handled)
+        }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("logout") => {
             println!("Usage: clawfs logout");
             println!();
@@ -318,8 +328,19 @@ pub fn print_general_help() {
     println!("  clawfs up -- [command...]");
     println!("  clawfs mount");
     println!("  clawfs serve");
+    println!("  clawfs version");
     println!();
     println!("Manual object-store configuration moved to `clawfsd`.");
+}
+
+fn print_version() {
+    println!("clawfs {CLI_VERSION}");
+}
+
+fn print_version_help() {
+    println!("Usage: clawfs version");
+    println!();
+    println!("Print the installed ClawFS CLI version.");
 }
 
 pub fn manual_cli_hint(args: &[OsString]) -> Option<&'static str> {
@@ -893,8 +914,8 @@ fn format_candidates(candidates: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        manual_cli_hint, object_provider_name, provider_from_api, resolve_mount_path,
-        resolve_prefix_path, sanitize_volume_name,
+        manual_cli_hint, object_provider_name, print_version, provider_from_api,
+        resolve_mount_path, resolve_prefix_path, sanitize_volume_name,
     };
     use crate::config::ObjectStoreProvider;
     use std::ffi::OsString;
@@ -946,5 +967,12 @@ mod tests {
         assert_eq!(provider_from_api("gcp"), ObjectStoreProvider::Gcs);
         assert_eq!(provider_from_api("unknown"), ObjectStoreProvider::Local);
         assert_eq!(object_provider_name(ObjectStoreProvider::Aws), "aws");
+    }
+
+    #[test]
+    fn version_string_comes_from_package_metadata() {
+        let version_fn: fn() = print_version;
+        let _ = version_fn;
+        assert_eq!(env!("CARGO_PKG_VERSION"), super::CLI_VERSION);
     }
 }

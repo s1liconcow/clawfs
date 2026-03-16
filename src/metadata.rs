@@ -1634,54 +1634,32 @@ mod tests {
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
-    use crate::config::{Config, ObjectStoreProvider};
+    use crate::config::Config;
 
     fn test_config(root: &std::path::Path) -> Config {
         Config {
-            mount_path: root.join("mnt"),
-            store_path: root.join("store"),
-            local_cache_path: root.join("cache"),
             inline_threshold: 512,
-            inline_compression: true,
-            inline_encryption_key: None,
-            segment_compression: true,
-            segment_encryption_key: None,
             shard_size: 64,
             inode_batch: 8,
             segment_batch: 8,
             pending_bytes: 8 * 1024 * 1024,
             entry_ttl_secs: 5,
-            object_provider: ObjectStoreProvider::Local,
-            bucket: None,
-            region: None,
-            endpoint: None,
-            object_prefix: String::new(),
-            telemetry_object_prefix: None,
-            gcs_service_account: None,
-            aws_allow_http: false,
-            aws_force_path_style: false,
-            source: None,
-            state_path: root.join("state.bin"),
-            foreground: false,
-            allow_other: false,
             home_prefix: "/home".into(),
-            perf_log: None,
-            replay_log: None,
             disable_journal: true,
-            fsync_on_close: false,
             flush_interval_ms: 0,
             disable_cleanup: true,
             lookup_cache_ttl_ms: 0,
             dir_cache_ttl_ms: 0,
             metadata_poll_interval_ms: 0,
             segment_cache_bytes: 0,
-            log_file: None,
-            debug_log: false,
             imap_delta_batch: 32,
-            writeback_cache: false,
             fuse_threads: 0,
-            fuse_fsname: "clawfs".into(),
-            log_storage_io: false,
+            ..Config::with_paths(
+                root.join("mnt"),
+                root.join("store"),
+                root.join("cache"),
+                root.join("state.bin"),
+            )
         }
     }
 

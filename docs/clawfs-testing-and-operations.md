@@ -15,6 +15,7 @@
 - `segment_sequential_read_throughput` in `benches/perf_local_criterion.rs` must treat `write_batch` output as a logical extent list sorted by `logical_offset`, not a single pointer, because large payloads are chunked into 4 MiB extents.
 
 ## Script Notes
+- `./ship.sh` bumps the local package version (`minor` by default, or `--major`/`--patch`/explicit `vX.Y.Z`), updates the workspace crate versions plus `Cargo.lock`, commits `release: vX.Y.Z`, tags, and pushes. Run it only from a clean branch you intend to publish.
 - `scripts/fio_workloads.sh` supports `WORKLOADS`, `FAST_REPRO=1`, and `HEAPTRACK=1`. Example: `WORKLOADS=smallfiles_sync FAST_REPRO=1 ./scripts/fio_workloads.sh`.
 - `scripts/micro_workflows.sh` supports `MODE=both`, `BUILD_MODE=check`, and `WORKFLOW_PROFILE=quick|realistic|all`. Common knobs include `SMALLFILE_COUNT=5000`, `DEV_SCAN_TREE_COPIES=8`, and `ETL_ROWS=500000`.
 - `scripts/run_clawfs.sh` auto-rebuilds when source files are newer. It defaults `PERF_LOG_PATH=$ROOT/clawfs-perf.jsonl`; set `PERF_LOG_PATH=` to disable logging.

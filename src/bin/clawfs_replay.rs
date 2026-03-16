@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
-use clawfs::config::{Config, ObjectStoreProvider};
+use clawfs::config::Config;
 use clawfs::fs::OsageFs;
 use clawfs::inode::{InodeRecord, ROOT_INODE};
 use clawfs::journal::JournalManager;
@@ -418,34 +418,10 @@ fn build_config(
     state_path: &Path,
 ) -> Config {
     Config {
-        mount_path: PathBuf::from("/tmp/clawfs-replay-unused-mount"),
-        store_path: store_path.to_path_buf(),
-        local_cache_path: cache_path.to_path_buf(),
-        log_storage_io: false,
         inline_threshold: effective.inline_threshold,
-        inline_compression: true,
-        inline_encryption_key: None,
-        segment_compression: true,
-        segment_encryption_key: None,
-        shard_size: 2048,
-        inode_batch: 1280,
-        segment_batch: 2560,
         pending_bytes: effective.pending_bytes,
         home_prefix: effective.home_prefix.clone(),
-        object_provider: ObjectStoreProvider::Local,
-        bucket: None,
-        region: None,
-        endpoint: None,
         entry_ttl_secs: 10,
-        object_prefix: String::new(),
-        telemetry_object_prefix: None,
-        gcs_service_account: None,
-        aws_allow_http: false,
-        aws_force_path_style: false,
-        source: None,
-        state_path: state_path.to_path_buf(),
-        perf_log: None,
-        replay_log: None,
         disable_journal: effective.disable_journal,
         fsync_on_close: effective.fsync_on_close,
         flush_interval_ms: effective.flush_interval_ms,
@@ -455,13 +431,14 @@ fn build_config(
         metadata_poll_interval_ms: effective.metadata_poll_interval_ms,
         segment_cache_bytes: effective.segment_cache_bytes,
         foreground: true,
-        allow_other: false,
-        log_file: None,
-        debug_log: false,
         imap_delta_batch: effective.imap_delta_batch,
-        writeback_cache: false,
         fuse_threads: 0,
-        fuse_fsname: "clawfs".to_string(),
+        ..Config::with_paths(
+            PathBuf::from("/tmp/clawfs-replay-unused-mount"),
+            store_path.to_path_buf(),
+            cache_path.to_path_buf(),
+            state_path.to_path_buf(),
+        )
     }
 }
 

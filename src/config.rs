@@ -276,6 +276,62 @@ pub struct Config {
     pub fuse_fsname: String,
 }
 
+impl Config {
+    pub fn with_paths(
+        mount_path: PathBuf,
+        store_path: PathBuf,
+        local_cache_path: PathBuf,
+        state_path: PathBuf,
+    ) -> Self {
+        Self {
+            mount_path,
+            store_path,
+            local_cache_path,
+            log_storage_io: false,
+            inline_threshold: 32 * 1024,
+            inline_compression: true,
+            inline_encryption_key: None,
+            segment_compression: true,
+            segment_encryption_key: None,
+            shard_size: 2048,
+            inode_batch: 1280,
+            segment_batch: 2560,
+            pending_bytes: 256 * 1024 * 1024,
+            home_prefix: "/home".to_string(),
+            object_provider: ObjectStoreProvider::Local,
+            bucket: None,
+            region: None,
+            endpoint: None,
+            object_prefix: String::new(),
+            telemetry_object_prefix: None,
+            gcs_service_account: None,
+            aws_allow_http: false,
+            aws_force_path_style: false,
+            source: None,
+            state_path,
+            perf_log: None,
+            replay_log: None,
+            disable_journal: false,
+            fsync_on_close: false,
+            flush_interval_ms: 5000,
+            disable_cleanup: false,
+            lookup_cache_ttl_ms: 5000,
+            dir_cache_ttl_ms: 5000,
+            metadata_poll_interval_ms: 2000,
+            segment_cache_bytes: 512 * 1024 * 1024,
+            foreground: false,
+            allow_other: false,
+            log_file: None,
+            debug_log: false,
+            imap_delta_batch: 512,
+            writeback_cache: false,
+            fuse_threads: default_fuse_threads(),
+            entry_ttl_secs: 5,
+            fuse_fsname: "clawfs".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceStoreConfig {
     pub object_provider: ObjectStoreProvider,
@@ -326,13 +382,6 @@ impl From<Cli> for Config {
         };
 
         Config {
-            mount_path: cli.mount_path.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(DEFAULT_MOUNT_DIR)
-            }),
-            store_path,
-            local_cache_path,
             log_storage_io: cli.log_storage_io,
             inline_threshold: cli.inline_threshold,
             inline_compression: cli.inline_compression,
@@ -353,12 +402,10 @@ impl From<Cli> for Config {
             region: cli.region,
             endpoint: cli.endpoint,
             object_prefix: cli.object_prefix,
-            telemetry_object_prefix: None,
             gcs_service_account: cli.gcs_service_account,
             aws_allow_http: cli.aws_allow_http,
             aws_force_path_style: cli.aws_force_path_style,
             source,
-            state_path,
             perf_log: cli.perf_log,
             replay_log: cli.replay_log,
             disable_journal: cli.disable_journal,
@@ -382,6 +429,16 @@ impl From<Cli> for Config {
             } else {
                 cli.fuse_fsname
             },
+            ..Config::with_paths(
+                cli.mount_path.unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(DEFAULT_MOUNT_DIR)
+                }),
+                store_path,
+                local_cache_path,
+                state_path,
+            )
         }
     }
 }

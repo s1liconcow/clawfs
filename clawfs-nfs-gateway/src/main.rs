@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clawfs::clawfs as clawfs_runtime;
 use clawfs::config::{Config, ObjectStoreProvider};
 use clawfs::fs::OsageFs;
@@ -19,7 +19,7 @@ use clawfs::superblock::SuperblockManager;
 use serde_json::json;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::signal;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -55,8 +55,31 @@ Why teams use it:\n\
 \n\
 Enjoy building on ClawFS.\n";
 
+const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser, Debug)]
+#[command(
+    name = "clawfs-nfs-gateway",
+    version,
+    about = "Serve ClawFS over user-mode NFS",
+    disable_help_subcommand = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Print the installed clawfs-nfs-gateway version.
+    Version,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
     /// Mount path (used for local compatibility and state-path defaults).
     #[arg(long, value_name = "PATH", default_value = "/tmp/clawfs-mnt")]
     mount_path: PathBuf,
@@ -153,7 +176,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
 
-    match cli.protocol {
+    if let Some(CliCommand::Version) = cli.command {
+        println!("clawfs-nfs-gateway {GATEWAY_VERSION}");
+        return Ok(());
+    }
+
+    match cli.serve.protocol {
         Protocol::V3 => run_user_mode(cli).await,
         Protocol::V4 => Err(anyhow!(
             "--protocol v4 is available in ClawFS Enterprise builds only"
@@ -167,6 +195,7 @@ fn init_tracing() {
 }
 
 async fn run_user_mode(cli: Cli) -> Result<()> {
+    let cli = cli.serve;
     if cli.use_existing_mount {
         return Err(anyhow!(
             "--use-existing-mount is not supported with --protocol v3; direct mode serves ClawFS without FUSE"
@@ -209,6 +238,7 @@ async fn run_user_mode(cli: Cli) -> Result<()> {
 
 #[allow(dead_code)]
 async fn run_ganesha(cli: Cli) -> Result<()> {
+    let cli = cli.serve;
     if !cli.use_existing_mount {
         return Err(anyhow!(
             "--protocol v4 requires --use-existing-mount because ganesha exports a real POSIX path"
@@ -253,7 +283,7 @@ async fn run_ganesha(cli: Cli) -> Result<()> {
         "launching nfs-ganesha"
     );
 
-    let mut child = Command::new(&bin)
+    let mut child = TokioCommand::new(&bin)
         .arg("-f")
         .arg(config_file.path())
         .arg("-L")
@@ -307,7 +337,7 @@ struct OsageDirectFs {
 }
 
 impl OsageDirectFs {
-    async fn new(cli: &Cli) -> Result<Self> {
+    async fn new(cli: &ServeArgs) -> Result<Self> {
         let config = build_config(cli)?;
         if matches!(config.object_provider, ObjectStoreProvider::Local) {
             std::fs::create_dir_all(&config.store_path)?;
@@ -367,6 +397,8 @@ impl OsageDirectFs {
             client_state,
             None,
             replay_logger,
+            None,
+            None,
         ));
 
         let fs_for_replay = fs.clone();
@@ -790,7 +822,7 @@ impl NFSFileSystem for OsageDirectFs {
     }
 }
 
-fn build_config(cli: &Cli) -> Result<Config> {
+fn build_config(cli: &ServeArgs) -> Result<Config> {
     let config_root = default_user_config_root();
     let state_path = cli
         .state_path
@@ -802,28 +834,14 @@ fn build_config(cli: &Cli) -> Result<Config> {
         .unwrap_or_else(|| config_root.join("cache"));
 
     let mut config = Config {
-        mount_path: cli.mount_path.clone(),
-        store_path: cli.store_path.clone(),
-        local_cache_path,
-        log_storage_io: false,
         inline_threshold: 4 * 1024,
-        inline_compression: true,
-        inline_encryption_key: None,
-        segment_compression: true,
-        segment_encryption_key: None,
-        shard_size: 2048,
-        inode_batch: 1280,
-        segment_batch: 2560,
         pending_bytes: 1024 * 1024 * 1024,
-        home_prefix: "/home".to_string(),
         object_provider: cli.object_provider,
         bucket: cli.bucket.clone(),
         region: cli.region.clone(),
         endpoint: cli.endpoint.clone(),
         object_prefix: cli.object_prefix.clone(),
         gcs_service_account: cli.gcs_service_account.clone(),
-        state_path,
-        perf_log: None,
         replay_log: cli.replay_log.clone(),
         disable_journal: if cli.enable_journal {
             false
@@ -837,19 +855,14 @@ fn build_config(cli: &Cli) -> Result<Config> {
         lookup_cache_ttl_ms: 1_000,
         dir_cache_ttl_ms: 1_000,
         metadata_poll_interval_ms: 1_000,
-        segment_cache_bytes: 512 * 1024 * 1024,
         foreground: true,
-        log_file: None,
-        debug_log: false,
-        imap_delta_batch: 512,
-        writeback_cache: false,
         fuse_threads: 0,
-        allow_other: false,
-        aws_allow_http: false,
-        aws_force_path_style: false,
-        source: None,
-        entry_ttl_secs: 5,
-        fuse_fsname: "clawfs".to_string(),
+        ..Config::with_paths(
+            cli.mount_path.clone(),
+            cli.store_path.clone(),
+            local_cache_path,
+            state_path,
+        )
     };
     clawfs_runtime::apply_env_runtime_spec(&mut config)?;
     Ok(config)

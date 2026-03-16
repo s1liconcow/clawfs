@@ -71,52 +71,20 @@ impl ClawfsRuntime {
             .unwrap_or_else(|_| cache_root.join("cache"));
 
         let mut config = Config {
-            mount_path: PathBuf::from("/clawfs-preload"),
-            store_path: PathBuf::from(&store_path),
-            local_cache_path: local_cache_path.clone(),
-            log_storage_io: false,
-            inline_threshold: 32 * 1024,
-            inline_compression: true,
-            inline_encryption_key: None,
-            segment_compression: true,
-            segment_encryption_key: None,
-            shard_size: 2048,
-            inode_batch: 1280,
-            segment_batch: 2560,
-            pending_bytes: 256 * 1024 * 1024,
-            home_prefix: "/home".to_string(),
-            object_provider: ObjectStoreProvider::Local,
-            bucket: None,
-            region: None,
-            endpoint: None,
-            object_prefix: String::new(),
-            telemetry_object_prefix: None,
-            gcs_service_account: None,
-            aws_allow_http: false,
-            aws_force_path_style: false,
-            source: None,
-            state_path: state_path.clone(),
-            perf_log: None,
-            replay_log: None,
             // Preload sessions are short-lived and often span many processes.
             // Avoid shared journal coordination in the hot path by default.
             disable_journal: true,
-            fsync_on_close: false,
-            flush_interval_ms: 5000,
             disable_cleanup: true,
             lookup_cache_ttl_ms: 1000,
             dir_cache_ttl_ms: 1000,
-            metadata_poll_interval_ms: 2000,
-            segment_cache_bytes: 512 * 1024 * 1024,
             foreground: true,
-            allow_other: false,
-            log_file: None,
-            debug_log: false,
-            imap_delta_batch: 512,
-            writeback_cache: false,
             fuse_threads: 0,
-            entry_ttl_secs: 5,
-            fuse_fsname: "clawfs".to_string(),
+            ..Config::with_paths(
+                PathBuf::from("/clawfs-preload"),
+                PathBuf::from(&store_path),
+                local_cache_path.clone(),
+                state_path.clone(),
+            )
         };
 
         // Apply env-driven runtime spec (storage mode, provider overrides, etc.)

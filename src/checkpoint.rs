@@ -268,56 +268,31 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{create_checkpoint, restore_checkpoint};
-    use crate::config::{Config, ObjectStoreProvider};
+    use crate::config::Config;
     use crate::metadata::MetadataStore;
     use crate::superblock::SuperblockManager;
 
     fn test_config(store_path: PathBuf) -> Config {
         Config {
-            mount_path: PathBuf::from("/tmp/mnt"),
-            store_path,
-            local_cache_path: PathBuf::from("/tmp/cache"),
-            log_storage_io: false,
             inline_threshold: 1024,
-            inline_compression: true,
-            inline_encryption_key: None,
-            segment_compression: true,
-            segment_encryption_key: None,
             shard_size: 1024,
             inode_batch: 128,
             segment_batch: 128,
             pending_bytes: 1024,
             entry_ttl_secs: 5,
-            home_prefix: "/home".to_string(),
-            object_provider: ObjectStoreProvider::Local,
-            bucket: None,
-            region: None,
-            endpoint: None,
-            object_prefix: String::new(),
-            telemetry_object_prefix: None,
-            gcs_service_account: None,
-            aws_allow_http: false,
-            aws_force_path_style: false,
-            source: None,
-            state_path: PathBuf::from("/tmp/state"),
-            perf_log: None,
-            replay_log: None,
-            disable_journal: false,
-            fsync_on_close: false,
             flush_interval_ms: 0,
-            disable_cleanup: false,
             lookup_cache_ttl_ms: 0,
             dir_cache_ttl_ms: 0,
             metadata_poll_interval_ms: 0,
             segment_cache_bytes: 0,
-            foreground: false,
-            allow_other: false,
-            log_file: None,
-            debug_log: false,
             imap_delta_batch: 32,
-            writeback_cache: false,
             fuse_threads: 0,
-            fuse_fsname: "clawfs".to_string(),
+            ..Config::with_paths(
+                PathBuf::from("/tmp/mnt"),
+                store_path,
+                PathBuf::from("/tmp/cache"),
+                PathBuf::from("/tmp/state"),
+            )
         }
     }
 
