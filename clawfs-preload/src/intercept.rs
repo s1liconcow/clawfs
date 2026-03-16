@@ -880,7 +880,17 @@ fn try_classify(rt: &ClawfsRuntime, path: &str) -> Option<String> {
         log::trace!("classify abs {:?} -> {:?}", path, result);
         result
     } else {
-        // Relative path: resolve against the real process cwd first.
+        // Virtual CWD inside ClawFS — resolve relative to it.
+        if let Some((_, inner_cwd, _)) = rt.cwd.get_clawfs() {
+            let raw = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
+            let inner = crate::prefix::normalize_path(&raw)
+                .to_str()
+                .unwrap_or("/")
+                .to_string();
+            log::trace!("classify rel {:?} (virtual cwd) -> {:?}", path, inner);
+            return Some(inner);
+        }
+        // Fall back to real OS CWD.
         let abs = std::env::current_dir().ok()?.join(path);
         let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
         log::trace!("classify rel {:?} (-> {:?}) -> {:?}", path, abs, result);
@@ -908,7 +918,11 @@ fn resolve_at_path(rt: &ClawfsRuntime, dirfd: i32, path: &str) -> Option<String>
     // Relative path with AT_FDCWD: resolve against virtual or real cwd.
     if dirfd == libc::AT_FDCWD {
         if let Some((_, inner_cwd, _)) = rt.cwd.get_clawfs() {
-            let inner = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
+            let raw = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
+            let inner = crate::prefix::normalize_path(&raw)
+                .to_str()
+                .unwrap_or("/")
+                .to_string();
             log::trace!(
                 "resolve_at AT_FDCWD (virtual cwd) {:?} -> {:?}",
                 path,
@@ -2245,7 +2259,11 @@ pub unsafe extern "C" fn chdir(path: *const libc::c_char) -> i32 {
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
                 if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_chdir(rt, &path_str, &inner) {
+                    let full = rt
+                        .prefix_router
+                        .full_path(&inner)
+                        .unwrap_or_else(|| path_str.to_string());
+                    return match dispatch::dispatch_chdir(rt, &full, &inner) {
                         Ok(()) => 0,
                         Err(e) => set_errno(e) as i32,
                     };

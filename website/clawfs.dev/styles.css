@@ -225,6 +225,38 @@ section { margin: 2.8rem 0; }
   margin: 0;
 }
 
+.beta-banner {
+  display: flex;
+  gap: 0.8rem;
+  align-items: flex-start;
+  margin: 1rem 0 1.2rem;
+  padding: 0.95rem 1.05rem;
+  max-width: 50rem;
+  border: 1px solid rgba(182, 58, 33, 0.28);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(182, 58, 33, 0.12), rgba(240, 190, 90, 0.2));
+  color: var(--accent-4);
+  box-shadow: 0 14px 32px rgba(67, 35, 26, 0.08);
+}
+
+.beta-banner strong {
+  flex: 0 0 auto;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(67, 35, 26, 0.92);
+  color: #fff8ef;
+}
+
+.beta-banner span {
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+
 h1, h2, h3 { margin: 0; line-height: 1.08; }
 h1 { font-size: clamp(2.1rem, 5.2vw, 4.3rem); margin-top: 0.7rem; }
 h2 { font-size: clamp(1.45rem, 3.2vw, 2.4rem); }
@@ -613,4 +645,8 @@ h1, h2 { letter-spacing: -0.03em; }
   .hero { padding: 1.35rem; }
   .site-header { padding-top: 0.8rem; }
   .brand { letter-spacing: 0.04em; }
+  .beta-banner {
+    flex-direction: column;
+    gap: 0.55rem;
+  }
 }

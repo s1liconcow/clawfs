@@ -73,7 +73,7 @@ impl PrefixRouter {
 }
 
 /// Normalize a path: resolve `.` and `..` lexically, collapse repeated `/`.
-fn normalize_path(path: &str) -> PathBuf {
+pub fn normalize_path(path: &str) -> PathBuf {
     let mut result = PathBuf::new();
     let p = PathBuf::from(path);
     for component in p.components() {
