@@ -1,7 +1,125 @@
 // demo.js — Interactive demo controller for ClawFS website
-// Loads ClawFS WASM (compiled from clawfs-wasm-demo/) and drives the three tab demos.
+// Loads ClawFS WASM (compiled from clawfs-wasm-demo/) when present and falls
+// back to a local simulator when the generated bundle is not available.
 
-import init, { compute_storage, FsDemo } from "./wasm/clawfs_wasm_demo.js";
+function estimateCompression(data) {
+  const bytes = new TextEncoder().encode(data).length;
+  if (bytes === 0) {
+    return { original_bytes: 0, stored_bytes: 0, ratio: 1, codec: "Raw" };
+  }
+
+  const unique = new Set(data).size;
+  const repetition = Math.max(0, 1 - unique / Math.min(data.length || 1, 64));
+  const looksStructured = /[\{\}\[\]\":,_\n]/.test(data);
+  const compressibility = Math.min(0.45, repetition * 0.35 + (looksStructured ? 0.18 : 0));
+  const stored = Math.max(32, Math.round(bytes * (1 - compressibility)));
+  const codec = stored < bytes ? "LZ4" : "Raw";
+
+  return {
+    original_bytes: bytes,
+    stored_bytes: codec === "LZ4" ? stored : bytes,
+    ratio: codec === "LZ4" ? stored / bytes : 1,
+    codec,
+  };
+}
+
+function fallbackComputeStorage(content) {
+  return JSON.stringify(estimateCompression(content));
+}
+
+class FallbackFsDemo {
+  constructor() {
+    this.files = [];
+    this.checkpoints = [];
+    this._generation = 0;
+  }
+
+  add_file(path, content, now_ms) {
+    const stats = estimateCompression(content);
+    this.files = this.files.filter((f) => f.path !== path);
+    this.files.push({
+      path,
+      original_bytes: stats.original_bytes,
+      stored_bytes: stats.stored_bytes,
+      codec: stats.codec,
+      mtime_ms: now_ms,
+    });
+    return stats.stored_bytes;
+  }
+
+  add_file_sized(path, original_bytes, compressible, now_ms) {
+    const stored_bytes = compressible ? Math.round(original_bytes * 0.55) : original_bytes;
+    this.files = this.files.filter((f) => f.path !== path);
+    this.files.push({
+      path,
+      original_bytes,
+      stored_bytes,
+      codec: compressible ? "LZ4" : "Raw",
+      mtime_ms: now_ms,
+    });
+  }
+
+  checkpoint(label) {
+    this._generation += 1;
+    this.checkpoints.push({
+      generation: this._generation,
+      label,
+      files: this.files.map((f) => ({ ...f })),
+    });
+    return this._generation;
+  }
+
+  restore(gen) {
+    const cp = this.checkpoints.find((item) => item.generation === gen);
+    if (cp) this.files = cp.files.map((f) => ({ ...f }));
+  }
+
+  clear_files() {
+    this.files = [];
+  }
+
+  reset() {
+    this.files = [];
+    this.checkpoints = [];
+    this._generation = 0;
+  }
+
+  get_tree_json() {
+    return JSON.stringify(this.files);
+  }
+
+  get_checkpoints_json() {
+    return JSON.stringify(
+      this.checkpoints.map((cp) => ({
+        generation: cp.generation,
+        label: cp.label,
+        file_count: cp.files.length,
+        total_original: cp.files.reduce((sum, f) => sum + f.original_bytes, 0),
+        total_stored: cp.files.reduce((sum, f) => sum + f.stored_bytes, 0),
+      }))
+    );
+  }
+
+  get_totals_json() {
+    const total_original = this.files.reduce((sum, f) => sum + f.original_bytes, 0);
+    const total_stored = this.files.reduce((sum, f) => sum + f.stored_bytes, 0);
+    return JSON.stringify({
+      file_count: this.files.length,
+      total_original,
+      total_stored,
+      ratio: total_original === 0 ? 1 : total_stored / total_original,
+    });
+  }
+
+  generation() {
+    return this._generation;
+  }
+
+  free() {}
+}
+
+let compute_storage = fallbackComputeStorage;
+let FsDemo = FallbackFsDemo;
 
 // ─── WASM bootstrap ──────────────────────────────────────────────────────────
 let wasmReady = false;
@@ -10,12 +128,28 @@ async function loadWasm() {
   const status = document.getElementById("wasm-status");
   try {
     status.style.display = "block";
-    await init();
+    const moduleUrl = "./wasm/clawfs_wasm_demo.js";
+    const probe = await fetch(moduleUrl, { method: "GET" });
+    const contentType = probe.headers.get("content-type") || "";
+    if (!probe.ok || !/(javascript|ecmascript|wasm)/i.test(contentType)) {
+      throw new Error(`missing or invalid module asset (${probe.status || "unknown"} ${contentType || "no content-type"})`);
+    }
+    const wasm = await import(moduleUrl);
+    await wasm.default();
+    compute_storage = wasm.compute_storage;
+    FsDemo = wasm.FsDemo;
     wasmReady = true;
     status.style.display = "none";
     initDemos();
   } catch (e) {
-    status.innerHTML = `<span style="color:#e85c5c">⚠ Could not load WebAssembly: ${e.message}. Try a modern browser.</span>`;
+    console.warn("ClawFS demo falling back to JS simulator:", e);
+    wasmReady = false;
+    status.innerHTML =
+      `<span style="color:var(--ink-soft)">Using built-in simulator. Build <code>website/clawfs.dev/wasm/</code> to enable the Rust/WASM demo bundle.</span>`;
+    window.setTimeout(() => {
+      status.style.display = "none";
+    }, 1600);
+    initDemos();
   }
 }
 
@@ -84,7 +218,7 @@ function renderFileTree(files, emptyMsg = "No files.") {
         html += `<div class="entry"><span class="fdir">📁 ${dir}/</span></div>`;
       }
       dirs[dir].forEach((f) => {
-        const fname = f.path.split("/").pop();
+        const fname = dir === "." ? f.path : f.path.slice(dir.length + 1);
         const savedPct =
           f.original_bytes > 0
             ? Math.round((1 - f.stored_bytes / f.original_bytes) * 100)
@@ -103,7 +237,7 @@ function renderFileTree(files, emptyMsg = "No files.") {
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 function initDemos() {
   initColdStart();
-  initCrashRecovery();
+  initRedTeamAudit();
   initPipeline();
 }
 
@@ -312,215 +446,184 @@ function initColdStart() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TAB 2: Crash Recovery
+// TAB 2: Recurring Red Team Audit
 // ══════════════════════════════════════════════════════════════════════════════
 
-const RESEARCH_FILES = [
-  { path: "papers/arxiv_dump.jsonl",        bytes: 48_000_000,  compressible: true },
-  { path: "papers/embeddings_batch_1.npy",  bytes: 180_000_000, compressible: false },
-  { path: "papers/embeddings_batch_2.npy",  bytes: 180_000_000, compressible: false },
-  { path: "analysis/patterns_v1.json",      bytes: 1_200_000,   compressible: true },
-  { path: "analysis/patterns_v2.json",      bytes: 1_800_000,   compressible: true },
-  { path: "analysis/clusters.json",         bytes: 3_400_000,   compressible: true },
-  { path: "workspace/context.md",           bytes: 22_000,      compressible: true },
-  { path: "workspace/scratchpad.md",        bytes: 8_400,       compressible: true },
-  { path: "workspace/agent_state.json",     bytes: 140_000,     compressible: true },
-  { path: "outputs/summary_draft_v1.md",    bytes: 48_000,      compressible: true },
-  { path: "outputs/summary_draft_v2.md",    bytes: 62_000,      compressible: true },
-  { path: "papers/embeddings_batch_3.npy",  bytes: 180_000_000, compressible: false },
-  { path: "analysis/cross_ref.json",        bytes: 4_200_000,   compressible: true },
-  { path: "workspace/iteration_log.jsonl",  bytes: 280_000,     compressible: true },
-  { path: "outputs/final_insights.md",      bytes: 94_000,      compressible: true },
+const REDTEAM_RUNS = [
+  {
+    label: "Baseline audit · week 1",
+    domain: "https://acmebank.example",
+    started_at: "2026-03-01T02:00:00Z",
+    findings: [
+      { id: "RT-101", severity: "high", title: "Admin portal exposed in robots.txt", path: "/robots.txt" },
+      { id: "RT-102", severity: "medium", title: "Missing content-security-policy header", path: "/login" },
+      { id: "RT-103", severity: "medium", title: "Password policy page missing MFA language", path: "/legal/password-policy" },
+      { id: "RT-104", severity: "low", title: "Staging JS bundle references internal hostname", path: "/assets/app.js" },
+    ],
+    artifacts: [
+      { path: "snapshots/week-1/crawl/index.json", bytes: 540_000, compressible: true },
+      { path: "snapshots/week-1/headers/login.json", bytes: 18_000, compressible: true },
+      { path: "findings/week-1/findings.json", bytes: 24_000, compressible: true },
+      { path: "notes/week-1/compliance.md", bytes: 11_000, compressible: true },
+      { path: "diffs/week-1/baseline-summary.md", bytes: 7_000, compressible: true },
+    ],
+    steps: [
+      "$ clawfs mount vol-acme-redteam /workspace",
+      "$ python audit_agent.py --target https://acmebank.example --profile weekly",
+      "  → crawl 842 URLs and normalize route inventory",
+      "  → capture response headers for auth, legal, and account surfaces",
+      "  → diff exposed paths against last approved scope (none yet)",
+      "  → write findings/week-1/findings.json",
+      "  → write notes/week-1/compliance.md",
+    ],
+    diffSummary:
+      "Baseline stored. The agent now has a reusable route inventory, header captures, and a compliance notebook to diff against future deploys.",
+    stats: {
+      routes: 842,
+      findings: 4,
+      compliance: "2 gaps noted",
+      changed: "baseline",
+    },
+    progressLabel: "Baseline audit completed · 5 artifacts committed to the volume",
+  },
+  {
+    label: "Recurring audit · week 2 deploy",
+    domain: "https://acmebank.example",
+    started_at: "2026-03-08T02:00:00Z",
+    findings: [
+      { id: "RT-101", severity: "resolved", title: "robots.txt exposure removed", path: "/robots.txt" },
+      { id: "RT-205", severity: "critical", title: "New /debug/graphql endpoint exposed without auth", path: "/debug/graphql" },
+      { id: "RT-206", severity: "high", title: "Session cookie lost SameSite=strict after deploy", path: "/login" },
+      { id: "RT-207", severity: "medium", title: "Privacy page changed; SOC2 retention statement removed", path: "/legal/privacy" },
+    ],
+    artifacts: [
+      { path: "snapshots/week-2/crawl/index.json", bytes: 566_000, compressible: true },
+      { path: "snapshots/week-2/headers/login.json", bytes: 19_000, compressible: true },
+      { path: "findings/week-2/findings.json", bytes: 29_000, compressible: true },
+      { path: "diffs/week-2/route-diff.json", bytes: 8_000, compressible: true },
+      { path: "reports/week-2/executive-summary.md", bytes: 13_000, compressible: true },
+    ],
+    steps: [
+      "$ clawfs mount vol-acme-redteam /workspace",
+      "$ python audit_agent.py --target https://acmebank.example --profile weekly --resume-history",
+      "  → load previous crawl graph and finding ledger from /workspace",
+      "  → detect 37 new routes and 12 changed headers since week 1",
+      "  → flag /debug/graphql as net-new internet-exposed surface",
+      "  → compare privacy/legal copy against stored compliance notes",
+      "  → write diffs/week-2/route-diff.json and reports/week-2/executive-summary.md",
+    ],
+    diffSummary:
+      "Week 2 diff surfaced one critical new attack surface, one cookie regression, and one compliance drift issue. The agent also marked the old robots.txt finding as resolved because the baseline history was still mounted.",
+    stats: {
+      routes: "842 → 879",
+      findings: "3 open / 1 resolved",
+      compliance: "retention statement drift",
+      changed: "+37 routes",
+    },
+    progressLabel: "Recurring audit completed · old vs new deploy diffed from persistent history",
+  },
 ];
 
-function initCrashRecovery() {
+function initRedTeamAudit() {
   let fsDemo = new FsDemo();
+  let runIndex = 0;
   let running = false;
-  let crashed = false;
-  let currentGen = 0;
-  let fileIdx = 0;
-  let animHandle = null;
 
-  const crashTerm = document.getElementById("crash-term");
-  const crashTree = document.getElementById("crash-filetree");
+  const term = document.getElementById("redteam-term");
+  const tree = document.getElementById("redteam-filetree");
+  const stats = document.getElementById("redteam-stats");
+  const progress = document.getElementById("redteam-progress");
+  const progressLabel = document.getElementById("redteam-progress-label");
+  const diffSummary = document.getElementById("redteam-diff-summary");
+  const genBadge = document.getElementById("redteam-gen-badge");
+  const btnBaseline = document.getElementById("btn-redteam-baseline");
+  const btnRerun = document.getElementById("btn-redteam-rerun");
+  const btnReset = document.getElementById("btn-redteam-reset");
 
-  function renderCrashTree(files) {
-    crashTree.innerHTML = renderFileTree(files, "No files written yet…");
+  function renderTree() {
+    tree.innerHTML = renderFileTree(JSON.parse(fsDemo.get_tree_json()), "No scans stored yet…");
   }
 
-  function updateProgress(count, totalBytes) {
-    const pct = Math.round((count / RESEARCH_FILES.length) * 100);
-    document.getElementById("crash-progress").style.width = pct + "%";
-    document.getElementById("crash-progress-label").textContent =
-      `${count} files written · ${fmtBytes(totalBytes)} accumulated`;
-
+  function renderStats(run) {
     const totals = JSON.parse(fsDemo.get_totals_json());
-    document.getElementById("crash-stats").innerHTML =
-      renderStatBox(count.toString(), "files in volume") +
-      renderStatBox(fmtBytes(totals.total_original), "accumulated") +
-      renderStatBox(fmtBytes(totals.total_stored), "stored (compressed)");
+    stats.innerHTML =
+      renderStatBox(String(run.stats.routes), "routes tracked") +
+      renderStatBox(String(run.stats.findings), "finding status") +
+      renderStatBox(String(run.stats.compliance), "compliance drift") +
+      renderStatBox(fmtBytes(totals.total_stored), "history stored", "green");
   }
 
-  function renderTimeline() {
-    const cps = JSON.parse(fsDemo.get_checkpoints_json());
-    const container = document.getElementById("crash-timeline");
-    container.innerHTML = `<div class="cp-node locked" data-gen="0"><div class="cp-dot">0</div><div class="cp-lbl">start</div></div>`;
-    cps.forEach((cp) => {
-      container.innerHTML += `<span class="cp-arrow">→</span>
-        <div class="cp-node locked" data-gen="${cp.generation}">
-          <div class="cp-dot">G${cp.generation}</div>
-          <div class="cp-lbl">${cp.label}<br>${cp.file_count} files</div>
-        </div>`;
-    });
-  }
-
-  async function runAgent() {
+  async function runAudit(run) {
+    if (running) return;
     running = true;
-    crashed = false;
-    document.getElementById("btn-crash-run").disabled = true;
-    document.getElementById("btn-crash-crash").disabled = false;
+    btnBaseline.disabled = true;
+    btnRerun.disabled = true;
+    progress.style.width = "8%";
 
-    appendLine(crashTerm, `$ clawfs mount vol-research-2025 /workspace`, "prompt");
-    await sleep(200);
-    appendLine(crashTerm, `✓ Mounted at /workspace (gen ${currentGen})`, "ok");
-    await sleep(150);
-    appendLine(crashTerm, `$ python research_agent.py --resume`, "prompt");
-    await sleep(200);
+    appendLine(term, `$ # ${run.label}`, "prompt");
+    await sleep(120);
 
-    const dot = document.getElementById("crash-dot");
-    const workerLabel = document.getElementById("crash-worker-label");
-    dot.className = "dot-green";
-    workerLabel.textContent = "Research Agent — running";
-
-    const now = Date.now();
-
-    while (fileIdx < RESEARCH_FILES.length && !crashed) {
-      const f = RESEARCH_FILES[fileIdx];
-      const content = f.compressible
-        ? JSON.stringify({ file: f.path, data: "x".repeat(Math.min(f.bytes, 2048)) })
-        : new Array(32).fill(0).map(() => Math.random().toString(36)).join("");
-
-      fsDemo.add_file(f.path, content, now + fileIdx * 1000);
-      fileIdx++;
-
-      const fname = f.path.split("/").pop();
-      appendLine(crashTerm, `  → writing ${fname} (${fmtBytes(f.bytes)})`, "dim");
-
-      const files = JSON.parse(fsDemo.get_tree_json());
-      renderCrashTree(files);
-      const totalBytes = files.reduce((s, x) => s + x.original_bytes, 0);
-      updateProgress(fileIdx, totalBytes);
-
-      // Auto-checkpoint every 5 files
-      if (fileIdx % 5 === 0) {
-        const gen = fsDemo.checkpoint(`~${fmtBytes(totalBytes)}`);
-        currentGen = gen;
-        appendLine(crashTerm, `  ✓ checkpoint gen ${gen}`, "ok");
-        renderTimeline();
-      }
-
-      await sleep(350);
+    for (const [idx, step] of run.steps.entries()) {
+      const cls =
+        step.startsWith("$") ? "prompt" :
+        step.includes("flag") ? "err" :
+        step.includes("write") ? "ok" : "dim";
+      appendLine(term, step, cls);
+      progress.style.width = `${Math.round(((idx + 1) / run.steps.length) * 72) + 8}%`;
+      await sleep(180);
     }
 
-    if (!crashed) {
-      appendLine(crashTerm, `✓ Research complete. All outputs written.`, "ok");
-      running = false;
-      document.getElementById("btn-crash-crash").disabled = true;
-      document.getElementById("btn-crash-reset").style.display = "inline-block";
+    const now = Date.parse(run.started_at);
+    for (const artifact of run.artifacts) {
+      fsDemo.add_file_sized(artifact.path, artifact.bytes, artifact.compressible, now);
     }
-  }
 
-  function crash() {
-    crashed = true;
+    const findingsDoc = JSON.stringify({
+      target: run.domain,
+      audited_at: run.started_at,
+      findings: run.findings,
+    });
+    fsDemo.add_file(`history/${run.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.json`, findingsDoc, now + 5000);
+    const gen = fsDemo.checkpoint(run.label);
+
+    renderTree();
+    renderStats(run);
+    diffSummary.textContent = run.diffSummary;
+    progress.style.width = "100%";
+    progressLabel.textContent = run.progressLabel;
+    genBadge.textContent = `gen ${gen} · ${JSON.parse(fsDemo.get_totals_json()).file_count} audit artifacts`;
+
+    appendLine(term, `✓ Saved audit history to /workspace at gen ${gen}`, "ok");
+    appendLine(term, `✓ Findings remain queryable for the next weekly scan`, "accent");
+    appendLine(term, "", "");
+
+    runIndex += 1;
+    btnBaseline.disabled = true;
+    btnRerun.disabled = runIndex >= REDTEAM_RUNS.length;
     running = false;
-    const dot = document.getElementById("crash-dot");
-    const workerLabel = document.getElementById("crash-worker-label");
-    dot.className = "dot-red";
-    workerLabel.textContent = "Research Agent — CRASHED";
-
-    appendLine(crashTerm, ``, "");
-    appendLine(crashTerm, `FATAL: worker preempted by OOM killer`, "err");
-    appendLine(crashTerm, `Process terminated. All in-memory state lost.`, "err");
-    appendLine(crashTerm, ``, "");
-    appendLine(crashTerm, `Without ClawFS: 0 of ${fileIdx} files recoverable.`, "err");
-    appendLine(crashTerm, `With ClawFS:    volume persisted — resume from gen ${currentGen}.`, "ok");
-
-    // Grey out the tree
-    const tree = document.getElementById("crash-filetree");
-    tree.style.opacity = "0.4";
-
-    document.getElementById("btn-crash-crash").disabled = true;
-    document.getElementById("btn-crash-resume").disabled = false;
   }
 
-  async function resume() {
-    document.getElementById("btn-crash-resume").disabled = true;
-
-    const dot = document.getElementById("crash-dot");
-    const workerLabel = document.getElementById("crash-worker-label");
-    dot.className = "dot-yellow";
-    workerLabel.textContent = "Research Agent — resuming…";
-
-    appendLine(crashTerm, ``, "");
-    appendLine(crashTerm, `$ # New worker starting up…`, "prompt");
-    await sleep(300);
-    appendLine(crashTerm, `$ clawfs mount vol-research-2025 /workspace`, "prompt");
-    await sleep(200);
-    appendLine(crashTerm, `✓ Mounted at /workspace — restoring gen ${currentGen}`, "ok");
-    await sleep(150);
-
-    fsDemo.restore(currentGen);
-    const files = JSON.parse(fsDemo.get_tree_json());
-    document.getElementById("crash-filetree").style.opacity = "1";
-    renderCrashTree(files);
-    const totalBytes = files.reduce((s, x) => s + x.original_bytes, 0);
-    fileIdx = files.length;
-    updateProgress(fileIdx, totalBytes);
-
-    appendLine(crashTerm, `✓ ${files.length} files restored from checkpoint (gen ${currentGen})`, "ok");
-    appendLine(crashTerm, `$ python research_agent.py --resume`, "prompt");
-    await sleep(200);
-    appendLine(crashTerm, `  ↩ Resuming from last checkpoint — continuing work…`, "accent");
-
-    dot.className = "dot-green";
-    workerLabel.textContent = "Research Agent — running (resumed)";
-
-    // Continue from where we left off
-    await sleep(400);
-    await runAgent();
-
-    document.getElementById("btn-crash-reset").style.display = "inline-block";
-  }
-
-  function resetCrash() {
-    if (animHandle) clearTimeout(animHandle);
+  function resetRedTeam() {
     fsDemo.free();
     fsDemo = new FsDemo();
+    runIndex = 0;
     running = false;
-    crashed = false;
-    currentGen = 0;
-    fileIdx = 0;
-
-    clearTerm(crashTerm);
-    document.getElementById("crash-dot").className = "dot-yellow";
-    document.getElementById("crash-worker-label").textContent = "Research Agent — idle";
-    document.getElementById("crash-progress").style.width = "0%";
-    document.getElementById("crash-progress-label").textContent = "0 files written · 0 MB accumulated";
-    document.getElementById("crash-stats").innerHTML = "";
-    document.getElementById("crash-filetree").style.opacity = "1";
-    crashTree.innerHTML = `<div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">No files yet…</div>`;
-    document.getElementById("crash-timeline").innerHTML = `
-      <div class="cp-node active" data-gen="0"><div class="cp-dot">0</div><div class="cp-lbl">empty</div></div>`;
-    document.getElementById("btn-crash-run").disabled = false;
-    document.getElementById("btn-crash-crash").disabled = true;
-    document.getElementById("btn-crash-resume").disabled = true;
-    document.getElementById("btn-crash-reset").style.display = "none";
+    clearTerm(term);
+    tree.innerHTML = `<div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">No scans stored yet…</div>`;
+    stats.innerHTML = "";
+    progress.style.width = "0%";
+    progressLabel.textContent = "No scans yet";
+    diffSummary.textContent = "Run the baseline audit to build the first site snapshot and compliance notebook.";
+    genBadge.textContent = "baseline only";
+    btnBaseline.disabled = false;
+    btnRerun.disabled = true;
   }
 
-  document.getElementById("btn-crash-run").addEventListener("click", runAgent);
-  document.getElementById("btn-crash-crash").addEventListener("click", crash);
-  document.getElementById("btn-crash-resume").addEventListener("click", resume);
-  document.getElementById("btn-crash-reset").addEventListener("click", resetCrash);
+  btnBaseline.addEventListener("click", () => runAudit(REDTEAM_RUNS[0]));
+  btnRerun.addEventListener("click", () => {
+    if (runIndex < REDTEAM_RUNS.length) runAudit(REDTEAM_RUNS[runIndex]);
+  });
+  btnReset.addEventListener("click", resetRedTeam);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

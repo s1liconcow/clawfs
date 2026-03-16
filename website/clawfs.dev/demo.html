@@ -6,7 +6,7 @@
     <title>ClawFS | Interactive Demo</title>
     <meta
       name="description"
-      content="See ClawFS in action: eliminate cold starts, survive crashes with checkpoint recovery, and coordinate agents through a shared persistent volume."
+      content="See ClawFS in action: eliminate cold starts, keep a recurring red-team website audit history, and coordinate agents through a shared persistent volume."
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -369,7 +369,7 @@
 
       <div class="tab-bar reveal" data-delay="80">
         <button class="tab-btn active" data-tab="tab-cold">1 · Cold Start Tax</button>
-        <button class="tab-btn" data-tab="tab-crash">2 · Crash Recovery</button>
+        <button class="tab-btn" data-tab="tab-redteam">2 · Stateful Reoccuring Agents</button>
         <button class="tab-btn" data-tab="tab-pipeline">3 · Agent Pipeline</button>
       </div>
 
@@ -419,43 +419,43 @@
       </div>
 
       <!-- ══════════════════════════════════════════════════════════════════
-           TAB 2: Crash Recovery
+           TAB 2: Recurring Red Team
       ══════════════════════════════════════════════════════════════════════ -->
-      <div id="tab-crash" class="tab-panel">
+      <div id="tab-redteam" class="tab-panel">
         <div class="demo-section">
           <p class="eyebrow">Demo 2</p>
-          <h2>Your Agent's Work Shouldn't Vanish When the Worker Does</h2>
-          <p class="sub">Long-running agents accumulate hours of work. When a worker disappears — preemption, OOM, network loss — that work should survive. Watch what happens with and without ClawFS.</p>
+          <h2>Stateful Reoccuring Agents</h2>
+          <p class="sub">A security agent revisits the same customer site every week. It should remember old crawl state, prior findings, compliance notes, and exactly what changed between deploys. ClawFS turns that audit history into a mounted workspace instead of a pile of disconnected reports.</p>
+
+          <div class="volume-badge">
+            <div class="vol-dot"></div>
+            <span>Audit workspace: <strong>vol-acme-redteam</strong></span>
+            <span style="margin-left:auto;opacity:.6" id="redteam-gen-badge">baseline only</span>
+          </div>
 
           <div class="demo-cols">
             <div>
-              <div class="panel-label"><span class="dot-yellow" id="crash-dot"></span><span id="crash-worker-label">Research Agent — running</span></div>
-              <div class="term-box" id="crash-term"></div>
-              <div class="progress-wrap"><div class="progress-bar" id="crash-progress" style="width:0%"></div></div>
-              <div style="font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:var(--ink-soft)" id="crash-progress-label">0 files written · 0 MB accumulated</div>
+              <div class="panel-label"><span class="dot-orange"></span>Audit agent console</div>
+              <div class="term-box" id="redteam-term"></div>
+              <div class="progress-wrap"><div class="progress-bar" id="redteam-progress" style="width:0%"></div></div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:var(--ink-soft)" id="redteam-progress-label">No scans yet</div>
             </div>
             <div>
-              <div class="panel-label"><span class="dot-orange"></span>Volume state (persisted to ClawFS)</div>
-              <div class="file-tree" id="crash-filetree"><div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">No files yet…</div></div>
-              <div class="stat-row" id="crash-stats" style="margin-top:.8rem"></div>
+              <div class="panel-label"><span class="dot-green"></span>Persistent audit history in ClawFS</div>
+              <div class="file-tree" id="redteam-filetree"><div style="color:var(--ink-soft);font-size:.8rem;padding:.5rem">No scans stored yet…</div></div>
+              <div class="stat-row" id="redteam-stats" style="margin-top:.8rem"></div>
             </div>
           </div>
 
           <div class="action-row">
-            <button class="btn-demo primary" id="btn-crash-run">▶ Run Agent</button>
-            <button class="btn-demo danger" id="btn-crash-crash" disabled>☠ Simulate Crash</button>
-            <button class="btn-demo success" id="btn-crash-resume" disabled>↩ Resume from Checkpoint</button>
-            <button class="btn-demo secondary" id="btn-crash-reset" style="display:none">Reset</button>
+            <button class="btn-demo primary" id="btn-redteam-baseline">▶ Run Baseline Audit</button>
+            <button class="btn-demo secondary" id="btn-redteam-rerun" disabled>↻ Audit New Deploy</button>
+            <button class="btn-demo secondary" id="btn-redteam-reset">Reset</button>
           </div>
 
           <div style="margin-top:1.5rem">
-            <div class="panel-label">Checkpoint Timeline</div>
-            <div class="checkpoint-timeline" id="crash-timeline">
-              <div class="cp-node active" data-gen="0">
-                <div class="cp-dot">0</div>
-                <div class="cp-lbl">empty</div>
-              </div>
-            </div>
+            <div class="panel-label">What changed since the last audit</div>
+            <div class="callout" id="redteam-diff-summary">Run the baseline audit to build the first site snapshot and compliance notebook.</div>
           </div>
         </div>
       </div>
@@ -467,7 +467,7 @@
         <div class="demo-section">
           <p class="eyebrow">Demo 3</p>
           <h2>Shared Volumes as the Backbone of Multi-Agent Pipelines</h2>
-          <p class="sub">Four specialized agents cooperate through a single ClawFS volume — no message queues, no handoff APIs. Files written by one agent are immediately visible to the next. The filesystem IS the coordination layer.</p>
+          <p class="sub">Four specialized agents cooperate through a single ClawFS volume, using <code>ionotify</code> on the mount to react to filesystem changes. No message queues, no handoff APIs: one agent writes outputs, the next sees them in the shared workspace and keeps going.</p>
 
           <div class="volume-badge">
             <div class="vol-dot"></div>

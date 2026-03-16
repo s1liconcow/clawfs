@@ -41,3 +41,35 @@ if (matrix) {
     }
   }
 }
+
+const navToggle = document.querySelector(".nav-toggle");
+const siteNav = document.getElementById("site-nav");
+
+if (navToggle && siteNav) {
+  const closeNav = () => {
+    navToggle.setAttribute("aria-expanded", "false");
+    navToggle.setAttribute("aria-label", "Open navigation menu");
+    siteNav.classList.remove("is-open");
+    document.body.classList.remove("nav-open");
+  };
+
+  navToggle.addEventListener("click", () => {
+    const isOpen = navToggle.getAttribute("aria-expanded") === "true";
+    if (isOpen) {
+      closeNav();
+      return;
+    }
+    navToggle.setAttribute("aria-expanded", "true");
+    navToggle.setAttribute("aria-label", "Close navigation menu");
+    siteNav.classList.add("is-open");
+    document.body.classList.add("nav-open");
+  });
+
+  for (const link of siteNav.querySelectorAll("a")) {
+    link.addEventListener("click", closeNav);
+  }
+
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 760) closeNav();
+  });
+}
