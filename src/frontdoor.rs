@@ -1,11 +1,13 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, ValueEnum};
@@ -632,7 +634,7 @@ fn run_up(args: UpArgs) -> Result<()> {
     );
     command.env("CLAWFS_API_TOKEN", hosted.api_token);
 
-    Err(command.exec().into())
+    exec_command(command)
 }
 
 fn run_serve(args: ServeArgs) -> Result<()> {
@@ -675,7 +677,18 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         command.env("AWS_SECRET_ACCESS_KEY", secret_access_key);
     }
 
+    exec_command(command)
+}
+
+#[cfg(unix)]
+fn exec_command(mut command: Command) -> Result<()> {
     Err(command.exec().into())
+}
+
+#[cfg(not(unix))]
+fn exec_command(mut command: Command) -> Result<()> {
+    let status = command.status().context("failed to launch child process")?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn run_compact(args: CompactArgs) -> Result<()> {
