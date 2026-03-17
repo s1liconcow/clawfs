@@ -354,16 +354,31 @@ pub fn dispatch_readlink(rt: &ClawfsRuntime, inner: &str) -> Result<Vec<u8>, i32
     rt.fs.nfs_readlink(target_ino)
 }
 
-/// Dispatch `chdir` for a ClawFS path. Returns true if handled.
-pub fn dispatch_chdir(rt: &ClawfsRuntime, full_path: &str, inner: &str) -> Result<(), i32> {
+/// Dispatch `chdir` for a ClawFS path.
+pub fn dispatch_chdir(
+    rt: &ClawfsRuntime,
+    cwd: &crate::cwd::CwdTracker,
+    full_path: &str,
+    inner: &str,
+) -> Result<(), i32> {
     let (_, target_ino, _) = resolve_path(rt, inner)?;
     let record = rt.fs.nfs_getattr(target_ino)?;
     if !record.is_dir() {
         return Err(libc::ENOTDIR);
     }
-    rt.cwd
-        .set_clawfs(full_path.to_string(), inner.to_string(), target_ino);
+    cwd.set_clawfs(full_path.to_string(), inner.to_string(), target_ino);
     Ok(())
+}
+
+/// Variant used during lazy init to restore virtual CWD.
+pub fn dispatch_chdir_lazy(
+    rt: &ClawfsRuntime,
+    cwd: &crate::cwd::CwdTracker,
+    _prefix_router: &crate::prefix::PrefixRouter,
+    full_path: &str,
+    inner: &str,
+) -> Result<(), i32> {
+    dispatch_chdir(rt, cwd, full_path, inner)
 }
 
 /// Dispatch `readdir` via nfs_readdir_plus, caching results (with d_type) in the FdEntry.

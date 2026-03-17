@@ -9,10 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::{debug, error, info, warn};
-use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::local::LocalFileSystem;
+use log::{debug, info, warn};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectError, ObjectStore, PutPayload};
 use parking_lot::Mutex;
@@ -22,9 +19,8 @@ use uuid::Uuid;
 
 use lru::LruCache;
 
-use crate::clawfs;
 use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
-use crate::config::{Config, ObjectStoreProvider};
+use crate::config::Config;
 use crate::inode::{InlinePayloadCodec, SegmentExtent};
 
 const SEGMENT_MAGIC_V2: &[u8; 4] = b"OSG2";
@@ -1166,84 +1162,11 @@ impl ActiveStage {
 }
 
 pub(crate) fn create_segment_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
-    match config.object_provider {
-        ObjectStoreProvider::Local => {
-            fs::create_dir_all(&config.store_path).with_context(|| {
-                format!("creating segment root {}", config.store_path.display())
-            })?;
-            let store = Arc::new(LocalFileSystem::new_with_prefix(config.store_path.clone())?)
-                as Arc<dyn ObjectStore>;
-            Ok((store, segment_prefix(&config.object_prefix)))
-        }
-        ObjectStoreProvider::Aws => {
-            let bucket = config
-                .bucket
-                .clone()
-                .context("--bucket is required for AWS provider")?;
-
-            let mut builder = AmazonS3Builder::new().with_bucket_name(&bucket);
-
-            let mut region = config
-                .region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string());
-            if region == "auto" {
-                region = "us-east-1".to_string();
-            }
-            builder = builder.with_region(&region);
-
-            if let Some(endpoint) = &config.endpoint {
-                builder = builder.with_endpoint(endpoint);
-                builder = builder.with_metadata_endpoint("http://127.0.0.1:1");
-            }
-
-            if let Some(key) = clawfs::aws_access_key_id() {
-                builder = builder.with_access_key_id(key);
-            }
-            if let Some(secret) = clawfs::aws_secret_access_key() {
-                builder = builder.with_secret_access_key(secret);
-            }
-            if let Some(token) = clawfs::aws_session_token() {
-                builder = builder.with_token(token);
-            }
-
-            if config.aws_allow_http {
-                builder = builder.with_allow_http(true);
-                if clawfs::aws_access_key_id().is_none()
-                    && clawfs::aws_secret_access_key().is_none()
-                {
-                    error!(
-                        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set; using dummy credentials for --aws-allow-http to bypass IMDS"
-                    );
-                    builder = builder
-                        .with_access_key_id("test")
-                        .with_secret_access_key("test");
-                }
-            }
-            if config.aws_force_path_style {
-                builder = builder.with_virtual_hosted_style_request(false);
-            }
-
-            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
-            Ok((store, segment_prefix(&config.object_prefix)))
-        }
-        ObjectStoreProvider::Gcs => {
-            let bucket = config
-                .bucket
-                .clone()
-                .context("--bucket is required for GCS provider")?;
-            let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&bucket);
-            if let Some(sa_path) = &config.gcs_service_account {
-                let creds = sa_path.to_string_lossy().into_owned();
-                builder = builder.with_service_account_path(creds);
-            }
-            let store = Arc::new(builder.build()?) as Arc<dyn ObjectStore>;
-            Ok((store, segment_prefix(&config.object_prefix)))
-        }
-    }
+    let (store, _) = crate::metadata::create_object_store(config)?;
+    Ok((store, segment_prefix(&config.object_prefix)))
 }
 
-fn segment_prefix(user_prefix: &str) -> String {
+pub fn segment_prefix(user_prefix: &str) -> String {
     let trimmed = user_prefix.trim_matches('/');
     if trimmed.is_empty() {
         String::new()

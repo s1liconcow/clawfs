@@ -17,8 +17,19 @@ use crate::cwd::CwdTracker;
 use crate::fd_table::FdTable;
 use crate::prefix::PrefixRouter;
 
-/// Global singleton holding the bootstrapped ClawFS runtime.
-static CLAWFS_RUNTIME: OnceLock<ClawfsRuntime> = OnceLock::new();
+/// Lightweight config parsed at ctor time — no I/O beyond local dirs.
+pub struct LazyRuntimeConfig {
+    pub config: Config,
+    pub prefix_router: PrefixRouter,
+    pub cwd: CwdTracker,
+}
+
+/// Global lightweight config — set once in `#[ctor]`, never does network I/O.
+static CLAWFS_CONFIG: OnceLock<LazyRuntimeConfig> = OnceLock::new();
+
+/// Global singleton holding the full bootstrapped ClawFS runtime.
+/// Initialized lazily on first access to a ClawFS path.
+static CLAWFS_RUNTIME: OnceLock<Option<ClawfsRuntime>> = OnceLock::new();
 
 /// Flag set after fork() — all hooks fall through once poisoned.
 static FORK_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -26,23 +37,78 @@ static FORK_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub struct ClawfsRuntime {
     pub fs: Arc<OsageFs>,
     pub fd_table: FdTable,
-    pub prefix_router: PrefixRouter,
-    pub cwd: CwdTracker,
     /// Kept alive to sustain async workers; not directly accessed.
     _tokio_rt: tokio::runtime::Runtime,
 }
 
+fn is_fork_poisoned() -> bool {
+    FORK_POISONED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ClawfsRuntime {
-    /// Get the global runtime, if initialized.
+    /// Get the global runtime if it has already been fully initialized.
+    /// Returns `None` if fork-poisoned or if runtime hasn't been initialized yet.
     pub fn get() -> Option<&'static ClawfsRuntime> {
-        if FORK_POISONED.load(std::sync::atomic::Ordering::Relaxed) {
+        if is_fork_poisoned() {
             return None;
         }
-        CLAWFS_RUNTIME.get()
+        CLAWFS_RUNTIME.get().and_then(|opt| opt.as_ref())
     }
 
-    /// Initialize the global runtime. Called once from `#[ctor]`.
-    /// Returns `Ok(true)` if initialized, `Ok(false)` if CLAWFS_PREFIXES is not set (no-op mode).
+    /// Get the lightweight config (prefix router + cwd tracker) without
+    /// triggering full runtime initialization. Fast, no I/O.
+    pub fn config() -> Option<&'static LazyRuntimeConfig> {
+        if is_fork_poisoned() {
+            return None;
+        }
+        CLAWFS_CONFIG.get()
+    }
+
+    /// Trigger full runtime initialization if not already done.
+    /// Called when we know a ClawFS path is being accessed.
+    pub fn ensure_runtime() -> Option<&'static ClawfsRuntime> {
+        if is_fork_poisoned() {
+            return None;
+        }
+        let cfg = CLAWFS_CONFIG.get()?;
+        CLAWFS_RUNTIME
+            .get_or_init(|| match do_full_init(&cfg.config) {
+                Ok(rt) => {
+                    crate::inotify::spawn_poller();
+
+                    unsafe {
+                        libc::atexit(atexit_flush);
+                    }
+
+                    // Restore virtual CWD from parent process.
+                    if let Ok(val) = std::env::var("CLAWFS_VIRTUAL_CWD") {
+                        if let Some((full, inner)) = val.split_once('\n') {
+                            let _ = crate::dispatch::dispatch_chdir_lazy(
+                                &rt,
+                                &cfg.cwd,
+                                &cfg.prefix_router,
+                                full,
+                                inner,
+                            );
+                            log::trace!(
+                                "restored virtual CWD from env: full={full:?} inner={inner:?}"
+                            );
+                        }
+                    }
+
+                    log::info!("clawfs-preload: full runtime initialized (lazy)");
+                    Some(rt)
+                }
+                Err(e) => {
+                    eprintln!("clawfs-preload: lazy initialization failed: {e:#}");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// Initialize the lightweight config. Called once from `#[ctor]`.
+    /// Returns `Ok(true)` if config was set, `Ok(false)` if CLAWFS_PREFIXES is not set.
     pub fn init() -> Result<bool> {
         let prefixes = match std::env::var("CLAWFS_PREFIXES") {
             Ok(val) if !val.trim().is_empty() => val,
@@ -71,8 +137,6 @@ impl ClawfsRuntime {
             .unwrap_or_else(|_| cache_root.join("cache"));
 
         let mut config = Config {
-            // Preload sessions are short-lived and often span many processes.
-            // Avoid shared journal coordination in the hot path by default.
             disable_journal: true,
             disable_cleanup: true,
             lookup_cache_ttl_ms: 1000,
@@ -87,10 +151,9 @@ impl ClawfsRuntime {
             )
         };
 
-        // Apply env-driven runtime spec (storage mode, provider overrides, etc.)
         clawfs::clawfs::apply_env_runtime_spec(&mut config).context("applying env runtime spec")?;
 
-        // Ensure directories exist.
+        // Ensure local directories exist (fast, local-only I/O).
         if matches!(config.object_provider, ObjectStoreProvider::Local) {
             std::fs::create_dir_all(&config.store_path).context("creating store_path")?;
         }
@@ -99,121 +162,122 @@ impl ClawfsRuntime {
             std::fs::create_dir_all(parent).context("creating state_path parent")?;
         }
 
-        let worker_threads: usize = std::env::var("CLAWFS_TOKIO_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
-
-        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .thread_name("clawfs-preload")
-            .build()
-            .context("building tokio runtime")?;
-
-        let handle = tokio_rt.handle().clone();
-
-        let fs = tokio_rt.block_on(async {
-            let metadata = Arc::new(
-                MetadataStore::new(&config, handle.clone())
-                    .await
-                    .context("MetadataStore::new")?,
-            );
-            let superblock = Arc::new(
-                SuperblockManager::load_or_init(metadata.clone(), config.shard_size)
-                    .await
-                    .context("SuperblockManager::load_or_init")?,
-            );
-
-            ensure_root(metadata.clone(), superblock.clone(), &config)
-                .await
-                .context("ensure_root")?;
-
-            let segments = Arc::new(
-                SegmentManager::new(&config, handle.clone()).context("SegmentManager::new")?,
-            );
-            let client_state = Arc::new(
-                ClientStateManager::load(&config.state_path).context("ClientStateManager::load")?,
-            );
-            let journal = if config.disable_journal {
-                None
-            } else {
-                Some(Arc::new(
-                    JournalManager::new(&config.local_cache_path).context("JournalManager::new")?,
-                ))
-            };
-
-            let replay_logger = config
-                .replay_log
-                .as_ref()
-                .map(ReplayLogger::new)
-                .transpose()
-                .context("ReplayLogger::new")?
-                .map(Arc::new);
-
-            let fs = Arc::new(OsageFs::new(
-                config,
-                metadata,
-                superblock,
-                segments,
-                None,
-                journal,
-                handle,
-                client_state,
-                None,
-                replay_logger,
-                None,
-                None,
-            ));
-
-            // Replay pending journal entries.
-            let fs_clone = fs.clone();
-            let replayed = tokio::task::spawn_blocking(move || fs_clone.replay_journal())
-                .await
-                .context("replay task join")?
-                .context("replay_journal")?;
-            if replayed > 0 {
-                log::info!("clawfs-preload: replayed {replayed} journal entries");
-            }
-
-            Ok::<_, anyhow::Error>(fs)
-        })?;
-
-        let runtime = ClawfsRuntime {
-            fs,
-            fd_table: FdTable::new(),
+        let lazy_config = LazyRuntimeConfig {
+            config,
             prefix_router: router,
             cwd: CwdTracker::new(),
-            _tokio_rt: tokio_rt,
         };
 
-        let _ = CLAWFS_RUNTIME.set(runtime);
+        let _ = CLAWFS_CONFIG.set(lazy_config);
 
-        crate::inotify::spawn_poller();
-
-        // Register atexit handler to flush pending writes on process exit.
-        unsafe {
-            libc::atexit(atexit_flush);
-        }
-
-        // Register fork poison handler.
+        // Register fork poison handler early — must happen before any tokio runtime.
         unsafe {
             libc::pthread_atfork(None, None, Some(post_fork_child));
         }
 
-        // Restore virtual CWD from parent process (propagated via env var across fork+exec).
-        if let Ok(val) = std::env::var("CLAWFS_VIRTUAL_CWD") {
-            if let Some((full, inner)) = val.split_once('\n') {
-                if let Some(rt) = ClawfsRuntime::get() {
-                    let _ = crate::dispatch::dispatch_chdir(rt, full, inner);
-                    log::trace!("restored virtual CWD from env: full={full:?} inner={inner:?}");
-                }
-            }
-        }
-
-        log::info!("clawfs-preload: initialized with prefixes={prefixes}");
+        log::info!("clawfs-preload: config loaded, prefixes={prefixes} (runtime deferred)");
         Ok(true)
     }
+}
+
+/// Perform the expensive full initialization: tokio runtime, metadata store,
+/// superblock, segments, journal replay. Called lazily on first ClawFS path access.
+fn do_full_init(config: &Config) -> Result<ClawfsRuntime> {
+    let worker_threads: usize = std::env::var("CLAWFS_TOKIO_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+
+    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("clawfs-preload")
+        .build()
+        .context("building tokio runtime")?;
+
+    let handle = tokio_rt.handle().clone();
+
+    // Create a single shared object store for both metadata and segments.
+    let (shared_store, meta_prefix) = clawfs::metadata::create_object_store(config)?;
+    let seg_prefix = clawfs::segment::segment_prefix(&config.object_prefix);
+
+    let fs = tokio_rt.block_on(async {
+        let metadata = Arc::new(
+            MetadataStore::new_with_store(
+                shared_store.clone(),
+                meta_prefix,
+                config,
+                handle.clone(),
+            )
+            .await
+            .context("MetadataStore::new_with_store")?,
+        );
+        let superblock = Arc::new(
+            SuperblockManager::load_or_init(metadata.clone(), config.shard_size)
+                .await
+                .context("SuperblockManager::load_or_init")?,
+        );
+
+        ensure_root(metadata.clone(), superblock.clone(), config)
+            .await
+            .context("ensure_root")?;
+
+        let segments = Arc::new(
+            SegmentManager::new_with_store(shared_store, seg_prefix, config, handle.clone())
+                .context("SegmentManager::new_with_store")?,
+        );
+        let client_state = Arc::new(
+            ClientStateManager::load(&config.state_path).context("ClientStateManager::load")?,
+        );
+        let journal = if config.disable_journal {
+            None
+        } else {
+            Some(Arc::new(
+                JournalManager::new(&config.local_cache_path).context("JournalManager::new")?,
+            ))
+        };
+
+        let replay_logger = config
+            .replay_log
+            .as_ref()
+            .map(ReplayLogger::new)
+            .transpose()
+            .context("ReplayLogger::new")?
+            .map(Arc::new);
+
+        let fs = Arc::new(OsageFs::new(
+            config.clone(),
+            metadata,
+            superblock,
+            segments,
+            None,
+            journal,
+            handle,
+            client_state,
+            None,
+            replay_logger,
+            None,
+            None,
+        ));
+
+        // Replay pending journal entries.
+        let fs_clone = fs.clone();
+        let replayed = tokio::task::spawn_blocking(move || fs_clone.replay_journal())
+            .await
+            .context("replay task join")?
+            .context("replay_journal")?;
+        if replayed > 0 {
+            log::info!("clawfs-preload: replayed {replayed} journal entries");
+        }
+
+        Ok::<_, anyhow::Error>(fs)
+    })?;
+
+    Ok(ClawfsRuntime {
+        fs,
+        fd_table: FdTable::new(),
+        _tokio_rt: tokio_rt,
+    })
 }
 
 /// Atexit handler: flush any pending writes before the process exits.

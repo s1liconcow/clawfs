@@ -1549,7 +1549,7 @@ impl CacheEntry {
     }
 }
 
-pub(crate) fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
+pub fn create_object_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
     match config.object_provider {
         ObjectStoreProvider::Local => {
             std::fs::create_dir_all(&config.store_path)

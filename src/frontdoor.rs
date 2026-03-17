@@ -179,6 +179,28 @@ struct ServeArgs {
     listen: String,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "clawfs compact",
+    about = "Trigger manual compaction of segments and metadata deltas"
+)]
+struct CompactArgs {
+    #[arg(long, default_value = DEFAULT_VOLUME)]
+    volume: String,
+
+    /// Maximum number of segments to compact per batch
+    #[arg(long, default_value_t = 32)]
+    batch_size: usize,
+
+    /// Only compact deltas, skip segment compaction
+    #[arg(long, default_value_t = false)]
+    deltas_only: bool,
+
+    /// Only compact segments, skip delta compaction
+    #[arg(long, default_value_t = false)]
+    segments_only: bool,
+}
+
 #[derive(Debug)]
 struct VolumePaths {
     store_path: PathBuf,
@@ -269,6 +291,12 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             run_serve(serve)?;
             Ok(DispatchAction::Handled)
         }
+        "compact" => {
+            let parse_args = subcommand_args("clawfs compact", args);
+            let compact = CompactArgs::parse_from(parse_args);
+            run_compact(compact)?;
+            Ok(DispatchAction::Handled)
+        }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("login") => {
             LoginArgs::command().print_help()?;
             println!();
@@ -296,6 +324,11 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
         }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("serve") => {
             ServeArgs::command().print_help()?;
+            println!();
+            Ok(DispatchAction::Handled)
+        }
+        "help" if args.get(2).and_then(|value| value.to_str()) == Some("compact") => {
+            CompactArgs::command().print_help()?;
             println!();
             Ok(DispatchAction::Handled)
         }
@@ -328,6 +361,7 @@ pub fn print_general_help() {
     println!("  clawfs up -- [command...]");
     println!("  clawfs mount");
     println!("  clawfs serve");
+    println!("  clawfs compact");
     println!("  clawfs version");
     println!();
     println!("Manual object-store configuration moved to `clawfsd`.");
@@ -488,6 +522,46 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     }
 
     Err(command.exec().into())
+}
+
+fn run_compact(args: CompactArgs) -> Result<()> {
+    let volume_paths = volume_paths(&args.volume)?;
+    volume_paths.ensure_dirs()?;
+    let hosted = resolve_hosted_volume(&args.volume)?;
+
+    let mut cli_args = vec![
+        OsString::from("clawfs"),
+        OsString::from("--mount-path"),
+        OsString::from("/tmp/clawfs-compact-dummy"),
+        OsString::from("--store-path"),
+        volume_paths.store_path.as_os_str().to_os_string(),
+        OsString::from("--local-cache-path"),
+        volume_paths.cache_path.as_os_str().to_os_string(),
+        OsString::from("--state-path"),
+        volume_paths.mount_state_path.as_os_str().to_os_string(),
+        OsString::from("--disable-cleanup"),
+    ];
+    append_hosted_storage_args(&mut cli_args, &hosted.config);
+    let cli = Cli::parse_from(cli_args);
+    let mut config: Config = cli.into();
+    config.telemetry_object_prefix = hosted.config.telemetry_object_prefix.clone();
+
+    let hosted_cp = HostedControlPlane {
+        api_url: hosted.api_base_url,
+        api_token: hosted.api_token,
+        volume_slug: hosted.volume_slug,
+        access_key_id: hosted.config.access_key_id,
+        secret_access_key: hosted.config.secret_access_key,
+        storage_mode: hosted.config.storage_mode,
+    };
+
+    crate::launch::run_compact_entry(
+        config,
+        &hosted_cp,
+        args.batch_size,
+        args.deltas_only,
+        args.segments_only,
+    )
 }
 
 fn resolve_hosted_volume(volume: &str) -> Result<HostedVolume> {

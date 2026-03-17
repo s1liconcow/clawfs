@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use crate::dispatch;
 use crate::errno::set_errno;
 use crate::fd_table::FdEntry;
-use crate::runtime::ClawfsRuntime;
+use crate::runtime::{ClawfsRuntime, LazyRuntimeConfig};
 use dashmap::DashMap;
 
 // ---------------------------------------------------------------------------
@@ -904,14 +904,15 @@ fn cleanup_fd_proxy(fd: i32) {
 
 /// Try to handle a path-based operation through ClawFS. Returns `None` if
 /// the path doesn't match any ClawFS prefix (caller should fall through to real libc).
-fn try_classify(rt: &ClawfsRuntime, path: &str) -> Option<String> {
+/// Uses only the lightweight config (no full runtime needed).
+fn try_classify(cfg: &LazyRuntimeConfig, path: &str) -> Option<String> {
     if path.starts_with('/') {
-        let result = rt.prefix_router.classify(path).map(|cp| cp.inner);
+        let result = cfg.prefix_router.classify(path).map(|cp| cp.inner);
         log::trace!("classify abs {:?} -> {:?}", path, result);
         result
     } else {
         // Virtual CWD inside ClawFS — resolve relative to it.
-        if let Some((_, inner_cwd, _)) = rt.cwd.get_clawfs() {
+        if let Some((_, inner_cwd, _)) = cfg.cwd.get_clawfs() {
             let raw = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
             let inner = crate::prefix::normalize_path(&raw)
                 .to_str()
@@ -922,7 +923,7 @@ fn try_classify(rt: &ClawfsRuntime, path: &str) -> Option<String> {
         }
         // Fall back to real OS CWD.
         let abs = std::env::current_dir().ok()?.join(path);
-        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+        let result = cfg.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
         log::trace!("classify rel {:?} (-> {:?}) -> {:?}", path, abs, result);
         result
     }
@@ -941,13 +942,14 @@ fn host_path_for_dirfd(dirfd: i32) -> Option<PathBuf> {
 
 /// Resolve a path that may be relative to a dirfd (for `*at` family).
 /// Returns the inner ClawFS path if it can be resolved, or None for fall-through.
-fn resolve_at_path(rt: &ClawfsRuntime, dirfd: i32, path: &str) -> Option<String> {
+/// Uses the lightweight config for prefix/cwd resolution and optional runtime for fd_table.
+fn resolve_at_path(cfg: &LazyRuntimeConfig, dirfd: i32, path: &str) -> Option<String> {
     if path.starts_with('/') {
-        return try_classify(rt, path);
+        return try_classify(cfg, path);
     }
     // Relative path with AT_FDCWD: resolve against virtual or real cwd.
     if dirfd == libc::AT_FDCWD {
-        if let Some((_, inner_cwd, _)) = rt.cwd.get_clawfs() {
+        if let Some((_, inner_cwd, _)) = cfg.cwd.get_clawfs() {
             let raw = format!("{}/{}", inner_cwd.trim_end_matches('/'), path);
             let inner = crate::prefix::normalize_path(&raw)
                 .to_str()
@@ -962,33 +964,36 @@ fn resolve_at_path(rt: &ClawfsRuntime, dirfd: i32, path: &str) -> Option<String>
         }
         // Cwd is on the host: resolve against the real process cwd then classify.
         let abs = std::env::current_dir().ok()?.join(path);
-        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+        let result = cfg.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
         log::trace!("resolve_at AT_FDCWD (host cwd) {:?} -> {:?}", path, result);
         return result;
     }
     // Relative path with a ClawFS dirfd: resolve using the fd's inner_path.
-    let entry = rt.fd_table.get(dirfd)?;
-    if entry.is_dir {
-        let inner = format!("{}/{}", entry.inner_path.trim_end_matches('/'), path);
-        log::trace!("resolve_at dirfd={} {:?} -> {:?}", dirfd, path, inner);
-        return Some(inner);
-    }
-    log::trace!(
-        "resolve_at dirfd={} {:?}: dirfd is not a ClawFS directory",
-        dirfd,
-        path
-    );
-    None.or_else(|| {
-        let abs = host_path_for_dirfd(dirfd)?.join(path);
-        let result = rt.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+    // This requires the full runtime (fd_table), which must already be initialized
+    // since the dirfd was opened via ClawFS.
+    if let Some(rt) = ClawfsRuntime::get() {
+        let entry = rt.fd_table.get(dirfd)?;
+        if entry.is_dir {
+            let inner = format!("{}/{}", entry.inner_path.trim_end_matches('/'), path);
+            log::trace!("resolve_at dirfd={} {:?} -> {:?}", dirfd, path, inner);
+            return Some(inner);
+        }
         log::trace!(
-            "resolve_at dirfd={} (host dirfd) {:?} -> {:?}",
+            "resolve_at dirfd={} {:?}: dirfd is not a ClawFS directory",
             dirfd,
-            path,
-            result
+            path
         );
+    }
+    // Try resolving via host dirfd path.
+    let abs = host_path_for_dirfd(dirfd)?.join(path);
+    let result = cfg.prefix_router.classify(abs.to_str()?).map(|cp| cp.inner);
+    log::trace!(
+        "resolve_at dirfd={} (host dirfd) {:?} -> {:?}",
+        dirfd,
+        path,
         result
-    })
+    );
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,10 +1035,12 @@ fn do_open(rt: &ClawfsRuntime, path_str: &str, inner: &str, flags: i32, mode: li
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open(path: *const libc::c_char, flags: i32, mode: libc::mode_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return do_open(rt, &path_str, &inner, flags, mode);
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return do_open(rt, &path_str, &inner, flags, mode);
+                    }
                 }
             }
         }
@@ -1046,10 +1053,12 @@ pub unsafe extern "C" fn open(path: *const libc::c_char, flags: i32, mode: libc:
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open64(path: *const libc::c_char, flags: i32, mode: libc::mode_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return do_open(rt, &path_str, &inner, flags, mode);
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return do_open(rt, &path_str, &inner, flags, mode);
+                    }
                 }
             }
         }
@@ -1067,10 +1076,12 @@ pub unsafe extern "C" fn openat(
     mode: libc::mode_t,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return do_open(rt, &path_str, &inner, flags, mode);
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return do_open(rt, &path_str, &inner, flags, mode);
+                    }
                 }
             }
         }
@@ -1408,9 +1419,10 @@ pub unsafe extern "C" fn lseek64(fd: i32, offset: libc::off64_t, whence: i32) ->
 // stat family
 // ---------------------------------------------------------------------------
 
-/// Helper for stat/lstat — shared logic.
-fn do_stat(rt: &ClawfsRuntime, path: &str, buf: *mut libc::stat) -> Option<i32> {
-    let inner = try_classify(rt, path)?;
+/// Helper for stat/lstat — shared logic. Classifies with config, triggers runtime lazily.
+fn do_stat(cfg: &LazyRuntimeConfig, path: &str, buf: *mut libc::stat) -> Option<i32> {
+    let inner = try_classify(cfg, path)?;
+    let rt = ClawfsRuntime::ensure_runtime()?;
     Some(match dispatch::dispatch_stat(rt, &inner) {
         Ok(st) => {
             unsafe { *buf = st };
@@ -1425,9 +1437,9 @@ fn do_stat(rt: &ClawfsRuntime, path: &str, buf: *mut libc::stat) -> Option<i32> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(path: *const libc::c_char, buf: *mut libc::stat) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1442,9 +1454,9 @@ pub unsafe extern "C" fn stat(path: *const libc::c_char, buf: *mut libc::stat) -
 pub unsafe extern "C" fn lstat(path: *const libc::c_char, buf: *mut libc::stat) -> i32 {
     // Phase 1: lstat == stat (no symlink distinction).
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1485,9 +1497,9 @@ pub unsafe extern "C" fn fstat(fd: i32, buf: *mut libc::stat) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __xstat(ver: i32, path: *const libc::c_char, buf: *mut libc::stat) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1505,9 +1517,9 @@ pub unsafe extern "C" fn __lxstat(
     buf: *mut libc::stat,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1547,16 +1559,18 @@ pub unsafe extern "C" fn fstatat(
     flags: i32,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_stat(rt, &inner) {
-                        Ok(st) => {
-                            unsafe { *buf = st };
-                            0
-                        }
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_stat(rt, &inner) {
+                            Ok(st) => {
+                                unsafe { *buf = st };
+                                0
+                            }
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1587,16 +1601,18 @@ pub unsafe extern "C" fn fstatat64(
     flags: i32,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_stat(rt, &inner) {
-                        Ok(st) => {
-                            unsafe { *buf = st };
-                            0
-                        }
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_stat(rt, &inner) {
+                            Ok(st) => {
+                                unsafe { *buf = st };
+                                0
+                            }
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1609,9 +1625,9 @@ pub unsafe extern "C" fn fstatat64(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat64(path: *const libc::c_char, buf: *mut libc::stat) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1625,9 +1641,9 @@ pub unsafe extern "C" fn stat64(path: *const libc::c_char, buf: *mut libc::stat)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat64(path: *const libc::c_char, buf: *mut libc::stat) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(result) = do_stat(rt, &path_str, buf) {
+                if let Some(result) = do_stat(cfg, &path_str, buf) {
                     return result;
                 }
             }
@@ -1665,13 +1681,15 @@ pub unsafe extern "C" fn fstat64(fd: i32, buf: *mut libc::stat) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(path: *const libc::c_char, mode: i32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_access(rt, &inner, mode) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_access(rt, &inner, mode) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1702,13 +1720,15 @@ pub unsafe extern "C" fn eaccess(path: *const libc::c_char, mode: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdir(path: *const libc::c_char, mode: libc::mode_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_mkdir(rt, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_mkdir(rt, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1721,13 +1741,15 @@ pub unsafe extern "C" fn mkdir(path: *const libc::c_char, mode: libc::mode_t) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlink(path: *const libc::c_char) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_unlink(rt, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_unlink(rt, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1740,13 +1762,15 @@ pub unsafe extern "C" fn unlink(path: *const libc::c_char) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rmdir(path: *const libc::c_char) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_rmdir(rt, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_rmdir(rt, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1759,17 +1783,19 @@ pub unsafe extern "C" fn rmdir(path: *const libc::c_char) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rename(oldpath: *const libc::c_char, newpath: *const libc::c_char) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(old_str), Some(new_str)) = (c_path_to_str(oldpath), c_path_to_str(newpath))
             {
-                let old_inner = try_classify(rt, &old_str);
-                let new_inner = try_classify(rt, &new_str);
+                let old_inner = try_classify(cfg, &old_str);
+                let new_inner = try_classify(cfg, &new_str);
                 match (old_inner, new_inner) {
                     (Some(oi), Some(ni)) => {
-                        return match dispatch::dispatch_rename(rt, &oi, &ni) {
-                            Ok(()) => 0,
-                            Err(e) => set_errno(e) as i32,
-                        };
+                        if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                            return match dispatch::dispatch_rename(rt, &oi, &ni) {
+                                Ok(()) => 0,
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        }
                     }
                     // Cross-boundary rename: one side ClawFS, other side host.
                     (Some(_), None) | (None, Some(_)) => {
@@ -1888,13 +1914,15 @@ pub unsafe extern "C" fn pwrite64(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn truncate(path: *const libc::c_char, length: libc::off_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_truncate(rt, &inner, length) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_truncate(rt, &inner, length) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -1907,13 +1935,15 @@ pub unsafe extern "C" fn truncate(path: *const libc::c_char, length: libc::off_t
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn truncate64(path: *const libc::c_char, length: libc::off64_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_truncate(rt, &inner, length) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_truncate(rt, &inner, length) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -2171,15 +2201,17 @@ pub unsafe extern "C" fn symlink(
     linkpath: *const libc::c_char,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(target_str), Some(link_str)) =
                 (c_path_to_str(target), c_path_to_str(linkpath))
             {
-                if let Some(inner) = try_classify(rt, &link_str) {
-                    return match dispatch::dispatch_symlink(rt, &target_str, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &link_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_symlink(rt, &target_str, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -2196,34 +2228,42 @@ pub unsafe extern "C" fn readlink(
     bufsiz: libc::size_t,
 ) -> libc::ssize_t {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
                 // /proc/self/fd/<N> — return the full external path for ClawFS fds.
                 if let Some(fd) = parse_proc_fd_path(&path_str) {
-                    if let Some(entry) = rt.fd_table.get(fd) {
-                        if let Some(full) = rt.prefix_router.full_path(&entry.inner_path) {
-                            log::trace!(
-                                "readlink({:?}) -> {:?} (clawfs fd={})",
-                                path_str,
-                                full,
-                                fd
-                            );
-                            return write_str_to_buf(&full, buf, bufsiz);
+                    if let Some(rt) = ClawfsRuntime::get() {
+                        if let Some(entry) = rt.fd_table.get(fd) {
+                            if let Some(full) = cfg.prefix_router.full_path(&entry.inner_path) {
+                                log::trace!(
+                                    "readlink({:?}) -> {:?} (clawfs fd={})",
+                                    path_str,
+                                    full,
+                                    fd
+                                );
+                                return write_str_to_buf(&full, buf, bufsiz);
+                            }
                         }
                     }
                 }
                 // ClawFS symlinks.
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_readlink(rt, &inner) {
-                        Ok(target) => {
-                            let n = target.len().min(bufsiz);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n);
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_readlink(rt, &inner) {
+                            Ok(target) => {
+                                let n = target.len().min(bufsiz);
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        target.as_ptr(),
+                                        buf as *mut u8,
+                                        n,
+                                    );
+                                }
+                                n as libc::ssize_t
                             }
-                            n as libc::ssize_t
-                        }
-                        Err(e) => set_errno(e) as libc::ssize_t,
-                    };
+                            Err(e) => set_errno(e) as libc::ssize_t,
+                        };
+                    }
                 }
             }
         }
@@ -2241,35 +2281,43 @@ pub unsafe extern "C" fn readlinkat(
     bufsiz: libc::size_t,
 ) -> libc::ssize_t {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
                 // /proc/self/fd/<N> — always absolute, dirfd is irrelevant.
                 if let Some(fd) = parse_proc_fd_path(&path_str) {
-                    if let Some(entry) = rt.fd_table.get(fd) {
-                        if let Some(full) = rt.prefix_router.full_path(&entry.inner_path) {
-                            log::trace!(
-                                "readlinkat({}, {:?}) -> {:?} (clawfs fd={})",
-                                dirfd,
-                                path_str,
-                                full,
-                                fd
-                            );
-                            return write_str_to_buf(&full, buf, bufsiz);
+                    if let Some(rt) = ClawfsRuntime::get() {
+                        if let Some(entry) = rt.fd_table.get(fd) {
+                            if let Some(full) = cfg.prefix_router.full_path(&entry.inner_path) {
+                                log::trace!(
+                                    "readlinkat({}, {:?}) -> {:?} (clawfs fd={})",
+                                    dirfd,
+                                    path_str,
+                                    full,
+                                    fd
+                                );
+                                return write_str_to_buf(&full, buf, bufsiz);
+                            }
                         }
                     }
                 }
                 // ClawFS symlinks.
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_readlink(rt, &inner) {
-                        Ok(target) => {
-                            let n = target.len().min(bufsiz);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, n);
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_readlink(rt, &inner) {
+                            Ok(target) => {
+                                let n = target.len().min(bufsiz);
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        target.as_ptr(),
+                                        buf as *mut u8,
+                                        n,
+                                    );
+                                }
+                                n as libc::ssize_t
                             }
-                            n as libc::ssize_t
-                        }
-                        Err(e) => set_errno(e) as libc::ssize_t,
-                    };
+                            Err(e) => set_errno(e) as libc::ssize_t,
+                        };
+                    }
                 }
             }
         }
@@ -2286,24 +2334,29 @@ pub unsafe extern "C" fn readlinkat(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chdir(path: *const libc::c_char) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    let full = rt
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    let full = cfg
                         .prefix_router
                         .full_path(&inner)
                         .unwrap_or_else(|| path_str.to_string());
-                    return match dispatch::dispatch_chdir(rt, &full, &inner) {
-                        Ok(()) => {
-                            // Propagate virtual CWD to child processes via env var.
-                            std::env::set_var("CLAWFS_VIRTUAL_CWD", format!("{}\n{}", full, inner));
-                            0
-                        }
-                        Err(e) => set_errno(e) as i32,
-                    };
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_chdir(rt, &cfg.cwd, &full, &inner) {
+                            Ok(()) => {
+                                // Propagate virtual CWD to child processes via env var.
+                                std::env::set_var(
+                                    "CLAWFS_VIRTUAL_CWD",
+                                    format!("{}\n{}", full, inner),
+                                );
+                                0
+                            }
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
                 // Changing to a host path — reset virtual cwd.
-                rt.cwd.set_host();
+                cfg.cwd.set_host();
                 std::env::remove_var("CLAWFS_VIRTUAL_CWD");
             }
         }
@@ -2316,8 +2369,8 @@ pub unsafe extern "C" fn chdir(path: *const libc::c_char) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getcwd(buf: *mut libc::c_char, size: libc::size_t) -> *mut libc::c_char {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
-            if let Some((full_path, _, _)) = rt.cwd.get_clawfs() {
+        if let Some(cfg) = ClawfsRuntime::config() {
+            if let Some((full_path, _, _)) = cfg.cwd.get_clawfs() {
                 let bytes = full_path.as_bytes();
                 if bytes.len() + 1 > size {
                     unsafe { *libc::__errno_location() = libc::ERANGE };
@@ -2347,19 +2400,21 @@ pub unsafe extern "C" fn getcwd(buf: *mut libc::c_char, size: libc::size_t) -> *
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn opendir(name: *const libc::c_char) -> *mut libc::DIR {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(name) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    match dispatch::dispatch_open(rt, &inner, libc::O_RDONLY, 0) {
-                        Ok(fd) => {
-                            // Pre-fill directory entries.
-                            if let Some(entry) = rt.fd_table.get(fd) {
-                                let _ = dispatch::dispatch_readdir_fill(rt, &entry);
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        match dispatch::dispatch_open(rt, &inner, libc::O_RDONLY, 0) {
+                            Ok(fd) => {
+                                // Pre-fill directory entries.
+                                if let Some(entry) = rt.fd_table.get(fd) {
+                                    let _ = dispatch::dispatch_readdir_fill(rt, &entry);
+                                }
+                                return fd as usize as *mut libc::DIR;
                             }
-                            return fd as usize as *mut libc::DIR;
-                        }
-                        Err(e) => {
-                            return crate::errno::set_errno_null(e);
+                            Err(e) => {
+                                return crate::errno::set_errno_null(e);
+                            }
                         }
                     }
                 }
@@ -2631,13 +2686,15 @@ pub unsafe extern "C" fn faccessat(
     _flags: i32,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_access(rt, &inner, mode) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_access(rt, &inner, mode) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -2654,15 +2711,17 @@ pub unsafe extern "C" fn symlinkat(
     linkpath: *const libc::c_char,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(target_str), Some(link_str)) =
                 (c_path_to_str(target), c_path_to_str(linkpath))
             {
-                if let Some(inner) = resolve_at_path(rt, newdirfd, &link_str) {
-                    return match dispatch::dispatch_symlink(rt, &target_str, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, newdirfd, &link_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_symlink(rt, &target_str, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -2720,9 +2779,13 @@ unsafe fn do_fopen(
     real_fn: unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::FILE,
 ) -> *mut libc::FILE {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(path_str), Some(mode_str)) = (c_path_to_str(path), c_path_to_str(mode)) {
-                if let Some(inner) = try_classify(rt, &path_str) {
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    let rt = match ClawfsRuntime::ensure_runtime() {
+                        Some(rt) => rt,
+                        None => return unsafe { real_fn(path, mode) },
+                    };
                     let flags = fopen_mode_to_flags(&mode_str);
                     if flags == -1 {
                         set_errno(libc::EINVAL);
@@ -3147,10 +3210,12 @@ pub unsafe extern "C" fn openat64(
     mode: libc::mode_t,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return do_open(rt, &path_str, &inner, flags, mode);
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return do_open(rt, &path_str, &inner, flags, mode);
+                    }
                 }
             }
         }
@@ -3163,13 +3228,15 @@ pub unsafe extern "C" fn openat64(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdirat(dirfd: i32, path: *const libc::c_char, mode: libc::mode_t) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_mkdir(rt, &inner) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_mkdir(rt, &inner) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -3182,19 +3249,21 @@ pub unsafe extern "C" fn mkdirat(dirfd: i32, path: *const libc::c_char, mode: li
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlinkat(dirfd: i32, path: *const libc::c_char, flags: i32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    if flags & libc::AT_REMOVEDIR != 0 {
-                        return match dispatch::dispatch_rmdir(rt, &inner) {
-                            Ok(()) => 0,
-                            Err(e) => set_errno(e) as i32,
-                        };
-                    } else {
-                        return match dispatch::dispatch_unlink(rt, &inner) {
-                            Ok(()) => 0,
-                            Err(e) => set_errno(e) as i32,
-                        };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        if flags & libc::AT_REMOVEDIR != 0 {
+                            return match dispatch::dispatch_rmdir(rt, &inner) {
+                                Ok(()) => 0,
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        } else {
+                            return match dispatch::dispatch_unlink(rt, &inner) {
+                                Ok(()) => 0,
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        }
                     }
                 }
             }
@@ -3213,17 +3282,19 @@ pub unsafe extern "C" fn renameat(
     newpath: *const libc::c_char,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(old_str), Some(new_str)) = (c_path_to_str(oldpath), c_path_to_str(newpath))
             {
-                let old_inner = resolve_at_path(rt, olddirfd, &old_str);
-                let new_inner = resolve_at_path(rt, newdirfd, &new_str);
+                let old_inner = resolve_at_path(cfg, olddirfd, &old_str);
+                let new_inner = resolve_at_path(cfg, newdirfd, &new_str);
                 match (old_inner, new_inner) {
                     (Some(oi), Some(ni)) => {
-                        return match dispatch::dispatch_rename(rt, &oi, &ni) {
-                            Ok(()) => 0,
-                            Err(e) => set_errno(e) as i32,
-                        };
+                        if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                            return match dispatch::dispatch_rename(rt, &oi, &ni) {
+                                Ok(()) => 0,
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        }
                     }
                     (Some(_), None) | (None, Some(_)) => {
                         return set_errno(libc::EXDEV) as i32;
@@ -3247,17 +3318,19 @@ pub unsafe extern "C" fn renameat2(
     flags: libc::c_uint,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let (Some(old_str), Some(new_str)) = (c_path_to_str(oldpath), c_path_to_str(newpath))
             {
-                let old_inner = resolve_at_path(rt, olddirfd, &old_str);
-                let new_inner = resolve_at_path(rt, newdirfd, &new_str);
+                let old_inner = resolve_at_path(cfg, olddirfd, &old_str);
+                let new_inner = resolve_at_path(cfg, newdirfd, &new_str);
                 match (old_inner, new_inner) {
                     (Some(oi), Some(ni)) => {
-                        return match dispatch::dispatch_rename(rt, &oi, &ni) {
-                            Ok(()) => 0,
-                            Err(e) => set_errno(e) as i32,
-                        };
+                        if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                            return match dispatch::dispatch_rename(rt, &oi, &ni) {
+                                Ok(()) => 0,
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        }
                     }
                     (Some(_), None) | (None, Some(_)) => {
                         return set_errno(libc::EXDEV) as i32;
@@ -3392,21 +3465,23 @@ pub unsafe extern "C" fn inotify_init1(flags: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inotify_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
-            if crate::inotify::is_inotify_fd(fd) {
+        if ClawfsRuntime::get().is_some() && crate::inotify::is_inotify_fd(fd) {
+            if let Some(cfg) = ClawfsRuntime::config() {
                 if let Some(path_str) = c_path_to_str(path) {
-                    if let Some(inner) = try_classify(rt, &path_str) {
-                        return match dispatch::resolve_path(rt, &inner) {
-                            Ok((_, inode, _)) => {
-                                let wd = crate::inotify::add_watch(fd, inode, mask);
-                                if wd < 0 {
-                                    set_errno(-wd) as i32
-                                } else {
-                                    wd
+                    if let Some(inner) = try_classify(cfg, &path_str) {
+                        if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                            return match dispatch::resolve_path(rt, &inner) {
+                                Ok((_, inode, _)) => {
+                                    let wd = crate::inotify::add_watch(fd, inode, mask);
+                                    if wd < 0 {
+                                        set_errno(-wd) as i32
+                                    } else {
+                                        wd
+                                    }
                                 }
-                            }
-                            Err(e) => set_errno(e) as i32,
-                        };
+                                Err(e) => set_errno(e) as i32,
+                            };
+                        }
                     }
                     // Path not in ClawFS but fd is our fake pipe — can't forward to
                     // the kernel, so report the path as not found.
@@ -3479,9 +3554,9 @@ pub unsafe extern "C" fn statx(
     statxbuf: *mut libc::statx,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
+        // Handle fd-based case (AT_EMPTY_PATH) — needs runtime already initialized.
         if let Some(rt) = ClawfsRuntime::get() {
             if let Some(path_str) = c_path_to_str(path) {
-                // AT_EMPTY_PATH with an empty path: stat the fd itself.
                 if path_str.is_empty() && (flags & libc::AT_EMPTY_PATH != 0) {
                     if let Some(entry) = rt.fd_table.get(dirfd) {
                         return match dispatch::dispatch_fstat(rt, &entry) {
@@ -3497,19 +3572,27 @@ pub unsafe extern "C" fn statx(
                             Err(e) => set_errno(e) as i32,
                         };
                     }
-                } else if !path_str.is_empty() {
-                    if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                        return match dispatch::dispatch_stat(rt, &inner) {
-                            Ok(st) => {
-                                log::trace!("statx({:?}) -> size={}", path_str, st.st_size);
-                                stat_to_statx(&st, mask, statxbuf);
-                                0
-                            }
-                            Err(e) => {
-                                log::trace!("statx({:?}) -> err={}", path_str, e);
-                                set_errno(e) as i32
-                            }
-                        };
+                }
+            }
+        }
+        // Handle path-based case — use lazy init.
+        if let Some(cfg) = ClawfsRuntime::config() {
+            if let Some(path_str) = c_path_to_str(path) {
+                if !path_str.is_empty() {
+                    if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                        if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                            return match dispatch::dispatch_stat(rt, &inner) {
+                                Ok(st) => {
+                                    log::trace!("statx({:?}) -> size={}", path_str, st.st_size);
+                                    stat_to_statx(&st, mask, statxbuf);
+                                    0
+                                }
+                                Err(e) => {
+                                    log::trace!("statx({:?}) -> err={}", path_str, e);
+                                    set_errno(e) as i32
+                                }
+                            };
+                        }
                     }
                 }
             }
@@ -3527,13 +3610,15 @@ pub unsafe extern "C" fn statx(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn utime(path: *const libc::c_char, times: *const libc::utimbuf) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_utime(rt, &inner, times) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_utime(rt, &inner, times) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -3546,13 +3631,15 @@ pub unsafe extern "C" fn utime(path: *const libc::c_char, times: *const libc::ut
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn utimes(path: *const libc::c_char, times: *const libc::timeval) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_utimes(rt, &inner, times) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_utimes(rt, &inner, times) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -3567,13 +3654,15 @@ pub unsafe extern "C" fn lutimes(path: *const libc::c_char, times: *const libc::
     // ClawFS doesn't distinguish symlink targets for time operations,
     // so this behaves the same as utimes.
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = try_classify(rt, &path_str) {
-                    return match dispatch::dispatch_utimes(rt, &inner, times) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = try_classify(cfg, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_utimes(rt, &inner, times) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }
@@ -3591,9 +3680,9 @@ pub unsafe extern "C" fn utimensat(
     flags: i32,
 ) -> i32 {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        if let Some(rt) = ClawfsRuntime::get() {
-            // Handle AT_EMPTY_PATH + fd case (equivalent to futimens on dirfd).
-            if flags & libc::AT_EMPTY_PATH != 0 {
+        // Handle AT_EMPTY_PATH + fd case (fd already opened through ClawFS).
+        if flags & libc::AT_EMPTY_PATH != 0 {
+            if let Some(rt) = ClawfsRuntime::get() {
                 if let Some(entry) = rt.fd_table.get(dirfd) {
                     return match dispatch::dispatch_futimens(rt, &entry, times) {
                         Ok(()) => 0,
@@ -3601,12 +3690,17 @@ pub unsafe extern "C" fn utimensat(
                     };
                 }
             }
+        }
+        // Handle path-based case.
+        if let Some(cfg) = ClawfsRuntime::config() {
             if let Some(path_str) = c_path_to_str(path) {
-                if let Some(inner) = resolve_at_path(rt, dirfd, &path_str) {
-                    return match dispatch::dispatch_utimensat(rt, &inner, times) {
-                        Ok(()) => 0,
-                        Err(e) => set_errno(e) as i32,
-                    };
+                if let Some(inner) = resolve_at_path(cfg, dirfd, &path_str) {
+                    if let Some(rt) = ClawfsRuntime::ensure_runtime() {
+                        return match dispatch::dispatch_utimensat(rt, &inner, times) {
+                            Ok(()) => 0,
+                            Err(e) => set_errno(e) as i32,
+                        };
+                    }
                 }
             }
         }

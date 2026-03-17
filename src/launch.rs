@@ -176,41 +176,30 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
     let (metadata, segments) = if has_control_plane_creds && let Some(ref hosted) = hosted {
         use crate::refreshable_store::{RefreshableObjectStore, StoreBuilder};
 
-        // Metadata store — refreshable.
-        let (raw_meta_store, meta_prefix) = crate::metadata::create_object_store(&config)?;
-        let meta_config = config.clone();
-        let meta_builder: StoreBuilder = Arc::new(move || {
-            let (store, _) = crate::metadata::create_object_store(&meta_config)?;
+        let (raw_store, meta_prefix) = crate::metadata::create_object_store(&config)?;
+        let seg_prefix = crate::segment::segment_prefix(&config.object_prefix);
+
+        let refresh_config = config.clone();
+        let builder: StoreBuilder = Arc::new(move || {
+            let (store, _) = crate::metadata::create_object_store(&refresh_config)?;
             Ok(store)
         });
-        let refreshable_meta = Arc::new(RefreshableObjectStore::new(
-            raw_meta_store,
-            meta_builder,
+
+        let refreshable = Arc::new(RefreshableObjectStore::new(
+            raw_store,
+            builder,
             config.state_path.clone(),
             hosted,
         )) as Arc<dyn object_store::ObjectStore>;
+
         let metadata = Arc::new(runtime.block_on(MetadataStore::new_with_store(
-            refreshable_meta,
+            refreshable.clone(),
             meta_prefix,
             &config,
             handle.clone(),
         ))?);
-
-        // Segment store — refreshable.
-        let (raw_seg_store, seg_prefix) = crate::segment::create_segment_store(&config)?;
-        let seg_config = config.clone();
-        let seg_builder: StoreBuilder = Arc::new(move || {
-            let (store, _) = crate::segment::create_segment_store(&seg_config)?;
-            Ok(store)
-        });
-        let refreshable_seg = Arc::new(RefreshableObjectStore::new(
-            raw_seg_store,
-            seg_builder,
-            config.state_path.clone(),
-            hosted,
-        )) as Arc<dyn object_store::ObjectStore>;
         let segments = Arc::new(SegmentManager::new_with_store(
-            refreshable_seg,
+            refreshable,
             seg_prefix,
             &config,
             handle.clone(),
@@ -218,8 +207,21 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
 
         (metadata, segments)
     } else {
-        let metadata = Arc::new(runtime.block_on(MetadataStore::new(&config, handle.clone()))?);
-        let segments = Arc::new(SegmentManager::new(&config, handle.clone())?);
+        let (store, meta_prefix) = crate::metadata::create_object_store(&config)?;
+        let seg_prefix = crate::segment::segment_prefix(&config.object_prefix);
+
+        let metadata = Arc::new(runtime.block_on(MetadataStore::new_with_store(
+            store.clone(),
+            meta_prefix,
+            &config,
+            handle.clone(),
+        ))?);
+        let segments = Arc::new(SegmentManager::new_with_store(
+            store,
+            seg_prefix,
+            &config,
+            handle.clone(),
+        )?);
         (metadata, segments)
     };
     let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
@@ -1087,6 +1089,210 @@ fn provision_credentials_from_control_plane(
     let creds = fetch_credentials_from_api(hosted)?;
     save_cached_credentials(state_path, &creds);
     Ok(Some(creds))
+}
+
+pub fn run_compact_entry(
+    mut config: Config,
+    hosted: &HostedControlPlane,
+    batch_size: usize,
+    deltas_only: bool,
+    segments_only: bool,
+) -> Result<()> {
+    if let Some(ref storage_mode) = hosted.storage_mode {
+        unsafe {
+            env::set_var(crate::clawfs::STORAGE_MODE_ENV, storage_mode);
+        }
+    }
+    clawfs_runtime::apply_env_runtime_spec(&mut config)?;
+    init_logging(config.log_file.as_deref(), config.debug_log)?;
+
+    let has_control_plane_creds = apply_hosted_credentials(&mut config, hosted)?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let handle = runtime.handle().clone();
+
+    let (metadata, segments) = if has_control_plane_creds {
+        use crate::refreshable_store::{RefreshableObjectStore, StoreBuilder};
+
+        let (raw_store, meta_prefix) = crate::metadata::create_object_store(&config)?;
+        let seg_prefix = crate::segment::segment_prefix(&config.object_prefix);
+
+        let refresh_config = config.clone();
+        let builder: StoreBuilder = Arc::new(move || {
+            let (store, _) = crate::metadata::create_object_store(&refresh_config)?;
+            Ok(store)
+        });
+
+        let refreshable = Arc::new(RefreshableObjectStore::new(
+            raw_store,
+            builder,
+            config.state_path.clone(),
+            hosted,
+        )) as Arc<dyn object_store::ObjectStore>;
+
+        let metadata = Arc::new(runtime.block_on(MetadataStore::new_with_store(
+            refreshable.clone(),
+            meta_prefix,
+            &config,
+            handle.clone(),
+        ))?);
+        let segments = Arc::new(SegmentManager::new_with_store(
+            refreshable,
+            seg_prefix,
+            &config,
+            handle.clone(),
+        )?);
+        (metadata, segments)
+    } else {
+        let (store, meta_prefix) = crate::metadata::create_object_store(&config)?;
+        let seg_prefix = crate::segment::segment_prefix(&config.object_prefix);
+
+        let metadata = Arc::new(runtime.block_on(MetadataStore::new_with_store(
+            store.clone(),
+            meta_prefix,
+            &config,
+            handle.clone(),
+        ))?);
+        let segments = Arc::new(SegmentManager::new_with_store(
+            store,
+            seg_prefix,
+            &config,
+            handle.clone(),
+        )?);
+        (metadata, segments)
+    };
+
+    let superblock = Arc::new(runtime.block_on(SuperblockManager::load_or_init(
+        metadata.clone(),
+        config.shard_size,
+    ))?);
+
+    let snapshot = superblock.snapshot();
+    println!(
+        "volume generation: {}, next_inode: {}, next_segment: {}",
+        snapshot.generation, snapshot.next_inode, snapshot.next_segment
+    );
+
+    runtime.block_on(async {
+        run_compact_tasks(
+            metadata.clone(),
+            superblock.clone(),
+            segments.clone(),
+            batch_size,
+            deltas_only,
+            segments_only,
+        )
+        .await
+    })?;
+
+    runtime.block_on(async {
+        metadata.shutdown().await.ok();
+    });
+    Ok(())
+}
+
+async fn run_compact_tasks(
+    metadata: Arc<MetadataStore>,
+    superblock: Arc<SuperblockManager>,
+    segments: Arc<SegmentManager>,
+    batch_size: usize,
+    deltas_only: bool,
+    segments_only: bool,
+) -> Result<()> {
+    // Delta compaction
+    if !segments_only {
+        let delta_count = task::spawn_blocking({
+            let md = metadata.clone();
+            move || md.delta_file_count()
+        })
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+
+        println!("delta files: {delta_count}");
+        if delta_count > 0 {
+            println!("compacting deltas (keeping newest {DELTA_COMPACT_KEEP})...");
+            match task::spawn_blocking({
+                let md = metadata.clone();
+                move || md.prune_deltas(DELTA_COMPACT_KEEP)
+            })
+            .await
+            .unwrap_or(Ok(0))
+            {
+                Ok(pruned) => println!("pruned {pruned} delta files"),
+                Err(err) => println!("delta compaction failed: {err}"),
+            }
+        } else {
+            println!("no deltas to compact");
+        }
+    }
+
+    // Segment compaction
+    if !deltas_only {
+        let current_generation = superblock.snapshot().generation;
+        let cutoff_generation = current_generation.saturating_sub(SEGMENT_COMPACT_LAG);
+        let mut total_compacted = 0usize;
+
+        if cutoff_generation == 0 {
+            println!(
+                "volume too young for segment compaction (generation {current_generation}, need > {SEGMENT_COMPACT_LAG})"
+            );
+        } else {
+            loop {
+                let candidates = task::spawn_blocking({
+                    let md = metadata.clone();
+                    let bs = batch_size;
+                    move || md.segment_candidates(bs)
+                })
+                .await
+                .unwrap_or(Ok(Vec::new()))
+                .unwrap_or_default();
+
+                let filtered: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|record| {
+                        record
+                            .segment_pointer()
+                            .map(|ptr| ptr.generation < cutoff_generation)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+
+                if filtered.len() < 2 {
+                    if total_compacted == 0 {
+                        println!("no segment candidates eligible for compaction");
+                    }
+                    break;
+                }
+
+                let count = filtered.len();
+                println!("compacting {count} segment candidates...");
+                match perform_segment_compaction(
+                    metadata.clone(),
+                    superblock.clone(),
+                    segments.clone(),
+                    filtered,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        total_compacted += count;
+                        println!("compacted batch of {count} segments");
+                    }
+                    Err(err) => {
+                        println!("segment compaction failed: {err}");
+                        break;
+                    }
+                }
+            }
+            if total_compacted > 0 {
+                println!("total segments compacted: {total_compacted}");
+            }
+        }
+    }
+
+    println!("compaction complete");
+    Ok(())
 }
 
 fn sanitize_error(error: String) -> String {
