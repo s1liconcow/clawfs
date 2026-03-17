@@ -158,10 +158,23 @@ impl ClawfsRuntime {
             std::fs::create_dir_all(parent).context("creating state_path parent")?;
         }
 
+        let cwd = CwdTracker::new();
+
+        // Pre-populate virtual CWD from parent process so that try_classify()
+        // can resolve relative paths (e.g. "." after `cd clawfs`) before the
+        // full runtime is lazily initialized.  The inode is set to 0 here and
+        // will be corrected during ensure_runtime() → dispatch_chdir_lazy().
+        if let Ok(val) = std::env::var("CLAWFS_VIRTUAL_CWD") {
+            if let Some((full, inner)) = val.split_once('\n') {
+                cwd.set_clawfs(full.to_string(), inner.to_string(), 0);
+                log::trace!("pre-populated virtual CWD from env: full={full:?} inner={inner:?}");
+            }
+        }
+
         let lazy_config = LazyRuntimeConfig {
             config,
             prefix_router: router,
-            cwd: CwdTracker::new(),
+            cwd,
         };
 
         let _ = CLAWFS_CONFIG.set(lazy_config);

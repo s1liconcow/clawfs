@@ -500,3 +500,86 @@ with open(root + "/sub/nested.txt", "w") as f:
         .expect("failed to stat removed directory");
     assert_eq!(stat.code(), Some(1), "directory still exists after rm -rf");
 }
+
+/// Regression test: after `cd` into a ClawFS prefix, external commands (like `ls`)
+/// fork+exec'd by the shell must see the virtual directory contents, not the real
+/// filesystem.  Previously the child process's CwdTracker started as Host because
+/// CLAWFS_VIRTUAL_CWD was only restored during lazy full-runtime init, which ran
+/// after try_classify() had already fallen through to real libc.
+#[test]
+fn preload_cd_then_ls_shows_virtual_contents() {
+    let host_root = tempfile::tempdir().unwrap();
+    let host_cwd = host_root.path().to_path_buf();
+    let prefix_str = host_cwd.join("clawfs").to_str().unwrap().to_string();
+    let env = TestEnv::new(&prefix_str);
+
+    // Create a distinctive file inside the ClawFS volume so we can recognise it.
+    let setup = env
+        .command("python3")
+        .current_dir(&host_cwd)
+        .arg("-c")
+        .arg(format!(
+            r#"
+import os
+os.makedirs("{prefix_str}/subdir", exist_ok=True)
+with open("{prefix_str}/clawfs_marker.txt", "w") as f:
+    f.write("marker")
+with open("{prefix_str}/subdir/nested.txt", "w") as f:
+    f.write("nested")
+"#
+        ))
+        .output()
+        .expect("failed to create test files");
+    assert!(
+        setup.status.success(),
+        "setup failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&setup.stdout),
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    // `cd clawfs && ls` — bash's cd intercepts chdir, then ls (external command)
+    // is fork+exec'd and must inherit the virtual CWD.
+    let output = env
+        .command("bash")
+        .current_dir(&host_cwd)
+        .arg("-lc")
+        .arg("cd clawfs && ls")
+        .output()
+        .expect("failed to run bash cd+ls");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "bash cd+ls failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    assert!(
+        stdout.contains("clawfs_marker.txt"),
+        "ls after cd should show ClawFS contents (clawfs_marker.txt), got:\n{stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("subdir"),
+        "ls after cd should show ClawFS contents (subdir), got:\n{stdout}\nstderr: {stderr}"
+    );
+
+    // Also test `cd clawfs/subdir && ls` — nested cd.
+    let output2 = env
+        .command("bash")
+        .current_dir(&host_cwd)
+        .arg("-lc")
+        .arg("cd clawfs/subdir && ls")
+        .output()
+        .expect("failed to run bash cd+ls nested");
+
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert!(
+        output2.status.success(),
+        "bash cd+ls nested failed:\nstdout: {stdout2}\nstderr: {stderr2}"
+    );
+    assert!(
+        stdout2.contains("nested.txt"),
+        "ls after cd into subdir should show nested.txt, got:\n{stdout2}\nstderr: {stderr2}"
+    );
+}
