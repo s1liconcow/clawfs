@@ -191,6 +191,11 @@ impl ClawfsRuntime {
 
         crate::inotify::spawn_poller();
 
+        // Register atexit handler to flush pending writes on process exit.
+        unsafe {
+            libc::atexit(atexit_flush);
+        }
+
         // Register fork poison handler.
         unsafe {
             libc::pthread_atfork(None, None, Some(post_fork_child));
@@ -208,6 +213,13 @@ impl ClawfsRuntime {
 
         log::info!("clawfs-preload: initialized with prefixes={prefixes}");
         Ok(true)
+    }
+}
+
+/// Atexit handler: flush any pending writes before the process exits.
+extern "C" fn atexit_flush() {
+    if let Some(rt) = ClawfsRuntime::get() {
+        let _ = rt.fs.nfs_flush();
     }
 }
 

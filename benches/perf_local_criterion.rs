@@ -697,6 +697,154 @@ fn bench_inline_resize_strategy_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Preload-path benchmarks
+// ---------------------------------------------------------------------------
+
+fn run_preload_create_write_close_iops_once(with_flush: bool) -> RunResult {
+    use clawfs::perf_bench::perf_osagefs;
+    let temp = tempdir().expect("temp dir");
+    let (_runtime, fs) = perf_osagefs(temp.path());
+
+    let uid = unsafe { libc::geteuid() as u32 };
+    let gid = unsafe { libc::getegid() as u32 };
+    let n = 100usize;
+    let data = vec![0x42u8; 1024]; // 1 KB
+
+    let start = Instant::now();
+    for i in 0..n {
+        let name = format!("f{i}");
+        let rec = fs.nfs_create(1, &name, uid, gid).expect("nfs_create");
+        fs.nfs_write(rec.inode, 0, &data).expect("nfs_write");
+        if with_flush {
+            fs.nfs_flush().expect("nfs_flush");
+        }
+    }
+    let elapsed = start.elapsed();
+    RunResult {
+        duration: elapsed,
+        metric: n as f64 / elapsed.as_secs_f64(),
+    }
+}
+
+fn run_preload_mkdir_iops_once(with_flush: bool) -> RunResult {
+    use clawfs::perf_bench::perf_osagefs;
+    let temp = tempdir().expect("temp dir");
+    let (_runtime, fs) = perf_osagefs(temp.path());
+
+    let uid = unsafe { libc::geteuid() as u32 };
+    let gid = unsafe { libc::getegid() as u32 };
+    let n = 100usize;
+
+    let start = Instant::now();
+    for i in 0..n {
+        let name = format!("d{i}");
+        fs.nfs_mkdir(1, &name, uid, gid).expect("nfs_mkdir");
+        if with_flush {
+            fs.nfs_flush().expect("nfs_flush");
+        }
+    }
+    let elapsed = start.elapsed();
+    RunResult {
+        duration: elapsed,
+        metric: n as f64 / elapsed.as_secs_f64(),
+    }
+}
+
+fn run_preload_read_throughput_once() -> RunResult {
+    use clawfs::perf_bench::perf_osagefs;
+    let temp = tempdir().expect("temp dir");
+    let (_runtime, fs) = perf_osagefs(temp.path());
+
+    let uid = unsafe { libc::geteuid() as u32 };
+    let gid = unsafe { libc::getegid() as u32 };
+    // Create a 1 MB file.
+    let rec = fs.nfs_create(1, "bigfile", uid, gid).expect("nfs_create");
+    let chunk = vec![0xABu8; 64 * 1024]; // 64 KB
+    for offset in (0..1024 * 1024).step_by(64 * 1024) {
+        fs.nfs_write(rec.inode, offset as u64, &chunk)
+            .expect("nfs_write");
+    }
+    fs.nfs_flush().expect("nfs_flush");
+
+    let read_size = 64 * 1024u32;
+    let iterations = 100usize;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = fs.nfs_read(rec.inode, 0, read_size).expect("nfs_read");
+    }
+    let elapsed = start.elapsed();
+    let bytes_read = read_size as usize * iterations;
+    let throughput = bytes_read as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    RunResult {
+        duration: elapsed,
+        metric: throughput,
+    }
+}
+
+fn bench_preload_create_write_close_iops(c: &mut Criterion) {
+    let mut group = c.benchmark_group("preload");
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("create_write_close_iops_with_flush", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_preload_create_write_close_iops_once(true).duration;
+            }
+            total
+        });
+    });
+    group.bench_function("create_write_close_iops_no_flush", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_preload_create_write_close_iops_once(false).duration;
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
+fn bench_preload_mkdir_iops(c: &mut Criterion) {
+    let mut group = c.benchmark_group("preload");
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("mkdir_iops_with_flush", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_preload_mkdir_iops_once(true).duration;
+            }
+            total
+        });
+    });
+    group.bench_function("mkdir_iops_no_flush", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_preload_mkdir_iops_once(false).duration;
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
+fn bench_preload_read_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("preload");
+    group.throughput(Throughput::Bytes(64 * 1024 * 100));
+    group.bench_function("read_throughput", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += run_preload_read_throughput_once().duration;
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
 fn collect_guard_metrics() {
     collect_guard_metric(
         "flush_metadata_batch_latency_ms",
@@ -732,6 +880,22 @@ fn collect_guard_metrics() {
         run_inline_resize_strategy_speedup_once,
     );
     collect_guard_metric("untar_flush_latency_ms", run_untar_flush_latency_once);
+    collect_guard_metric("preload_create_write_close_iops_with_flush", || {
+        run_preload_create_write_close_iops_once(true)
+    });
+    collect_guard_metric("preload_create_write_close_iops_no_flush", || {
+        run_preload_create_write_close_iops_once(false)
+    });
+    collect_guard_metric("preload_mkdir_iops_with_flush", || {
+        run_preload_mkdir_iops_once(true)
+    });
+    collect_guard_metric("preload_mkdir_iops_no_flush", || {
+        run_preload_mkdir_iops_once(false)
+    });
+    collect_guard_metric(
+        "preload_read_throughput_mib_per_s",
+        run_preload_read_throughput_once,
+    );
 }
 
 fn main() {
@@ -746,6 +910,9 @@ fn main() {
     bench_inode_clone_directory_heavy(&mut criterion);
     bench_inline_resize_strategy_benchmark(&mut criterion);
     bench_untar_flush_latency(&mut criterion);
+    bench_preload_create_write_close_iops(&mut criterion);
+    bench_preload_mkdir_iops(&mut criterion);
+    bench_preload_read_throughput(&mut criterion);
     criterion.final_summary();
 
     collect_guard_metrics();

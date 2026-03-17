@@ -1,42 +1,59 @@
 use super::*;
 
 impl OsageFs {
+    /// Emit telemetry for an error without constructing replay JSON.
+    #[inline]
+    fn emit_errno_only(&self, layer: &str, op: &str, errno: Option<i32>) {
+        if let (Some(errno), Some(telemetry)) = (errno, &self.telemetry) {
+            telemetry.emit_errno_sampled(layer, op, errno);
+        }
+    }
+
     pub fn nfs_lookup(&self, parent: u64, name: &str) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
         let result = self.op_lookup(parent, name);
-        self.log_replay(
-            "nfs",
-            "lookup",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name, "ino": result.as_ref().ok().map(|record| record.inode) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "lookup",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name, "ino": result.as_ref().ok().map(|record| record.inode) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "lookup", errno);
+        }
         result
     }
 
     pub fn nfs_getattr(&self, ino: u64) -> std::result::Result<InodeRecord, i32> {
         let replay = self.replay_start();
         let result = self.op_getattr(ino);
-        self.log_replay(
-            "nfs",
-            "getattr",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "ino": ino }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay("nfs", "getattr", replay, errno, json!({ "ino": ino }));
+        } else {
+            self.emit_errno_only("nfs", "getattr", errno);
+        }
         result
     }
 
     pub fn nfs_readdir(&self, ino: u64) -> std::result::Result<Vec<(u64, String)>, i32> {
         let replay = self.replay_start();
         let result = self.op_readdir_nfs(ino);
-        self.log_replay(
-            "nfs",
-            "readdir",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e| e.len()) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "readdir",
+                replay,
+                errno,
+                json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e| e.len()) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "readdir", errno);
+        }
         result
     }
 
@@ -66,13 +83,18 @@ impl OsageFs {
                 })
                 .collect()
         });
-        self.log_replay(
-            "nfs",
-            "readdir_plus",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e: &Vec<(u64, u8, String)>| e.len()) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "readdir_plus",
+                replay,
+                errno,
+                json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e: &Vec<(u64, u8, String)>| e.len()) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "readdir_plus", errno);
+        }
         result
     }
 
@@ -90,13 +112,18 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(ino);
         let result = self.op_nfs_setattr(ino, mode, uid, gid, size, atime, mtime);
-        self.log_replay(
-            "nfs",
-            "setattr",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "ino": ino, "mode": mode, "uid": uid, "gid": gid, "size": size }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "setattr",
+                replay,
+                errno,
+                json!({ "ino": ino, "mode": mode, "uid": uid, "gid": gid, "size": size }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "setattr", errno);
+        }
         result
     }
 
@@ -110,13 +137,18 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(parent);
         let result = self.op_create(parent, name, uid, gid);
-        self.log_replay(
-            "nfs",
-            "create",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "create",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "create", errno);
+        }
         result
     }
 
@@ -130,13 +162,18 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(parent);
         let result = self.op_mkdir(parent, name, uid, gid);
-        self.log_replay(
-            "nfs",
-            "mkdir",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "mkdir",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "ino": result.as_ref().ok().map(|record| record.inode) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "mkdir", errno);
+        }
         result
     }
 
@@ -152,44 +189,59 @@ impl OsageFs {
         let target_len = target.len();
         let _dir_guard = self.lock_dir(parent);
         let result = self.op_symlink(parent, name, target, uid, gid);
-        self.log_replay(
-            "nfs",
-            "symlink",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "target_len": target_len, "ino": result.as_ref().ok().map(|record| record.inode) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "symlink",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name, "uid": uid, "gid": gid, "target_len": target_len, "ino": result.as_ref().ok().map(|record| record.inode) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "symlink", errno);
+        }
         result
     }
 
     pub fn nfs_read(&self, ino: u64, offset: u64, size: u32) -> std::result::Result<Vec<u8>, i32> {
         let replay = self.replay_start();
         let result = self.op_read(ino, offset, size);
-        self.log_replay(
-            "nfs",
-            "read",
-            replay,
-            result.as_ref().err().copied(),
-            json!({
-                "ino": ino,
-                "offset": offset,
-                "requested": size,
-                "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()),
-            }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "read",
+                replay,
+                errno,
+                json!({
+                    "ino": ino,
+                    "offset": offset,
+                    "requested": size,
+                    "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()),
+                }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "read", errno);
+        }
         result
     }
 
     pub fn nfs_readlink(&self, ino: u64) -> std::result::Result<Vec<u8>, i32> {
         let replay = self.replay_start();
         let result = self.op_readlink(ino);
-        self.log_replay(
-            "nfs",
-            "readlink",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "ino": ino, "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()) }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "readlink",
+                replay,
+                errno,
+                json!({ "ino": ino, "returned": result.as_ref().ok().map_or(0, |bytes| bytes.len()) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "readlink", errno);
+        }
         result
     }
 
@@ -197,18 +249,23 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(ino);
         let result = self.op_write(ino, offset, data);
-        self.log_replay(
-            "nfs",
-            "write",
-            replay,
-            result.as_ref().err().copied(),
-            json!({
-                "ino": ino,
-                "offset": offset,
-                "len": data.len(),
-                "written": result.as_ref().ok().copied().unwrap_or(0),
-            }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "write",
+                replay,
+                errno,
+                json!({
+                    "ino": ino,
+                    "offset": offset,
+                    "len": data.len(),
+                    "written": result.as_ref().ok().copied().unwrap_or(0),
+                }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "write", errno);
+        }
         result
     }
 
@@ -221,13 +278,18 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(parent);
         let result = self.op_remove_file(parent, name, caller_uid);
-        self.log_replay(
-            "nfs",
-            "unlink",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "unlink",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "unlink", errno);
+        }
         result
     }
 
@@ -240,13 +302,18 @@ impl OsageFs {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(parent);
         let result = self.op_remove_dir(parent, name, caller_uid);
-        self.log_replay(
-            "nfs",
-            "rmdir",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "rmdir",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "rmdir", errno);
+        }
         result
     }
 
@@ -262,26 +329,42 @@ impl OsageFs {
         let replay = self.replay_start();
         let (_dir_guard_a, _dir_guard_b) = self.lock_dir_pair(parent, newparent);
         let result = self.op_rename(parent, name, newparent, newname, flags, caller_uid);
-        self.log_replay(
-            "nfs",
-            "rename",
-            replay,
-            result.as_ref().err().copied(),
-            json!({ "parent": parent, "name": name, "newparent": newparent, "newname": newname, "flags": flags }),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "rename",
+                replay,
+                errno,
+                json!({ "parent": parent, "name": name, "newparent": newparent, "newname": newname, "flags": flags }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "rename", errno);
+        }
         result
     }
 
     pub fn nfs_flush(&self) -> std::result::Result<(), i32> {
         let replay = self.replay_start();
         let result = self.op_flush_all();
-        self.log_replay(
-            "nfs",
-            "flush",
-            replay,
-            result.as_ref().err().copied(),
-            json!({}),
-        );
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay("nfs", "flush", replay, errno, json!({}));
+        } else {
+            self.emit_errno_only("nfs", "flush", errno);
+        }
+        result
+    }
+
+    pub fn nfs_flush_inode(&self, ino: u64) -> std::result::Result<(), i32> {
+        let replay = self.replay_start();
+        let result = self.op_flush_inode(ino);
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay("nfs", "flush_inode", replay, errno, json!({ "ino": ino }));
+        } else {
+            self.emit_errno_only("nfs", "flush_inode", errno);
+        }
         result
     }
 }

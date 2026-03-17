@@ -122,13 +122,10 @@ pub fn dispatch_open(
     Ok(fd)
 }
 
-/// Dispatch `close` — remove from fd table, optionally flush.
+/// Dispatch `close` — remove from fd table.
+/// Writes are staged in memory and flushed by background interval or at exit.
 pub fn dispatch_close(rt: &ClawfsRuntime, fd: i32) -> Result<(), i32> {
-    let entry = rt.fd_table.remove(fd).ok_or(libc::EBADF)?;
-    // Best-effort flush for files opened for writing.
-    if entry.flags & (libc::O_WRONLY | libc::O_RDWR) != 0 && !entry.is_dir {
-        let _ = rt.fs.nfs_flush();
-    }
+    let _entry = rt.fd_table.remove(fd).ok_or(libc::EBADF)?;
     Ok(())
 }
 
@@ -227,7 +224,6 @@ pub fn dispatch_mkdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
         return Err(libc::EEXIST);
     }
     rt.fs.nfs_mkdir(parent_ino, &basename, uid, gid)?;
-    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -240,9 +236,7 @@ pub fn dispatch_unlink(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
     }
     log::trace!("dispatch_unlink(inner={inner:?})");
     rt.fs.nfs_remove_file(parent_ino, &basename, uid)?;
-    let result = rt.fs.nfs_flush();
-    log::trace!("dispatch_unlink flush -> {result:?}");
-    result
+    Ok(())
 }
 
 /// Dispatch `rmdir`.
@@ -253,7 +247,7 @@ pub fn dispatch_rmdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
         return Err(libc::EBUSY); // can't rmdir "/"
     }
     rt.fs.nfs_remove_dir(parent_ino, &basename, uid)?;
-    rt.fs.nfs_flush()
+    Ok(())
 }
 
 /// Dispatch `rename`.
@@ -266,7 +260,7 @@ pub fn dispatch_rename(rt: &ClawfsRuntime, old_inner: &str, new_inner: &str) -> 
     }
     rt.fs
         .nfs_rename(old_parent, &old_name, new_parent, &new_name, 0, uid)?;
-    rt.fs.nfs_flush()
+    Ok(())
 }
 
 /// Dispatch `pread` — read at explicit offset without updating fd offset.
@@ -336,9 +330,9 @@ pub fn dispatch_ftruncate(rt: &ClawfsRuntime, entry: &FdEntry, length: i64) -> R
     Ok(())
 }
 
-/// Dispatch `fsync`/`fdatasync`.
-pub fn dispatch_fsync(rt: &ClawfsRuntime, _entry: &FdEntry) -> Result<(), i32> {
-    rt.fs.nfs_flush()
+/// Dispatch `fsync`/`fdatasync` — flush only the target inode + ancestors.
+pub fn dispatch_fsync(rt: &ClawfsRuntime, entry: &FdEntry) -> Result<(), i32> {
+    rt.fs.nfs_flush_inode(entry.inode)
 }
 
 /// Dispatch `symlink`.
@@ -351,7 +345,6 @@ pub fn dispatch_symlink(rt: &ClawfsRuntime, target: &str, link_inner: &str) -> R
     }
     rt.fs
         .nfs_symlink(parent_ino, &basename, target.as_bytes().to_vec(), uid, gid)?;
-    rt.fs.nfs_flush()?;
     Ok(())
 }
 

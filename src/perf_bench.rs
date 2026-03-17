@@ -2,8 +2,89 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::inode::{FileStorage, InodeKind, InodeRecord};
+use crate::fs::OsageFs;
+use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
+use crate::metadata::MetadataStore;
+use crate::segment::SegmentManager;
+use crate::state::ClientStateManager;
+use crate::superblock::SuperblockManager;
 use time::OffsetDateTime;
+use tokio::runtime::Runtime;
+
+/// Create a fully-initialized OsageFs suitable for benchmarks.
+/// Returns the tokio runtime (must be kept alive) and the filesystem.
+pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
+    let config = perf_config(root);
+    std::fs::create_dir_all(&config.mount_path).expect("create mount path");
+    std::fs::create_dir_all(&config.store_path).expect("create store");
+    std::fs::create_dir_all(&config.local_cache_path).expect("create cache");
+
+    let runtime = Runtime::new().expect("tokio runtime");
+    let metadata = Arc::new(
+        runtime
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+            .expect("metadata init"),
+    );
+    let superblock = Arc::new(
+        runtime
+            .block_on(SuperblockManager::load_or_init(
+                metadata.clone(),
+                config.shard_size,
+            ))
+            .expect("superblock init"),
+    );
+
+    // Ensure root inode exists.
+    {
+        let uid = unsafe { libc::geteuid() as u32 };
+        let gid = unsafe { libc::getegid() as u32 };
+        let desired_mode = 0o40777;
+        let existing = runtime
+            .block_on(metadata.get_inode(ROOT_INODE))
+            .expect("get root inode");
+        if existing.is_none() {
+            let snapshot = superblock.prepare_dirty_generation().expect("prepare gen");
+            let generation = snapshot.generation;
+            let mut root_rec = InodeRecord::new_directory(
+                ROOT_INODE,
+                ROOT_INODE,
+                String::new(),
+                "/".to_string(),
+                uid,
+                gid,
+            );
+            root_rec.mode = desired_mode;
+            runtime
+                .block_on(metadata.persist_inode(&root_rec, generation, config.shard_size))
+                .expect("persist root");
+            runtime
+                .block_on(superblock.commit_generation(generation))
+                .expect("commit gen");
+        }
+    }
+
+    let segments =
+        Arc::new(SegmentManager::new(&config, runtime.handle().clone()).expect("segment manager"));
+    let client_state =
+        Arc::new(ClientStateManager::load(&config.state_path).expect("client state"));
+
+    let fs = OsageFs::new(
+        config,
+        metadata,
+        superblock,
+        segments,
+        None,
+        None,
+        runtime.handle().clone(),
+        client_state,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    (runtime, fs)
+}
 
 pub fn perf_config(root: &Path) -> Config {
     Config {
