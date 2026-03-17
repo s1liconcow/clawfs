@@ -36,8 +36,8 @@ pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
 
     // Ensure root inode exists.
     {
-        let uid = unsafe { libc::geteuid() as u32 };
-        let gid = unsafe { libc::getegid() as u32 };
+        let uid = crate::compat::current_uid();
+        let gid = crate::compat::current_gid();
         let desired_mode = 0o40777;
         let existing = runtime
             .block_on(metadata.get_inode(ROOT_INODE))

@@ -90,10 +90,58 @@ jobs:
           path: dist/clawfs-*.tar.gz
           if-no-files-found: error
 
+  build-windows:
+    name: Build Windows Artifacts
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.get-tag.outputs.tag }}
+    steps:
+      - name: Determine release tag
+        id: get-tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build ClawFS CLI (NFS-only, no FUSE)
+        run: cargo build --release --no-default-features --bin clawfs
+
+      - name: Build NFS gateway
+        run: cargo build --release --manifest-path clawfs-nfs-gateway/Cargo.toml
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          DIST="dist/windows"
+          mkdir -p "$DIST"
+
+          cp target/release/clawfs.exe "$DIST/"
+          cp target/release/clawfs-nfs-gateway.exe "$DIST/"
+          cp README.md "$DIST/"
+
+          cd dist/windows
+          7z a -tzip "../clawfs-${TAG}-windows-x86_64.zip" .
+
+      - name: Upload packaged release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawfs-release-windows
+          path: dist/clawfs-*.zip
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: [build-linux, build-windows]
     steps:
       - uses: actions/checkout@v4
 
@@ -114,7 +162,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          find dist -type f -name '*.tar.gz' -exec cp {} release-assets/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
           ls -lah release-assets
 
       - name: Create GitHub release and tag

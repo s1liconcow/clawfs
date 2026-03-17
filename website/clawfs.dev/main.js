@@ -73,3 +73,32 @@ if (navToggle && siteNav) {
     if (window.innerWidth > 760) closeNav();
   });
 }
+
+for (const block of document.querySelectorAll(".install-block")) {
+  const tabs = [...block.querySelectorAll('.install-tab[role="tab"]')];
+  const panels = [...block.querySelectorAll('.install-panel[role="tabpanel"]')];
+  if (tabs.length === 0 || panels.length === 0) continue;
+
+  const selectTab = (tab) => {
+    const panelId = tab.getAttribute("aria-controls");
+    for (const currentTab of tabs) {
+      const isSelected = currentTab === tab;
+      currentTab.setAttribute("aria-selected", isSelected ? "true" : "false");
+    }
+    for (const panel of panels) {
+      panel.setAttribute("aria-hidden", panel.id === panelId ? "false" : "true");
+    }
+  };
+
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => selectTab(tab));
+  }
+
+  const platform = navigator.userAgent.toLowerCase().includes("windows") ? "win" : "unix";
+  const defaultTab =
+    tabs.find((tab) => tab.id.endsWith(`-${platform}`)) ??
+    tabs.find((tab) => tab.getAttribute("aria-selected") === "true") ??
+    tabs[0];
+
+  if (defaultTab) selectTab(defaultTab);
+}

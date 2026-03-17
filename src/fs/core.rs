@@ -10,6 +10,7 @@ pub(crate) fn epoch_millis_now() -> u64 {
 }
 
 impl OsageFs {
+    #[cfg(feature = "fuse")]
     pub(crate) fn mode_to_file_type(mode: u32) -> FileType {
         match mode & S_IFMT {
             x if x == S_IFDIR => FileType::Directory,
@@ -287,6 +288,7 @@ impl OsageFs {
         }
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn record_attr(record: &InodeRecord) -> FileAttr {
         let attr_kind = match record.kind {
             InodeKind::Directory { .. } => FileType::Directory,

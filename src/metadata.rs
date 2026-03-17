@@ -3,12 +3,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::compat::{ENOENT, ENOTDIR};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use futures::StreamExt;
 use futures::future::try_join_all;
-use libc::{ENOENT, ENOTDIR};
 use log::{debug, info};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;

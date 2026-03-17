@@ -78,6 +78,7 @@ impl OsageFs {
         Ok(entries)
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn op_readdir_fuse(
         &self,
         ino: u64,
@@ -188,6 +189,7 @@ impl OsageFs {
         }
     }
 
+    #[cfg(feature = "fuse")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_fuse_setattr(
         &self,

@@ -870,6 +870,7 @@ fn build_config(cli: &ServeArgs) -> Result<Config> {
 
 fn default_user_config_root() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".clawfs")
@@ -880,8 +881,8 @@ async fn ensure_root(
     superblock: Arc<SuperblockManager>,
     config: &Config,
 ) -> Result<()> {
-    let uid = unsafe { libc::geteuid() as u32 };
-    let gid = unsafe { libc::getegid() as u32 };
+    let uid = clawfs::compat::current_uid();
+    let gid = clawfs::compat::current_gid();
     let desired_mode = 0o40777;
 
     if let Some(mut existing) = metadata.get_inode(ROOT_INODE).await? {
@@ -985,15 +986,16 @@ async fn ensure_welcome_file(
 }
 
 fn map_errno(code: i32) -> nfsstat3 {
+    use clawfs::compat;
     match code {
-        libc::ENOENT => nfsstat3::NFS3ERR_NOENT,
-        libc::EPERM => nfsstat3::NFS3ERR_PERM,
-        libc::EACCES => nfsstat3::NFS3ERR_ACCES,
-        libc::EEXIST => nfsstat3::NFS3ERR_EXIST,
-        libc::ENOTDIR => nfsstat3::NFS3ERR_NOTDIR,
-        libc::EISDIR => nfsstat3::NFS3ERR_ISDIR,
-        libc::EINVAL => nfsstat3::NFS3ERR_INVAL,
-        libc::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
+        compat::ENOENT => nfsstat3::NFS3ERR_NOENT,
+        compat::EPERM => nfsstat3::NFS3ERR_PERM,
+        compat::EACCES => nfsstat3::NFS3ERR_ACCES,
+        compat::EEXIST => nfsstat3::NFS3ERR_EXIST,
+        compat::ENOTDIR => nfsstat3::NFS3ERR_NOTDIR,
+        compat::EISDIR => nfsstat3::NFS3ERR_ISDIR,
+        compat::EINVAL => nfsstat3::NFS3ERR_INVAL,
+        compat::ENOTEMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
         _ => nfsstat3::NFS3ERR_IO,
     }
 }

@@ -473,17 +473,18 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 pub fn errno_name(errno: i32) -> &'static str {
+    use crate::compat::*;
     match errno {
-        libc::EIO => "EIO",
-        libc::ENOENT => "ENOENT",
-        libc::EPERM => "EPERM",
-        libc::EEXIST => "EEXIST",
-        libc::EINVAL => "EINVAL",
-        libc::ENOTDIR => "ENOTDIR",
-        libc::ENOTEMPTY => "ENOTEMPTY",
-        libc::EISDIR => "EISDIR",
-        libc::ENAMETOOLONG => "ENAMETOOLONG",
-        libc::EFBIG => "EFBIG",
+        EIO => "EIO",
+        ENOENT => "ENOENT",
+        EPERM => "EPERM",
+        EEXIST => "EEXIST",
+        EINVAL => "EINVAL",
+        ENOTDIR => "ENOTDIR",
+        ENOTEMPTY => "ENOTEMPTY",
+        EISDIR => "EISDIR",
+        ENAMETOOLONG => "ENAMETOOLONG",
+        EFBIG => "EFBIG",
         _ => "OTHER",
     }
 }

@@ -375,7 +375,6 @@ dependencies = [
  "clap",
  "clawfs",
  "dashmap 5.5.3",
- "libc",
  "serde",
  "serde_json",
  "tempfile",

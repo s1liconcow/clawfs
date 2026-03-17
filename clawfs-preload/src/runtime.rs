@@ -76,10 +76,6 @@ impl ClawfsRuntime {
                 Ok(rt) => {
                     crate::inotify::spawn_poller();
 
-                    unsafe {
-                        libc::atexit(atexit_flush);
-                    }
-
                     // Restore virtual CWD from parent process.
                     if let Ok(val) = std::env::var("CLAWFS_VIRTUAL_CWD") {
                         if let Some((full, inner)) = val.split_once('\n') {
@@ -278,13 +274,6 @@ fn do_full_init(config: &Config) -> Result<ClawfsRuntime> {
         fd_table: FdTable::new(),
         _tokio_rt: tokio_rt,
     })
-}
-
-/// Atexit handler: flush any pending writes before the process exits.
-extern "C" fn atexit_flush() {
-    if let Some(rt) = ClawfsRuntime::get() {
-        let _ = rt.fs.nfs_flush();
-    }
 }
 
 /// Post-fork child handler: poison all hooks so they fall through to real libc.

@@ -236,6 +236,7 @@ pub fn dispatch_unlink(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
     }
     log::trace!("dispatch_unlink(inner={inner:?})");
     rt.fs.nfs_remove_file(parent_ino, &basename, uid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -247,6 +248,7 @@ pub fn dispatch_rmdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
         return Err(libc::EBUSY); // can't rmdir "/"
     }
     rt.fs.nfs_remove_dir(parent_ino, &basename, uid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 

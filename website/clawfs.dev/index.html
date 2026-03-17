@@ -38,7 +38,7 @@
         <span></span>
       </button>
       <nav id="site-nav">
-        <a href="#how">How It Works</a>
+        <a href="faq.html">How It Works</a>
         <a href="getting-started.html">Getting Started</a>
         <a href="demo.html">Demo</a>
         <a href="enterprise.html">Enterprise</a>
@@ -69,13 +69,26 @@
               durable state, and storage that follows the work wherever it runs.  Ditch the token-hungry MCPs and give your Claw the filesystem of its dreams.
             </p>
             <p class="hero-copy">
-              Mount it with FUSE, serve it over user-mode NFS, or inject it through the preload shared library.  One install gives you `clawfs up`,
-              `clawfs mount` for FUSE, and `clawfs serve` for NFS.
+              Mount it with `clawfs mount` over FUSE or NFS, launch an explicit NFS server with `clawfs serve`, or
+              inject it through the preload shared library. One install gives you `clawfs up`, `clawfs mount`, and
+              `clawfs serve`.
             </p>
-            <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
+            <div class="install-block">
+              <div class="install-tabs" role="tablist">
+                <button class="install-tab" role="tab" aria-selected="true" aria-controls="idx-panel-unix" id="idx-tab-unix">Linux / macOS</button>
+                <button class="install-tab" role="tab" aria-selected="false" aria-controls="idx-panel-win" id="idx-tab-win">Windows</button>
+              </div>
+              <div class="install-panel" id="idx-panel-unix" role="tabpanel" aria-hidden="false" aria-labelledby="idx-tab-unix">
+                <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
+              </div>
+              <div class="install-panel" id="idx-panel-win" role="tabpanel" aria-hidden="true" aria-labelledby="idx-tab-win">
+                <div class="code-block"><code>iwr https://clawfs.dev/install.ps1 -UseBasicParsing | iex</code></div>
+              </div>
+            </div>
             <div class="hero-cta">
               <a class="btn btn-primary" href="getting-started.html">Get Started</a>
-              <a class="btn btn-secondary" href="#how">How It Works</a>
+              <a class="btn btn-primary" href="demo.html">Demo</a>
+              <a class="btn btn-secondary" href="faq.html">How It Works</a>
             </div>
             <p class="hero-note">
               Start in minutes with the CLI, then scale up with team access, cloud storage, and enterprise controls.
@@ -98,6 +111,9 @@
         <div class="section-title">
           <p class="eyebrow">Operator Flow</p>
           <h2>From Blank Runtime to Reusable Workspace</h2>
+          <p class="faq-inline-link">
+            Need the practical FAQ or the filesystem deets? <a href="faq.html">Read the FAQ</a>.
+          </p>
         </div>
         <div class="cards two-up">
           <article class="card oss">

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use env_logger::Env;
+#[cfg(feature = "fuse")]
 use fuser::MountOption;
 use log::{LevelFilter, info, warn};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,7 @@ pub struct HostedControlPlane {
     pub storage_mode: Option<String>,
 }
 
+#[cfg(feature = "fuse")]
 pub fn run_mount_entry(
     config: Config,
     args: &[OsString],
@@ -82,6 +84,7 @@ pub fn run_mount_entry(
     Ok(())
 }
 
+#[cfg(feature = "fuse")]
 fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
     let exe = env::current_exe()?;
     let mut child_args: Vec<_> = args.iter().skip(1).cloned().collect();
@@ -134,6 +137,7 @@ fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "fuse")]
 fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<()> {
     if let Some(storage_mode) = hosted
         .as_ref()
@@ -491,8 +495,8 @@ fn ensure_root(
     superblock: Arc<SuperblockManager>,
     config: &Config,
 ) -> Result<()> {
-    let uid = unsafe { libc::geteuid() as u32 };
-    let gid = unsafe { libc::getegid() as u32 };
+    let uid = crate::compat::current_uid();
+    let gid = crate::compat::current_gid();
     let desired_mode = 0o40777;
     if let Some(mut existing) = runtime.block_on(metadata.get_inode(ROOT_INODE))? {
         if existing.uid != uid || existing.gid != gid || existing.mode != desired_mode {

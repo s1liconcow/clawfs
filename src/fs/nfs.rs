@@ -59,7 +59,9 @@ impl OsageFs {
 
     /// Like `nfs_readdir` but includes `d_type` (DT_* constant) for each entry.
     /// Uses the FUSE readdir path which batch-loads inodes to determine file types.
+    #[cfg(feature = "fuse")]
     pub fn nfs_readdir_plus(&self, ino: u64) -> std::result::Result<Vec<(u64, u8, String)>, i32> {
+        use crate::compat::{DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK};
         use fuser::FileType;
 
         let replay = self.replay_start();
@@ -71,13 +73,13 @@ impl OsageFs {
                 .filter(|(_, _, name)| name != "." && name != "..")
                 .map(|(ino, ft, name)| {
                     let dt = match ft {
-                        FileType::RegularFile => libc::DT_REG,
-                        FileType::Directory => libc::DT_DIR,
-                        FileType::Symlink => libc::DT_LNK,
-                        FileType::BlockDevice => libc::DT_BLK,
-                        FileType::CharDevice => libc::DT_CHR,
-                        FileType::NamedPipe => libc::DT_FIFO,
-                        FileType::Socket => libc::DT_SOCK,
+                        FileType::RegularFile => DT_REG,
+                        FileType::Directory => DT_DIR,
+                        FileType::Symlink => DT_LNK,
+                        FileType::BlockDevice => DT_BLK,
+                        FileType::CharDevice => DT_CHR,
+                        FileType::NamedPipe => DT_FIFO,
+                        FileType::Socket => DT_SOCK,
                     };
                     (ino, dt, name)
                 })

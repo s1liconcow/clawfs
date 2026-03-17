@@ -6,18 +6,19 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::compat::{
+    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL,
+    O_TRUNC, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+};
 use anyhow::{Result, anyhow};
+#[cfg(feature = "fuse")]
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
-};
-use libc::{
-    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL,
-    O_TRUNC, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use parking_lot::Mutex;
 use time::OffsetDateTime;
@@ -49,10 +50,11 @@ const ADAPTIVE_PENDING_MULTIPLIER: u64 = 16;
 const ADAPTIVE_PENDING_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
 const NAME_MAX_BYTES: usize = 255;
+static PROCESS_EXITING: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(unix, target_os = "linux")))]
 const RENAME_NOREPLACE_FLAG: u32 = 0;
 
 #[derive(Clone)]
@@ -86,11 +88,13 @@ pub struct OsageFs {
 
 mod core;
 mod flush;
+#[cfg(feature = "fuse")]
 mod fuse;
 mod nfs;
 mod ops;
 mod write_path;
 
+#[cfg(feature = "fuse")]
 fn file_type(record: &InodeRecord) -> FileType {
     match record.kind {
         InodeKind::Directory { .. } => FileType::Directory,
@@ -121,6 +125,22 @@ fn to_system_time(ts: OffsetDateTime) -> SystemTime {
             + Duration::from_nanos(nanos as u64)
     } else {
         SystemTime::UNIX_EPOCH
+    }
+}
+
+pub fn set_process_exiting(exiting: bool) {
+    PROCESS_EXITING.store(exiting, AtomicOrdering::Relaxed);
+}
+
+pub(crate) fn process_exiting() -> bool {
+    PROCESS_EXITING.load(AtomicOrdering::Relaxed)
+}
+
+pub(crate) fn current_thread_label() -> String {
+    if process_exiting() {
+        "teardown".to_string()
+    } else {
+        format!("{:?}", thread::current().id())
     }
 }
 

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 
 use crate::auth::{
     API_BASE_URL_ENV, AuthProfile, LoginArgs, WhoamiArgs, clear_profile, load_profile,
@@ -71,24 +71,24 @@ struct SummonApiConfig {
 }
 
 #[derive(Debug, Clone)]
-struct HostedVolumeConfig {
-    provider: ObjectStoreProvider,
-    bucket: String,
-    region: Option<String>,
-    endpoint: Option<String>,
-    access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    storage_mode: Option<String>,
-    object_prefix: Option<String>,
-    telemetry_object_prefix: Option<String>,
+pub struct HostedVolumeConfig {
+    pub provider: ObjectStoreProvider,
+    pub bucket: String,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub storage_mode: Option<String>,
+    pub object_prefix: Option<String>,
+    pub telemetry_object_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct HostedVolume {
-    api_base_url: String,
-    api_token: String,
-    volume_slug: String,
-    config: HostedVolumeConfig,
+pub struct HostedVolume {
+    pub api_base_url: String,
+    pub api_token: String,
+    pub volume_slug: String,
+    pub config: HostedVolumeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -129,10 +129,18 @@ async fn fetch_summon_config(
     Ok(config)
 }
 
+pub struct NfsMountInvocation {
+    pub mount_path: PathBuf,
+    pub volume_paths: VolumePaths,
+    pub hosted: HostedVolume,
+    pub foreground: bool,
+}
+
 pub enum DispatchAction {
     FallThrough,
     Handled,
     Mount(Box<HostedMountInvocation>),
+    NfsMount(Box<NfsMountInvocation>),
 }
 
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -153,8 +161,18 @@ struct UpArgs {
     command: Vec<OsString>,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Transport {
+    Auto,
+    Fuse,
+    Nfs,
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "clawfs mount", about = "Mount a named ClawFS volume via FUSE")]
+#[command(
+    name = "clawfs mount",
+    about = "Mount a named ClawFS volume (auto-detects FUSE or NFS)"
+)]
 struct MountArgs {
     #[arg(long, default_value = DEFAULT_VOLUME)]
     volume: String,
@@ -164,6 +182,10 @@ struct MountArgs {
 
     #[arg(long, default_value_t = false)]
     foreground: bool,
+
+    /// Transport to use: auto (default), fuse, or nfs
+    #[arg(long, value_enum, default_value_t = Transport::Auto)]
+    transport: Transport,
 }
 
 #[derive(Debug, Parser)]
@@ -201,13 +223,27 @@ struct CompactArgs {
     segments_only: bool,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "clawfs umount",
+    about = "Unmount a ClawFS volume (FUSE or NFS)"
+)]
+struct UmountArgs {
+    #[arg(long, default_value = DEFAULT_VOLUME)]
+    volume: String,
+
+    #[arg(long, value_name = "PATH")]
+    path: Option<PathBuf>,
+}
+
 #[derive(Debug)]
-struct VolumePaths {
-    store_path: PathBuf,
-    cache_path: PathBuf,
-    mount_state_path: PathBuf,
-    preload_state_path: PathBuf,
-    nfs_state_path: PathBuf,
+pub struct VolumePaths {
+    pub store_path: PathBuf,
+    pub cache_path: PathBuf,
+    pub mount_state_path: PathBuf,
+    pub preload_state_path: PathBuf,
+    pub nfs_state_path: PathBuf,
+    pub nfs_mount_info_path: PathBuf,
 }
 
 impl VolumePaths {
@@ -282,8 +318,16 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
         "mount" => {
             let parse_args = subcommand_args("clawfs mount", args);
             let mount = MountArgs::parse_from(parse_args);
-            let invocation = build_mount_invocation(mount)?;
-            Ok(DispatchAction::Mount(Box::new(invocation)))
+            match resolve_transport(mount.transport) {
+                Transport::Fuse => {
+                    let invocation = build_mount_invocation(mount)?;
+                    Ok(DispatchAction::Mount(Box::new(invocation)))
+                }
+                Transport::Nfs | Transport::Auto => {
+                    let invocation = build_nfs_mount_invocation(mount)?;
+                    Ok(DispatchAction::NfsMount(Box::new(invocation)))
+                }
+            }
         }
         "serve" => {
             let parse_args = subcommand_args("clawfs serve", args);
@@ -295,6 +339,12 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             let parse_args = subcommand_args("clawfs compact", args);
             let compact = CompactArgs::parse_from(parse_args);
             run_compact(compact)?;
+            Ok(DispatchAction::Handled)
+        }
+        "umount" | "unmount" => {
+            let parse_args = subcommand_args("clawfs umount", args);
+            let umount = UmountArgs::parse_from(parse_args);
+            run_umount(umount)?;
             Ok(DispatchAction::Handled)
         }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("login") => {
@@ -332,6 +382,14 @@ pub fn dispatch(args: &[OsString]) -> Result<DispatchAction> {
             println!();
             Ok(DispatchAction::Handled)
         }
+        "help"
+            if args.get(2).and_then(|value| value.to_str()) == Some("umount")
+                || args.get(2).and_then(|value| value.to_str()) == Some("unmount") =>
+        {
+            UmountArgs::command().print_help()?;
+            println!();
+            Ok(DispatchAction::Handled)
+        }
         "help" if args.get(2).and_then(|value| value.to_str()) == Some("version") => {
             print_version_help();
             Ok(DispatchAction::Handled)
@@ -359,7 +417,8 @@ pub fn print_general_help() {
     println!("  clawfs whoami");
     println!("  clawfs telemetry [status|enable|disable]");
     println!("  clawfs up -- [command...]");
-    println!("  clawfs mount");
+    println!("  clawfs mount [--transport auto|fuse|nfs]");
+    println!("  clawfs umount");
     println!("  clawfs serve");
     println!("  clawfs compact");
     println!("  clawfs version");
@@ -423,6 +482,101 @@ fn build_mount_invocation(args: MountArgs) -> Result<HostedMountInvocation> {
             storage_mode: hosted.config.storage_mode,
         },
     })
+}
+
+fn resolve_transport(requested: Transport) -> Transport {
+    match requested {
+        Transport::Fuse | Transport::Nfs => requested,
+        Transport::Auto => {
+            // Windows has no FUSE support; always use NFS
+            if cfg!(target_os = "windows") {
+                return Transport::Nfs;
+            }
+            if cfg!(target_os = "linux") && std::path::Path::new("/dev/fuse").exists() {
+                Transport::Fuse
+            } else {
+                Transport::Nfs
+            }
+        }
+    }
+}
+
+fn build_nfs_mount_invocation(args: MountArgs) -> Result<NfsMountInvocation> {
+    let volume_paths = volume_paths(&args.volume)?;
+    volume_paths.ensure_dirs()?;
+    let mount_path = resolve_mount_path(args.path)?;
+    fs::create_dir_all(&mount_path)
+        .with_context(|| format!("creating mount path {}", mount_path.display()))?;
+
+    let hosted = resolve_hosted_volume(&args.volume)?;
+
+    Ok(NfsMountInvocation {
+        mount_path,
+        volume_paths,
+        hosted,
+        foreground: args.foreground,
+    })
+}
+
+fn run_umount(args: UmountArgs) -> Result<()> {
+    let volume_paths = volume_paths(&args.volume)?;
+    let mount_path = resolve_mount_path(args.path)?;
+
+    // Check if there's an NFS mount state file
+    if volume_paths.nfs_mount_info_path.exists() {
+        let state_data = fs::read_to_string(&volume_paths.nfs_mount_info_path)
+            .context("reading NFS mount state")?;
+        let state: crate::nfs_mount::NfsMountState =
+            serde_json::from_str(&state_data).context("parsing NFS mount state")?;
+
+        let mount_target = std::path::PathBuf::from(&state.mount_path);
+
+        // Unmount the NFS filesystem
+        match crate::nfs_mount::run_umount_cmd(&mount_target) {
+            Ok(()) => println!("Unmounted {}", state.mount_path),
+            Err(err) => eprintln!("warning: {err}"),
+        }
+
+        // Kill the gateway process
+        crate::nfs_mount::kill_gateway(state.gateway_pid);
+        println!("Stopped NFS gateway (pid {})", state.gateway_pid);
+
+        // Remove state file
+        let _ = fs::remove_file(&volume_paths.nfs_mount_info_path);
+        return Ok(());
+    }
+
+    // Fall back to FUSE unmount (Unix only; Windows always uses NFS path)
+    if cfg!(target_os = "windows") {
+        bail!(
+            "no NFS mount state found for this volume; nothing to unmount at {}",
+            mount_path.display()
+        );
+    }
+
+    let status = Command::new("fusermount")
+        .arg("-u")
+        .arg(&mount_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("Unmounted {}", mount_path.display());
+        }
+        Ok(s) => {
+            bail!(
+                "fusermount -u failed with status {} for {}",
+                s,
+                mount_path.display()
+            );
+        }
+        Err(err) => {
+            bail!(
+                "failed to run fusermount -u on {}: {err}",
+                mount_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_up(args: UpArgs) -> Result<()> {
@@ -621,7 +775,7 @@ fn provider_from_api(provider: &str) -> ObjectStoreProvider {
     }
 }
 
-fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolumeConfig) {
+pub fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolumeConfig) {
     args.push(OsString::from("--object-provider"));
     args.push(OsString::from(object_provider_name(hosted.provider)));
     args.push(OsString::from("--bucket"));
@@ -640,7 +794,7 @@ fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolumeCon
     }
 }
 
-fn object_provider_name(provider: ObjectStoreProvider) -> &'static str {
+pub fn object_provider_name(provider: ObjectStoreProvider) -> &'static str {
     match provider {
         ObjectStoreProvider::Local => "local",
         ObjectStoreProvider::Aws => "aws",
@@ -922,6 +1076,7 @@ fn volume_paths(volume: &str) -> Result<VolumePaths> {
         mount_state_path: root.join("state").join("mount_state.bin"),
         preload_state_path: root.join("state").join("preload_state.bin"),
         nfs_state_path: root.join("state").join("nfs_state.bin"),
+        nfs_mount_info_path: root.join("state").join("nfs_mount.json"),
     })
 }
 
@@ -950,7 +1105,7 @@ fn resolve_preload_library() -> Result<PathBuf> {
     resolve_existing_path(&candidates, "libclawfs_preload.so")
 }
 
-fn resolve_gateway_binary() -> Result<PathBuf> {
+pub fn resolve_gateway_binary() -> Result<PathBuf> {
     let exe = env::current_exe().context("resolving current executable")?;
     let exe_dir = exe
         .parent()

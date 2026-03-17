@@ -26,7 +26,7 @@
       <span class="brand-sub">FS</span>
     </a>
     <nav>
-      <a href="index.html#how">How It Works</a>
+      <a href="faq.html">How It Works</a>
       <a href="getting-started.html">Getting Started</a>
       <a href="demo.html">Demo</a>
       <a href="enterprise.html">Enterprise</a>
@@ -43,12 +43,16 @@
       <h1>Get ClawFS Running in the Environment You Already Use</h1>
       <p class="hero-copy">
         The `clawfs` binary is the front door. Use `clawfs up` for preload-based agent launches,
-        `clawfs mount` for FUSE, and `clawfs serve` for user-mode NFS.
+        `clawfs mount` to mount through FUSE or NFS, and `clawfs serve` to launch an explicit user-mode NFS server.
       </p>
-      <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
+      <div class="code-block"><code><strong>Linux / macOS:</strong>
+curl -fsSL https://clawfs.dev/install.sh | bash
+
+<strong>Windows (PowerShell):</strong>
+iwr https://clawfs.dev/install.ps1 -UseBasicParsing | iex</code></div>
       <div class="hero-cta">
         <a class="btn btn-primary" href="#up">Start it Up</a>
-        <a class="btn btn-primary" href="#fuse">Mount With FUSE</a>
+        <a class="btn btn-primary" href="#fuse">Mount a Volume</a>
         <a class="btn btn-secondary" href="#nfs">Serve With NFS</a>
         <a class="btn btn-secondary" href="#config">Configure Runtime</a>
       </div>
@@ -107,16 +111,16 @@ clawfs whoami</code></div>
         <h3>Current Shipping Modes</h3>
         <ul>
           <li>`clawfs up` for preload-based agent launches</li>
-          <li>`clawfs mount` for direct FUSE mounts</li>
-          <li>`clawfs serve` for user-mode NFS</li>
+          <li>`clawfs mount` for direct mounts over FUSE or NFS</li>
+          <li>`clawfs serve` for launching a user-mode NFS server explicitly</li>
         </ul>
       </article>
       <article class="card">
         <h3>How to Choose</h3>
         <ul>
           <li>Use `up` when the runtime wants file APIs without a host mount. <b>Note: </b>This doesn't work with statically linked binaries.  Use FUSE or NFS in those cases.</li>
-          <li>Use `mount` when you control the host mountpoint</li>
-          <li>Use `serve` when you want a networked userspace server</li>
+          <li>Use `mount` when you want the CLI to mount the volume for you and pick the transport with `--transport auto|fuse|nfs`</li>
+          <li>Use `serve` when you explicitly want a standalone NFS server process</li>
         </ul>
       </article>
     </section>
@@ -203,43 +207,45 @@ For more information, see https://clawfs.dev</pre>
     <section id="fuse" class="feature-grid reveal" data-delay="120">
       <div class="section-title">
         <p class="eyebrow">Mode 1</p>
-        <h2>FUSE: Mount ClawFS Directly on the Host</h2>
+        <h2>Mount: Let ClawFS Use FUSE or NFS</h2>
       </div>
       <div class="cards two-up">
         <article class="card">
           <h3>When to Use It</h3>
-          <p>Use FUSE when the agent or developer environment wants a real mount point and the host can support it.</p>
+          <p>Use `clawfs mount` when you want the CLI to mount a volume directly on the host.</p>
           <ul>
-            <li>Local development</li>
-            <li>Single-node agent runners</li>
-            <li>Workflows that expect POSIX paths directly on the host</li>
+            <li>Default transport is `auto`</li>
+            <li>Set `--transport fuse` when you want FUSE directly</li>
+            <li>Set `--transport nfs` when NFS is the better path for the host</li>
           </ul>
         </article>
         <article class="card">
           <h3>Quick Start</h3>
           <div class="code-block"><code>clawfs mount --path .clawfs</code></div>
           <p class="footnote">Defaults to the `default` volume and mounts relative to the current working directory
-            unless you override `--volume` or `--path`.</p>
+            unless you override `--volume` or `--path`. Transport defaults to <code>auto</code>.</p>
         </article>
       </div>
       <article class="callout">
-        <strong>Direct CLI launch</strong><br />
-        The front-door wrapper creates the local store/cache/state layout for the volume, then launches the FUSE path
-        behind the scenes.
-        <div class="code-block"><code>clawfs mount --volume datasets --path /tmp/clawfs-mnt</code></div>
+        <strong>Transport selection</strong><br />
+        `clawfs mount` accepts <code>--transport auto|fuse|nfs</code>. Use the default when you want ClawFS to pick,
+        or force a transport explicitly when you know what the host should use.
+        <div class="code-block"><code>clawfs mount --volume datasets --path /tmp/clawfs-mnt
+clawfs mount --transport fuse --path /tmp/clawfs-fuse
+clawfs mount --transport nfs --path /tmp/clawfs-nfs</code></div>
       </article>
     </section>
 
     <section id="nfs" class="feature-grid reveal" data-delay="180">
       <div class="section-title">
         <p class="eyebrow">Mode 2</p>
-        <h2>NFS: Serve ClawFS Over User-Mode NFS</h2>
+        <h2>Serve: Launch an Explicit NFS Server</h2>
       </div>
       <div class="cards two-up">
         <article class="card">
           <h3>When to Use It</h3>
-          <p>Use NFS when you want ClawFS running as a user-space server and the client side can mount NFS or connect
-            from another runtime.</p>
+          <p>Use `clawfs serve` when you want ClawFS running as an explicit user-space NFS server and the client side
+            will mount or connect to that server.</p>
           <ul>
             <li>Remote workers and VMs</li>
             <li>Containerized runners</li>
@@ -249,7 +255,7 @@ For more information, see https://clawfs.dev</pre>
         <article class="card">
           <h3>Quick Start</h3>
           <div class="code-block"><code>clawfs serve --listen 127.0.0.1:2049</code></div>
-          <p class="footnote">Defaults to the `default` volume and launches the user-mode NFS gateway for that volume.
+          <p class="footnote">Defaults to the `default` volume and launches the NFS gateway for that volume.
           </p>
         </article>
       </div>
@@ -358,8 +364,8 @@ CLAWFS_AWS_SESSION_TOKEN=...</code></div>
 
     <section class="cta reveal" data-delay="420">
       <h2>Start with the integration path that matches your runtime.</h2>
-      <p>Most teams begin with the hosted experience, then adopt FUSE or NFS when they want more direct control over
-        deployment and storage.</p>
+      <p>Most teams begin with the hosted experience, then adopt `mount`, `serve`, or preload-based launches when they
+        want more direct control over deployment and storage.</p>
       <div class="hero-cta">
         <a class="btn btn-primary" href="pricing.html">Pick a Plan</a>
         <a class="btn btn-secondary" href="enterprise.html">See Enterprise Controls</a>

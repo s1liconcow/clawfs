@@ -35,20 +35,23 @@ impl ReentrancyGuard {
     /// Try to enter the guard. Returns `Some(ReentrancyGuard)` if we're not
     /// already inside a hook, `None` if we are (caller should fall through).
     fn enter() -> Option<Self> {
-        REENTRANT.with(|r| {
-            if r.get() {
-                None
-            } else {
-                r.set(true);
-                Some(ReentrancyGuard)
-            }
-        })
+        REENTRANT
+            .try_with(|r| {
+                if r.get() {
+                    None
+                } else {
+                    r.set(true);
+                    Some(ReentrancyGuard)
+                }
+            })
+            .ok()
+            .flatten()
     }
 }
 
 impl Drop for ReentrancyGuard {
     fn drop(&mut self) {
-        REENTRANT.with(|r| r.set(false));
+        let _ = REENTRANT.try_with(|r| r.set(false));
     }
 }
 
@@ -104,6 +107,24 @@ real_fn!(
     get_real_close,
     "close",
     unsafe extern "C" fn(i32) -> i32
+);
+real_fn!(
+    REAL_EXIT_PTR,
+    get_real_exit,
+    "exit",
+    unsafe extern "C" fn(i32) -> !
+);
+real_fn!(
+    REAL_UNDERSCORE_EXIT_PTR,
+    get_real_underscore_exit,
+    "_exit",
+    unsafe extern "C" fn(i32) -> !
+);
+real_fn!(
+    REAL_CAPITAL_EXIT_PTR,
+    get_real_capital_exit,
+    "_Exit",
+    unsafe extern "C" fn(i32) -> !
 );
 real_fn!(
     REAL_READ_PTR,
@@ -1121,6 +1142,45 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
         }
     }
     unsafe { get_real_close()(fd) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn exit(status: i32) -> ! {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        clawfs::fs::set_process_exiting(true);
+        if let Some(rt) = ClawfsRuntime::get() {
+            let _ = rt.fs.nfs_flush();
+        }
+    }
+    unsafe { get_real_exit()(status) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _exit(status: i32) -> ! {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        clawfs::fs::set_process_exiting(true);
+        if let Some(rt) = ClawfsRuntime::get() {
+            let _ = rt.fs.nfs_flush();
+        }
+    }
+    unsafe { get_real_underscore_exit()(status) }
+}
+
+/// # Safety
+/// Called by the dynamic linker as a libc function replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Exit(status: i32) -> ! {
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        clawfs::fs::set_process_exiting(true);
+        if let Some(rt) = ClawfsRuntime::get() {
+            let _ = rt.fs.nfs_flush();
+        }
+    }
+    unsafe { get_real_capital_exit()(status) }
 }
 
 /// # Safety

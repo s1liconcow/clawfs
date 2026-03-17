@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -174,14 +173,7 @@ impl ClientStateManager {
             .write(true)
             .open(&self.lock_path)
             .with_context(|| format!("opening client state lock {}", self.lock_path.display()))?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if result != 0 {
-            return Err(anyhow::anyhow!(
-                "locking client state {} failed: {}",
-                self.lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
+        lock_file_exclusive(&file, &self.lock_path)?;
         Ok(file)
     }
 }
@@ -240,6 +232,28 @@ fn deserialize_state_fb(data: &[u8]) -> Result<ClientState> {
         segment_next,
         segment_remaining,
     })
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File, lock_path: &Path) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(anyhow::anyhow!(
+            "locking client state {} failed: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File, _lock_path: &Path) -> anyhow::Result<()> {
+    // File locking is advisory on Unix and primarily guards against concurrent
+    // client-state writes from multiple mounts.  On non-Unix platforms we
+    // accept the small race since single-client NFS mode is the expected path.
+    Ok(())
 }
 
 #[cfg(test)]

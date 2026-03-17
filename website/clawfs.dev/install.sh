@@ -12,10 +12,14 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-if [[ "$OS" != "Linux" ]]; then
-  echo "clawfs install.sh currently supports Linux only." >&2
-  exit 1
-fi
+case "$OS" in
+  Linux)  PLATFORM="linux" ;;
+  *)
+    echo "clawfs install.sh supports Linux." >&2
+    echo "For Windows, use PowerShell: iwr https://clawfs.dev/install.ps1 -UseBasicParsing | iex" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$ARCH" != "x86_64" ]]; then
   echo "clawfs install.sh currently supports x86_64 only." >&2
@@ -31,7 +35,7 @@ if [[ "$VERSION" == "latest" ]]; then
   fi
 fi
 
-TARBALL="clawfs-${VERSION}-linux-x86_64.tar.gz"
+TARBALL="clawfs-${VERSION}-${PLATFORM}-x86_64.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
 
 echo "Installing ClawFS ${VERSION} from ${URL}"
@@ -40,9 +44,14 @@ tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"
 
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 install -m 0755 "$TMP_DIR/clawfs" "$BIN_DIR/clawfs"
-install -m 0755 "$TMP_DIR/clawfs_checkpoint" "$BIN_DIR/clawfs_checkpoint"
-install -m 0755 "$TMP_DIR/clawfs_replay" "$BIN_DIR/clawfs_replay"
 install -m 0755 "$TMP_DIR/clawfs-nfs-gateway" "$BIN_DIR/clawfs-nfs-gateway"
+
+# Linux-only binaries
+for bin in clawfs_checkpoint clawfs_replay; do
+  if [[ -f "$TMP_DIR/$bin" ]]; then
+    install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/$bin"
+  fi
+done
 
 if [[ -f "$TMP_DIR/libclawfs_preload.so" ]]; then
   install -m 0755 "$TMP_DIR/libclawfs_preload.so" "$LIB_DIR/libclawfs_preload.so"
@@ -50,10 +59,10 @@ fi
 
 echo
 echo "Installed the all-in-one ClawFS CLI to $BIN_DIR"
-echo "Installed support binaries and preload library to $BIN_DIR and $LIB_DIR"
+echo "Installed support binaries to $BIN_DIR"
 echo
 echo "Next steps:"
 echo "  export PATH=\"$BIN_DIR:\$PATH\""
 echo "  clawfs login"
 echo "  clawfs whoami"
-echo "  clawfs up -- codex"
+echo "  clawfs mount --volume default"

@@ -105,7 +105,7 @@ impl OsageFs {
         let _flush_guard = self.flush_lock.lock();
         let flush_lock_wait = flush_lock_wait_start.elapsed();
         let pid = process::id();
-        let tid = format!("{:?}", thread::current().id());
+        let tid = super::current_thread_label();
         let mut prepared_generation: Option<u64> = None;
         let mut drained_pending: Option<HashMap<u64, PendingEntry>> = None;
         let result = (|| {
@@ -736,7 +736,9 @@ impl OsageFs {
     }
 
     pub(crate) fn replay_start(&self) -> Option<Instant> {
-        self.replay.as_ref().map(|_| Instant::now())
+        (!super::process_exiting())
+            .then_some(())
+            .and_then(|_| self.replay.as_ref().map(|_| Instant::now()))
     }
 
     pub(crate) fn log_replay(
@@ -750,15 +752,15 @@ impl OsageFs {
         if let (Some(errno), Some(telemetry)) = (errno, &self.telemetry) {
             telemetry.emit_errno_sampled(layer, op, errno);
         }
+        if super::process_exiting() {
+            return;
+        }
         let (Some(logger), Some(started)) = (&self.replay, start) else {
             return;
         };
         if let serde_json::Value::Object(ref mut map) = details {
             map.insert("pid".to_string(), json!(process::id()));
-            map.insert(
-                "tid".to_string(),
-                json!(format!("{:?}", thread::current().id())),
-            );
+            map.insert("tid".to_string(), json!(super::current_thread_label()));
         }
         let duration = started.elapsed();
         let start_offset = logger.elapsed_since_start(started);
@@ -825,7 +827,7 @@ impl OsageFs {
 
     pub(crate) fn log_fuse_error(&self, op: &str, detail: &str, code: i32) {
         let pid = process::id();
-        let tid = format!("{:?}", thread::current().id());
+        let tid = super::current_thread_label();
         error!(
             "{} failed pid={} tid={} {} errno={}",
             op, pid, tid, detail, code
