@@ -125,7 +125,19 @@ pub fn dispatch_open(
 /// Dispatch `close` — remove from fd table.
 /// Writes are staged in memory and flushed by background interval or at exit.
 pub fn dispatch_close(rt: &ClawfsRuntime, fd: i32) -> Result<(), i32> {
-    let _entry = rt.fd_table.remove(fd).ok_or(libc::EBADF)?;
+    let entry = rt.fd_table.remove(fd).ok_or(libc::EBADF)?;
+    let needs_flush = !entry.is_dir
+        && (entry.flags & libc::O_ACCMODE == libc::O_WRONLY
+            || entry.flags & libc::O_ACCMODE == libc::O_RDWR
+            || entry.flags & libc::O_APPEND != 0
+            || entry.flags & libc::O_TRUNC != 0
+            || entry.flags & libc::O_CREAT != 0);
+    if let Some(path) = entry.host_backing_path.lock().take() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    if needs_flush {
+        rt.fs.nfs_flush_inode(entry.inode)?;
+    }
     Ok(())
 }
 
@@ -224,6 +236,7 @@ pub fn dispatch_mkdir(rt: &ClawfsRuntime, inner: &str) -> Result<(), i32> {
         return Err(libc::EEXIST);
     }
     rt.fs.nfs_mkdir(parent_ino, &basename, uid, gid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -262,6 +275,7 @@ pub fn dispatch_rename(rt: &ClawfsRuntime, old_inner: &str, new_inner: &str) -> 
     }
     rt.fs
         .nfs_rename(old_parent, &old_name, new_parent, &new_name, 0, uid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -312,6 +326,7 @@ pub fn dispatch_truncate(rt: &ClawfsRuntime, inner: &str, length: i64) -> Result
         None,
         None,
     )?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -329,6 +344,7 @@ pub fn dispatch_ftruncate(rt: &ClawfsRuntime, entry: &FdEntry, length: i64) -> R
         None,
         None,
     )?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 
@@ -347,6 +363,7 @@ pub fn dispatch_symlink(rt: &ClawfsRuntime, target: &str, link_inner: &str) -> R
     }
     rt.fs
         .nfs_symlink(parent_ino, &basename, target.as_bytes().to_vec(), uid, gid)?;
+    rt.fs.nfs_flush()?;
     Ok(())
 }
 

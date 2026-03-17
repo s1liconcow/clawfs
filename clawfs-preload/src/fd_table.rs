@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -24,6 +25,9 @@ pub struct FdEntry {
     /// Each entry is (inode, d_type, name).
     #[allow(clippy::type_complexity)]
     pub dir_entries: Mutex<Option<(Vec<(u64, u8, String)>, usize)>>,
+    /// Optional host directory used to back a real dirfd/DIR* for libc code
+    /// that requires an actual kernel directory handle.
+    pub host_backing_path: Mutex<Option<PathBuf>>,
 }
 
 /// Thread-safe table of synthetic file descriptors for ClawFS files.
@@ -65,6 +69,7 @@ impl FdTable {
             offset: AtomicI64::new(0),
             is_dir,
             dir_entries: Mutex::new(None),
+            host_backing_path: Mutex::new(None),
         });
         self.map.insert(fd, entry);
         fd
@@ -185,6 +190,7 @@ mod tests {
             offset: AtomicI64::new(0),
             is_dir: false,
             dir_entries: Mutex::new(None),
+            host_backing_path: Mutex::new(None),
         };
         assert_eq!(entry.get_offset(), 0);
         entry.set_offset(100);

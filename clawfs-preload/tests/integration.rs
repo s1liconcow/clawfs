@@ -413,3 +413,90 @@ fn preload_relative_rm_from_host_cwd_succeeds() {
         .expect("failed to stat relative removed file");
     assert_eq!(stat.code(), Some(1), "relative file still exists after rm");
 }
+
+#[test]
+fn preload_mkdir_persists_across_processes() {
+    let env = TestEnv::new("/clawfs-mkdir-prefix");
+    let path = format!("{}/dir1", env.prefix);
+
+    let create = env
+        .command("mkdir")
+        .arg(&path)
+        .output()
+        .expect("failed to run mkdir");
+    assert!(
+        create.status.success(),
+        "mkdir failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        create.status,
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let stat = env
+        .command("python3")
+        .arg("-c")
+        .arg("import os, sys; sys.exit(0 if os.path.isdir(sys.argv[1]) else 1)")
+        .arg(&path)
+        .status()
+        .expect("failed to stat created directory");
+    assert_eq!(
+        stat.code(),
+        Some(0),
+        "directory did not persist across processes"
+    );
+}
+
+#[test]
+fn preload_recursive_rm_directory_succeeds() {
+    let env = TestEnv::new("/clawfs-rmrf-prefix");
+    let root = format!("{}/dir1", env.prefix);
+
+    let create = env
+        .command("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import os, sys
+root = sys.argv[1]
+os.makedirs(root + "/sub", exist_ok=True)
+for i in range(50):
+    with open(f"{root}/batch_{i}.txt", "w") as f:
+        f.write("x")
+with open(root + "/sub/nested.txt", "w") as f:
+    f.write("nested")
+"#,
+        )
+        .arg(&root)
+        .output()
+        .expect("failed to create directory tree");
+    assert!(
+        create.status.success(),
+        "tree setup failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        create.status,
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let remove = env
+        .command("rm")
+        .arg("-rf")
+        .arg(&root)
+        .output()
+        .expect("failed to run rm -rf");
+    assert!(
+        remove.status.success(),
+        "rm -rf failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        remove.status,
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let stat = env
+        .command("python3")
+        .arg("-c")
+        .arg("import os, sys; sys.exit(0 if os.path.exists(sys.argv[1]) else 1)")
+        .arg(&root)
+        .status()
+        .expect("failed to stat removed directory");
+    assert_eq!(stat.code(), Some(1), "directory still exists after rm -rf");
+}

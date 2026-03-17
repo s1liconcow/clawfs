@@ -111,7 +111,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build ClawFS CLI (NFS-only, no FUSE)
-        run: cargo build --release --no-default-features --bin clawfs
+        run: cargo build --release -p clawfs --no-default-features --bin clawfs
 
       - name: Build NFS gateway
         run: cargo build --release --manifest-path clawfs-nfs-gateway/Cargo.toml

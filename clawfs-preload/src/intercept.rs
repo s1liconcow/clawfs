@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::dispatch;
@@ -30,6 +30,7 @@ thread_local! {
 struct ReentrancyGuard;
 
 static FD_PROXY_THREADS: OnceLock<DashMap<i32, std::thread::JoinHandle<()>>> = OnceLock::new();
+static DIR_BACKING_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl ReentrancyGuard {
     /// Try to enter the guard. Returns `Some(ReentrancyGuard)` if we're not
@@ -1031,6 +1032,15 @@ fn do_open(rt: &ClawfsRuntime, path_str: &str, inner: &str, flags: i32, mode: li
         Ok(fd) => fd,
         Err(e) => return set_errno(e) as i32,
     };
+    let Some(entry) = rt.fd_table.get(synth_fd) else {
+        return set_errno(libc::EBADF) as i32;
+    };
+    if entry.is_dir {
+        return match materialize_dir_fd(rt, synth_fd, entry, flags) {
+            Ok(fd) => fd,
+            Err(errno) => set_errno(errno) as i32,
+        };
+    }
     // Get a real kernel fd by opening /dev/null.
     let devnull = CString::new("/dev/null").unwrap();
     let kernel_fd = unsafe { get_real_open()(devnull.as_ptr(), libc::O_RDWR, 0) };
@@ -1049,6 +1059,68 @@ fn do_open(rt: &ClawfsRuntime, path_str: &str, inner: &str, flags: i32, mode: li
         synth_fd
     );
     kernel_fd
+}
+
+fn materialize_dir_fd(
+    rt: &ClawfsRuntime,
+    synth_fd: i32,
+    entry: std::sync::Arc<FdEntry>,
+    flags: i32,
+) -> Result<i32, i32> {
+    dispatch::dispatch_readdir_fill(rt, &entry)?;
+
+    let seq = DIR_BACKING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let backing_root =
+        std::env::temp_dir().join(format!("clawfs-preload-dir-{}-{seq}", std::process::id()));
+    std::fs::create_dir_all(&backing_root).map_err(|_| libc::EIO)?;
+
+    let create_result = (|| -> Result<(), i32> {
+        let dir = entry.dir_entries.lock();
+        let Some((entries, _)) = dir.as_ref() else {
+            return Ok(());
+        };
+        for (_, d_type, name) in entries {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = backing_root.join(name);
+            match *d_type {
+                x if x == libc::DT_DIR => std::fs::create_dir(&child).map_err(|_| libc::EIO)?,
+                x if x == libc::DT_LNK => std::os::unix::fs::symlink("clawfs-placeholder", &child)
+                    .map_err(|_| libc::EIO)?,
+                _ => {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&child)
+                        .map_err(|_| libc::EIO)?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(errno) = create_result {
+        let _ = std::fs::remove_dir_all(&backing_root);
+        let _ = dispatch::dispatch_close(rt, synth_fd);
+        return Err(errno);
+    }
+
+    let backing_c =
+        CString::new(backing_root.to_string_lossy().as_bytes()).map_err(|_| libc::EIO)?;
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | (flags & libc::O_CLOEXEC);
+    let kernel_fd = unsafe { get_real_open()(backing_c.as_ptr(), dir_flags, 0) };
+    if kernel_fd < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        let _ = std::fs::remove_dir_all(&backing_root);
+        let _ = dispatch::dispatch_close(rt, synth_fd);
+        return Err(errno);
+    }
+
+    *entry.host_backing_path.lock() = Some(backing_root);
+    rt.fd_table.dup_to(synth_fd, kernel_fd);
+    rt.fd_table.remove(synth_fd);
+    Ok(kernel_fd)
 }
 
 /// # Safety
@@ -2464,18 +2536,12 @@ pub unsafe extern "C" fn opendir(name: *const libc::c_char) -> *mut libc::DIR {
             if let Some(path_str) = c_path_to_str(name) {
                 if let Some(inner) = try_classify(cfg, &path_str) {
                     if let Some(rt) = ClawfsRuntime::ensure_runtime() {
-                        match dispatch::dispatch_open(rt, &inner, libc::O_RDONLY, 0) {
-                            Ok(fd) => {
-                                // Pre-fill directory entries.
-                                if let Some(entry) = rt.fd_table.get(fd) {
-                                    let _ = dispatch::dispatch_readdir_fill(rt, &entry);
-                                }
-                                return fd as usize as *mut libc::DIR;
-                            }
-                            Err(e) => {
-                                return crate::errno::set_errno_null(e);
-                            }
+                        let fd =
+                            do_open(rt, &path_str, &inner, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+                        if fd < 0 {
+                            return std::ptr::null_mut();
                         }
+                        return unsafe { get_real_fdopendir()(fd) };
                     }
                 }
             }
@@ -2616,6 +2682,17 @@ pub unsafe extern "C" fn closedir(dirp: *mut libc::DIR) -> i32 {
             }
         }
     }
+    if let Some(_guard) = ReentrancyGuard::enter() {
+        if let Some(rt) = ClawfsRuntime::get() {
+            let fd = unsafe { get_real_dirfd()(dirp) };
+            if rt.fd_table.is_clawfs_fd(fd) {
+                match dispatch::dispatch_close(rt, fd) {
+                    Ok(()) => {}
+                    Err(e) => return set_errno(e) as i32,
+                }
+            }
+        }
+    }
     unsafe { get_real_closedir()(dirp) }
 }
 
@@ -2640,6 +2717,9 @@ pub unsafe extern "C" fn fdopendir(fd: i32) -> *mut libc::DIR {
                     if !entry.is_dir {
                         set_errno(libc::ENOTDIR);
                         return std::ptr::null_mut();
+                    }
+                    if fd < crate::fd_table::FD_BASE {
+                        return unsafe { get_real_fdopendir()(fd) };
                     }
                     let _ = dispatch::dispatch_readdir_fill(rt, &entry);
                 }
