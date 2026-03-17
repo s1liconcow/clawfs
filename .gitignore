@@ -12,3 +12,6 @@ pjdfstest_*
 fio-results-*
 scripts/__pycache__
 clawfs-nfs-gateway/target
+
+# bv (beads viewer) local config and caches
+.bv/
