@@ -20,6 +20,7 @@ Network expectations:
 | Client -> coordination | Low-latency preferred, but advisory only |
 | Client -> relay executor | Lowest practical latency, because close/fsync depend on it |
 | Worker -> object store | Same-region or same-VPC preferred |
+| Org worker replica -> replica | Pod-to-pod or VPC-internal; required for HA relay forwarding |
 
 ## Normal Operation
 
@@ -211,6 +212,178 @@ Rollback:
 - Disable relay-write for the affected volume.
 - If direct fallback is allowed for that volume, switch only after confirming policy and latency tradeoffs.
 - Do not clear journal state until a committed generation is confirmed.
+
+## Org-Scoped Worker (`clawfs_org_worker`)
+
+The org-scoped worker manages maintenance and relay commit authority for **all**
+ClawFS volumes under a single discovery prefix.  It replaces the per-volume
+`clawfs_maintenance_worker` and `clawfs_relay_executor` binaries for multi-volume
+deployments and discovers volumes dynamically, so no volume list configuration is
+required at startup.
+
+### When to use
+
+| Mode | Recommended binary |
+| --- | --- |
+| Single volume, maintenance only | `clawfs_maintenance_worker` |
+| Single volume, relay write | `clawfs_relay_executor` |
+| Many volumes under one org prefix | `clawfs_org_worker` |
+
+### Required arguments
+
+| Flag | Description |
+| --- | --- |
+| `--discovery-prefix` | Org-scoped root the worker scans for volumes (e.g. `orgs/myorg`). The worker NEVER touches paths outside this prefix. |
+| `--bucket` / `--region` / `--endpoint` | Object store connection (same as single-volume binaries). |
+| `--advertise-url` | Publicly reachable URL of this replica — required when `--enable-relay` is set. Written into relay owner records so peer replicas can forward requests here. |
+| `--replica-id` | Stable, unique identity for this replica — required when `--enable-relay` is set. Must survive restarts. Use the pod name or a UUID stored in a ConfigMap. |
+
+### Optional arguments with defaults
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--scan-interval-secs` | `300` | How often to rescan for new or removed volumes. |
+| `--max-active-volumes` | `64` | Maximum simultaneously loaded volume contexts. Contexts idle longer than `--idle-eviction-secs` are evicted. |
+| `--enable-maintenance` | `true` | Run delta/segment compaction, checkpointing, and lifecycle cleanup. |
+| `--maintenance-concurrency` | `4` | Maximum concurrent per-volume maintenance rounds. |
+| `--maintenance-poll-secs` | `30` | How often to check for due work. |
+| `--enable-relay` | `false` | Enable relay write ownership and forwarding. Requires `--advertise-url` and `--replica-id`. |
+| `--relay-listen` | `0.0.0.0:8080` | HTTP server address (relay + health). |
+| `--jwt-secret` / `CLAWFS_RELAY_JWT_SECRET` | unset (dev mode) | HMAC-SHA256 secret for relay JWT tokens. Unset accepts all requests. |
+
+### Deployment: container image
+
+The shared `hosted-accelerator` image already includes the binary.  Select it
+with `HOSTED_ACCELERATOR_BIN=clawfs_org_worker`:
+
+```yaml
+# docker run example
+docker run \
+  -e HOSTED_ACCELERATOR_BIN=clawfs_org_worker \
+  -e CLAWFS_RELAY_JWT_SECRET=<secret> \
+  hosted-accelerator \
+  --bucket my-org-bucket \
+  --region us-east-1 \
+  --discovery-prefix orgs/myorg \
+  --enable-relay \
+  --advertise-url http://$(hostname):8080 \
+  --replica-id $(hostname)
+```
+
+### Deployment: Kubernetes (HA relay, 2 replicas)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clawfs-org-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: clawfs-org-worker
+  template:
+    metadata:
+      labels:
+        app: clawfs-org-worker
+    spec:
+      containers:
+      - name: worker
+        image: ghcr.io/yourorg/hosted-accelerator:latest
+        env:
+        - name: HOSTED_ACCELERATOR_BIN
+          value: clawfs_org_worker
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: CLAWFS_RELAY_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: clawfs-relay-secret
+              key: jwt-secret
+        args:
+        - --bucket=my-org-bucket
+        - --region=us-east-1
+        - --discovery-prefix=orgs/myorg
+        - --enable-relay
+        - --replica-id=$(POD_NAME)
+        - --advertise-url=http://$(POD_NAME).clawfs-org-worker-headless.default.svc.cluster.local:8080
+        ports:
+        - containerPort: 8080
+---
+# Headless service for pod-to-pod forwarding (required for HA relay).
+# Replicas forward relay requests to the current lease-owner via its
+# advertise-url.  Without backend reachability the forwarding hop fails.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clawfs-org-worker-headless
+spec:
+  clusterIP: None
+  selector:
+    app: clawfs-org-worker
+  ports:
+  - port: 8080
+```
+
+### Network requirements for HA relay forwarding
+
+The org-scoped worker performs internal request forwarding when it receives a
+relay write for a volume whose lease is held by another replica.  This requires
+**backend-network reachability between all replicas**.
+
+| Path | Requirement |
+| --- | --- |
+| Client → any replica | Routable; typically a ClusterIP or load-balancer service |
+| Replica → replica (forwarding) | Direct pod-to-pod or VPC-internal; NOT through a public load balancer |
+| Replica → object store | Same-region or same-VPC preferred |
+
+**Common failure mode**: all replicas are reachable from clients but not from
+each other (e.g., deployed behind a public load balancer with no pod-to-pod
+route).  The forwarding hop returns a connection error and the non-owner replica
+returns HTTP 502 to the client.  Use a headless service in Kubernetes or a
+VPC-internal ALB listener in ECS/Cloud Run.
+
+Max forwarding hops before rejection: **2** (prevents infinite loops).
+
+### Health endpoints
+
+```
+GET  /health                    → aggregate health JSON
+GET  /health/volumes            → per-volume health list
+GET  /health/volumes/<prefix>   → single volume detail (relay_enabled, maintenance_enabled, generation, shard_size)
+```
+
+### Per-volume policy override
+
+Place `<volume-prefix>/metadata/accelerator_policy.json` in the bucket to
+override defaults for a specific volume.  The worker re-reads the policy file
+on each discovery scan; updates take effect without restarting the binary.
+
+```json
+{
+  "relay_enabled": true,
+  "maintenance_enabled": true,
+  "checkpoint_enabled": true,
+  "checkpoint_interval_secs": 86400,
+  "lifecycle_cleanup": false
+}
+```
+
+Missing fields use defaults (see `src/org_policy.rs`).  An invalid JSON file
+marks only that volume as `unhealthy_policy`; other volumes continue normally.
+
+### Rollout guidance
+
+1. Deploy the org-scoped worker alongside existing per-volume workers.
+2. Verify discovery via `GET /health/volumes` — all expected volumes should appear within one scan interval.
+3. Confirm per-volume health is `healthy_idle` or `healthy_backlogged` (not `unhealthy_init`).
+4. Set `relay_enabled: true` in policy files one volume at a time.
+5. After relay is stable, decommission per-volume relay executor instances.
+6. Finally, decommission per-volume maintenance workers once the org worker confirms sustained healthy maintenance rounds.
+
+Rollback: set `HOSTED_ACCELERATOR_BIN=clawfs_maintenance_worker` (or `clawfs_relay_executor`) to return to per-volume mode.  The org-scoped worker leaves no side effects in the object store beyond the relay owner lease file (`<prefix>/metadata/relay_owner.json`), which expires automatically after `RELAY_OWNER_LEASE_TTL_SECS` (30 seconds).
 
 ## Alert Definitions
 
