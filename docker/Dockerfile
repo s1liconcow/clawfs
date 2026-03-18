@@ -20,7 +20,8 @@ COPY ../fuser-mt ./fuser-mt
 RUN cargo build --release --locked --no-default-features \
     --package clawfs \
     --bin clawfs_maintenance_worker \
-    --bin clawfs_relay_executor
+    --bin clawfs_relay_executor \
+    --bin clawfs_org_worker
 
 FROM debian:bookworm-slim AS runtime
 
@@ -36,6 +37,7 @@ WORKDIR /var/lib/clawfs
 
 COPY --from=builder /app/target/release/clawfs_maintenance_worker /usr/local/bin/clawfs_maintenance_worker
 COPY --from=builder /app/target/release/clawfs_relay_executor /usr/local/bin/clawfs_relay_executor
+COPY --from=builder /app/target/release/clawfs_org_worker /usr/local/bin/clawfs_org_worker
 COPY hosted-accelerator-entrypoint.sh /usr/local/bin/hosted-accelerator-entrypoint.sh
 
 ENV HOSTED_ACCELERATOR_BIN=clawfs_maintenance_worker

@@ -14,6 +14,8 @@ pub mod launch;
 pub mod maintenance;
 pub mod metadata;
 pub mod nfs_mount;
+pub mod org_policy;
+pub mod org_registry;
 pub mod perf;
 pub mod perf_bench;
 pub mod refreshable_store;

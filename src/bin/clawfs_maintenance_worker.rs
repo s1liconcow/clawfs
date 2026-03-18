@@ -9,7 +9,7 @@
 //! at a time.
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,10 +18,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use clawfs::config::{Config, ObjectStoreProvider};
-use clawfs::maintenance::{self, CheckpointConfig, CompactionConfig, LifecyclePolicy};
+use clawfs::maintenance::{
+    CheckpointConfig, CompactionConfig, LifecyclePolicy, MaintenanceRoundContext,
+    MaintenanceSchedule, run_maintenance_round,
+};
 use clawfs::metadata::MetadataStore;
 use clawfs::segment::{SegmentManager, segment_prefix};
-use clawfs::superblock::{CleanupTaskKind, SuperblockManager};
+use clawfs::superblock::SuperblockManager;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -258,273 +261,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-const LIFECYCLE_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-struct MaintenanceSchedule {
-    last_checkpoint_run: Option<Instant>,
-    last_lifecycle_run: Option<Instant>,
-}
-
-impl MaintenanceSchedule {
-    fn new() -> Self {
-        Self {
-            last_checkpoint_run: None,
-            last_lifecycle_run: None,
-        }
-    }
-
-    fn checkpoint_due(&self, interval: Duration) -> bool {
-        if interval.is_zero() {
-            return false;
-        }
-        match self.last_checkpoint_run {
-            Some(last) => last.elapsed() >= interval,
-            None => true,
-        }
-    }
-
-    fn lifecycle_due(&self) -> bool {
-        match self.last_lifecycle_run {
-            Some(last) => last.elapsed() >= LIFECYCLE_SWEEP_INTERVAL,
-            None => true,
-        }
-    }
-
-    fn mark_checkpoint_ran(&mut self) {
-        self.last_checkpoint_run = Some(Instant::now());
-    }
-
-    fn mark_lifecycle_ran(&mut self) {
-        self.last_lifecycle_run = Some(Instant::now());
-    }
-}
-
-struct RoundStatus {
-    delta_backlog: usize,
-    segment_backlog: usize,
-    checkpoint_backlog: usize,
-}
-
-struct MaintenanceRoundContext<'a> {
-    metadata: &'a Arc<MetadataStore>,
-    segments: &'a Arc<SegmentManager>,
-    superblock: &'a Arc<SuperblockManager>,
-    client_id: &'a str,
-    compaction_config: &'a CompactionConfig,
-    checkpoint_config: Option<&'a CheckpointConfig>,
-    lifecycle_policy: Option<&'a LifecyclePolicy>,
-    schedule: &'a mut MaintenanceSchedule,
-}
-
-async fn run_maintenance_round(ctx: MaintenanceRoundContext<'_>) -> RoundStatus {
-    let MaintenanceRoundContext {
-        metadata,
-        segments,
-        superblock,
-        client_id,
-        compaction_config: config,
-        checkpoint_config,
-        lifecycle_policy,
-        schedule,
-    } = ctx;
-
-    let mut did_delta_work = false;
-    let mut status = RoundStatus {
-        delta_backlog: 0,
-        segment_backlog: 0,
-        checkpoint_backlog: 0,
-    };
-
-    // --- Delta compaction ---
-    // Pre-check count to avoid acquiring a lease when there is nothing to do.
-    let delta_count = {
-        let md = metadata.clone();
-        tokio::task::spawn_blocking(move || md.delta_file_count())
-            .await
-            .unwrap_or(Ok(0))
-            .unwrap_or(0)
-    };
-
-    if delta_count > config.delta_compact_threshold {
-        match maintenance::acquire_cleanup_lease(
-            superblock,
-            CleanupTaskKind::DeltaCompaction,
-            client_id,
-            config,
-        )
-        .await
-        {
-            Ok(true) => {
-                match maintenance::run_delta_compaction(metadata, config).await {
-                    Ok(result) => {
-                        info!(
-                            target: "maintenance",
-                            deltas_pruned = result.deltas_pruned,
-                            delta_backlog = result.delta_backlog,
-                            duration_ms = result.duration_ms(),
-                            "delta_compaction_complete"
-                        );
-                        did_delta_work = result.deltas_pruned > 0;
-                        status.delta_backlog = result.delta_backlog;
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            target: "maintenance",
-                            kind = "delta_compaction",
-                            error = %err,
-                            "compaction_failed"
-                        );
-                    }
-                }
-                if let Err(err) = maintenance::release_cleanup_lease(
-                    superblock,
-                    CleanupTaskKind::DeltaCompaction,
-                    client_id,
-                )
-                .await
-                {
-                    warn!("failed to release delta compaction lease: {err:?}");
-                }
-            }
-            Ok(false) => {
-                // lease_contention is now logged inside acquire_cleanup_lease
-            }
-            Err(err) => tracing::error!(
-                target: "maintenance",
-                kind = "delta_compaction",
-                error = %err,
-                "lease_acquire_failed"
-            ),
-        }
-    }
-
-    // --- Segment compaction ---
-    // Only run segment compaction if the volume is old enough and we didn't
-    // just do delta work (avoid two heavy operations in the same cycle).
-    if !did_delta_work {
-        let current_generation = superblock.snapshot().generation;
-        let cutoff_generation = current_generation.saturating_sub(config.segment_compact_lag);
-
-        if cutoff_generation > 0 {
-            match maintenance::acquire_cleanup_lease(
-                superblock,
-                CleanupTaskKind::SegmentCompaction,
-                client_id,
-                config,
-            )
-            .await
-            {
-                Ok(true) => {
-                    match maintenance::run_segment_compaction(metadata, segments, config).await {
-                        Ok(result) => {
-                            info!(
-                                target: "maintenance",
-                                segments_merged = result.segments_merged,
-                                bytes_rewritten = result.bytes_rewritten,
-                                segment_backlog = result.segment_backlog,
-                                duration_ms = result.duration_ms(),
-                                "segment_compaction_complete"
-                            );
-                            status.segment_backlog = result.segment_backlog;
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                target: "maintenance",
-                                kind = "segment_compaction",
-                                error = %err,
-                                "compaction_failed"
-                            );
-                        }
-                    }
-                    if let Err(err) = maintenance::release_cleanup_lease(
-                        superblock,
-                        CleanupTaskKind::SegmentCompaction,
-                        client_id,
-                    )
-                    .await
-                    {
-                        warn!("failed to release segment compaction lease: {err:?}");
-                    }
-                }
-                Ok(false) => {
-                    // lease_contention is now logged inside acquire_cleanup_lease
-                }
-                Err(err) => tracing::error!(
-                    target: "maintenance",
-                    kind = "segment_compaction",
-                    error = %err,
-                    "lease_acquire_failed"
-                ),
-            }
-        }
-    }
-
-    if let Some(checkpoint_config) = checkpoint_config.filter(|config| config.is_enabled())
-        && schedule.checkpoint_due(checkpoint_config.interval)
-    {
-        match maintenance::create_checkpoint(metadata, checkpoint_config).await {
-            Ok(saved) => {
-                schedule.mark_checkpoint_ran();
-                match maintenance::enforce_retention_policy(
-                    metadata,
-                    &checkpoint_config.retention_policy(),
-                )
-                .await
-                {
-                    Ok(retention) => {
-                        info!(
-                            target: "maintenance",
-                            checkpoint_path = %saved.checkpoint_path,
-                            checkpoints_seen = retention.checkpoints_seen,
-                            checkpoints_deleted = retention.checkpoints_deleted,
-                            checkpoints_kept = retention.checkpoints_kept,
-                            "checkpoint_retention_complete"
-                        );
-                        status.checkpoint_backlog = retention.checkpoints_kept;
-                    }
-                    Err(err) => tracing::error!(
-                        target: "maintenance",
-                        kind = "checkpoint_retention",
-                        error = %err,
-                        "retention_failed"
-                    ),
-                }
-            }
-            Err(err) => tracing::error!(
-                target: "maintenance",
-                kind = "checkpoint_creation",
-                error = %err,
-                "checkpoint_failed"
-            ),
-        }
-    }
-
-    if let Some(policy) = lifecycle_policy.filter(|policy| policy.expiry_days > 0)
-        && schedule.lifecycle_due()
-    {
-        let store = metadata.object_store();
-        match maintenance::cleanup_expired_prefix(store.as_ref(), metadata.root_prefix(), policy)
-            .await
-        {
-            Ok(()) => {
-                schedule.mark_lifecycle_ran();
-                info!(
-                    target: "maintenance",
-                    prefix = %metadata.root_prefix(),
-                    expiry_days = policy.expiry_days,
-                    "lifecycle_cleanup_complete"
-                );
-            }
-            Err(err) => tracing::error!(
-                target: "maintenance",
-                kind = "lifecycle_cleanup",
-                error = %err,
-                "lifecycle_cleanup_failed"
-            ),
-        }
-    }
-    status
-}
+// MaintenanceSchedule, RoundStatus, MaintenanceRoundContext, and
+// run_maintenance_round are now defined in clawfs::maintenance and imported
+// above.  The single-volume worker uses them directly.
 
 fn build_config(cli: &Cli, state_path: PathBuf) -> Config {
     let store_path = cli

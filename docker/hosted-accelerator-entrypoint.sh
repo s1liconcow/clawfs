@@ -4,7 +4,7 @@ set -eu
 BIN="${HOSTED_ACCELERATOR_BIN:-clawfs_maintenance_worker}"
 
 case "$BIN" in
-  clawfs_maintenance_worker|clawfs_relay_executor)
+  clawfs_maintenance_worker|clawfs_relay_executor|clawfs_org_worker)
     exec "/usr/local/bin/$BIN" "$@"
     ;;
   *)
