@@ -933,7 +933,7 @@ impl Write for TracingWriter {
     }
 }
 
-fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result<()> {
+pub(crate) fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result<()> {
     let file = if let Some(path) = log_path {
         Some(Arc::new(Mutex::new(BufWriter::new(
             OpenOptions::new().create(true).append(true).open(path)?,
@@ -946,8 +946,11 @@ fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result<()> {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
-    let _ = tracing_log::LogTracer::init();
-    tracing_subscriber::fmt()
+    // Treat "already initialized" as success: this can happen when init_logging
+    // is called from a test harness that has already installed a subscriber, or
+    // if it is called more than once in the same process.  Any other error
+    // (e.g. failure to open the log file) is still propagated.
+    if let Err(err) = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
         .with_target(true)
@@ -955,7 +958,13 @@ fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result<()> {
         .without_time()
         .with_writer(move || TracingWriter { file: file.clone() })
         .try_init()
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    {
+        let msg = err.to_string();
+        if !msg.contains("already") {
+            anyhow::bail!(msg);
+        }
+        // Subscriber or log bridge already set — silently continue.
+    }
     Ok(())
 }
 
@@ -1526,6 +1535,7 @@ fn sanitize_error(error: String) -> String {
 mod tests {
     use super::{
         ControlPlaneCredentials, EventSettings, HostedControlPlane, apply_hosted_runtime_config,
+        init_logging,
     };
     use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
     use crate::config::Config;
@@ -1653,5 +1663,16 @@ mod tests {
             Some("session-token")
         );
         assert_eq!(decoded.accelerator_session_expiry, Some(1_700_000_000));
+    }
+
+    /// Verify that `init_logging` is idempotent: calling it twice must not
+    /// return an error.  This guards against re-introducing the double-init
+    /// pattern that previously caused a "attempted to set a logger after the
+    /// logging system was already initialized" startup crash.
+    #[test]
+    fn init_logging_is_idempotent() {
+        init_logging(None, false).expect("first init_logging call should succeed");
+        init_logging(None, false)
+            .expect("second init_logging call should be a no-op, not an error");
     }
 }
