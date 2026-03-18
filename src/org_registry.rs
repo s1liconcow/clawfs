@@ -26,7 +26,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::config::{Config, ObjectStoreProvider};
-use crate::maintenance::{CompactionConfig, MaintenanceSchedule};
+use crate::maintenance::{CompactionConfig, MaintenanceSchedule, RoundStatus};
 use crate::metadata::MetadataStore;
 use crate::org_policy::VolumeAcceleratorPolicy;
 use crate::relay::DEFAULT_RELAY_QUEUE_DEPTH;
@@ -120,6 +120,17 @@ pub struct VolumeContext {
     /// weighted round-robin scheduler to prioritize backlogged volumes.
     /// 0 = idle, positive = backlogged (higher → more work pending).
     pub last_backlog_score: std::sync::atomic::AtomicU32,
+    /// Full status from the most recent maintenance round (backlogs, etc.).
+    /// Updated after each round completes.
+    pub last_round_status: Mutex<Option<RoundStatus>>,
+    /// Timestamp of last successful maintenance round completion (Unix seconds).
+    /// None if no round has completed successfully yet.
+    pub last_maintenance_success: Mutex<Option<u64>>,
+    /// Timestamp of last policy refresh from bucket (Unix seconds).
+    pub last_policy_refresh: Mutex<u64>,
+    /// Current relay owner record for this volume (if relay is enabled).
+    /// Updated when ownership is acquired or when forwarding to another replica.
+    pub relay_owner: Mutex<Option<crate::relay::RelayOwnerRecord>>,
 }
 
 impl VolumeContext {
@@ -151,10 +162,18 @@ impl VolumeContext {
     }
 
     /// Apply a policy update, returning `true` if the policy actually changed.
+    /// Also updates `last_policy_refresh` timestamp when the policy changes.
     pub fn apply_policy_update(&self, new_policy: VolumeAcceleratorPolicy) -> bool {
         let mut guard = self.policy.lock();
         if *guard != new_policy {
             *guard = new_policy;
+            drop(guard);
+            // Update policy refresh timestamp
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            *self.last_policy_refresh.lock() = now_secs;
             true
         } else {
             false
@@ -426,6 +445,10 @@ impl OrgVolumeRegistry {
             compaction_config: CompactionConfig::default(),
             last_backlog_score: std::sync::atomic::AtomicU32::new(0),
             relay_admit_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_RELAY_QUEUE_DEPTH)),
+            last_round_status: Mutex::new(None),
+            last_maintenance_success: Mutex::new(None),
+            last_policy_refresh: Mutex::new(now_secs),
+            relay_owner: Mutex::new(None),
         })
     }
 

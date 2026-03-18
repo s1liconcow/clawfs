@@ -646,6 +646,14 @@ async fn run_discovery_and_maintenance_loop(
                     ctx2.last_backlog_score
                         .store(backlog, std::sync::atomic::Ordering::Relaxed);
 
+                    // Store full round status and update last success timestamp.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    *ctx2.last_round_status.lock() = Some(round);
+                    *ctx2.last_maintenance_success.lock() = Some(now_secs);
+
                     // Update health.
                     let health = if backlog > 0 {
                         VolumeHealth::HealthyBacklogged
@@ -692,16 +700,47 @@ struct AggregateHealth {
     discovered_volumes: usize,
     active_contexts: usize,
     unhealthy_count: usize,
+    /// Sum of delta_backlog across all volumes (approximate maintenance queue depth).
+    total_delta_backlog: usize,
+    /// Sum of segment_backlog across all volumes.
+    total_segment_backlog: usize,
+    /// Number of volumes with relay_enabled=true.
+    relay_enabled_count: usize,
+    /// Scheduler activity: number of healthy volumes that can be scheduled.
+    healthy_volumes_count: usize,
 }
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let prefixes = state.registry.loaded_prefixes();
     let active = prefixes.len();
-    let unhealthy = prefixes
-        .iter()
-        .filter_map(|p| state.registry.get_if_loaded(p))
-        .filter(|ctx| !ctx.health().is_healthy())
-        .count();
+
+    let mut unhealthy = 0usize;
+    let mut total_delta_backlog = 0usize;
+    let mut total_segment_backlog = 0usize;
+    let mut relay_enabled_count = 0usize;
+    let mut healthy_count = 0usize;
+
+    for prefix in &prefixes {
+        if let Some(ctx) = state.registry.get_if_loaded(prefix) {
+            let health = ctx.health();
+            if !health.is_healthy() {
+                unhealthy += 1;
+            } else {
+                healthy_count += 1;
+            }
+
+            // Sum backlogs from last round status
+            if let Some(ref status) = *ctx.last_round_status.lock() {
+                total_delta_backlog += status.delta_backlog;
+                total_segment_backlog += status.segment_backlog;
+            }
+
+            // Count relay-enabled volumes
+            if ctx.read_policy().relay_enabled {
+                relay_enabled_count += 1;
+            }
+        }
+    }
 
     Json(AggregateHealth {
         status: "ok",
@@ -710,6 +749,10 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         discovered_volumes: active,
         active_contexts: active,
         unhealthy_count: unhealthy,
+        total_delta_backlog,
+        total_segment_backlog,
+        relay_enabled_count,
+        healthy_volumes_count: healthy_count,
     })
 }
 
@@ -717,8 +760,19 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 struct VolumeHealthSummary {
     prefix: String,
     health: String,
+    health_details: Option<String>,
     relay_enabled: bool,
     maintenance_enabled: bool,
+    /// Backlog metrics from last maintenance round.
+    delta_backlog: usize,
+    segment_backlog: usize,
+    checkpoint_backlog: usize,
+    /// Unix timestamp of last successful maintenance round (if any).
+    last_maintenance_success: Option<u64>,
+    /// Unix timestamp of last policy refresh.
+    last_policy_refresh: u64,
+    /// Current relay owner replica_id (if relay is enabled and owner known).
+    relay_owner_replica_id: Option<String>,
 }
 
 async fn handle_health_volumes(State(state): State<AppState>) -> impl IntoResponse {
@@ -729,11 +783,41 @@ async fn handle_health_volumes(State(state): State<AppState>) -> impl IntoRespon
         .filter_map(|prefix| {
             state.registry.get_if_loaded(&prefix).map(|ctx| {
                 let policy = ctx.read_policy();
+                let health = ctx.health();
+                let round_status = *ctx.last_round_status.lock();
+                let last_maintenance = *ctx.last_maintenance_success.lock();
+                let last_policy = *ctx.last_policy_refresh.lock();
+                let relay_owner = ctx.relay_owner.lock().clone();
+
+                // Extract health details for unhealthy states
+                let health_details = match &health {
+                    clawfs::org_registry::VolumeHealth::UnhealthyPolicy(reason) => {
+                        Some(reason.clone())
+                    }
+                    clawfs::org_registry::VolumeHealth::UnhealthyInit(reason) => {
+                        Some(reason.clone())
+                    }
+                    _ => None,
+                };
+
                 VolumeHealthSummary {
-                    health: ctx.health().as_str().to_string(),
+                    prefix: ctx.prefix.clone(),
+                    health: health.as_str().to_string(),
+                    health_details,
                     relay_enabled: policy.relay_enabled,
                     maintenance_enabled: policy.maintenance_enabled,
-                    prefix,
+                    delta_backlog: round_status.as_ref().map(|s| s.delta_backlog).unwrap_or(0),
+                    segment_backlog: round_status
+                        .as_ref()
+                        .map(|s| s.segment_backlog)
+                        .unwrap_or(0),
+                    checkpoint_backlog: round_status
+                        .as_ref()
+                        .map(|s| s.checkpoint_backlog)
+                        .unwrap_or(0),
+                    last_maintenance_success: last_maintenance,
+                    last_policy_refresh: last_policy,
+                    relay_owner_replica_id: relay_owner.map(|o| o.replica_id),
                 }
             })
         })
@@ -756,15 +840,57 @@ async fn handle_health_volume(
         Some(ctx) => {
             let generation = ctx.superblock.snapshot().generation;
             let policy = ctx.read_policy();
-            Json(serde_json::json!({
+            let health = ctx.health();
+            let round_status = *ctx.last_round_status.lock();
+            let last_maintenance = *ctx.last_maintenance_success.lock();
+            let last_policy = *ctx.last_policy_refresh.lock();
+            let relay_owner = ctx.relay_owner.lock().clone();
+            let schedule = ctx.maintenance_schedule.lock().await;
+
+            // Extract health details for unhealthy states
+            let health_details = match &health {
+                clawfs::org_registry::VolumeHealth::UnhealthyPolicy(reason) => Some(reason.clone()),
+                clawfs::org_registry::VolumeHealth::UnhealthyInit(reason) => Some(reason.clone()),
+                _ => None,
+            };
+
+            // Build comprehensive response
+            let mut response = serde_json::json!({
                 "prefix": ctx.prefix,
-                "health": ctx.health().as_str(),
+                "health": health.as_str(),
+                "health_details": health_details,
                 "generation": generation,
                 "shard_size": ctx.shard_size,
                 "relay_enabled": policy.relay_enabled,
                 "maintenance_enabled": policy.maintenance_enabled,
-            }))
-            .into_response()
+                "delta_backlog": round_status.as_ref().map(|s| s.delta_backlog).unwrap_or(0),
+                "segment_backlog": round_status.as_ref().map(|s| s.segment_backlog).unwrap_or(0),
+                "checkpoint_backlog": round_status.as_ref().map(|s| s.checkpoint_backlog).unwrap_or(0),
+                "last_maintenance_success": last_maintenance,
+                "last_policy_refresh": last_policy,
+            });
+
+            // Add relay owner details if available
+            if let Some(owner) = relay_owner {
+                response["relay_owner"] = serde_json::json!({
+                    "replica_id": owner.replica_id,
+                    "advertise_url": owner.advertise_url,
+                    "epoch": owner.epoch,
+                    "lease_until": owner.lease_until,
+                });
+            }
+
+            // Add schedule info (last checkpoint/lifecycle runs)
+            if let Some(last_checkpoint) = schedule.last_checkpoint_run {
+                let secs = last_checkpoint.elapsed().as_secs();
+                response["last_checkpoint_age_secs"] = serde_json::json!(secs);
+            }
+            if let Some(last_lifecycle) = schedule.last_lifecycle_run {
+                let secs = last_lifecycle.elapsed().as_secs();
+                response["last_lifecycle_age_secs"] = serde_json::json!(secs);
+            }
+
+            Json(response).into_response()
         }
     }
 }
@@ -899,11 +1025,15 @@ async fn handle_relay_write(
         // ── We own the volume — process locally ──────────────────────────
         OwnershipAcquireResult::Acquired { record, .. }
         | OwnershipAcquireResult::AlreadyOwned { record, .. } => {
+            // Store ownership record in volume context for health reporting.
+            *ctx.relay_owner.lock() = Some(record.clone());
             process_relay_write_locally(state, ctx, record.epoch, request).await
         }
 
         // ── Another replica owns the volume — forward ─────────────────────
         OwnershipAcquireResult::OwnedByOther(owner) => {
+            // Store other owner in context for health reporting.
+            *ctx.relay_owner.lock() = Some(owner.clone());
             forward_relay_write(
                 &state.forward_client,
                 &owner.advertise_url,
