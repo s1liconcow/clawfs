@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -580,6 +581,304 @@ impl DedupStore {
     }
 }
 
+// ── Relay ownership ─────────────────────────────────────────────────────────
+
+/// TTL for relay ownership leases (seconds).  Matches the cleanup-lease TTL
+/// used by the maintenance worker so operators have a single mental model.
+pub const RELAY_OWNER_LEASE_TTL_SECS: u64 = 30;
+
+/// Background renewal cadence (seconds).  Set to TTL/3 so a single missed
+/// renewal interval does not expire the lease; two consecutive failures cause
+/// voluntary release.
+pub const RELAY_OWNER_RENEWAL_INTERVAL_SECS: u64 = 10;
+
+/// Object store path suffix for the per-volume relay owner record, relative to
+/// the volume prefix.  Kept separate from the superblock to avoid write
+/// amplification on the generation-commit path.
+pub const RELAY_OWNER_SUFFIX: &str = "metadata/relay_owner.json";
+
+/// Durable per-volume relay ownership record stored at
+/// `<volume_prefix>/metadata/relay_owner.json`.
+///
+/// The record is a separate object from the superblock to avoid contention on
+/// the CAS-commit path and to allow ownership to change independently of
+/// generation commits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayOwnerRecord {
+    /// Stable identity of the replica that holds ownership.  Must be
+    /// consistent across process restarts; operators set this via
+    /// `--replica-id`.
+    pub replica_id: String,
+    /// HTTP URL of this replica's relay endpoint.  Must be reachable from
+    /// other replicas in the trusted backend network for request forwarding.
+    pub advertise_url: String,
+    /// Unix timestamp (seconds) after which this lease is expired and another
+    /// replica may take over.
+    pub lease_until: u64,
+    /// Fencing token incremented on every acquisition (initial or takeover).
+    /// Relay commit requests carry the epoch of the owner they were routed to;
+    /// a stale-epoch commit is rejected by the current owner.
+    pub epoch: u64,
+}
+
+impl RelayOwnerRecord {
+    /// Returns `true` if the lease is still live at `now_secs` (unix time).
+    pub fn is_live_at(&self, now_secs: u64) -> bool {
+        self.lease_until > now_secs
+    }
+}
+
+/// Outcome of `acquire_relay_ownership`.
+#[derive(Debug)]
+pub enum OwnershipAcquireResult {
+    /// Ownership was freshly acquired (initial acquisition or takeover of an
+    /// expired lease).  Contains the committed record and its ETag (needed
+    /// for `renew_relay_ownership`).
+    Acquired {
+        record: RelayOwnerRecord,
+        etag: String,
+    },
+    /// We already hold the lease (same `replica_id` in the existing record).
+    /// Contains the existing record and its ETag.
+    AlreadyOwned {
+        record: RelayOwnerRecord,
+        etag: String,
+    },
+    /// A live lease is held by a different replica.  Callers should back off
+    /// and retry, or forward the request to `record.advertise_url`.
+    OwnedByOther(RelayOwnerRecord),
+}
+
+/// Build the object store path for a volume's relay owner record.
+pub fn relay_owner_path(volume_prefix: &str) -> object_store::path::Path {
+    let trimmed = volume_prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        object_store::path::Path::from(RELAY_OWNER_SUFFIX)
+    } else {
+        object_store::path::Path::from(format!("{trimmed}/{RELAY_OWNER_SUFFIX}"))
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn owner_put_payload(record: &RelayOwnerRecord) -> Result<object_store::PutPayload> {
+    let b = serde_json::to_vec(record).context("serialize relay owner record")?;
+    Ok(object_store::PutPayload::from_bytes(Bytes::from(b)))
+}
+
+/// Attempt to acquire relay ownership for a volume.
+///
+/// Uses conditional object-store puts for atomicity:
+/// - `PutMode::Create` (if-not-exists) for the initial acquisition.
+/// - `PutMode::Update(etag)` for takeover of an expired lease.
+///
+/// Stores that do not support conditional puts (e.g. `LocalFileSystem` in
+/// tests) fall back to an unconditional put — this loses atomicity guarantees
+/// in concurrent environments but is acceptable for local/test use.
+///
+/// # Returns
+///
+/// - `Acquired` — freshly obtained (initial or takeover).
+/// - `AlreadyOwned` — this `replica_id` already holds the lease.
+/// - `OwnedByOther` — another live lease exists; caller should back off.
+pub async fn acquire_relay_ownership(
+    store: &dyn object_store::ObjectStore,
+    volume_prefix: &str,
+    replica_id: &str,
+    advertise_url: &str,
+) -> Result<OwnershipAcquireResult> {
+    use object_store::{PutMode, PutOptions, UpdateVersion};
+
+    let path = relay_owner_path(volume_prefix);
+    let now = now_unix_secs();
+
+    let new_record = RelayOwnerRecord {
+        replica_id: replica_id.to_string(),
+        advertise_url: advertise_url.to_string(),
+        lease_until: now + RELAY_OWNER_LEASE_TTL_SECS,
+        epoch: 0,
+    };
+
+    // ── Try initial creation (if-not-exists) ─────────────────────────────
+    let create_opts = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    match store
+        .put_opts(&path, owner_put_payload(&new_record)?, create_opts)
+        .await
+    {
+        Ok(result) => {
+            let etag = result.e_tag.unwrap_or_default();
+            info!(
+                volume_prefix,
+                replica_id,
+                epoch = 0,
+                "relay_ownership_acquired"
+            );
+            return Ok(OwnershipAcquireResult::Acquired {
+                record: new_record,
+                etag,
+            });
+        }
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            // Fall through to read-then-conditionally-update path.
+        }
+        Err(object_store::Error::NotImplemented) => {
+            // Non-conditional store (e.g. LocalFileSystem in tests).
+            let result = store
+                .put(&path, owner_put_payload(&new_record)?)
+                .await
+                .context("unconditional relay owner put")?;
+            let etag = result.e_tag.unwrap_or_default();
+            info!(
+                volume_prefix,
+                replica_id,
+                epoch = 0,
+                "relay_ownership_acquired_unconditional"
+            );
+            return Ok(OwnershipAcquireResult::Acquired {
+                record: new_record,
+                etag,
+            });
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("relay owner create")),
+    }
+
+    // ── Object already exists: read current state ─────────────────────────
+    let get_result = store
+        .get(&path)
+        .await
+        .context("read existing relay owner")?;
+    let existing_etag = get_result.meta.e_tag.clone().unwrap_or_default();
+    let body = get_result.bytes().await.context("read relay owner bytes")?;
+    let existing: RelayOwnerRecord =
+        serde_json::from_slice(&body).context("parse relay owner record")?;
+
+    // Same replica — already owned.
+    if existing.replica_id == replica_id {
+        return Ok(OwnershipAcquireResult::AlreadyOwned {
+            record: existing,
+            etag: existing_etag,
+        });
+    }
+
+    // Live foreign lease — back off.
+    if existing.is_live_at(now_unix_secs()) {
+        return Ok(OwnershipAcquireResult::OwnedByOther(existing));
+    }
+
+    // ── Expired lease: attempt takeover via conditional update ────────────
+    let takeover = RelayOwnerRecord {
+        replica_id: replica_id.to_string(),
+        advertise_url: advertise_url.to_string(),
+        lease_until: now_unix_secs() + RELAY_OWNER_LEASE_TTL_SECS,
+        epoch: existing.epoch + 1,
+    };
+    let update_opts = PutOptions {
+        mode: PutMode::Update(UpdateVersion {
+            e_tag: Some(existing_etag),
+            version: None,
+        }),
+        ..Default::default()
+    };
+    match store
+        .put_opts(&path, owner_put_payload(&takeover)?, update_opts)
+        .await
+    {
+        Ok(result) => {
+            let etag = result.e_tag.unwrap_or_default();
+            info!(
+                volume_prefix,
+                replica_id,
+                epoch = takeover.epoch,
+                "relay_ownership_takeover"
+            );
+            Ok(OwnershipAcquireResult::Acquired {
+                record: takeover,
+                etag,
+            })
+        }
+        Err(object_store::Error::Precondition { .. }) => {
+            // Another replica won the takeover race; treat as OwnedByOther.
+            Ok(OwnershipAcquireResult::OwnedByOther(existing))
+        }
+        Err(object_store::Error::NotImplemented) => {
+            let result = store
+                .put(&path, owner_put_payload(&takeover)?)
+                .await
+                .context("unconditional relay owner takeover")?;
+            let etag = result.e_tag.unwrap_or_default();
+            Ok(OwnershipAcquireResult::Acquired {
+                record: takeover,
+                etag,
+            })
+        }
+        Err(e) => Err(anyhow::Error::from(e).context("relay owner takeover")),
+    }
+}
+
+/// Renew an active relay ownership lease.
+///
+/// Uses `PutMode::Update(etag)` to prevent overwriting a concurrent takeover.
+/// Returns the new ETag on success.
+///
+/// If the update fails with `Precondition` the caller should treat the lease
+/// as lost, stop accepting relay commits for the volume, and call
+/// `release_relay_ownership` best-effort.
+pub async fn renew_relay_ownership(
+    store: &dyn object_store::ObjectStore,
+    volume_prefix: &str,
+    current_etag: &str,
+    record: &RelayOwnerRecord,
+) -> Result<String> {
+    use object_store::{PutMode, PutOptions, UpdateVersion};
+
+    let renewed = RelayOwnerRecord {
+        lease_until: now_unix_secs() + RELAY_OWNER_LEASE_TTL_SECS,
+        ..record.clone()
+    };
+    let opts = PutOptions {
+        mode: PutMode::Update(UpdateVersion {
+            e_tag: Some(current_etag.to_string()),
+            version: None,
+        }),
+        ..Default::default()
+    };
+    let result = store
+        .put_opts(
+            &relay_owner_path(volume_prefix),
+            owner_put_payload(&renewed)?,
+            opts,
+        )
+        .await
+        .context("relay owner renewal")?;
+    Ok(result.e_tag.unwrap_or_default())
+}
+
+/// Release relay ownership by deleting the owner record.
+///
+/// Best-effort: `NotFound` is silently ignored because the lease may have
+/// already expired and been overwritten by another replica.
+pub async fn release_relay_ownership(
+    store: &dyn object_store::ObjectStore,
+    volume_prefix: &str,
+) -> Result<()> {
+    match store.delete(&relay_owner_path(volume_prefix)).await {
+        Ok(()) => {
+            info!(volume_prefix, "relay_ownership_released");
+            Ok(())
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context("relay owner release")),
+    }
+}
+
 /// Execute a relay write commit in-region.
 ///
 /// The pipeline:
@@ -728,6 +1027,7 @@ pub async fn relay_commit_pipeline(
 
 #[cfg(test)]
 mod tests {
+    use object_store::ObjectStore as _;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{
@@ -1211,5 +1511,176 @@ mod tests {
             resp.actual_generation, None,
             "old response format should default to None"
         );
+    }
+
+    // ── Relay ownership unit tests ────────────────────────────────────────
+
+    #[test]
+    fn relay_owner_record_serde_round_trips() {
+        let record = super::RelayOwnerRecord {
+            replica_id: "worker-us-east-1a".to_string(),
+            advertise_url: "http://10.0.1.5:8080".to_string(),
+            lease_until: 1_710_800_000,
+            epoch: 3,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: super::RelayOwnerRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn relay_owner_is_live_checks_lease_until() {
+        let record = super::RelayOwnerRecord {
+            replica_id: "r1".to_string(),
+            advertise_url: "http://localhost:8080".to_string(),
+            lease_until: 1_000,
+            epoch: 0,
+        };
+        assert!(record.is_live_at(999), "should be live before lease_until");
+        assert!(
+            !record.is_live_at(1_000),
+            "should be expired at lease_until"
+        );
+        assert!(
+            !record.is_live_at(1_001),
+            "should be expired after lease_until"
+        );
+    }
+
+    #[test]
+    fn relay_owner_path_with_prefix() {
+        let path = super::relay_owner_path("orgs/myorg/vol1");
+        assert_eq!(path.as_ref(), "orgs/myorg/vol1/metadata/relay_owner.json");
+    }
+
+    #[test]
+    fn relay_owner_path_empty_prefix() {
+        let path = super::relay_owner_path("");
+        assert_eq!(path.as_ref(), "metadata/relay_owner.json");
+    }
+
+    #[tokio::test]
+    async fn acquire_relay_ownership_initial_acquisition() {
+        let store = object_store::memory::InMemory::new();
+        let result = super::acquire_relay_ownership(
+            &store,
+            "orgs/test/vol1",
+            "replica-a",
+            "http://replica-a:8080",
+        )
+        .await
+        .expect("acquire");
+
+        match result {
+            super::OwnershipAcquireResult::Acquired { record, .. } => {
+                assert_eq!(record.replica_id, "replica-a");
+                assert_eq!(record.epoch, 0);
+            }
+            other => panic!("expected Acquired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_relay_ownership_already_owned_returns_existing() {
+        let store = object_store::memory::InMemory::new();
+
+        // First acquisition.
+        super::acquire_relay_ownership(&store, "vol1", "replica-a", "http://a:8080")
+            .await
+            .unwrap();
+
+        // Second acquisition from the same replica.
+        let result = super::acquire_relay_ownership(&store, "vol1", "replica-a", "http://a:8080")
+            .await
+            .expect("re-acquire");
+
+        match result {
+            super::OwnershipAcquireResult::AlreadyOwned { record, .. } => {
+                assert_eq!(record.replica_id, "replica-a");
+            }
+            other => panic!("expected AlreadyOwned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_relay_ownership_live_foreign_returns_owned_by_other() {
+        let store = object_store::memory::InMemory::new();
+
+        // Replica-a acquires.
+        super::acquire_relay_ownership(&store, "vol1", "replica-a", "http://a:8080")
+            .await
+            .unwrap();
+
+        // Replica-b attempts to acquire while a's lease is still live.
+        let result = super::acquire_relay_ownership(&store, "vol1", "replica-b", "http://b:8080")
+            .await
+            .expect("attempt acquire");
+
+        match result {
+            super::OwnershipAcquireResult::OwnedByOther(record) => {
+                assert_eq!(record.replica_id, "replica-a");
+            }
+            other => panic!("expected OwnedByOther, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_relay_ownership_expired_lease_takeover() {
+        use super::{RELAY_OWNER_SUFFIX, relay_owner_path};
+
+        let store = object_store::memory::InMemory::new();
+
+        // Manually write an already-expired owner record.
+        let expired = super::RelayOwnerRecord {
+            replica_id: "old-replica".to_string(),
+            advertise_url: "http://old:8080".to_string(),
+            lease_until: 1, // expired long ago
+            epoch: 5,
+        };
+        let path = relay_owner_path("vol1");
+        let bytes = serde_json::to_vec(&expired).unwrap();
+        store
+            .put(
+                &path,
+                object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+            )
+            .await
+            .unwrap();
+
+        // New replica should be able to take over.
+        let result =
+            super::acquire_relay_ownership(&store, "vol1", "new-replica", "http://new:8080")
+                .await
+                .expect("takeover");
+
+        match result {
+            super::OwnershipAcquireResult::Acquired { record, .. } => {
+                assert_eq!(record.replica_id, "new-replica");
+                assert_eq!(record.epoch, 6, "epoch must be incremented on takeover");
+            }
+            other => panic!("expected Acquired (takeover), got {other:?}"),
+        }
+
+        // Suppress dead-code warning for imported constant.
+        let _ = RELAY_OWNER_SUFFIX;
+    }
+
+    #[tokio::test]
+    async fn release_relay_ownership_idempotent() {
+        let store = object_store::memory::InMemory::new();
+
+        super::acquire_relay_ownership(&store, "vol1", "r1", "http://r1:8080")
+            .await
+            .unwrap();
+
+        // Release once.
+        super::release_relay_ownership(&store, "vol1")
+            .await
+            .expect("first release");
+
+        // Release again should be a no-op (not-found ignored).
+        super::release_relay_ownership(&store, "vol1")
+            .await
+            .expect("idempotent release");
     }
 }
