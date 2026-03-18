@@ -19,9 +19,10 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
-use crate::clawfs;
+use crate::clawfs::{self, AcceleratorMode};
 use crate::config::{Config, ObjectStoreProvider};
 use crate::coordination::InvalidationScope;
+use crate::hosted_cache::HostedMetadataCache;
 use crate::inode::{
     ExternalObject, FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord,
     InodeShard, SegmentExtent,
@@ -556,6 +557,10 @@ pub struct MetadataStore {
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
     negative_cache: RwLock<HashMap<u64, Instant>>,
     handle: Handle,
+    /// Optional hosted metadata cache for `direct_plus_cache` mode.  When
+    /// present, inode lookups try this service before falling back to the
+    /// object store.  Purely advisory — any miss or error is silently ignored.
+    hosted_cache: Option<Arc<HostedMetadataCache>>,
 }
 
 impl MetadataStore {
@@ -570,6 +575,14 @@ impl MetadataStore {
         config: &Config,
         handle: Handle,
     ) -> Result<Self> {
+        let hosted_cache = if config.accelerator_mode == Some(AcceleratorMode::DirectPlusCache) {
+            config
+                .accelerator_endpoint
+                .as_deref()
+                .map(HostedMetadataCache::from_endpoint)
+        } else {
+            None
+        };
         let store = Self {
             store,
             root_prefix: prefix,
@@ -580,6 +593,7 @@ impl MetadataStore {
             log_storage_io: config.log_storage_io,
             negative_cache: RwLock::new(HashMap::new()),
             handle,
+            hosted_cache,
         };
 
         store.load_latest_imaps().await?;
@@ -872,6 +886,25 @@ impl MetadataStore {
             }
         }
 
+        // Advisory hosted metadata cache: consult before the object store so
+        // that hot-path lookups can be served without a shard fetch.  On any
+        // miss or error we fall through to the authoritative object store path.
+        if let Some(ref hosted) = self.hosted_cache {
+            let min_gen = *self.last_delta_generation.lock();
+            if let Some(record) = hosted.get_inode(inode, min_gen).await {
+                // Populate the local cache so TTL-based sibling lookups are fast.
+                self.cache.write().insert(
+                    inode,
+                    CacheEntry {
+                        record: record.clone(),
+                        refreshed: Instant::now(),
+                        generation: min_gen,
+                    },
+                );
+                return Ok(Some(record));
+            }
+        }
+
         self.reload_shard_for_inode(inode).await?;
 
         let result = self
@@ -893,6 +926,23 @@ impl MetadataStore {
     pub async fn get_inode(&self, inode: u64) -> Result<Option<InodeRecord>> {
         self.get_inode_with_ttl(inode, Duration::ZERO, Duration::ZERO)
             .await
+    }
+
+    /// Invalidate entries in the hosted metadata cache based on the scope of
+    /// a coordination invalidation event.  No-op if no hosted cache is
+    /// configured.
+    pub fn invalidate_hosted_cache(&self, scope: &InvalidationScope) {
+        let Some(ref hosted) = self.hosted_cache else {
+            return;
+        };
+        match scope {
+            InvalidationScope::Full | InvalidationScope::Prefix(_) => {
+                hosted.invalidate_all();
+            }
+            InvalidationScope::Inodes(inodes) => {
+                hosted.invalidate_inodes(inodes);
+            }
+        }
     }
 
     /// Batch-load multiple inodes from the cache, reloading shards as needed

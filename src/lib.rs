@@ -7,6 +7,7 @@ pub mod config;
 pub mod coordination;
 pub mod frontdoor;
 pub mod fs;
+pub mod hosted_cache;
 pub mod inode;
 pub mod journal;
 pub mod launch;

@@ -355,6 +355,7 @@ impl CoordinationSubscriber {
                 }
                 CoordinationPayload::InvalidationEvent(event) => {
                     self.metadata.invalidate_cached_scope(&event.scope);
+                    self.metadata.invalidate_hosted_cache(&event.scope);
                     self.set_health(CoordinationHealth::Connected);
                 }
             }
