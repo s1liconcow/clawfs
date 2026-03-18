@@ -1468,4 +1468,40 @@ mod tests {
             Some(RelayOutagePolicy::FailClosed)
         );
     }
+
+    #[test]
+    fn unknown_accelerator_mode_string_falls_back_to_direct() {
+        // An API server might return an unrecognized mode (e.g. from a future version).
+        // The client must degrade to Direct and not fail the mount.
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{"provider":"aws","bucket":"bucket-a","accelerator_mode":"quantum_write"}"#,
+        )
+        .expect("parse summon config");
+
+        let hosted =
+            parse_hosted_volume_config(summon).expect("hosted config despite unknown mode");
+        assert_eq!(hosted.accelerator_mode, Some(AcceleratorMode::Direct));
+    }
+
+    #[test]
+    fn unknown_fallback_policy_string_defaults_per_mode() {
+        // An API server may return a future policy string the client doesn't know.
+        // Should degrade to the mode default (FailClosed for relay_write).
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{
+                "provider":"aws",
+                "bucket":"bucket-a",
+                "accelerator_mode":"relay_write",
+                "accelerator_fallback_policy":"future_mode_policy"
+            }"#,
+        )
+        .expect("parse summon config");
+
+        let hosted = parse_hosted_volume_config(summon).expect("hosted config");
+        // Unknown policy for relay_write should fall back to FailClosed.
+        assert_eq!(
+            hosted.accelerator_fallback_policy,
+            Some(AcceleratorFallbackPolicy::FailClosed)
+        );
+    }
 }

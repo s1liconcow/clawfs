@@ -386,4 +386,36 @@ mod tests {
             Some(super::DEFAULT_RELAY_QUEUE_DEPTH)
         );
     }
+
+    #[test]
+    fn idempotency_key_differs_by_client_and_volume() {
+        let key_a = RelayWriteRequest::derive_idempotency_key("client-a", "/vol/prefix", 1);
+        let key_b = RelayWriteRequest::derive_idempotency_key("client-b", "/vol/prefix", 1);
+        let key_c = RelayWriteRequest::derive_idempotency_key("client-a", "/other/prefix", 1);
+
+        assert_ne!(
+            key_a, key_b,
+            "different client_ids must produce different keys"
+        );
+        assert_ne!(
+            key_a, key_c,
+            "different volume prefixes must produce different keys"
+        );
+        // All keys are lowercase hex of sha256 (64 chars).
+        assert_eq!(key_a.len(), 64);
+    }
+
+    #[test]
+    fn relay_status_serializes_all_variants() {
+        for status in [
+            RelayStatus::Accepted,
+            RelayStatus::Committed,
+            RelayStatus::Failed,
+            RelayStatus::Duplicate,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize status");
+            let decoded: RelayStatus = serde_json::from_str(&json).expect("deserialize status");
+            assert_eq!(decoded, status);
+        }
+    }
 }
