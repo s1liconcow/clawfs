@@ -12,6 +12,13 @@ pub(crate) fn epoch_millis_now() -> u64 {
         .as_millis() as u64
 }
 
+fn relay_pending_state_is_reflected_by_superblock(
+    current_generation: u64,
+    expected_generation: u64,
+) -> bool {
+    current_generation >= expected_generation
+}
+
 impl OsageFs {
     #[cfg(feature = "fuse")]
     pub(crate) fn mode_to_file_type(mode: u32) -> FileType {
@@ -168,9 +175,37 @@ impl OsageFs {
                 return Ok(entries.len());
             }
 
+            let current_generation = self.superblock.snapshot().generation;
+            let expected_generation = relay_state.request.expected_parent_generation + 1;
+            if relay_pending_state_is_reflected_by_superblock(
+                current_generation,
+                expected_generation,
+            ) {
+                let entries = journal.load_entries()?;
+                for entry in &entries {
+                    if let Err(err) = journal.clear_entry(entry.record.inode) {
+                        log::warn!(
+                            "replay_journal locally committed relay clear failed ino={} err={err:#}",
+                            entry.record.inode
+                        );
+                    }
+                }
+                if let Err(err) = journal.clear_relay_pending_state() {
+                    log::warn!(
+                        "replay_journal failed to clear locally committed relay pending state: {err:#}"
+                    );
+                }
+                info!(
+                    "replay_journal cleared relay state already reflected by superblock current_generation={} expected_generation={} entries={}",
+                    current_generation,
+                    expected_generation,
+                    entries.len()
+                );
+                return Ok(entries.len());
+            }
+
             let snapshot = self.superblock.prepare_dirty_generation()?;
             let target_generation = snapshot.generation;
-            let expected_generation = relay_state.request.expected_parent_generation + 1;
             if target_generation != expected_generation {
                 self.superblock.abort_generation(target_generation);
                 return Err(anyhow!(
@@ -1467,5 +1502,17 @@ impl OsageFs {
             candidate = inode.parent;
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay_pending_state_is_reflected_by_superblock;
+
+    #[test]
+    fn relay_pending_state_is_reflected_once_superblock_reaches_expected_generation() {
+        assert!(!relay_pending_state_is_reflected_by_superblock(12, 13));
+        assert!(relay_pending_state_is_reflected_by_superblock(13, 13));
+        assert!(relay_pending_state_is_reflected_by_superblock(14, 13));
     }
 }

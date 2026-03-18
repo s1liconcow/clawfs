@@ -1,4 +1,5 @@
 use super::*;
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 
 use crate::clawfs::AcceleratorMode;
@@ -512,6 +513,7 @@ impl OsageFs {
             }
             let merge_duration = merge_start.elapsed();
             let mut relay_fell_back_to_direct = false;
+            let relay_sidecar_committed_generation = Cell::new(None);
             if self.config.accelerator_mode == Some(AcceleratorMode::RelayWrite) {
                 let relay_commit_start = Instant::now();
                 let relay_fallback_policy = self
@@ -674,16 +676,25 @@ impl OsageFs {
                                     committed_generation
                                 );
                             }
-                            if let Some(journal) = &self.journal
-                                && let Err(err) = journal.mark_relay_committed(committed_generation)
-                            {
-                                log::warn!(
-                                    "flush_pending relay mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
-                                    pid,
-                                    tid,
-                                    scope,
-                                    committed_generation
-                                );
+                            let relay_commit_sidecar_marked = if let Some(journal) = &self.journal {
+                                if let Err(err) = journal.mark_relay_committed(committed_generation)
+                                {
+                                    log::warn!(
+                                        "flush_pending relay mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
+                                        pid,
+                                        tid,
+                                        scope,
+                                        committed_generation
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            };
+                            if relay_commit_sidecar_marked {
+                                relay_sidecar_committed_generation.set(Some(committed_generation));
                             }
                             prepared_generation = None;
                             let commit_duration = relay_commit_start.elapsed();
@@ -937,17 +948,18 @@ impl OsageFs {
                 prepared_generation = None;
                 return Err(EIO);
             }
-            if relay_fell_back_to_direct
-                && let Some(journal) = &self.journal
-                && let Err(err) = journal.mark_relay_committed(target_generation)
-            {
-                log::warn!(
-                    "flush_pending relay fallback mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
-                    pid,
-                    tid,
-                    scope,
-                    target_generation
-                );
+            if relay_fell_back_to_direct && let Some(journal) = &self.journal {
+                if let Err(err) = journal.mark_relay_committed(target_generation) {
+                    log::warn!(
+                        "flush_pending relay fallback mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
+                        pid,
+                        tid,
+                        scope,
+                        target_generation
+                    );
+                } else {
+                    relay_sidecar_committed_generation.set(Some(target_generation));
+                }
             }
             prepared_generation = None;
             let commit_duration = commit_start.elapsed();
@@ -1068,9 +1080,11 @@ impl OsageFs {
                     })?;
                     journal_cleared_inodes = journal_cleared_inodes.saturating_add(1);
                 }
-                if relay_fell_back_to_direct && let Err(err) = journal.clear_relay_pending_state() {
+                if relay_sidecar_committed_generation.get().is_some()
+                    && let Err(err) = journal.clear_relay_pending_state()
+                {
                     log::warn!(
-                        "flush_pending relay fallback clear_relay_pending_state failed pid={} tid={} scope={} err={err:#}",
+                        "flush_pending relay clear_relay_pending_state failed pid={} tid={} scope={} err={err:#}",
                         pid,
                         tid,
                         scope
