@@ -72,6 +72,25 @@ pub struct RelayPendingState {
     pub committed_generation: Option<u64>,
 }
 
+impl RelayPendingState {
+    pub fn new(request: RelayWriteRequest) -> Self {
+        Self {
+            request,
+            committed_generation: None,
+        }
+    }
+
+    pub fn with_committed_generation(
+        request: RelayWriteRequest,
+        committed_generation: u64,
+    ) -> Self {
+        Self {
+            request,
+            committed_generation: Some(committed_generation),
+        }
+    }
+}
+
 // ── WAL state held under the lock ─────────────────────────────────────────
 
 struct WalState {

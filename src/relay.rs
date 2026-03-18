@@ -610,6 +610,14 @@ pub async fn relay_commit_pipeline(
     }
 
     // --- Generation validation ---
+    // Reload the in-memory superblock from the object store before validating
+    // so that cold-start or post-outage relays have current state.  The reload
+    // must happen before the validation check so that both the validation and
+    // the subsequent prepare_dirty_generation see the same generation.
+    superblock
+        .reload()
+        .await
+        .context("relay superblock reload")?;
     let current = meta
         .load_superblock()
         .await?

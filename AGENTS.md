@@ -15,6 +15,7 @@ Continuously update this guide and the linked docs with anything that will impro
 - Tests and Troubleshooting policy: always validate your change with unit and integration tests where possible, reproduce bugs with tests before solving them
 - Performance improvements: always try to quantify the lift of performance improvements.
 *important* After compaction, agents must re-read AGENTS.md
+- *important* do not run cargo bench without the user's authorization
 
 ## ClawFS Summary
 ClawFS is a FUSE-based log-structured filesystem that stages writes locally, flushes immutable data segments to object storage, and stores metadata as immutable inode-map shards plus per-generation delta logs.
@@ -309,9 +310,10 @@ git push                # Push to remote
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
+2. **Run quality gates** (if code changed) - Tests, linters, and `cargo build --release --bin clawfsd`
+3. **Fresh eyes review** Carefully read over all of the new code you just wrote and other existing code you just modified with "fresh eyes" looking super carefully for any obvious bugs, errors, problems, issues, confusion, etc. Carefully fix anything you uncover. Use ultrathink.
+4. **Update issue status** - Close finished work, update in-progress items
+5. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
    br sync --flush-only
@@ -320,9 +322,9 @@ git push                # Push to remote
    git push
    git status  # MUST show "up to date with origin"
    ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+6. **Clean up** - Clear stashes, prune remote branches
+7. **Verify** - All changes committed AND pushed
+8. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
 - Work is NOT complete until `git push` succeeds
@@ -331,4 +333,3 @@ git push                # Push to remote
 - If push fails, resolve and retry until it succeeds
 
 ---
-

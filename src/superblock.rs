@@ -102,7 +102,7 @@ impl SuperblockManager {
         self.state.lock().block.clone()
     }
 
-    async fn reload(&self) -> Result<()> {
+    pub(crate) async fn reload(&self) -> Result<()> {
         if let Some(wrapper) = self.store.load_superblock().await? {
             let mut guard = self.state.lock();
             // Preserve pending_generation logic?

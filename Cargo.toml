@@ -51,6 +51,14 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "perf_local_criterion"
 harness = false
 
+[[bench]]
+name = "bench_hosted"
+harness = false
+
+[[bench]]
+name = "hosted"
+harness = false
+
 [profile.release]
 debug = true
 lto = "thin"

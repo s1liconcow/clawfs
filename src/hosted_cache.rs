@@ -68,9 +68,9 @@ impl Default for MetadataCacheConfig {
 
 // ── Internal LRU entry ────────────────────────────────────────────────────────
 
-struct LocalEntry {
-    entry: CachedMetadataEntry,
-    cached_at: Instant,
+pub(crate) struct LocalEntry {
+    pub(crate) entry: CachedMetadataEntry,
+    pub(crate) cached_at: Instant,
 }
 
 // ── HostedMetadataCache ───────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ pub struct HostedMetadataCache {
     config: MetadataCacheConfig,
     client: reqwest::Client,
     /// In-process LRU keyed by inode number.
-    local: RwLock<lru::LruCache<u64, LocalEntry>>,
+    pub(crate) local: RwLock<lru::LruCache<u64, LocalEntry>>,
 }
 
 impl HostedMetadataCache {
@@ -118,7 +118,7 @@ impl HostedMetadataCache {
     /// - The entry is not in the hosted cache.
     /// - The cached entry's `generation` is older than `min_generation`.
     /// - The hosted service is unavailable or returns an error.
-    pub async fn get_inode(&self, inode: u64, min_generation: u64) -> Option<InodeRecord> {
+    pub async fn get_inode(&self, inode: u64, min_generation: u64) -> Option<CachedMetadataEntry> {
         // Fast path: check the in-process LRU before making an HTTP request.
         {
             let local = self.local.read();
@@ -131,7 +131,7 @@ impl HostedMetadataCache {
                     generation = e.entry.generation,
                     "hosted_cache_local_hit"
                 );
-                return Some(e.entry.record.clone());
+                return Some(e.entry.clone());
             }
         }
 
@@ -158,8 +158,8 @@ impl HostedMetadataCache {
             return None;
         }
 
-        let record = cached.record.clone();
-        info!(inode, generation = cached.generation, "hosted_cache_hit");
+        let entry = cached.clone();
+        info!(inode, generation = entry.generation, "hosted_cache_hit");
         // Store in the in-process LRU so subsequent requests are served locally.
         self.local.write().put(
             inode,
@@ -168,7 +168,7 @@ impl HostedMetadataCache {
                 cached_at: Instant::now(),
             },
         );
-        Some(record)
+        Some(entry)
     }
 
     /// Try to get a cached directory listing for `parent_inode`.
@@ -274,6 +274,153 @@ impl HostedMetadataCache {
             .map_err(anyhow::Error::from)
             .map_err(|e| e.context("hosted cache: failed to decode inode entry"))?;
         Ok(Some(entry))
+    }
+}
+
+// ── Segment cache ─────────────────────────────────────────────────────────────
+
+/// Configuration for the hosted near-bucket segment cache.
+#[derive(Debug, Clone)]
+pub struct SegmentCacheConfig {
+    /// HTTP base URL of the segment cache service (no trailing slash).
+    pub cache_endpoint: String,
+    /// Maximum segment range size that will be fetched from the hosted cache.
+    /// Ranges above this threshold bypass the cache entirely.
+    pub max_segment_bytes: u64,
+    /// Whether the segment cache is enabled.
+    pub enabled: bool,
+}
+
+impl Default for SegmentCacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_endpoint: String::new(),
+            max_segment_bytes: 32 * 1024 * 1024, // 32 MiB
+            enabled: false,
+        }
+    }
+}
+
+/// Advisory near-bucket hot-segment cache client.
+///
+/// Segments are immutable by identity (`generation`, `segment_id`).  A cached
+/// entry keyed by `(generation, segment_id, offset, length)` is always current
+/// — no active invalidation is required.  Cache misses and errors silently
+/// return `None`; the caller falls back to the authoritative object store.
+pub struct HostedSegmentCache {
+    config: SegmentCacheConfig,
+    client: reqwest::Client,
+}
+
+impl HostedSegmentCache {
+    pub fn new(config: SegmentCacheConfig) -> Arc<Self> {
+        Arc::new(Self {
+            client: reqwest::Client::new(),
+            config,
+        })
+    }
+
+    /// Build from an accelerator endpoint URL with default limits.
+    pub fn from_endpoint(endpoint: impl Into<String>) -> Arc<Self> {
+        Self::new(SegmentCacheConfig {
+            cache_endpoint: endpoint.into(),
+            enabled: true,
+            ..SegmentCacheConfig::default()
+        })
+    }
+
+    /// Try to fetch a segment byte range from the hosted cache.
+    ///
+    /// The URL template is `GET /segment/{gen}/{seg_id}/{offset}+{length}`.
+    /// Returns `None` on any miss, size limit exceeded, or network/HTTP error.
+    pub async fn get_segment(
+        &self,
+        generation: u64,
+        segment_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Option<bytes::Bytes> {
+        if !self.config.enabled {
+            return None;
+        }
+        if length > self.config.max_segment_bytes {
+            tracing::debug!(
+                generation,
+                segment_id,
+                length,
+                max = self.config.max_segment_bytes,
+                "segment_cache_bypass_too_large"
+            );
+            return None;
+        }
+
+        let url = format!(
+            "{}/segment/{}/{}/{}+{}",
+            self.config.cache_endpoint.trim_end_matches('/'),
+            generation,
+            segment_id,
+            offset,
+            length,
+        );
+
+        match self.client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    tracing::debug!(generation, segment_id, offset, length, "segment_cache_miss");
+                    return None;
+                }
+                match resp.error_for_status().map_err(anyhow::Error::from) {
+                    Ok(r) => match r.bytes().await {
+                        Ok(data) => {
+                            tracing::info!(
+                                generation,
+                                segment_id,
+                                offset,
+                                length,
+                                bytes = data.len(),
+                                "segment_cache_hit"
+                            );
+                            Some(data)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                generation,
+                                segment_id,
+                                err = %err,
+                                "segment_cache_body_error"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            generation,
+                            segment_id,
+                            err = %err,
+                            "segment_cache_http_error"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    generation,
+                    segment_id,
+                    err = %err,
+                    "segment_cache_fetch_error"
+                );
+                None
+            }
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    pub fn max_segment_bytes(&self) -> u64 {
+        self.config.max_segment_bytes
     }
 }
 

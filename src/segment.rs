@@ -15,6 +15,7 @@ use object_store::{Error as ObjectError, ObjectStore, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 use uuid::Uuid;
 
 use lru::LruCache;
@@ -924,10 +925,12 @@ impl SegmentManager {
         F: Future<Output = object_store::Result<T>> + Send + 'static,
         C: FnOnce() -> String,
     {
-        self.handle
-            .block_on(fut)
-            .map_err(anyhow::Error::from)
-            .with_context(ctx)
+        let result = if Handle::try_current().is_ok() {
+            block_in_place(|| self.handle.block_on(fut))
+        } else {
+            self.handle.block_on(fut)
+        };
+        result.map_err(anyhow::Error::from).with_context(ctx)
     }
 
     fn cache_path(&self, generation: u64, segment_id: u64) -> PathBuf {

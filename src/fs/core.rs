@@ -208,6 +208,11 @@ impl OsageFs {
                             ));
                         }
                         self.block_on(self.superblock.commit_generation(committed_generation))?;
+                        if let Err(err) = self.metadata.apply_external_deltas() {
+                            log::warn!(
+                                "replay_journal failed to refresh metadata after relay commit: {err:#}"
+                            );
+                        }
                         let entries = journal.load_entries()?;
                         if let Err(err) = journal.mark_relay_committed(committed_generation) {
                             log::warn!(

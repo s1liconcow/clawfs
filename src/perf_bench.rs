@@ -15,6 +15,50 @@ use tokio::runtime::Runtime;
 /// Returns the tokio runtime (must be kept alive) and the filesystem.
 pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
     let config = perf_config(root);
+    perf_osagefs_with_config(config)
+}
+
+/// Create a fully-initialized OsageFs from a custom benchmark config.
+///
+/// This is useful when a benchmark wants to vary accelerator mode, cache
+/// sizing, or hosted endpoint wiring while still reusing the standard
+/// bootstrap path.
+pub fn perf_osagefs_with_config(config: Config) -> (Runtime, OsageFs) {
+    let (runtime, metadata, superblock, segments, client_state) =
+        perf_runtime_components(config.clone());
+
+    let fs = OsageFs::new(
+        config,
+        metadata,
+        superblock,
+        segments,
+        None,
+        None,
+        runtime.handle().clone(),
+        client_state,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    (runtime, fs)
+}
+
+/// Create the benchmark runtime stack without wrapping it in `OsageFs`.
+///
+/// This is useful for benchmarks that need direct access to metadata,
+/// superblock, or segment managers for maintenance-style workloads.
+pub fn perf_runtime_components(
+    config: Config,
+) -> (
+    Runtime,
+    Arc<MetadataStore>,
+    Arc<SuperblockManager>,
+    Arc<SegmentManager>,
+    Arc<ClientStateManager>,
+) {
     std::fs::create_dir_all(&config.mount_path).expect("create mount path");
     std::fs::create_dir_all(&config.store_path).expect("create store");
     std::fs::create_dir_all(&config.local_cache_path).expect("create cache");
@@ -68,23 +112,7 @@ pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
     let client_state =
         Arc::new(ClientStateManager::load(&config.state_path).expect("client state"));
 
-    let fs = OsageFs::new(
-        config,
-        metadata,
-        superblock,
-        segments,
-        None,
-        None,
-        runtime.handle().clone(),
-        client_state,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    (runtime, fs)
+    (runtime, metadata, superblock, segments, client_state)
 }
 
 pub fn perf_config(root: &Path) -> Config {

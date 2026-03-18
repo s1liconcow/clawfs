@@ -439,6 +439,22 @@ Prefer existing tooling where possible:
 - `scripts/fio_workloads.sh`
 - `scripts/micro_workflows.sh`
 
+The hosted benchmark harness lives in `benches/hosted.rs` and reports a
+markdown comparison table plus optional JSONL/JSON artifacts when the
+`CLAWFS_BENCH_REPORT_MD` and `CLAWFS_BENCH_REPORT_JSON` environment
+variables are set.
+
+Expected directionality for the current hosted modes:
+
+- `direct` is the baseline direct-object-store control case.
+- `hosted_maintenance_only` should leave foreground close and fsync latency
+  near baseline while shifting maintenance bytes away from the client.
+- `direct_plus_cache` should primarily improve metadata visibility lag and
+  hot-read p99, with a smaller effect on the foreground write path.
+- `relay_write` should reduce close and fsync latency by roughly one
+  object-store round trip relative to direct remote commits, at the cost of
+  tighter dependency on the accelerator service.
+
 ## Proposed Phasing
 
 ### Phase 1: Hosted Maintenance Offload
