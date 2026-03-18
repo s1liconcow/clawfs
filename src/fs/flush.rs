@@ -561,6 +561,50 @@ impl OsageFs {
             }
             prepared_generation = None;
             let commit_duration = commit_start.elapsed();
+
+            // Post-commit coordination event emission (advisory, fire-and-forget).
+            // CRITICAL: only emit after the CAS-based commit_generation succeeds;
+            // never on failed or speculative commits.
+            if let Some(publisher) = self.coordination_publisher.clone() {
+                let volume_prefix = self.config.object_prefix.clone();
+                let committer_id = self.client_state.client_id();
+                let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+                let affected: Vec<u64> = flushed_inodes.clone();
+                self.handle.spawn(async move {
+                    use crate::coordination::{
+                        GenerationHint, InvalidationEvent, InvalidationScope,
+                    };
+                    let hint = GenerationHint {
+                        volume_prefix: volume_prefix.clone(),
+                        generation: target_generation,
+                        committer_id,
+                        timestamp,
+                    };
+                    if let Err(err) = publisher.publish_generation_advance(hint).await {
+                        tracing::warn!(
+                            target: "coordination",
+                            generation = target_generation,
+                            err = %err,
+                            "publish_generation_advance failed (advisory; commit already succeeded)"
+                        );
+                    }
+                    let inv = InvalidationEvent {
+                        volume_prefix,
+                        generation: target_generation,
+                        affected_inodes: Some(affected.clone()),
+                        scope: InvalidationScope::Inodes(affected),
+                    };
+                    if let Err(err) = publisher.publish_invalidation(inv).await {
+                        tracing::warn!(
+                            target: "coordination",
+                            generation = target_generation,
+                            err = %err,
+                            "publish_invalidation failed (advisory; commit already succeeded)"
+                        );
+                    }
+                });
+            }
+
             let finalize_start = Instant::now();
             let finalize_pending_bytes_start = Instant::now();
             // Use a CAS loop that floors at 0 instead of wrapping, as a

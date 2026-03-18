@@ -74,7 +74,6 @@ pub struct OsageFs {
     replay: Option<Arc<ReplayLogger>>,
     telemetry: Option<Arc<TelemetryClient>>,
     telemetry_session_id: Option<String>,
-    #[allow(dead_code)] // used by task x8z.3.2 (publish coordination events)
     coordination_publisher: Option<Arc<dyn CoordinationPublisher>>,
     mount_ready_emitted: Arc<AtomicBool>,
     fsync_on_close: bool,

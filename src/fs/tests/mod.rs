@@ -26,6 +26,19 @@ impl TestHarness {
     where
         F: FnOnce(&mut Config),
     {
+        Self::with_config_and_publisher(root, state_name, pending_bytes, tweak, None)
+    }
+
+    fn with_config_and_publisher<F>(
+        root: &Path,
+        state_name: &str,
+        pending_bytes: u64,
+        tweak: F,
+        publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
+    ) -> Self
+    where
+        F: FnOnce(&mut Config),
+    {
         let mut config = test_config(root, state_name, pending_bytes);
         tweak(&mut config);
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -69,7 +82,7 @@ impl TestHarness {
             None,
             None,
             None,
-            None,
+            publisher,
         );
         Self {
             runtime,
@@ -3979,4 +3992,109 @@ fn readdir_batch_large_directory() {
             name
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coordination publisher tests
+// ---------------------------------------------------------------------------
+
+use crate::coordination::{CoordinationPublisher, GenerationHint, InvalidationEvent};
+
+struct MockPublisher {
+    generation_hints: Arc<Mutex<Vec<GenerationHint>>>,
+    invalidations: Arc<Mutex<Vec<InvalidationEvent>>>,
+}
+
+type SharedHints = Arc<Mutex<Vec<GenerationHint>>>;
+type SharedInvs = Arc<Mutex<Vec<InvalidationEvent>>>;
+
+impl MockPublisher {
+    fn new() -> (Arc<Self>, SharedHints, SharedInvs) {
+        let hints = Arc::new(Mutex::new(Vec::new()));
+        let invs = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(Self {
+            generation_hints: hints.clone(),
+            invalidations: invs.clone(),
+        });
+        (publisher, hints, invs)
+    }
+}
+
+#[async_trait::async_trait]
+impl CoordinationPublisher for MockPublisher {
+    async fn publish_generation_advance(&self, hint: GenerationHint) -> anyhow::Result<()> {
+        self.generation_hints.lock().push(hint);
+        Ok(())
+    }
+
+    async fn publish_invalidation(&self, event: InvalidationEvent) -> anyhow::Result<()> {
+        self.invalidations.lock().push(event);
+        Ok(())
+    }
+}
+
+#[test]
+fn flush_emits_coordination_events_after_commit() {
+    let tmp = tempdir().unwrap();
+    let (publisher, hints_arc, invs_arc) = MockPublisher::new();
+
+    let harness = TestHarness::with_config_and_publisher(
+        tmp.path(),
+        "coord_publisher",
+        1 << 20,
+        |_| {},
+        Some(publisher as Arc<dyn CoordinationPublisher>),
+    );
+    let fs = &harness.fs;
+
+    // Stage a file so that flush_pending has something to commit.
+    let inode = stage_named_file(&harness, "coord_test.txt", b"hello coordination".to_vec());
+    assert!(inode > 0);
+
+    // Flush — this should trigger post-commit event emission.
+    fs.flush_pending().expect("flush_pending should succeed");
+
+    // Give the spawned async tasks a moment to execute in the runtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let hints = hints_arc.lock();
+    let invs = invs_arc.lock();
+
+    assert!(
+        !hints.is_empty(),
+        "expected at least one GenerationHint after flush"
+    );
+    assert!(
+        !invs.is_empty(),
+        "expected at least one InvalidationEvent after flush"
+    );
+
+    // All events must reference the same generation and it must be > 0.
+    for hint in hints.iter() {
+        assert!(hint.generation > 0, "generation must be positive");
+    }
+    for inv in invs.iter() {
+        assert!(
+            inv.generation > 0,
+            "invalidation generation must be positive"
+        );
+        // The affected inodes must include the inode we staged.
+        let affected = inv.affected_inodes.as_deref().unwrap_or(&[]);
+        assert!(
+            affected.contains(&inode) || affected.contains(&ROOT_INODE),
+            "flushed inode should appear in InvalidationEvent"
+        );
+    }
+}
+
+#[test]
+fn flush_without_publisher_succeeds_silently() {
+    let tmp = tempdir().unwrap();
+    // No publisher — should behave identically to before this feature was added.
+    let harness = TestHarness::new(tmp.path(), "no_publisher", 1 << 20);
+    let fs = &harness.fs;
+
+    stage_named_file(&harness, "no_pub.txt", b"no publisher data".to_vec());
+    fs.flush_pending()
+        .expect("flush_pending without publisher should succeed");
 }
