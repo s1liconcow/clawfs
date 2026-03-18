@@ -399,6 +399,7 @@ impl OsageDirectFs {
             replay_logger,
             None,
             None,
+            None,
         ));
 
         let fs_for_replay = fs.clone();
