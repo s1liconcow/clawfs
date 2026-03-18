@@ -3,7 +3,9 @@ use std::sync::atomic::Ordering;
 
 use crate::clawfs::AcceleratorMode;
 use crate::journal::RelayPendingState;
-use crate::relay::{RelayClient, RelayStatus, RelayWriteRequest};
+use crate::relay::{
+    RelayClient, RelayOutagePolicy, RelayStatus, RelayWriteRequest, RelayWriteResponse,
+};
 
 impl OsageFs {
     // Bound per-object segment serialization working set during flush. We keep
@@ -509,8 +511,13 @@ impl OsageFs {
                 }
             }
             let merge_duration = merge_start.elapsed();
+            let mut relay_fell_back_to_direct = false;
             if self.config.accelerator_mode == Some(AcceleratorMode::RelayWrite) {
                 let relay_commit_start = Instant::now();
+                let relay_fallback_policy = self
+                    .config
+                    .relay_fallback_policy
+                    .unwrap_or(RelayOutagePolicy::FailClosed);
                 let request = RelayWriteRequest::new(
                     self.client_state.client_id(),
                     self.config.object_prefix.clone(),
@@ -533,287 +540,345 @@ impl OsageFs {
                             EIO
                         })?;
                 }
-                let accelerator_endpoint = self.config.accelerator_endpoint.clone().ok_or_else(|| {
-                    log::error!(
-                        "flush_pending relay_write missing accelerator endpoint pid={} tid={} scope={} gen={}",
-                        pid,
-                        tid,
-                        scope,
-                        target_generation
-                    );
-                    EIO
-                })?;
-                let relay_client = RelayClient::new(accelerator_endpoint).map_err(|err| {
-                    log::error!(
-                        "flush_pending relay client build failed pid={} tid={} scope={} gen={} err={err:#}",
-                        pid,
-                        tid,
-                        scope,
-                        target_generation
-                    );
-                    EIO
-                })?;
-                let response = self.block_on(relay_client.submit_relay_write(request)).map_err(|err| {
-                    log::error!(
-                        "flush_pending relay submit failed pid={} tid={} scope={} gen={} err={err:#}",
-                        pid,
-                        tid,
-                        scope,
-                        target_generation
-                    );
-                    EIO
-                })?;
-                match response.status {
-                    RelayStatus::Committed | RelayStatus::Duplicate => {
-                        let committed_generation = response.committed_generation.ok_or_else(|| {
-                            log::error!(
-                                "flush_pending relay response missing committed_generation pid={} tid={} scope={} gen={}",
+                let relay_result: Option<RelayWriteResponse> = match self
+                    .config
+                    .accelerator_endpoint
+                    .clone()
+                {
+                    Some(accelerator_endpoint) => match RelayClient::new(accelerator_endpoint) {
+                        Ok(relay_client) => match self
+                            .block_on(relay_client.submit_relay_write(request))
+                        {
+                            Ok(response) => Some(response),
+                            Err(err) => {
+                                if relay_fallback_policy == RelayOutagePolicy::DirectWriteFallback {
+                                    log::warn!(
+                                        "flush_pending relay submit failed; falling back to direct commit pid={} tid={} scope={} gen={} err={err:#}",
+                                        pid,
+                                        tid,
+                                        scope,
+                                        target_generation
+                                    );
+                                    relay_fell_back_to_direct = true;
+                                    None
+                                } else {
+                                    log::error!(
+                                        "flush_pending relay submit failed pid={} tid={} scope={} gen={} err={err:#}",
+                                        pid,
+                                        tid,
+                                        scope,
+                                        target_generation
+                                    );
+                                    self.superblock.abort_generation(target_generation);
+                                    prepared_generation = None;
+                                    return Err(EIO);
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            if relay_fallback_policy == RelayOutagePolicy::DirectWriteFallback {
+                                log::warn!(
+                                    "flush_pending relay client build failed; falling back to direct commit pid={} tid={} scope={} gen={} err={err:#}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    target_generation
+                                );
+                                relay_fell_back_to_direct = true;
+                                None
+                            } else {
+                                log::error!(
+                                    "flush_pending relay client build failed pid={} tid={} scope={} gen={} err={err:#}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    target_generation
+                                );
+                                self.superblock.abort_generation(target_generation);
+                                prepared_generation = None;
+                                return Err(EIO);
+                            }
+                        }
+                    },
+                    None => {
+                        if relay_fallback_policy == RelayOutagePolicy::DirectWriteFallback {
+                            log::warn!(
+                                "flush_pending relay_write missing accelerator endpoint; falling back to direct commit pid={} tid={} scope={} gen={}",
                                 pid,
                                 tid,
                                 scope,
                                 target_generation
                             );
-                            EIO
-                        })?;
-                        if committed_generation != target_generation {
+                            relay_fell_back_to_direct = true;
+                            None
+                        } else {
                             log::error!(
-                                "flush_pending relay committed_generation mismatch pid={} tid={} scope={} prepared_gen={} committed_gen={}",
+                                "flush_pending relay_write missing accelerator endpoint pid={} tid={} scope={} gen={}",
                                 pid,
                                 tid,
                                 scope,
-                                target_generation,
-                                committed_generation
+                                target_generation
                             );
                             self.superblock.abort_generation(target_generation);
                             prepared_generation = None;
                             return Err(EIO);
                         }
-                        if let Err(err) =
-                            self.block_on(self.superblock.commit_generation(committed_generation))
-                        {
-                            log::error!(
-                                "flush_pending relay commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
-                                pid,
-                                tid,
-                                scope,
-                                committed_generation
-                            );
-                            self.superblock.abort_generation(target_generation);
-                            prepared_generation = None;
-                            return Err(EIO);
-                        }
-                        if let Err(err) = self.metadata.apply_external_deltas() {
-                            log::warn!(
-                                "flush_pending relay apply_external_deltas failed pid={} tid={} scope={} gen={} err={err:?}",
-                                pid,
-                                tid,
-                                scope,
-                                committed_generation
-                            );
-                        }
-                        if let Some(journal) = &self.journal
-                            && let Err(err) = journal.mark_relay_committed(committed_generation)
-                        {
-                            log::warn!(
-                                "flush_pending relay mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
-                                pid,
-                                tid,
-                                scope,
-                                committed_generation
-                            );
-                        }
-                        prepared_generation = None;
-                        let commit_duration = relay_commit_start.elapsed();
-                        let finalize_start = Instant::now();
-                        let finalize_pending_bytes_start = Instant::now();
-                        let pending_remaining = loop {
-                            let current = self.pending_bytes.load(Ordering::Relaxed);
-                            let new_val = current.saturating_sub(flushed_bytes);
-                            if self
-                                .pending_bytes
-                                .compare_exchange_weak(
-                                    current,
-                                    new_val,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                            {
-                                break new_val;
-                            }
-                        };
-                        let finalize_pending_bytes_duration =
-                            finalize_pending_bytes_start.elapsed();
-                        let flushed_entries = drained_pending
-                            .take()
-                            .expect("drained pending map must exist until flush commit");
-                        let finalize_clear_flushing_start = Instant::now();
-                        let mut finalize_flushing_lock_wait = Duration::from_secs(0);
-                        for inode in flushed_entries.keys() {
-                            if let Some(active_arc) = self.active_inodes.get(inode) {
-                                let lock_start = Instant::now();
-                                let mut state = active_arc.lock();
-                                finalize_flushing_lock_wait += lock_start.elapsed();
-                                state.flushing = None;
-                                if state.pending.is_none() {
-                                    self.pending_inodes.remove(inode);
-                                }
-                            }
-                        }
-                        let finalize_clear_flushing_duration =
-                            finalize_clear_flushing_start.elapsed();
-                        let finalize_release_data_start = Instant::now();
-                        let mut released_staged_chunks = 0u64;
-                        for pending_entry in flushed_entries.into_values() {
-                            if let Some(data) = pending_entry.data {
-                                if let PendingData::Staged(segments) = &data {
-                                    released_staged_chunks = released_staged_chunks
-                                        .saturating_add(segments.chunks.len() as u64);
-                                }
-                                self.release_pending_data(data);
-                            }
-                        }
-                        let finalize_release_data_duration = finalize_release_data_start.elapsed();
-                        let finalize_journal_phase_start = Instant::now();
-                        let mut finalize_journal_clear_duration = Duration::from_secs(0);
-                        let mut journal_cleared_inodes = 0u64;
-                        if let Some(journal) = &self.journal {
-                            let clearable_inodes = flushed_inodes
-                                .into_iter()
-                                .filter(|inode| {
-                                    self.active_inodes
-                                        .get(inode)
-                                        .is_none_or(|arc| arc.lock().pending.is_none())
-                                })
-                                .collect::<Vec<_>>();
-                            let journal_clear_start = Instant::now();
-                            for inode in clearable_inodes {
-                                if let Err(err) = journal.clear_entry(inode) {
-                                    log::warn!(
-                                        "flush_pending relay journal clear failed pid={} tid={} scope={} ino={} err={err:#}",
-                                        pid,
-                                        tid,
-                                        scope,
-                                        inode
-                                    );
-                                } else {
-                                    journal_cleared_inodes =
-                                        journal_cleared_inodes.saturating_add(1);
-                                }
-                            }
-                            if let Err(err) = journal.clear_relay_pending_state() {
-                                log::warn!(
-                                    "flush_pending relay clear_relay_pending_state failed pid={} tid={} scope={} err={err:#}",
+                    }
+                };
+                if let Some(response) = relay_result {
+                    match response.status {
+                        RelayStatus::Committed | RelayStatus::Duplicate => {
+                            let committed_generation = response.committed_generation.ok_or_else(|| {
+                                log::error!(
+                                    "flush_pending relay response missing committed_generation pid={} tid={} scope={} gen={}",
                                     pid,
                                     tid,
-                                    scope
+                                    scope,
+                                    target_generation
+                                );
+                                EIO
+                            })?;
+                            if committed_generation != target_generation {
+                                log::error!(
+                                    "flush_pending relay committed_generation mismatch pid={} tid={} scope={} prepared_gen={} committed_gen={}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    target_generation,
+                                    committed_generation
+                                );
+                                self.superblock.abort_generation(target_generation);
+                                prepared_generation = None;
+                                return Err(EIO);
+                            }
+                            if let Err(err) = self
+                                .block_on(self.superblock.commit_generation(committed_generation))
+                            {
+                                log::error!(
+                                    "flush_pending relay commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    committed_generation
+                                );
+                                self.superblock.abort_generation(target_generation);
+                                prepared_generation = None;
+                                return Err(EIO);
+                            }
+                            if let Err(err) = self.metadata.apply_external_deltas() {
+                                log::warn!(
+                                    "flush_pending relay apply_external_deltas failed pid={} tid={} scope={} gen={} err={err:?}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    committed_generation
                                 );
                             }
-                            finalize_journal_clear_duration = journal_clear_start.elapsed();
-                        }
-                        let finalize_journal_phase_duration =
-                            finalize_journal_phase_start.elapsed();
-                        let finalize_duration = finalize_start.elapsed();
-                        let accelerator_status = self.config.accelerator_status();
-                        self.log_perf(
-                            "flush_pending",
-                            start.elapsed(),
-                            json!({
-                                "scope": scope,
-                                "target_generation": target_generation,
-                                "files": inline_files + segment_files,
-                                "inline_files": inline_files,
-                                "segment_files": segment_files,
-                                "metadata_only": metadata_only,
-                                "inline_bytes": inline_bytes,
-                                "segment_bytes": segment_bytes,
-                                "flushed_bytes": flushed_bytes,
-                                "drained_inodes": drained_inodes,
-                                "drain_skipped_locked": drain_skipped_locked,
-                                "segment_id": Option::<u64>::None,
-                                "flush_lock_wait_ms": flush_lock_wait.as_secs_f64() * 1000.0,
-                                "drain_select_ms": drain_duration.as_secs_f64() * 1000.0,
-                                "rotate_stage_file_ms": rotate_stage_file_duration.as_secs_f64() * 1000.0,
-                                "prepare_generation_ms": prepare_duration.as_secs_f64() * 1000.0,
-                                "classify_records_ms": classify_duration.as_secs_f64() * 1000.0,
-                                "segment_write_ms": segment_write_duration.as_secs_f64() * 1000.0,
-                                "merge_segment_extents_ms": merge_duration.as_secs_f64() * 1000.0,
-                                "metadata_persist_only_ms": 0.0,
-                                "metadata_sync_only_ms": 0.0,
-                                "metadata_ms": commit_duration.as_secs_f64() * 1000.0,
-                                "commit_ms": commit_duration.as_secs_f64() * 1000.0,
-                                "finalize_ms": finalize_duration.as_secs_f64() * 1000.0,
-                                "finalize_pending_bytes_ms": finalize_pending_bytes_duration.as_secs_f64() * 1000.0,
-                                "finalize_clear_flushing_ms": finalize_clear_flushing_duration.as_secs_f64() * 1000.0,
-                                "finalize_clear_flushing_lock_wait_ms": finalize_flushing_lock_wait.as_secs_f64() * 1000.0,
-                                "finalize_release_pending_data_ms": finalize_release_data_duration.as_secs_f64() * 1000.0,
-                                "released_staged_chunks": released_staged_chunks,
-                                "finalize_journal_phase_ms": finalize_journal_phase_duration.as_secs_f64() * 1000.0,
-                                "finalize_journal_clear_ms": finalize_journal_clear_duration.as_secs_f64() * 1000.0,
-                                "journal_cleared_inodes": journal_cleared_inodes,
-                                "pending_remaining": pending_remaining,
-                                "accelerator_mode": accelerator_status.accelerator_mode,
-                                "accelerator_endpoint": accelerator_status.accelerator_endpoint,
-                                "accelerator_health": accelerator_status.accelerator_health.as_str(),
-                                "cleanup_owner": accelerator_status.cleanup_owner.as_str(),
-                                "coordination_status": accelerator_status.coordination_status.as_str(),
-                                "relay_status": accelerator_status.relay_status.as_str(),
-                                "accelerator_status": accelerator_status.clone(),
-                            }),
-                        );
-                        if self.config.accelerator_mode.is_some() {
-                            let accelerator_endpoint = accelerator_status
-                                .accelerator_endpoint
-                                .as_deref()
-                                .unwrap_or("not_configured");
-                            if accelerator_status.is_warnworthy() {
-                                tracing::warn!(
-                                    target: "status",
-                                    scope = scope,
-                                    pending_remaining = pending_remaining,
-                                    accelerator_mode = %accelerator_status.accelerator_mode,
-                                    accelerator_endpoint = %accelerator_endpoint,
-                                    accelerator_health = %accelerator_status.accelerator_health.as_str(),
-                                    cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
-                                    coordination_status = %accelerator_status.coordination_status.as_str(),
-                                    relay_status = %accelerator_status.relay_status.as_str(),
-                                    "accelerator_status"
-                                );
-                            } else {
-                                tracing::info!(
-                                    target: "status",
-                                    scope = scope,
-                                    pending_remaining = pending_remaining,
-                                    accelerator_mode = %accelerator_status.accelerator_mode,
-                                    accelerator_endpoint = %accelerator_endpoint,
-                                    accelerator_health = %accelerator_status.accelerator_health.as_str(),
-                                    cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
-                                    coordination_status = %accelerator_status.coordination_status.as_str(),
-                                    relay_status = %accelerator_status.relay_status.as_str(),
-                                    "accelerator_status"
+                            if let Some(journal) = &self.journal
+                                && let Err(err) = journal.mark_relay_committed(committed_generation)
+                            {
+                                log::warn!(
+                                    "flush_pending relay mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
+                                    pid,
+                                    tid,
+                                    scope,
+                                    committed_generation
                                 );
                             }
+                            prepared_generation = None;
+                            let commit_duration = relay_commit_start.elapsed();
+                            let finalize_start = Instant::now();
+                            let finalize_pending_bytes_start = Instant::now();
+                            let pending_remaining = loop {
+                                let current = self.pending_bytes.load(Ordering::Relaxed);
+                                let new_val = current.saturating_sub(flushed_bytes);
+                                if self
+                                    .pending_bytes
+                                    .compare_exchange_weak(
+                                        current,
+                                        new_val,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    break new_val;
+                                }
+                            };
+                            let finalize_pending_bytes_duration =
+                                finalize_pending_bytes_start.elapsed();
+                            let flushed_entries = drained_pending
+                                .take()
+                                .expect("drained pending map must exist until flush commit");
+                            let finalize_clear_flushing_start = Instant::now();
+                            let mut finalize_flushing_lock_wait = Duration::from_secs(0);
+                            for inode in flushed_entries.keys() {
+                                if let Some(active_arc) = self.active_inodes.get(inode) {
+                                    let lock_start = Instant::now();
+                                    let mut state = active_arc.lock();
+                                    finalize_flushing_lock_wait += lock_start.elapsed();
+                                    state.flushing = None;
+                                    if state.pending.is_none() {
+                                        self.pending_inodes.remove(inode);
+                                    }
+                                }
+                            }
+                            let finalize_clear_flushing_duration =
+                                finalize_clear_flushing_start.elapsed();
+                            let finalize_release_data_start = Instant::now();
+                            let mut released_staged_chunks = 0u64;
+                            for pending_entry in flushed_entries.into_values() {
+                                if let Some(data) = pending_entry.data {
+                                    if let PendingData::Staged(segments) = &data {
+                                        released_staged_chunks = released_staged_chunks
+                                            .saturating_add(segments.chunks.len() as u64);
+                                    }
+                                    self.release_pending_data(data);
+                                }
+                            }
+                            let finalize_release_data_duration =
+                                finalize_release_data_start.elapsed();
+                            let finalize_journal_phase_start = Instant::now();
+                            let mut finalize_journal_clear_duration = Duration::from_secs(0);
+                            let mut journal_cleared_inodes = 0u64;
+                            if let Some(journal) = &self.journal {
+                                let clearable_inodes = flushed_inodes
+                                    .into_iter()
+                                    .filter(|inode| {
+                                        self.active_inodes
+                                            .get(inode)
+                                            .is_none_or(|arc| arc.lock().pending.is_none())
+                                    })
+                                    .collect::<Vec<_>>();
+                                let journal_clear_start = Instant::now();
+                                for inode in clearable_inodes {
+                                    if let Err(err) = journal.clear_entry(inode) {
+                                        log::warn!(
+                                            "flush_pending relay journal clear failed pid={} tid={} scope={} ino={} err={err:#}",
+                                            pid,
+                                            tid,
+                                            scope,
+                                            inode
+                                        );
+                                    } else {
+                                        journal_cleared_inodes =
+                                            journal_cleared_inodes.saturating_add(1);
+                                    }
+                                }
+                                if let Err(err) = journal.clear_relay_pending_state() {
+                                    log::warn!(
+                                        "flush_pending relay clear_relay_pending_state failed pid={} tid={} scope={} err={err:#}",
+                                        pid,
+                                        tid,
+                                        scope
+                                    );
+                                }
+                                finalize_journal_clear_duration = journal_clear_start.elapsed();
+                            }
+                            let finalize_journal_phase_duration =
+                                finalize_journal_phase_start.elapsed();
+                            let finalize_duration = finalize_start.elapsed();
+                            let accelerator_status = self.config.accelerator_status();
+                            self.log_perf(
+                                "flush_pending",
+                                start.elapsed(),
+                                json!({
+                                    "scope": scope,
+                                    "target_generation": target_generation,
+                                    "files": inline_files + segment_files,
+                                    "inline_files": inline_files,
+                                    "segment_files": segment_files,
+                                    "metadata_only": metadata_only,
+                                    "inline_bytes": inline_bytes,
+                                    "segment_bytes": segment_bytes,
+                                    "flushed_bytes": flushed_bytes,
+                                    "drained_inodes": drained_inodes,
+                                    "drain_skipped_locked": drain_skipped_locked,
+                                    "segment_id": Option::<u64>::None,
+                                    "flush_lock_wait_ms": flush_lock_wait.as_secs_f64() * 1000.0,
+                                    "drain_select_ms": drain_duration.as_secs_f64() * 1000.0,
+                                    "rotate_stage_file_ms": rotate_stage_file_duration.as_secs_f64() * 1000.0,
+                                    "prepare_generation_ms": prepare_duration.as_secs_f64() * 1000.0,
+                                    "classify_records_ms": classify_duration.as_secs_f64() * 1000.0,
+                                    "segment_write_ms": segment_write_duration.as_secs_f64() * 1000.0,
+                                    "merge_segment_extents_ms": merge_duration.as_secs_f64() * 1000.0,
+                                    "metadata_persist_only_ms": 0.0,
+                                    "metadata_sync_only_ms": 0.0,
+                                    "metadata_ms": commit_duration.as_secs_f64() * 1000.0,
+                                    "commit_ms": commit_duration.as_secs_f64() * 1000.0,
+                                    "finalize_ms": finalize_duration.as_secs_f64() * 1000.0,
+                                    "finalize_pending_bytes_ms": finalize_pending_bytes_duration.as_secs_f64() * 1000.0,
+                                    "finalize_clear_flushing_ms": finalize_clear_flushing_duration.as_secs_f64() * 1000.0,
+                                    "finalize_clear_flushing_lock_wait_ms": finalize_flushing_lock_wait.as_secs_f64() * 1000.0,
+                                    "finalize_release_pending_data_ms": finalize_release_data_duration.as_secs_f64() * 1000.0,
+                                    "released_staged_chunks": released_staged_chunks,
+                                    "finalize_journal_phase_ms": finalize_journal_phase_duration.as_secs_f64() * 1000.0,
+                                    "finalize_journal_clear_ms": finalize_journal_clear_duration.as_secs_f64() * 1000.0,
+                                    "journal_cleared_inodes": journal_cleared_inodes,
+                                    "pending_remaining": pending_remaining,
+                                    "accelerator_mode": accelerator_status.accelerator_mode,
+                                    "accelerator_endpoint": accelerator_status.accelerator_endpoint,
+                                    "accelerator_health": accelerator_status.accelerator_health.as_str(),
+                                    "cleanup_owner": accelerator_status.cleanup_owner.as_str(),
+                                    "coordination_status": accelerator_status.coordination_status.as_str(),
+                                    "relay_status": accelerator_status.relay_status.as_str(),
+                                    "accelerator_status": accelerator_status.clone(),
+                                }),
+                            );
+                            if self.config.accelerator_mode.is_some() {
+                                let accelerator_endpoint = accelerator_status
+                                    .accelerator_endpoint
+                                    .as_deref()
+                                    .unwrap_or("not_configured");
+                                if accelerator_status.is_warnworthy() {
+                                    tracing::warn!(
+                                        target: "status",
+                                        scope = scope,
+                                        pending_remaining = pending_remaining,
+                                        accelerator_mode = %accelerator_status.accelerator_mode,
+                                        accelerator_endpoint = %accelerator_endpoint,
+                                        accelerator_health = %accelerator_status.accelerator_health.as_str(),
+                                        cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
+                                        coordination_status = %accelerator_status.coordination_status.as_str(),
+                                        relay_status = %accelerator_status.relay_status.as_str(),
+                                        "accelerator_status"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target: "status",
+                                        scope = scope,
+                                        pending_remaining = pending_remaining,
+                                        accelerator_mode = %accelerator_status.accelerator_mode,
+                                        accelerator_endpoint = %accelerator_endpoint,
+                                        accelerator_health = %accelerator_status.accelerator_health.as_str(),
+                                        cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
+                                        coordination_status = %accelerator_status.coordination_status.as_str(),
+                                        relay_status = %accelerator_status.relay_status.as_str(),
+                                        "accelerator_status"
+                                    );
+                                }
+                            }
+                            debug!(
+                                "flush_pending pid={} tid={} scope={} gen={} inline_files={} segment_files={} metadata_only={} inline_bytes={} segment_bytes={} pending_remaining={}",
+                                pid,
+                                tid,
+                                scope,
+                                committed_generation,
+                                inline_files,
+                                segment_files,
+                                metadata_only,
+                                inline_bytes,
+                                segment_bytes,
+                                pending_remaining
+                            );
+                            self.touch_last_flush();
+                            return Ok(());
                         }
-                        debug!(
-                            "flush_pending pid={} tid={} scope={} gen={} inline_files={} segment_files={} metadata_only={} inline_bytes={} segment_bytes={} pending_remaining={}",
-                            pid,
-                            tid,
-                            scope,
-                            committed_generation,
-                            inline_files,
-                            segment_files,
-                            metadata_only,
-                            inline_bytes,
-                            segment_bytes,
-                            pending_remaining
-                        );
-                        self.touch_last_flush();
-                        return Ok(());
-                    }
-                    RelayStatus::Accepted | RelayStatus::Failed => {
-                        self.superblock.abort_generation(target_generation);
-                        prepared_generation = None;
-                        return Err(EIO);
+                        RelayStatus::Accepted | RelayStatus::Failed => {
+                            self.superblock.abort_generation(target_generation);
+                            prepared_generation = None;
+                            return Err(EIO);
+                        }
                     }
                 }
             }
@@ -871,6 +936,18 @@ impl OsageFs {
                 self.superblock.abort_generation(target_generation);
                 prepared_generation = None;
                 return Err(EIO);
+            }
+            if relay_fell_back_to_direct
+                && let Some(journal) = &self.journal
+                && let Err(err) = journal.mark_relay_committed(target_generation)
+            {
+                log::warn!(
+                    "flush_pending relay fallback mark_relay_committed failed pid={} tid={} scope={} gen={} err={err:#}",
+                    pid,
+                    tid,
+                    scope,
+                    target_generation
+                );
             }
             prepared_generation = None;
             let commit_duration = commit_start.elapsed();
@@ -990,6 +1067,14 @@ impl OsageFs {
                         EIO
                     })?;
                     journal_cleared_inodes = journal_cleared_inodes.saturating_add(1);
+                }
+                if relay_fell_back_to_direct && let Err(err) = journal.clear_relay_pending_state() {
+                    log::warn!(
+                        "flush_pending relay fallback clear_relay_pending_state failed pid={} tid={} scope={} err={err:#}",
+                        pid,
+                        tid,
+                        scope
+                    );
                 }
                 finalize_journal_clear_duration = journal_clear_start.elapsed();
             }

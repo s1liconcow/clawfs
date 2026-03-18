@@ -616,6 +616,23 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn root_prefix(&self) -> &str {
+        &self.root_prefix
+    }
+
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
+    pub fn checkpoint_prefix(&self) -> ObjectPath {
+        let base = self.root_prefix.trim_matches('/');
+        if base.is_empty() {
+            ObjectPath::from("metadata/checkpoints")
+        } else {
+            ObjectPath::from(format!("{}/metadata/checkpoints", base))
+        }
+    }
+
     fn superblock_path(&self) -> ObjectPath {
         let base = self.root_prefix.trim_matches('/');
         if base.is_empty() {

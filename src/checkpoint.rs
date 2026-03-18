@@ -50,6 +50,23 @@ pub struct CheckpointResult {
     pub checkpoint_path: String,
 }
 
+pub(crate) fn encode_checkpoint_bytes(
+    superblock: &Superblock,
+    created_at_unix: i64,
+    note: Option<&str>,
+) -> Vec<u8> {
+    let checkpoint = CheckpointData {
+        version: CHECKPOINT_FORMAT_VERSION,
+        created_at_unix,
+        note: note.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        }),
+        superblock: superblock.clone(),
+    };
+    serialize_checkpoint_fb(&checkpoint)
+}
+
 pub async fn create_checkpoint(
     config: &Config,
     handle: Handle,
@@ -68,17 +85,11 @@ pub async fn create_checkpoint(
         })?
         .block;
 
-    let checkpoint = CheckpointData {
-        version: CHECKPOINT_FORMAT_VERSION,
-        created_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
-        note: note.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then_some(trimmed.to_string())
-        }),
-        superblock: superblock.clone(),
-    };
-
-    let data = serialize_checkpoint_fb(&checkpoint);
+    let data = encode_checkpoint_bytes(
+        &superblock,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+        note.as_deref(),
+    );
     let parent = checkpoint_path
         .parent()
         .map(|p| p.to_path_buf())

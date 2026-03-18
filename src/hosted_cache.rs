@@ -135,6 +135,10 @@ impl HostedMetadataCache {
             }
         }
 
+        if self.config.cache_endpoint.trim().is_empty() {
+            return None;
+        }
+
         // Slow path: fetch from the hosted cache service.
         let cached = match self.fetch_inode(inode).await {
             Ok(Some(entry)) => entry,
@@ -177,6 +181,10 @@ impl HostedMetadataCache {
     /// or cache miss.  The caller should treat a `None` result as "not cached"
     /// and fall back to its normal directory-loading path.
     pub async fn get_readdir(&self, parent_inode: u64) -> Option<Vec<CachedDirEntry>> {
+        if self.config.cache_endpoint.trim().is_empty() {
+            return None;
+        }
+
         let url = format!(
             "{}/readdir/{}",
             self.config.cache_endpoint.trim_end_matches('/'),
@@ -340,6 +348,10 @@ impl HostedSegmentCache {
         offset: u64,
         length: u64,
     ) -> Option<bytes::Bytes> {
+        if self.config.cache_endpoint.trim().is_empty() {
+            return None;
+        }
+
         if !self.config.enabled {
             return None;
         }
@@ -430,7 +442,10 @@ impl HostedSegmentCache {
 mod tests {
     use std::time::Duration;
 
-    use super::{CachedMetadataEntry, HostedMetadataCache, MetadataCacheConfig};
+    use super::{
+        CachedMetadataEntry, HostedMetadataCache, HostedSegmentCache, MetadataCacheConfig,
+        SegmentCacheConfig,
+    };
     use crate::inode::InodeRecord;
 
     fn dummy_record(inode: u64) -> InodeRecord {
@@ -520,5 +535,51 @@ mod tests {
         assert_eq!(cache.config.cache_endpoint, "http://cache.example.com");
         assert_eq!(cache.config.max_entries, 2048);
         assert_eq!(cache.config.ttl, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_cache_endpoint_bypasses_http() {
+        let cache = HostedMetadataCache::new(MetadataCacheConfig {
+            cache_endpoint: String::new(),
+            max_entries: 16,
+            ttl: Duration::from_secs(60),
+        });
+
+        assert!(cache.get_inode(7, 1).await.is_none());
+        assert!(cache.get_readdir(7).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_cache_endpoint_still_serves_local_lru() {
+        let cache = HostedMetadataCache::new(MetadataCacheConfig {
+            cache_endpoint: String::new(),
+            max_entries: 16,
+            ttl: Duration::from_secs(60),
+        });
+
+        {
+            let mut local = cache.local.write();
+            local.put(
+                7,
+                super::LocalEntry {
+                    entry: cached_entry(7, 3),
+                    cached_at: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let entry = cache.get_inode(7, 1).await.expect("local cache hit");
+        assert_eq!(entry.generation, 3);
+    }
+
+    #[tokio::test]
+    async fn empty_segment_cache_endpoint_bypasses_http() {
+        let cache = HostedSegmentCache::new(SegmentCacheConfig {
+            cache_endpoint: String::new(),
+            max_segment_bytes: 1024,
+            enabled: true,
+        });
+
+        assert!(cache.get_segment(1, 2, 0, 64).await.is_none());
     }
 }

@@ -1,9 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Reverse, max};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use futures::StreamExt;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, PutPayload};
+use time::OffsetDateTime;
 use tracing::{info, warn};
 
+use crate::checkpoint::encode_checkpoint_bytes;
 use crate::clawfs::AcceleratorMode;
 use crate::inode::{FileStorage, InodeRecord, SegmentExtent};
 use crate::metadata::MetadataStore;
@@ -90,6 +97,83 @@ impl CompactionConfig {
     }
 }
 
+const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_CHECKPOINT_MAX_COUNT: usize = 7;
+const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
+const DEFAULT_LIFECYCLE_EXPIRY_DAYS: u64 = 30;
+const CHECKPOINT_OBJECT_DIR: &str = "metadata/checkpoints";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointConfig {
+    pub interval: Duration,
+    pub max_checkpoints: usize,
+    pub retention_days: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
+            max_checkpoints: DEFAULT_CHECKPOINT_MAX_COUNT,
+            retention_days: DEFAULT_CHECKPOINT_RETENTION_DAYS,
+        }
+    }
+}
+
+impl CheckpointConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.interval.is_zero()
+    }
+
+    pub fn retention_policy(&self) -> RetentionPolicy {
+        let max_count = self.max_checkpoints.max(1);
+        let min_keep = max(1, self.max_checkpoints.min(2));
+        RetentionPolicy {
+            max_count,
+            max_age_days: self.retention_days,
+            min_keep,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub max_count: usize,
+    pub max_age_days: u64,
+    pub min_keep: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionResult {
+    pub checkpoints_seen: usize,
+    pub checkpoints_deleted: usize,
+    pub checkpoints_kept: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecyclePolicy {
+    pub expiry_days: u64,
+    pub require_confirmation: bool,
+    pub allowed_prefix: String,
+}
+
+impl Default for LifecyclePolicy {
+    fn default() -> Self {
+        Self {
+            expiry_days: DEFAULT_LIFECYCLE_EXPIRY_DAYS,
+            require_confirmation: true,
+            allowed_prefix: String::new(),
+        }
+    }
+}
+
+impl LifecyclePolicy {
+    pub fn with_allowed_prefix(mut self, allowed_prefix: impl Into<String>) -> Self {
+        self.allowed_prefix = allowed_prefix.into();
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
     pub deltas_pruned: usize,
@@ -123,6 +207,298 @@ impl CompactionResult {
     pub fn duration_ms(&self) -> u64 {
         self.duration.as_millis() as u64
     }
+}
+
+fn normalize_prefix_scope(prefix: &str) -> Result<String> {
+    let trimmed = prefix.trim_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "prefix must not be empty");
+    anyhow::ensure!(
+        !trimmed
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == ".."),
+        "prefix must be a normalized path without empty segments or dot segments"
+    );
+    Ok(trimmed.to_string())
+}
+
+fn prefix_within_scope(requested: &str, allowed: &str) -> bool {
+    requested == allowed
+        || requested
+            .strip_prefix(allowed)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn checkpoint_bucket_prefix(root_prefix: &str) -> String {
+    let base = root_prefix.trim_matches('/');
+    if base.is_empty() {
+        CHECKPOINT_OBJECT_DIR.to_string()
+    } else {
+        format!("{base}/{CHECKPOINT_OBJECT_DIR}")
+    }
+}
+
+fn checkpoint_object_name(generation: u64, created_at_unix_nanos: i128) -> String {
+    format!(
+        "checkpoint-g{:020}-t{:020}.bin",
+        generation,
+        created_at_unix_nanos.max(0)
+    )
+}
+
+fn checkpoint_object_key(
+    root_prefix: &str,
+    generation: u64,
+    created_at_unix_nanos: i128,
+) -> String {
+    format!(
+        "{}/{}",
+        checkpoint_bucket_prefix(root_prefix),
+        checkpoint_object_name(generation, created_at_unix_nanos)
+    )
+}
+
+fn parse_checkpoint_object_name(name: &str) -> Option<(u64, i128)> {
+    let stem = name.strip_suffix(".bin")?;
+    let rest = stem.strip_prefix("checkpoint-g")?;
+    let (generation_str, timestamp_str) = rest.split_once("-t")?;
+    let generation = generation_str.parse().ok()?;
+    let timestamp = timestamp_str.parse().ok()?;
+    Some((generation, timestamp))
+}
+
+fn checkpoint_within_scope(location: &str, prefix: &str) -> bool {
+    location == prefix
+        || location
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointEntry {
+    location: String,
+    generation: u64,
+    created_at_nanos: i128,
+}
+
+pub async fn create_checkpoint(
+    meta: &MetadataStore,
+    config: &CheckpointConfig,
+) -> Result<crate::checkpoint::CheckpointResult> {
+    let superblock = meta
+        .load_superblock()
+        .await?
+        .context("missing superblock for checkpoint creation")?
+        .block;
+    let now = OffsetDateTime::now_utc();
+    let created_at_unix = now.unix_timestamp();
+    let created_at_nanos = now.unix_timestamp_nanos();
+    let checkpoint_path =
+        checkpoint_object_key(meta.root_prefix(), superblock.generation, created_at_nanos);
+    let payload = encode_checkpoint_bytes(&superblock, created_at_unix, Some("hosted maintenance"));
+    let store = meta.object_store();
+    store
+        .put(
+            &ObjectPath::from(checkpoint_path.clone()),
+            PutPayload::from_bytes(Bytes::from(payload)),
+        )
+        .await
+        .context("writing checkpoint object")?;
+    info!(
+        target: "maintenance",
+        checkpoint_path = %checkpoint_path,
+        generation = superblock.generation,
+        next_inode = superblock.next_inode,
+        next_segment = superblock.next_segment,
+        checkpoint_interval_secs = config.interval.as_secs(),
+        "checkpoint_created"
+    );
+    Ok(crate::checkpoint::CheckpointResult {
+        generation: superblock.generation,
+        next_inode: superblock.next_inode,
+        next_segment: superblock.next_segment,
+        checkpoint_path,
+    })
+}
+
+pub async fn enforce_retention_policy(
+    meta: &MetadataStore,
+    policy: &RetentionPolicy,
+) -> Result<RetentionResult> {
+    let prefix = meta.checkpoint_prefix();
+    let store = meta.object_store();
+    let now_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let cutoff_nanos = if policy.max_age_days == 0 {
+        None
+    } else {
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::days(policy.max_age_days as i64);
+        Some(cutoff.unix_timestamp_nanos())
+    };
+
+    let mut entries = Vec::new();
+    let mut stream = store.list(Some(&prefix));
+    while let Some(item) = stream.next().await {
+        let meta = item?;
+        let location = meta.location.as_ref().trim_matches('/').to_string();
+        let filename = meta.location.filename().unwrap_or_default();
+        let (generation, created_at_nanos) = match parse_checkpoint_object_name(filename) {
+            Some(values) => values,
+            None => {
+                warn!(
+                    target: "maintenance",
+                    checkpoint_path = %location,
+                    "checkpoint_retention_skipped_unrecognized_name"
+                );
+                continue;
+            }
+        };
+        if !checkpoint_within_scope(&location, prefix.as_ref().trim_matches('/')) {
+            warn!(
+                target: "maintenance",
+                checkpoint_path = %location,
+                checkpoint_prefix = %prefix,
+                "checkpoint_retention_skipped_out_of_scope"
+            );
+            continue;
+        }
+        entries.push(CheckpointEntry {
+            location,
+            generation,
+            created_at_nanos,
+        });
+    }
+
+    if entries.is_empty() {
+        return Ok(RetentionResult {
+            checkpoints_seen: 0,
+            checkpoints_deleted: 0,
+            checkpoints_kept: 0,
+        });
+    }
+
+    entries.sort_by_key(|entry| Reverse((entry.created_at_nanos, entry.generation)));
+
+    let effective_max_count = policy.max_count.max(policy.min_keep.max(1));
+    let mut delete_indices = BTreeSet::new();
+
+    if entries.len() > effective_max_count {
+        let excess = entries.len() - effective_max_count;
+        for idx in entries.len().saturating_sub(excess)..entries.len() {
+            delete_indices.insert(idx);
+        }
+    }
+
+    if let Some(cutoff_nanos) = cutoff_nanos {
+        for (idx, entry) in entries
+            .iter()
+            .enumerate()
+            .skip(policy.min_keep.min(entries.len()))
+        {
+            if entry.created_at_nanos < cutoff_nanos {
+                delete_indices.insert(idx);
+            }
+        }
+    }
+
+    for idx in 0..policy.min_keep.min(entries.len()) {
+        delete_indices.remove(&idx);
+    }
+
+    let mut deleted = 0usize;
+    for idx in delete_indices {
+        let entry = &entries[idx];
+        info!(
+            target: "maintenance",
+            checkpoint_path = %entry.location,
+            age_cutoff_nanos = cutoff_nanos.unwrap_or(now_nanos),
+            "checkpoint_retention_delete"
+        );
+        store
+            .delete(&ObjectPath::from(entry.location.clone()))
+            .await
+            .context("deleting checkpoint object")?;
+        deleted += 1;
+    }
+
+    Ok(RetentionResult {
+        checkpoints_seen: entries.len(),
+        checkpoints_deleted: deleted,
+        checkpoints_kept: entries.len().saturating_sub(deleted),
+    })
+}
+
+pub async fn cleanup_expired_prefix(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    policy: &LifecyclePolicy,
+) -> Result<()> {
+    anyhow::ensure!(
+        policy.require_confirmation,
+        "lifecycle cleanup requires explicit confirmation"
+    );
+    if policy.expiry_days == 0 {
+        return Ok(());
+    }
+
+    let allowed_prefix = normalize_prefix_scope(&policy.allowed_prefix)?;
+    let requested_prefix = normalize_prefix_scope(prefix)?;
+    anyhow::ensure!(
+        prefix_within_scope(&requested_prefix, &allowed_prefix),
+        "requested prefix {} is outside allowed prefix {}",
+        requested_prefix,
+        allowed_prefix
+    );
+
+    let prefix_path = ObjectPath::from(requested_prefix.clone());
+    let mut entries = Vec::new();
+    let mut stream = store.list(Some(&prefix_path));
+    while let Some(item) = stream.next().await {
+        let meta = item?;
+        let location = meta.location.as_ref().trim_matches('/').to_string();
+        if !checkpoint_within_scope(&location, &requested_prefix) {
+            warn!(
+                target: "maintenance",
+                object_path = %location,
+                requested_prefix = %requested_prefix,
+                "lifecycle_cleanup_skipped_out_of_scope"
+            );
+            continue;
+        }
+        entries.push((
+            location,
+            meta.last_modified.timestamp() as i128 * 1_000_000_000
+                + meta.last_modified.timestamp_subsec_nanos() as i128,
+        ));
+    }
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let cutoff = (OffsetDateTime::now_utc() - time::Duration::days(policy.expiry_days as i64))
+        .unix_timestamp_nanos();
+    let newest = entries
+        .iter()
+        .map(|(_, last_modified_nanos)| *last_modified_nanos)
+        .max()
+        .unwrap_or_default();
+    if newest >= cutoff {
+        return Ok(());
+    }
+
+    for (location, _) in entries {
+        info!(
+            target: "maintenance",
+            object_path = %location,
+            expiry_days = policy.expiry_days,
+            "lifecycle_cleanup_delete"
+        );
+        store
+            .delete(&ObjectPath::from(location))
+            .await
+            .context("deleting expired lifecycle object")?;
+    }
+
+    Ok(())
 }
 
 pub async fn acquire_cleanup_lease(
@@ -364,8 +740,12 @@ async fn compact_segment_batch(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use super::{CleanupPolicy, CompactionConfig};
+    use super::{
+        CheckpointConfig, CleanupPolicy, CompactionConfig, LifecyclePolicy, checkpoint_object_key,
+        normalize_prefix_scope, prefix_within_scope,
+    };
     use crate::clawfs::AcceleratorMode;
     use crate::config::Config;
 
@@ -442,5 +822,46 @@ mod tests {
     #[test]
     fn hosted_with_local_fallback_spawns_worker() {
         assert!(CleanupPolicy::HostedWithLocalFallback.should_spawn_local_worker());
+    }
+
+    #[test]
+    fn checkpoint_defaults_are_daily_and_bounded() {
+        let config = CheckpointConfig::default();
+
+        assert_eq!(config.interval, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(config.max_checkpoints, 7);
+        assert_eq!(config.retention_days, 7);
+
+        let retention = config.retention_policy();
+        assert_eq!(retention.max_count, 7);
+        assert_eq!(retention.min_keep, 2);
+        assert_eq!(retention.max_age_days, 7);
+    }
+
+    #[test]
+    fn lifecycle_policy_defaults_require_confirmation() {
+        let policy = LifecyclePolicy::default();
+
+        assert!(policy.require_confirmation);
+        assert_eq!(policy.expiry_days, 30);
+        assert!(policy.allowed_prefix.is_empty());
+    }
+
+    #[test]
+    fn prefix_scope_validation_requires_boundary_match() {
+        assert_eq!(normalize_prefix_scope("/vol/root/").unwrap(), "vol/root");
+        assert!(prefix_within_scope("vol/root", "vol/root"));
+        assert!(prefix_within_scope("vol/root/checkpoints", "vol/root"));
+        assert!(!prefix_within_scope("vol/root2", "vol/root"));
+        assert!(!prefix_within_scope("vol/rootish/path", "vol/root"));
+    }
+
+    #[test]
+    fn checkpoint_object_key_embeds_generation_and_timestamp() {
+        let key = checkpoint_object_key("vol/root", 42, 123);
+        assert_eq!(
+            key,
+            "vol/root/metadata/checkpoints/checkpoint-g00000000000000000042-t00000000000000000123.bin"
+        );
     }
 }

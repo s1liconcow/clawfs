@@ -516,6 +516,8 @@ impl CoordinationSubscriber {
 
         // 3. Reset sequence tracking so any subsequent events are applied fresh.
         self.last_seen_sequence.store(0, Ordering::Relaxed);
+        self.last_applied_generation
+            .store(self.superblock.snapshot().generation, Ordering::Relaxed);
 
         info!(
             refreshed_records = refreshed,
@@ -585,10 +587,11 @@ impl CoordinationSubscriber {
                 newest_generation_hint = ?newest_generation_hint,
                 "coordination metadata refresh completed"
             );
-            if let Some(generation) = newest_generation_hint {
-                self.last_applied_generation
-                    .store(generation, Ordering::Relaxed);
-            }
+            let refreshed_generation = self.superblock.snapshot().generation;
+            let watermark = newest_generation_hint
+                .map_or(refreshed_generation, |hint| hint.max(refreshed_generation));
+            self.last_applied_generation
+                .store(watermark, Ordering::Relaxed);
             self.set_health(CoordinationHealth::Connected);
         }
 
@@ -1045,6 +1048,59 @@ mod tests {
         // Sequence resets to 0 for a fresh replay.
         assert_eq!(subscriber.last_seen_sequence(), 0);
         assert_eq!(subscriber.health().as_str(), "connected");
+    }
+
+    /// A successful reconciliation should synchronize the generation watermark
+    /// with the authoritative superblock snapshot, not leave a stale hint
+    /// behind from an earlier event batch.
+    #[tokio::test]
+    async fn reconcile_stale_state_updates_last_applied_generation_from_superblock() {
+        let tempdir = tempdir().expect("tempdir");
+        let config = Config::with_paths(
+            tempdir.path().join("mnt"),
+            tempdir.path().join("store"),
+            tempdir.path().join("cache"),
+            tempdir.path().join("state"),
+        );
+        let handle = tokio::runtime::Handle::current();
+        let metadata = Arc::new(
+            MetadataStore::new(&config, handle.clone())
+                .await
+                .expect("metadata"),
+        );
+        let superblock = Arc::new(
+            SuperblockManager::load_or_init(metadata.clone(), config.shard_size)
+                .await
+                .expect("superblock"),
+        );
+
+        let pending = superblock
+            .prepare_dirty_generation()
+            .expect("prepare dirty generation");
+        let committed_generation = pending.generation;
+        superblock
+            .commit_generation(committed_generation)
+            .await
+            .expect("commit generation");
+
+        let subscriber = CoordinationSubscriber::new(
+            "http://127.0.0.1:1".to_string(),
+            metadata,
+            superblock.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+
+        subscriber
+            .last_applied_generation
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        subscriber.reconcile_stale_state().await.expect("reconcile");
+
+        assert_eq!(
+            subscriber.last_applied_generation(),
+            superblock.snapshot().generation
+        );
     }
 
     /// Stale cache entries are discarded before serving: `invalidate_inodes`

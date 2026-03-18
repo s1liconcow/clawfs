@@ -9,7 +9,7 @@
 //! at a time.
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use clawfs::config::{Config, ObjectStoreProvider};
-use clawfs::maintenance::{self, CompactionConfig};
+use clawfs::maintenance::{self, CheckpointConfig, CompactionConfig, LifecyclePolicy};
 use clawfs::metadata::MetadataStore;
 use clawfs::segment::{SegmentManager, segment_prefix};
 use clawfs::superblock::{CleanupTaskKind, SuperblockManager};
@@ -73,6 +73,34 @@ struct Cli {
     /// Log object store I/O at debug level.
     #[arg(long, default_value_t = false)]
     log_storage_io: bool,
+
+    /// Enable checkpoint creation and retention.
+    #[arg(long, default_value_t = true)]
+    checkpoint_maintenance: bool,
+
+    /// Interval between checkpoints in seconds.
+    #[arg(long, default_value_t = 86_400)]
+    checkpoint_interval_secs: u64,
+
+    /// Maximum number of checkpoints to retain.
+    #[arg(long, default_value_t = 7)]
+    checkpoint_max_checkpoints: usize,
+
+    /// Retention window for checkpoints in days.
+    #[arg(long, default_value_t = 7)]
+    checkpoint_retention_days: u64,
+
+    /// Enable lifecycle cleanup for expired hosted prefixes.
+    #[arg(long, default_value_t = false)]
+    lifecycle_cleanup: bool,
+
+    /// Expiry window for hosted prefix cleanup in days.
+    #[arg(long, default_value_t = 30)]
+    lifecycle_expiry_days: u64,
+
+    /// Require confirmation before prefix cleanup can delete objects.
+    #[arg(long, default_value_t = true)]
+    lifecycle_require_confirmation: bool,
 }
 
 #[tokio::main]
@@ -86,6 +114,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let poll_interval = Duration::from_secs(cli.poll_interval_secs);
     let compaction_config = CompactionConfig::default();
+    let checkpoint_config = cli.checkpoint_maintenance.then(|| CheckpointConfig {
+        interval: Duration::from_secs(cli.checkpoint_interval_secs),
+        max_checkpoints: cli.checkpoint_max_checkpoints,
+        retention_days: cli.checkpoint_retention_days,
+    });
 
     info!(
         client_id = %client_id,
@@ -114,6 +147,24 @@ async fn main() -> Result<()> {
     )?);
     let superblock =
         Arc::new(SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?);
+    let lifecycle_policy = if cli.lifecycle_cleanup {
+        let allowed_prefix = metadata.root_prefix().trim_matches('/').to_string();
+        if allowed_prefix.is_empty() {
+            warn!(
+                "lifecycle cleanup requested but the volume prefix is empty; skipping lifecycle maintenance"
+            );
+            None
+        } else {
+            Some(LifecyclePolicy {
+                expiry_days: cli.lifecycle_expiry_days,
+                require_confirmation: cli.lifecycle_require_confirmation,
+                allowed_prefix,
+            })
+        }
+    } else {
+        None
+    };
+    let mut maintenance_schedule = MaintenanceSchedule::new();
 
     info!(
         generation = superblock.snapshot().generation,
@@ -167,13 +218,16 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let round_result = run_maintenance_round(
-            &metadata,
-            &segments,
-            &superblock,
-            &client_id,
-            &compaction_config,
-        )
+        let round_result = run_maintenance_round(MaintenanceRoundContext {
+            metadata: &metadata,
+            segments: &segments,
+            superblock: &superblock,
+            client_id: &client_id,
+            compaction_config: &compaction_config,
+            checkpoint_config: checkpoint_config.as_ref(),
+            lifecycle_policy: lifecycle_policy.as_ref(),
+            schedule: &mut maintenance_schedule,
+        })
         .await;
         round = round.saturating_add(1);
 
@@ -182,8 +236,11 @@ async fn main() -> Result<()> {
         let _ = std::fs::write(
             &status_path,
             format!(
-                "running\nclient_id={client_id}\npoll_interval_secs={}\nround={round}\ngeneration={generation}\ndelta_backlog={}\nsegment_backlog={}\n",
-                cli.poll_interval_secs, round_result.delta_backlog, round_result.segment_backlog,
+                "running\nclient_id={client_id}\npoll_interval_secs={}\nround={round}\ngeneration={generation}\ndelta_backlog={}\nsegment_backlog={}\ncheckpoint_backlog={}\n",
+                cli.poll_interval_secs,
+                round_result.delta_backlog,
+                round_result.segment_backlog,
+                round_result.checkpoint_backlog,
             ),
         );
 
@@ -201,22 +258,81 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+const LIFECYCLE_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct MaintenanceSchedule {
+    last_checkpoint_run: Option<Instant>,
+    last_lifecycle_run: Option<Instant>,
+}
+
+impl MaintenanceSchedule {
+    fn new() -> Self {
+        Self {
+            last_checkpoint_run: None,
+            last_lifecycle_run: None,
+        }
+    }
+
+    fn checkpoint_due(&self, interval: Duration) -> bool {
+        if interval.is_zero() {
+            return false;
+        }
+        match self.last_checkpoint_run {
+            Some(last) => last.elapsed() >= interval,
+            None => true,
+        }
+    }
+
+    fn lifecycle_due(&self) -> bool {
+        match self.last_lifecycle_run {
+            Some(last) => last.elapsed() >= LIFECYCLE_SWEEP_INTERVAL,
+            None => true,
+        }
+    }
+
+    fn mark_checkpoint_ran(&mut self) {
+        self.last_checkpoint_run = Some(Instant::now());
+    }
+
+    fn mark_lifecycle_ran(&mut self) {
+        self.last_lifecycle_run = Some(Instant::now());
+    }
+}
+
 struct RoundStatus {
     delta_backlog: usize,
     segment_backlog: usize,
+    checkpoint_backlog: usize,
 }
 
-async fn run_maintenance_round(
-    metadata: &Arc<MetadataStore>,
-    segments: &Arc<SegmentManager>,
-    superblock: &Arc<SuperblockManager>,
-    client_id: &str,
-    config: &CompactionConfig,
-) -> RoundStatus {
+struct MaintenanceRoundContext<'a> {
+    metadata: &'a Arc<MetadataStore>,
+    segments: &'a Arc<SegmentManager>,
+    superblock: &'a Arc<SuperblockManager>,
+    client_id: &'a str,
+    compaction_config: &'a CompactionConfig,
+    checkpoint_config: Option<&'a CheckpointConfig>,
+    lifecycle_policy: Option<&'a LifecyclePolicy>,
+    schedule: &'a mut MaintenanceSchedule,
+}
+
+async fn run_maintenance_round(ctx: MaintenanceRoundContext<'_>) -> RoundStatus {
+    let MaintenanceRoundContext {
+        metadata,
+        segments,
+        superblock,
+        client_id,
+        compaction_config: config,
+        checkpoint_config,
+        lifecycle_policy,
+        schedule,
+    } = ctx;
+
     let mut did_delta_work = false;
     let mut status = RoundStatus {
         delta_backlog: 0,
         segment_backlog: 0,
+        checkpoint_backlog: 0,
     };
 
     // --- Delta compaction ---
@@ -342,6 +458,71 @@ async fn run_maintenance_round(
             }
         }
     }
+
+    if let Some(checkpoint_config) = checkpoint_config.filter(|config| config.is_enabled())
+        && schedule.checkpoint_due(checkpoint_config.interval)
+    {
+        match maintenance::create_checkpoint(metadata, checkpoint_config).await {
+            Ok(saved) => {
+                schedule.mark_checkpoint_ran();
+                match maintenance::enforce_retention_policy(
+                    metadata,
+                    &checkpoint_config.retention_policy(),
+                )
+                .await
+                {
+                    Ok(retention) => {
+                        info!(
+                            target: "maintenance",
+                            checkpoint_path = %saved.checkpoint_path,
+                            checkpoints_seen = retention.checkpoints_seen,
+                            checkpoints_deleted = retention.checkpoints_deleted,
+                            checkpoints_kept = retention.checkpoints_kept,
+                            "checkpoint_retention_complete"
+                        );
+                        status.checkpoint_backlog = retention.checkpoints_kept;
+                    }
+                    Err(err) => tracing::error!(
+                        target: "maintenance",
+                        kind = "checkpoint_retention",
+                        error = %err,
+                        "retention_failed"
+                    ),
+                }
+            }
+            Err(err) => tracing::error!(
+                target: "maintenance",
+                kind = "checkpoint_creation",
+                error = %err,
+                "checkpoint_failed"
+            ),
+        }
+    }
+
+    if let Some(policy) = lifecycle_policy.filter(|policy| policy.expiry_days > 0)
+        && schedule.lifecycle_due()
+    {
+        let store = metadata.object_store();
+        match maintenance::cleanup_expired_prefix(store.as_ref(), metadata.root_prefix(), policy)
+            .await
+        {
+            Ok(()) => {
+                schedule.mark_lifecycle_ran();
+                info!(
+                    target: "maintenance",
+                    prefix = %metadata.root_prefix(),
+                    expiry_days = policy.expiry_days,
+                    "lifecycle_cleanup_complete"
+                );
+            }
+            Err(err) => tracing::error!(
+                target: "maintenance",
+                kind = "lifecycle_cleanup",
+                error = %err,
+                "lifecycle_cleanup_failed"
+            ),
+        }
+    }
     status
 }
 
@@ -381,5 +562,26 @@ fn build_config(cli: &Cli, state_path: PathBuf) -> Config {
             PathBuf::from("/tmp/clawfs-worker-cache"),
             state_path,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::MaintenanceSchedule;
+
+    #[test]
+    fn maintenance_schedule_starts_due_and_is_reset_by_marks() {
+        let mut schedule = MaintenanceSchedule::new();
+
+        assert!(schedule.checkpoint_due(Duration::from_secs(1)));
+        assert!(schedule.lifecycle_due());
+
+        schedule.mark_checkpoint_ran();
+        schedule.mark_lifecycle_ran();
+
+        assert!(!schedule.checkpoint_due(Duration::from_secs(3600)));
+        assert!(!schedule.lifecycle_due());
     }
 }
