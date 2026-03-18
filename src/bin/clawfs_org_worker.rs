@@ -566,7 +566,7 @@ async fn run_discovery_and_maintenance_loop(
         if enable_maintenance {
             let mut sorted_prefixes: Vec<String> = loaded
                 .iter()
-                .filter(|c| c.policy.maintenance_enabled)
+                .filter(|c| c.read_policy().maintenance_enabled)
                 .map(|c| c.prefix.clone())
                 .collect();
             sorted_prefixes.sort_unstable();
@@ -575,7 +575,7 @@ async fn run_discovery_and_maintenance_loop(
                 // Build (prefix, weight) pairs from loaded contexts.
                 let weighted: Vec<(String, u32)> = loaded
                     .iter()
-                    .filter(|c| c.policy.maintenance_enabled)
+                    .filter(|c| c.read_policy().maintenance_enabled)
                     .map(|c| (c.prefix.clone(), c.scheduler_weight()))
                     .collect();
                 scheduler.rebuild(&weighted);
@@ -625,8 +625,9 @@ async fn run_discovery_and_maintenance_loop(
                 tokio::spawn(async move {
                     let _permit = sem_permit;
                     let mut schedule = ctx2.maintenance_schedule.lock().await;
-                    let checkpoint_config = ctx2.policy.checkpoint_config();
-                    let lifecycle_policy = ctx2.policy.lifecycle_policy(ctx2.prefix.clone());
+                    let policy = ctx2.read_policy();
+                    let checkpoint_config = policy.checkpoint_config();
+                    let lifecycle_policy = policy.lifecycle_policy(ctx2.prefix.clone());
 
                     let round = run_maintenance_round(MaintenanceRoundContext {
                         metadata: &ctx2.metadata,
@@ -726,15 +727,15 @@ async fn handle_health_volumes(State(state): State<AppState>) -> impl IntoRespon
         .loaded_prefixes()
         .into_iter()
         .filter_map(|prefix| {
-            state
-                .registry
-                .get_if_loaded(&prefix)
-                .map(|ctx| VolumeHealthSummary {
+            state.registry.get_if_loaded(&prefix).map(|ctx| {
+                let policy = ctx.read_policy();
+                VolumeHealthSummary {
                     health: ctx.health().as_str().to_string(),
-                    relay_enabled: ctx.policy.relay_enabled,
-                    maintenance_enabled: ctx.policy.maintenance_enabled,
+                    relay_enabled: policy.relay_enabled,
+                    maintenance_enabled: policy.maintenance_enabled,
                     prefix,
-                })
+                }
+            })
         })
         .collect();
 
@@ -754,13 +755,14 @@ async fn handle_health_volume(
             .into_response(),
         Some(ctx) => {
             let generation = ctx.superblock.snapshot().generation;
+            let policy = ctx.read_policy();
             Json(serde_json::json!({
                 "prefix": ctx.prefix,
                 "health": ctx.health().as_str(),
                 "generation": generation,
                 "shard_size": ctx.shard_size,
-                "relay_enabled": ctx.policy.relay_enabled,
-                "maintenance_enabled": ctx.policy.maintenance_enabled,
+                "relay_enabled": policy.relay_enabled,
+                "maintenance_enabled": policy.maintenance_enabled,
             }))
             .into_response()
         }
@@ -862,7 +864,7 @@ async fn handle_relay_write(
     };
 
     // ── Per-volume relay policy check ─────────────────────────────────────
-    if !ctx.policy.relay_enabled {
+    if !ctx.read_policy().relay_enabled {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "relay not enabled for this volume"})),

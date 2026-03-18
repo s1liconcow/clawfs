@@ -53,7 +53,7 @@ fn default_lifecycle_require_confirmation() -> bool {
 /// All fields are optional in the JSON representation. Missing fields use the
 /// defaults defined by the `Default` impl, which mirror the current
 /// single-volume maintenance worker behaviour.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct VolumeAcceleratorPolicy {
     // ── Maintenance ──────────────────────────────────────────────────────

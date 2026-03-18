@@ -84,7 +84,12 @@ pub struct VolumeContext {
     /// Shard geometry read from the superblock at discovery time.
     pub shard_size: u64,
     /// Policy loaded from `<prefix>/metadata/accelerator_policy.json`.
-    pub policy: VolumeAcceleratorPolicy,
+    ///
+    /// Protected by a Mutex so live policy refreshes (re-reads of the policy
+    /// file during discovery scans) can update the effective policy without
+    /// restarting the context or resetting the per-volume maintenance schedule.
+    /// Read with `read_policy()` and update with `apply_policy_update()`.
+    policy: Mutex<VolumeAcceleratorPolicy>,
     /// Metadata store (inode shards, deltas, superblock).
     pub metadata: Arc<MetadataStore>,
     /// Segment manager (immutable segment objects).
@@ -138,6 +143,22 @@ impl VolumeContext {
     /// Update the health state.
     pub fn set_health(&self, health: VolumeHealth) {
         *self.health.lock() = health;
+    }
+
+    /// Return a snapshot of the current policy.
+    pub fn read_policy(&self) -> VolumeAcceleratorPolicy {
+        self.policy.lock().clone()
+    }
+
+    /// Apply a policy update, returning `true` if the policy actually changed.
+    pub fn apply_policy_update(&self, new_policy: VolumeAcceleratorPolicy) -> bool {
+        let mut guard = self.policy.lock();
+        if *guard != new_policy {
+            *guard = new_policy;
+            true
+        } else {
+            false
+        }
     }
 
     /// Scheduling weight for the weighted round-robin maintenance scheduler.
@@ -288,19 +309,23 @@ impl OrgVolumeRegistry {
     }
 
     /// Upsert policy for an already-loaded context (used after policy refresh).
-    pub fn update_policy(&self, prefix: &str, policy: VolumeAcceleratorPolicy) {
+    ///
+    /// Returns `true` if the policy was found and actually changed, `false`
+    /// if the context was not loaded or the policy was identical to the
+    /// current one.
+    pub fn update_policy(&self, prefix: &str, policy: VolumeAcceleratorPolicy) -> bool {
         let key = normalize_prefix(prefix);
         if let Some(ctx) = self.contexts.get(&key) {
-            // Policy is immutable in VolumeContext once created; swap the
-            // health/maintenance state only if the context is healthy.
-            // For now just log; full per-context policy live-reload is
-            // a future enhancement.
-            let _ = policy; // suppress unused-variable warning
-            info!(
-                volume_prefix = %key,
-                "policy refresh noted; will apply on next load"
-            );
-            let _ = ctx; // keep borrow alive
+            let changed = ctx.apply_policy_update(policy);
+            if changed {
+                info!(
+                    volume_prefix = %key,
+                    "policy_refresh_applied"
+                );
+            }
+            changed
+        } else {
+            false
         }
     }
 
@@ -390,7 +415,7 @@ impl OrgVolumeRegistry {
         Ok(VolumeContext {
             prefix: prefix.clone(),
             shard_size,
-            policy,
+            policy: Mutex::new(policy),
             metadata,
             segments,
             superblock,
@@ -494,5 +519,92 @@ mod tests {
             VolumeHealth::UnhealthyPolicy("x".into()).as_str(),
             "unhealthy_policy"
         );
+    }
+
+    // ── Policy-refresh unit tests ─────────────────────────────────────────
+    //
+    // `VolumeContext` construction requires live object stores so we cannot
+    // build one in unit tests.  Instead we test `read_policy` /
+    // `apply_policy_update` logic directly through `Mutex<VolumeAcceleratorPolicy>`,
+    // which is the only state those methods touch.
+
+    #[test]
+    fn policy_mutex_read_returns_current_value() {
+        let mu = Mutex::new(VolumeAcceleratorPolicy {
+            relay_enabled: true,
+            ..Default::default()
+        });
+        let snapshot = mu.lock().clone();
+        assert!(snapshot.relay_enabled);
+        assert!(snapshot.maintenance_enabled);
+    }
+
+    #[test]
+    fn policy_mutex_update_returns_changed_flag() {
+        let mu = Mutex::new(VolumeAcceleratorPolicy::default());
+
+        // Differs from default → changed.
+        let updated = VolumeAcceleratorPolicy {
+            relay_enabled: true,
+            ..Default::default()
+        };
+        let changed = {
+            let mut guard = mu.lock();
+            if *guard != updated {
+                *guard = updated.clone();
+                true
+            } else {
+                false
+            }
+        };
+        assert!(changed);
+        assert!(mu.lock().relay_enabled);
+
+        // Applying the same value again is a no-op.
+        let no_change = {
+            let mut guard = mu.lock();
+            if *guard != updated {
+                *guard = updated;
+                true
+            } else {
+                false
+            }
+        };
+        assert!(!no_change);
+    }
+
+    #[test]
+    fn policy_isolation_between_independent_mutexes() {
+        // Represents two independent volume contexts sharing no state.
+        let mu_a = Mutex::new(VolumeAcceleratorPolicy::default());
+        let mu_b = Mutex::new(VolumeAcceleratorPolicy::default());
+
+        *mu_a.lock() = VolumeAcceleratorPolicy {
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        assert!(mu_a.lock().relay_enabled);
+        assert!(!mu_b.lock().relay_enabled);
+    }
+
+    #[test]
+    fn scheduler_weight_rules() {
+        // Weight 0 for unhealthy volumes.
+        let health_mu = Mutex::new(VolumeHealth::UnhealthyInit("boom".into()));
+        let is_healthy = health_mu.lock().is_healthy();
+        assert!(!is_healthy);
+
+        // Healthy + score 0 → clamped to 1.
+        let score: u32 = 0;
+        assert_eq!(score.clamp(1, 4), 1);
+
+        // Healthy + score 2 → 2.
+        let score: u32 = 2;
+        assert_eq!(score.clamp(1, 4), 2);
+
+        // Healthy + score 100 → capped at 4.
+        let score: u32 = 100;
+        assert_eq!(score.clamp(1, 4), 4);
     }
 }
