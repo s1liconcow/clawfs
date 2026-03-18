@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -25,9 +26,12 @@ use clawfs::fs::OsageFs;
 use clawfs::inode::{FileStorage, InodeRecord, ROOT_INODE};
 use clawfs::journal::JournalManager;
 use clawfs::metadata::{MetadataStore, create_object_store};
+use clawfs::relay::{
+    DedupStore, RelayStatus, RelayWriteRequest, RelayWriteResponse, relay_commit_pipeline,
+};
 use clawfs::segment::{SegmentEntry, SegmentManager, SegmentPayload, segment_prefix};
 use clawfs::state::ClientStateManager;
-use clawfs::superblock::SuperblockManager;
+use clawfs::superblock::{CleanupTaskKind, SuperblockManager};
 
 pub struct VolumeHandle {
     pub runtime: Runtime,
@@ -43,6 +47,7 @@ pub struct HostedTestHarness {
     pub tempdir: TempDir,
     pub volume: VolumeHandle,
     delta_counter: AtomicU64,
+    #[allow(dead_code)]
     segment_counter: AtomicU64,
 }
 
@@ -57,10 +62,33 @@ pub struct MockCoordinationEndpoint {
     join: tokio::task::JoinHandle<()>,
 }
 
+#[allow(dead_code)]
+pub struct MockRelayExecutor {
+    pub url: String,
+    state: Arc<MockRelayState>,
+    join: tokio::task::JoinHandle<()>,
+}
+
 struct MockCoordinationState {
     available: AtomicBool,
     next_sequence: AtomicU64,
+    dropped_events: AtomicU64,
     events: Mutex<Vec<CoordinationEvent>>,
+}
+
+#[allow(dead_code)]
+struct MockRelayState {
+    available: AtomicBool,
+    request_count: AtomicU64,
+    commit_count: AtomicU64,
+    fail_next_before_commit: AtomicBool,
+    first_request_precommit_delay_ms: Mutex<Option<Duration>>,
+    first_response_delay_ms: Mutex<Option<Duration>>,
+    metadata: Arc<MetadataStore>,
+    segments: Arc<SegmentManager>,
+    superblock: Arc<SuperblockManager>,
+    dedup: Arc<DedupStore>,
+    shard_size: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -101,6 +129,30 @@ impl HostedTestHarness {
         config.local_cache_path = sibling_root.join("cache");
         config.state_path = sibling_root.join(suffix);
         build_volume_handle(config)
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_lease_expiry(&self, kind: CleanupTaskKind) -> Result<()> {
+        self.volume.runtime.block_on(async {
+            let current = self
+                .volume
+                .metadata
+                .load_superblock()
+                .await?
+                .context("missing superblock")?;
+            if let Some(lease) = current
+                .block
+                .cleanup_leases
+                .iter()
+                .find(|lease| lease.kind == kind)
+            {
+                self.volume
+                    .superblock
+                    .complete_cleanup(kind, &lease.client_id)
+                    .await?;
+            }
+            Result::<()>::Ok(())
+        })
     }
 
     pub fn create_test_volume_with_deltas(&self, count: usize) -> Result<()> {
@@ -150,6 +202,7 @@ impl HostedTestHarness {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn create_test_volume_with_segments(&self, count: usize) -> Result<()> {
         for _ in 0..count {
             let seq = self.segment_counter.fetch_add(1, Ordering::Relaxed) as usize;
@@ -213,6 +266,7 @@ impl HostedTestHarness {
 }
 
 impl MockControlPlane {
+    #[allow(dead_code)]
     pub fn direct_plus_cache(
         accelerator_endpoint: impl Into<String>,
         event_endpoint: impl Into<String>,
@@ -282,6 +336,7 @@ impl MockCoordinationEndpoint {
         let state = Arc::new(MockCoordinationState {
             available: AtomicBool::new(true),
             next_sequence: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
             events: Mutex::new(Vec::new()),
         });
         let listener = runtime.block_on(async {
@@ -305,8 +360,26 @@ impl MockCoordinationEndpoint {
         })
     }
 
+    #[allow(dead_code)]
     pub fn set_available(&self, available: bool) {
         self.state.available.store(available, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_network_partition(&self, duration: Duration) {
+        self.set_available(false);
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            state.available.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_event_gap(&self, skip_count: usize) {
+        self.state
+            .dropped_events
+            .fetch_add(skip_count as u64, Ordering::Relaxed);
     }
 
     pub fn push_generation_hint(&self, generation: u64, committer_id: impl Into<String>) -> u64 {
@@ -330,6 +403,20 @@ impl MockCoordinationEndpoint {
 
     fn push_event(&self, payload: CoordinationPayload) -> u64 {
         let sequence = self.state.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        if self
+            .state
+            .dropped_events
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return sequence;
+        }
         self.state
             .events
             .lock()
@@ -339,6 +426,86 @@ impl MockCoordinationEndpoint {
 }
 
 impl Drop for MockCoordinationEndpoint {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+#[allow(dead_code)]
+impl MockRelayExecutor {
+    pub fn spawn(runtime: &Runtime, volume: &VolumeHandle) -> Result<Self> {
+        let state = Arc::new(MockRelayState {
+            available: AtomicBool::new(true),
+            request_count: AtomicU64::new(0),
+            commit_count: AtomicU64::new(0),
+            fail_next_before_commit: AtomicBool::new(false),
+            first_request_precommit_delay_ms: Mutex::new(None),
+            first_response_delay_ms: Mutex::new(None),
+            metadata: volume.metadata.clone(),
+            segments: volume.segments.clone(),
+            superblock: volume.superblock.clone(),
+            dedup: DedupStore::new(Duration::from_secs(3600)),
+            shard_size: volume.config.shard_size,
+        });
+        let listener = runtime.block_on(async {
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .context("bind mock relay executor")
+        })?;
+        let addr = listener.local_addr().context("mock relay local addr")?;
+        let app = Router::new()
+            .route("/relay_write", post(handle_relay_write))
+            .route("/health", get(handle_relay_health))
+            .with_state(state.clone());
+        let join = runtime.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self {
+            url: format!("http://{}", addr),
+            state,
+            join,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_network_partition(&self, duration: Duration) {
+        self.state.available.store(false, Ordering::Relaxed);
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            state.available.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_request_before_commit(&self) {
+        self.state
+            .fail_next_before_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_available(&self, available: bool) {
+        self.state.available.store(available, Ordering::Relaxed);
+    }
+
+    pub fn delay_first_request_before_commit(&self, delay: Duration) {
+        *self.state.first_request_precommit_delay_ms.lock() = Some(delay);
+    }
+
+    pub fn delay_first_response_after_commit(&self, delay: Duration) {
+        *self.state.first_response_delay_ms.lock() = Some(delay);
+    }
+
+    pub fn request_count(&self) -> u64 {
+        self.state.request_count.load(Ordering::Relaxed)
+    }
+
+    pub fn commit_count(&self) -> u64 {
+        self.state.commit_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for MockRelayExecutor {
     fn drop(&mut self) {
         self.join.abort();
     }
@@ -395,6 +562,85 @@ async fn handle_poll(
         .cloned()
         .collect::<Vec<_>>();
     Json(CoordinationEventBatch { events }).into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_relay_write(
+    State(state): State<Arc<MockRelayState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let request: RelayWriteRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid relay request payload: {err}"),
+            )
+                .into_response();
+        }
+    };
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    if !state.available.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let precommit_delay = if state.request_count.load(Ordering::Relaxed) == 1 {
+        state.first_request_precommit_delay_ms.lock().take()
+    } else {
+        None
+    };
+    if let Some(delay) = precommit_delay {
+        tokio::time::sleep(delay).await;
+    }
+    if state.fail_next_before_commit.swap(false, Ordering::Relaxed) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    match relay_commit_pipeline(
+        &request,
+        &state.metadata,
+        &state.segments,
+        &state.superblock,
+        &state.dedup,
+        state.shard_size,
+    )
+    .await
+    {
+        Ok(response) => {
+            state.commit_count.fetch_add(1, Ordering::Relaxed);
+            let first_response_delay = if state.request_count.load(Ordering::Relaxed) == 1 {
+                state.first_response_delay_ms.lock().take()
+            } else {
+                None
+            };
+            if let Some(delay) = first_response_delay {
+                tokio::time::sleep(delay).await;
+            }
+            let status = match response.status {
+                RelayStatus::Failed => StatusCode::CONFLICT,
+                _ => StatusCode::OK,
+            };
+            (status, Json(response)).into_response()
+        }
+        Err(err) => {
+            let response = RelayWriteResponse {
+                status: RelayStatus::Failed,
+                committed_generation: None,
+                idempotency_key: request.idempotency_key,
+                error: Some(format!("internal error: {err}")),
+                actual_generation: None,
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn handle_relay_health(State(state): State<Arc<MockRelayState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "requests": state.request_count.load(Ordering::Relaxed),
+        "available": state.available.load(Ordering::Relaxed),
+    }))
 }
 
 fn build_config(root: &Path, state_name: &str) -> Config {
@@ -536,5 +782,41 @@ pub fn build_coordination_subscriber(
         superblock,
         Duration::from_millis(poll_interval_ms),
         Duration::from_millis(poll_interval_ms.max(1)),
+    )
+}
+
+#[allow(dead_code)]
+pub fn build_coordination_subscriber_with_staleness_timeout(
+    runtime: &Runtime,
+    endpoint: &MockCoordinationEndpoint,
+    metadata: Arc<MetadataStore>,
+    superblock: Arc<SuperblockManager>,
+    poll_interval_ms: u64,
+    staleness_timeout: Duration,
+) -> clawfs::coordination::CoordinationSubscriberHandle {
+    clawfs::coordination::CoordinationSubscriber::spawn_with_staleness_timeout(
+        runtime.handle(),
+        endpoint.url.clone(),
+        metadata,
+        superblock,
+        Duration::from_millis(poll_interval_ms),
+        Duration::from_millis(poll_interval_ms.max(1)),
+        staleness_timeout,
+    )
+}
+
+#[allow(dead_code)]
+pub fn build_relay_write_request(
+    volume: &VolumeHandle,
+    client_id: impl Into<String>,
+    journal_sequence: u64,
+) -> RelayWriteRequest {
+    RelayWriteRequest::new(
+        client_id,
+        volume.config.object_prefix.clone(),
+        journal_sequence,
+        volume.superblock.snapshot().generation,
+        Vec::new(),
+        Vec::new(),
     )
 }

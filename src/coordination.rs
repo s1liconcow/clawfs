@@ -300,13 +300,41 @@ impl CoordinationSubscriber {
         poll_interval: Duration,
         reconnect_backoff: Duration,
     ) -> CoordinationSubscriberHandle {
-        let subscriber = Self::new(
+        Self::spawn_with_staleness_timeout(
+            handle,
             endpoint,
             metadata,
             superblock,
             poll_interval,
             reconnect_backoff,
+            Duration::from_secs(DEFAULT_STALENESS_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn spawn_with_staleness_timeout(
+        handle: &Handle,
+        endpoint: String,
+        metadata: Arc<MetadataStore>,
+        superblock: Arc<SuperblockManager>,
+        poll_interval: Duration,
+        reconnect_backoff: Duration,
+        staleness_timeout: Duration,
+    ) -> CoordinationSubscriberHandle {
+        let subscriber = Self::new_with_staleness_timeout(
+            endpoint,
+            metadata,
+            superblock,
+            poll_interval,
+            reconnect_backoff,
+            staleness_timeout,
         );
+        Self::spawn_with_subscriber(handle, subscriber)
+    }
+
+    fn spawn_with_subscriber(
+        handle: &Handle,
+        subscriber: CoordinationSubscriber,
+    ) -> CoordinationSubscriberHandle {
         let health = subscriber.health.clone();
         let last_seen_sequence = subscriber.last_seen_sequence.clone();
         let last_applied_generation = subscriber.last_applied_generation.clone();
