@@ -386,7 +386,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "clawfs"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "clawfs-nfs-gateway"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "clawfs-preload"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "clawfs",
