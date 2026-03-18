@@ -281,6 +281,7 @@ pub struct Config {
     pub fuse_threads: usize,
     pub entry_ttl_secs: u64,
     pub fuse_fsname: String,
+    pub relay_session_token: Option<String>,
 }
 
 impl Config {
@@ -339,6 +340,7 @@ impl Config {
             fuse_threads: default_fuse_threads(),
             entry_ttl_secs: 5,
             fuse_fsname: "clawfs".to_string(),
+            relay_session_token: None,
         }
     }
 

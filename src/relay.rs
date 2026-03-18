@@ -343,15 +343,17 @@ pub struct RelayClient {
     attempt_timeout: Duration,
     max_retries: usize,
     retry_backoff: Duration,
+    session_token: Option<String>,
 }
 
 impl RelayClient {
-    pub fn new(base_url: impl Into<String>) -> Result<Self> {
+    pub fn new(base_url: impl Into<String>, session_token: Option<String>) -> Result<Self> {
         Self::with_retry_policy(
             base_url,
             DEFAULT_RELAY_ATTEMPT_TIMEOUT,
             DEFAULT_RELAY_MAX_RETRIES,
             DEFAULT_RELAY_RETRY_BACKOFF,
+            session_token,
         )
     }
 
@@ -360,6 +362,7 @@ impl RelayClient {
         attempt_timeout: Duration,
         max_retries: usize,
         retry_backoff: Duration,
+        session_token: Option<String>,
     ) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = reqwest::Client::builder()
@@ -372,6 +375,7 @@ impl RelayClient {
             attempt_timeout,
             max_retries,
             retry_backoff,
+            session_token,
         })
     }
 
@@ -385,7 +389,11 @@ impl RelayClient {
 
         for attempt in 0..=self.max_retries {
             let attempt_no = attempt + 1;
-            match self.client.post(&url).json(&request).send().await {
+            let mut req_builder = self.client.post(&url).json(&request);
+            if let Some(token) = &self.session_token {
+                req_builder = req_builder.bearer_auth(token);
+            }
+            match req_builder.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp
@@ -997,6 +1005,7 @@ mod tests {
             Duration::from_millis(100),
             1,
             Duration::from_millis(1),
+            None,
         )
         .expect("build client");
         let request = RelayWriteRequest::new(
@@ -1027,6 +1036,64 @@ mod tests {
         assert_eq!(response.status, RelayStatus::Committed);
         assert_eq!(response.committed_generation, Some(99));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_client_sends_bearer_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock relay server");
+        let addr = listener.local_addr().expect("listener address");
+        let saw_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_auth_clone = saw_auth.clone();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request_text = String::from_utf8_lossy(&buf[..n]);
+            let lower = request_text.to_ascii_lowercase();
+            if lower.contains("authorization: bearer test-token-xyz") {
+                saw_auth_clone.store(true, Ordering::SeqCst);
+            }
+            let body = serde_json::to_string(&RelayWriteResponse {
+                status: RelayStatus::Committed,
+                committed_generation: Some(1),
+                idempotency_key: RelayWriteRequest::derive_idempotency_key(
+                    "client-a",
+                    "/vol/prefix",
+                    1,
+                ),
+                error: None,
+                actual_generation: None,
+            })
+            .expect("serialize response");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = RelayClient::with_retry_policy(
+            format!("http://{}", addr),
+            Duration::from_millis(200),
+            0,
+            Duration::from_millis(1),
+            Some("test-token-xyz".to_string()),
+        )
+        .expect("build client");
+
+        let request = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 0, vec![], vec![]);
+        client
+            .submit_relay_write(request)
+            .await
+            .expect("submit write");
+        assert!(
+            saw_auth.load(Ordering::SeqCst),
+            "Authorization: Bearer header was not sent"
+        );
     }
 
     #[test]

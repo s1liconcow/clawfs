@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY clawfs-preload ./clawfs-preload
-COPY clawfs-nfs-gateway ./clawfs-nfs-gateway
-COPY fuser-mt ./fuser-mt
+COPY ../Cargo.toml Cargo.lock ./
+COPY ../src ./src
+COPY ../clawfs-preload ./clawfs-preload
+COPY ../clawfs-nfs-gateway ./clawfs-nfs-gateway
+COPY ../fuser-mt ./fuser-mt
 
 RUN cargo build --release --locked --no-default-features \
     --package clawfs \
@@ -36,7 +36,7 @@ WORKDIR /var/lib/clawfs
 
 COPY --from=builder /app/target/release/clawfs_maintenance_worker /usr/local/bin/clawfs_maintenance_worker
 COPY --from=builder /app/target/release/clawfs_relay_executor /usr/local/bin/clawfs_relay_executor
-COPY docker/hosted-accelerator-entrypoint.sh /usr/local/bin/hosted-accelerator-entrypoint.sh
+COPY hosted-accelerator-entrypoint.sh /usr/local/bin/hosted-accelerator-entrypoint.sh
 
 ENV HOSTED_ACCELERATOR_BIN=clawfs_maintenance_worker
 

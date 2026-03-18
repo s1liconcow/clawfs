@@ -547,7 +547,10 @@ impl OsageFs {
                     .accelerator_endpoint
                     .clone()
                 {
-                    Some(accelerator_endpoint) => match RelayClient::new(accelerator_endpoint) {
+                    Some(accelerator_endpoint) => match RelayClient::new(
+                        accelerator_endpoint,
+                        self.config.relay_session_token.clone(),
+                    ) {
                         Ok(relay_client) => match self
                             .block_on(relay_client.submit_relay_write(request))
                         {

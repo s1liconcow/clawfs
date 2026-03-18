@@ -568,6 +568,7 @@ fn apply_hosted_runtime_config(config: &mut Config, hosted: &HostedControlPlane)
     config.accelerator_endpoint = hosted.accelerator_endpoint.clone();
     config.accelerator_fallback_policy = Some(fallback);
     config.relay_fallback_policy = relay_policy;
+    config.relay_session_token = hosted.accelerator_session_token.clone();
 }
 
 fn apply_provisioned_credentials(config: &mut Config, creds: &ControlPlaneCredentials) {
@@ -591,6 +592,7 @@ fn apply_provisioned_credentials(config: &mut Config, creds: &ControlPlaneCreden
         unsafe {
             env::set_var("CLAWFS_ACCELERATOR_SESSION_TOKEN", token);
         }
+        config.relay_session_token = Some(token.to_string());
     }
     if let Some(expiry) = creds.accelerator_session_expiry {
         unsafe {

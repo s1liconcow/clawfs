@@ -221,11 +221,12 @@ impl OsageFs {
                     "relay_write replay requires an accelerator endpoint"
                 ));
             };
-            let client = RelayClient::new(endpoint).map_err(|err| {
-                self.superblock.abort_generation(target_generation);
-                log::error!("replay_journal failed to build relay client: {err:#}");
-                anyhow!("failed to build relay client: {err:#}")
-            })?;
+            let client = RelayClient::new(endpoint, self.config.relay_session_token.clone())
+                .map_err(|err| {
+                    self.superblock.abort_generation(target_generation);
+                    log::error!("replay_journal failed to build relay client: {err:#}");
+                    anyhow!("failed to build relay client: {err:#}")
+                })?;
             let response = self.block_on(client.submit_relay_write(relay_state.request.clone()));
             match response {
                 Ok(response) => match response.status {

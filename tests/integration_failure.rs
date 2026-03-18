@@ -288,6 +288,7 @@ fn relay_timeout_after_commit_retries_with_same_key() -> Result<()> {
         Duration::from_millis(750),
         1,
         Duration::from_millis(5),
+        None,
     )?;
     let request = build_relay_write_request(&harness.volume, "relay-timeout-client", 1);
 
@@ -331,6 +332,7 @@ fn relay_crash_before_commit_retries_cleanly() -> Result<()> {
         Duration::from_millis(100),
         0,
         Duration::from_millis(5),
+        None,
     )?;
     let request = build_relay_write_request(&harness.volume, "relay-crash-client", 1);
 
@@ -349,6 +351,7 @@ fn relay_crash_before_commit_retries_cleanly() -> Result<()> {
         Duration::from_millis(100),
         1,
         Duration::from_millis(5),
+        None,
     )?;
     let response = harness
         .volume
@@ -372,6 +375,7 @@ fn relay_duplicate_submission_returns_deduped_commit() -> Result<()> {
         Duration::from_millis(25),
         1,
         Duration::from_millis(5),
+        None,
     )?;
     let request = build_relay_write_request(&harness.volume, "relay-duplicate-client", 1);
 
@@ -407,12 +411,14 @@ fn relay_generation_race_commits_once_and_rejects_stale_request() -> Result<()> 
         Duration::from_secs(2),
         0,
         Duration::from_millis(5),
+        None,
     )?;
     let client_b = RelayClient::with_retry_policy(
         server_b.url.clone(),
         Duration::from_secs(2),
         0,
         Duration::from_millis(5),
+        None,
     )?;
     let request_a = build_relay_write_request(&harness.volume, "relay-race-a", 1);
     let request_b = build_relay_write_request(&peer, "relay-race-b", 1);

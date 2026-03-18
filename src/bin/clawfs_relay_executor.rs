@@ -16,11 +16,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use serde::Deserialize;
 use tracing::{info, warn};
 
 use clawfs::config::{Config, ObjectStoreProvider};
@@ -78,6 +80,12 @@ struct Cli {
     /// Log object store I/O at debug level.
     #[arg(long, default_value_t = false)]
     log_storage_io: bool,
+
+    /// HMAC-SHA256 secret for validating relay JWT session tokens.
+    /// When set, all /relay_write requests must include a valid Bearer token.
+    /// When unset, requests are accepted without authentication (dev/test mode).
+    #[arg(long, env = "CLAWFS_RELAY_JWT_SECRET")]
+    jwt_secret: Option<String>,
 }
 
 #[derive(Clone)]
@@ -87,6 +95,7 @@ struct AppState {
     superblock: Arc<SuperblockManager>,
     dedup: Arc<DedupStore>,
     shard_size: u64,
+    jwt_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -134,6 +143,7 @@ async fn main() -> Result<()> {
         superblock,
         dedup,
         shard_size: config.shard_size,
+        jwt_secret: cli.jwt_secret.clone(),
     };
 
     let app = Router::new()
@@ -146,10 +156,58 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct RelayClaims {
+    prefix: String,
+}
+
+fn validate_relay_token(
+    headers: &HeaderMap,
+    volume_prefix: &str,
+    secret: &str,
+) -> Result<(), String> {
+    let auth = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Missing Authorization header".to_string())?;
+    let token = auth
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| "Authorization header must use Bearer scheme".to_string())?;
+
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.leeway = 0;
+    let token_data = decode::<RelayClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|e| format!("JWT validation failed: {e}"))?;
+
+    if token_data.claims.prefix != volume_prefix {
+        return Err(format!(
+            "JWT prefix '{}' does not match request volume_prefix '{}'",
+            token_data.claims.prefix, volume_prefix
+        ));
+    }
+    Ok(())
+}
+
 async fn handle_relay_write(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<RelayWriteRequest>,
 ) -> impl IntoResponse {
+    if let Some(secret) = &state.jwt_secret
+        && let Err(reason) = validate_relay_token(&headers, &request.volume_prefix, secret)
+    {
+        warn!(reason = %reason, "relay_write auth rejected");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": reason})),
+        )
+            .into_response();
+    }
     match relay_commit_pipeline(
         &request,
         &state.metadata,
@@ -227,5 +285,95 @@ fn build_config(cli: &Cli) -> Config {
             PathBuf::from("/tmp/clawfs-relay-cache"),
             PathBuf::from("/tmp/clawfs-relay-state"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Serialize)]
+    struct TestClaims {
+        sub: String,
+        prefix: String,
+        iat: u64,
+        exp: u64,
+    }
+
+    fn make_token(prefix: &str, secret: &str, ttl_secs: i64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = (now as i64 + ttl_secs) as u64;
+        let claims = TestClaims {
+            sub: "org/vol".to_string(),
+            prefix: prefix.to_string(),
+            iat: now,
+            exp,
+        };
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn headers_with_bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn valid_token_accepted() {
+        let secret = "test-secret";
+        let prefix = "orgs/myorg/volumes/myvol";
+        let token = make_token(prefix, secret, 3600);
+        let headers = headers_with_bearer(&token);
+        assert!(validate_relay_token(&headers, prefix, secret).is_ok());
+    }
+
+    #[test]
+    fn wrong_prefix_rejected() {
+        let secret = "test-secret";
+        let token = make_token("orgs/myorg/volumes/other", secret, 3600);
+        let headers = headers_with_bearer(&token);
+        assert!(validate_relay_token(&headers, "orgs/myorg/volumes/myvol", secret).is_err());
+    }
+
+    #[test]
+    fn expired_token_rejected() {
+        let secret = "test-secret";
+        let prefix = "orgs/myorg/volumes/myvol";
+        // Use a clearly expired token (10 minutes ago) to exceed any leeway.
+        let token = make_token(prefix, secret, -600);
+        let headers = headers_with_bearer(&token);
+        assert!(validate_relay_token(&headers, prefix, secret).is_err());
+    }
+
+    #[test]
+    fn wrong_secret_rejected() {
+        let prefix = "orgs/myorg/volumes/myvol";
+        let token = make_token(prefix, "signing-secret", 3600);
+        let headers = headers_with_bearer(&token);
+        assert!(validate_relay_token(&headers, prefix, "different-secret").is_err());
+    }
+
+    #[test]
+    fn missing_header_rejected() {
+        let headers = HeaderMap::new();
+        assert!(validate_relay_token(&headers, "orgs/myorg/volumes/myvol", "secret").is_err());
+    }
+
+    #[test]
+    fn wrong_scheme_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert!(validate_relay_token(&headers, "orgs/myorg/volumes/myvol", "secret").is_err());
     }
 }
