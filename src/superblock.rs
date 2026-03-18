@@ -39,10 +39,19 @@ impl Superblock {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CleanupTaskKind {
     DeltaCompaction,
     SegmentCompaction,
+}
+
+impl CleanupTaskKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeltaCompaction => "delta_compaction",
+            Self::SegmentCompaction => "segment_compaction",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +245,7 @@ impl SuperblockManager {
                 return Ok(false);
             }
             block.cleanup_leases.push(CleanupLease {
-                kind: kind.clone(),
+                kind,
                 client_id: client_id.to_string(),
                 lease_until: deadline,
             });

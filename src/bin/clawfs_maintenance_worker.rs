@@ -161,12 +161,13 @@ async fn main() -> Result<()> {
     }
 
     // Main maintenance loop.
+    let mut round: u64 = 0;
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        run_maintenance_round(
+        let round_result = run_maintenance_round(
             &metadata,
             &segments,
             &superblock,
@@ -174,6 +175,17 @@ async fn main() -> Result<()> {
             &compaction_config,
         )
         .await;
+        round = round.saturating_add(1);
+
+        // Write structured health status after each round for container health checks.
+        let generation = superblock.snapshot().generation;
+        let _ = std::fs::write(
+            &status_path,
+            format!(
+                "running\nclient_id={client_id}\npoll_interval_secs={}\nround={round}\ngeneration={generation}\ndelta_backlog={}\nsegment_backlog={}\n",
+                cli.poll_interval_secs, round_result.delta_backlog, round_result.segment_backlog,
+            ),
+        );
 
         // Sleep for the poll interval or wake early on shutdown.
         tokio::select! {
@@ -189,14 +201,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+struct RoundStatus {
+    delta_backlog: usize,
+    segment_backlog: usize,
+}
+
 async fn run_maintenance_round(
     metadata: &Arc<MetadataStore>,
     segments: &Arc<SegmentManager>,
     superblock: &Arc<SuperblockManager>,
     client_id: &str,
     config: &CompactionConfig,
-) {
+) -> RoundStatus {
     let mut did_delta_work = false;
+    let mut status = RoundStatus {
+        delta_backlog: 0,
+        segment_backlog: 0,
+    };
 
     // --- Delta compaction ---
     // Pre-check count to avoid acquiring a lease when there is nothing to do.
@@ -221,13 +242,23 @@ async fn run_maintenance_round(
                 match maintenance::run_delta_compaction(metadata, config).await {
                     Ok(result) => {
                         info!(
+                            target: "maintenance",
                             deltas_pruned = result.deltas_pruned,
-                            duration_ms = result.duration.as_millis(),
-                            "delta compaction complete"
+                            delta_backlog = result.delta_backlog,
+                            duration_ms = result.duration_ms(),
+                            "delta_compaction_complete"
                         );
                         did_delta_work = result.deltas_pruned > 0;
+                        status.delta_backlog = result.delta_backlog;
                     }
-                    Err(err) => warn!("delta compaction failed: {err:?}"),
+                    Err(err) => {
+                        tracing::error!(
+                            target: "maintenance",
+                            kind = "delta_compaction",
+                            error = %err,
+                            "compaction_failed"
+                        );
+                    }
                 }
                 if let Err(err) = maintenance::release_cleanup_lease(
                     superblock,
@@ -240,9 +271,14 @@ async fn run_maintenance_round(
                 }
             }
             Ok(false) => {
-                info!("delta compaction lease contended, skipping this cycle");
+                // lease_contention is now logged inside acquire_cleanup_lease
             }
-            Err(err) => warn!("failed to acquire delta compaction lease: {err:?}"),
+            Err(err) => tracing::error!(
+                target: "maintenance",
+                kind = "delta_compaction",
+                error = %err,
+                "lease_acquire_failed"
+            ),
         }
     }
 
@@ -266,13 +302,23 @@ async fn run_maintenance_round(
                     match maintenance::run_segment_compaction(metadata, segments, config).await {
                         Ok(result) => {
                             info!(
+                                target: "maintenance",
                                 segments_merged = result.segments_merged,
                                 bytes_rewritten = result.bytes_rewritten,
-                                duration_ms = result.duration.as_millis(),
-                                "segment compaction complete"
+                                segment_backlog = result.segment_backlog,
+                                duration_ms = result.duration_ms(),
+                                "segment_compaction_complete"
+                            );
+                            status.segment_backlog = result.segment_backlog;
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                target: "maintenance",
+                                kind = "segment_compaction",
+                                error = %err,
+                                "compaction_failed"
                             );
                         }
-                        Err(err) => warn!("segment compaction failed: {err:?}"),
                     }
                     if let Err(err) = maintenance::release_cleanup_lease(
                         superblock,
@@ -285,12 +331,18 @@ async fn run_maintenance_round(
                     }
                 }
                 Ok(false) => {
-                    info!("segment compaction lease contended, skipping this cycle");
+                    // lease_contention is now logged inside acquire_cleanup_lease
                 }
-                Err(err) => warn!("failed to acquire segment compaction lease: {err:?}"),
+                Err(err) => tracing::error!(
+                    target: "maintenance",
+                    kind = "segment_compaction",
+                    error = %err,
+                    "lease_acquire_failed"
+                ),
             }
         }
     }
+    status
 }
 
 fn build_config(cli: &Cli, state_path: PathBuf) -> Config {

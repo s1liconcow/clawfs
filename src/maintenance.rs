@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tracing::{info, warn};
 
 use crate::clawfs::AcceleratorMode;
 use crate::inode::{FileStorage, InodeRecord, SegmentExtent};
@@ -89,12 +90,16 @@ impl CompactionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionResult {
     pub deltas_pruned: usize,
     pub segments_merged: usize,
     pub bytes_rewritten: u64,
     pub duration: Duration,
+    /// Number of delta files remaining in the store after compaction.
+    pub delta_backlog: usize,
+    /// Number of segment candidates remaining after compaction.
+    pub segment_backlog: usize,
 }
 
 impl CompactionResult {
@@ -109,7 +114,14 @@ impl CompactionResult {
             segments_merged,
             bytes_rewritten,
             duration,
+            delta_backlog: 0,
+            segment_backlog: 0,
         }
+    }
+
+    /// Duration in milliseconds, for structured log fields.
+    pub fn duration_ms(&self) -> u64 {
+        self.duration.as_millis() as u64
     }
 }
 
@@ -119,9 +131,26 @@ pub async fn acquire_cleanup_lease(
     client_id: &str,
     config: &CompactionConfig,
 ) -> Result<bool> {
-    sb_mgr
+    let acquired = sb_mgr
         .try_acquire_cleanup(kind, client_id, config.lease_ttl())
-        .await
+        .await?;
+    if acquired {
+        info!(
+            target: "maintenance",
+            lease_kind = kind.as_str(),
+            client_id = %client_id,
+            lease_ttl_secs = config.lease_ttl_secs,
+            "cleanup_lease_acquired"
+        );
+    } else {
+        warn!(
+            target: "maintenance",
+            lease_kind = kind.as_str(),
+            client_id = %client_id,
+            "cleanup_lease_contention"
+        );
+    }
+    Ok(acquired)
 }
 
 pub async fn release_cleanup_lease(
@@ -129,7 +158,14 @@ pub async fn release_cleanup_lease(
     kind: CleanupTaskKind,
     client_id: &str,
 ) -> Result<()> {
-    sb_mgr.complete_cleanup(kind, client_id).await
+    sb_mgr.complete_cleanup(kind, client_id).await?;
+    info!(
+        target: "maintenance",
+        lease_kind = kind.as_str(),
+        client_id = %client_id,
+        "cleanup_lease_released"
+    );
+    Ok(())
 }
 
 pub async fn run_delta_compaction(
@@ -144,8 +180,20 @@ pub async fn run_delta_compaction(
     }
 
     let pruned = meta.prune_deltas(config.delta_compact_keep)?;
+    let remaining = meta.delta_file_count().unwrap_or(0);
+    let duration = start.elapsed();
 
-    Ok(CompactionResult::new(pruned, 0, 0, start.elapsed()))
+    info!(
+        target: "maintenance",
+        deltas_pruned = pruned,
+        delta_backlog = remaining,
+        duration_ms = duration.as_millis() as u64,
+        "compaction_completed"
+    );
+
+    let mut result = CompactionResult::new(pruned, 0, 0, duration);
+    result.delta_backlog = remaining;
+    Ok(result)
 }
 
 pub async fn run_segment_compaction(
@@ -191,12 +239,27 @@ pub async fn run_segment_compaction(
         total_bytes_rewritten = total_bytes_rewritten.saturating_add(bytes);
     }
 
-    Ok(CompactionResult::new(
-        0,
-        total_segments_merged,
-        total_bytes_rewritten,
-        start.elapsed(),
-    ))
+    let remaining_candidates = meta
+        .segment_candidates(config.segment_compact_batch)
+        .map(|c| c.len())
+        .unwrap_or(0);
+    let duration = start.elapsed();
+
+    if total_segments_merged > 0 {
+        info!(
+            target: "maintenance",
+            segments_merged = total_segments_merged,
+            bytes_rewritten = total_bytes_rewritten,
+            segment_backlog = remaining_candidates,
+            duration_ms = duration.as_millis() as u64,
+            "compaction_completed"
+        );
+    }
+
+    let mut result =
+        CompactionResult::new(0, total_segments_merged, total_bytes_rewritten, duration);
+    result.segment_backlog = remaining_candidates;
+    Ok(result)
 }
 
 async fn compact_segment_batch(
