@@ -8,7 +8,7 @@
 //! - `Accepted` only means the request has been queued or admitted for work;
 //!   it is not safe to clear the local journal on that response.
 //!
-//! Retry and deduplication:
+//! Outage policy and retry semantics:
 //! - Idempotency keys are deterministic from client identity, volume prefix,
 //!   and journal sequence.
 //! - Servers should retain idempotency keys for a bounded window that covers
@@ -16,13 +16,20 @@
 //!   to remain discoverable to retried requests.
 //! - Eviction must never violate the rule that a retried request with the same
 //!   idempotency key can discover the committed result for the dedup window.
+//! - Relay outage policy is explicit: fail closed by default, direct fallback
+//!   only with operator opt-in, and queue-and-retry must remain bounded.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
+use std::time::Instant;
 
+use crate::clawfs::AcceleratorMode;
 use crate::inode::InodeRecord;
 use crate::segment::SegmentEntry;
+
+pub const DEFAULT_RELAY_QUEUE_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +38,128 @@ pub enum RelayStatus {
     Committed,
     Failed,
     Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayOutagePolicy {
+    FailClosed,
+    DirectWriteFallback,
+    QueueAndRetry,
+}
+
+impl RelayOutagePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::DirectWriteFallback => "direct_write_fallback",
+            Self::QueueAndRetry => "queue_and_retry",
+        }
+    }
+
+    pub const fn default_for_mode(mode: AcceleratorMode) -> Self {
+        match mode {
+            AcceleratorMode::RelayWrite => Self::FailClosed,
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => Self::FailClosed,
+        }
+    }
+
+    pub const fn normalize_for_mode(self, mode: AcceleratorMode) -> Self {
+        match mode {
+            AcceleratorMode::RelayWrite => self,
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => Self::FailClosed,
+        }
+    }
+
+    pub const fn queue_limit(self) -> Option<usize> {
+        match self {
+            Self::QueueAndRetry => Some(DEFAULT_RELAY_QUEUE_DEPTH),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for RelayOutagePolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_closed" => Ok(Self::FailClosed),
+            "direct_write_fallback" => Ok(Self::DirectWriteFallback),
+            "queue_and_retry" => Ok(Self::QueueAndRetry),
+            other => bail!(
+                "unsupported relay outage policy {other:?}; expected fail_closed, direct_write_fallback, or queue_and_retry"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayOutageAction {
+    FailClosed,
+    DirectWriteFallback,
+    QueueAndRetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayOutageState {
+    Normal,
+    Blocked { since: Instant },
+    FallingBack { since: Instant },
+    Queuing { depth: usize },
+}
+
+impl RelayOutageState {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Blocked { .. } => "blocked",
+            Self::FallingBack { .. } => "falling_back",
+            Self::Queuing { .. } => "queuing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayOutageDecision {
+    pub action: RelayOutageAction,
+    pub state: RelayOutageState,
+    pub queue_limit: Option<usize>,
+}
+
+impl RelayOutagePolicy {
+    pub fn decide_on_failure(self, queue_depth: usize, now: Instant) -> RelayOutageDecision {
+        match self {
+            Self::FailClosed => RelayOutageDecision {
+                action: RelayOutageAction::FailClosed,
+                state: RelayOutageState::Blocked { since: now },
+                queue_limit: None,
+            },
+            Self::DirectWriteFallback => RelayOutageDecision {
+                action: RelayOutageAction::DirectWriteFallback,
+                state: RelayOutageState::FallingBack { since: now },
+                queue_limit: None,
+            },
+            Self::QueueAndRetry => {
+                let limit = DEFAULT_RELAY_QUEUE_DEPTH;
+                if queue_depth < limit {
+                    RelayOutageDecision {
+                        action: RelayOutageAction::QueueAndRetry,
+                        state: RelayOutageState::Queuing {
+                            depth: queue_depth + 1,
+                        },
+                        queue_limit: Some(limit),
+                    }
+                } else {
+                    RelayOutageDecision {
+                        action: RelayOutageAction::FailClosed,
+                        state: RelayOutageState::Blocked { since: now },
+                        queue_limit: Some(limit),
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +236,12 @@ impl RelayWriteResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelayStatus, RelayWriteRequest, RelayWriteResponse};
+    use std::time::Instant;
+
+    use super::{
+        RelayOutageAction, RelayOutagePolicy, RelayOutageState, RelayStatus, RelayWriteRequest,
+        RelayWriteResponse,
+    };
     use crate::inode::InodeRecord;
 
     #[test]
@@ -198,5 +332,58 @@ mod tests {
             error: None,
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn outage_policy_defaults_and_round_trips() {
+        let policy = RelayOutagePolicy::QueueAndRetry;
+        let json = serde_json::to_string(&policy).expect("serialize policy");
+        let decoded: RelayOutagePolicy = serde_json::from_str(&json).expect("deserialize policy");
+        assert_eq!(decoded, policy);
+        assert_eq!(
+            RelayOutagePolicy::default_for_mode(crate::clawfs::AcceleratorMode::RelayWrite),
+            RelayOutagePolicy::FailClosed
+        );
+        assert_eq!(
+            RelayOutagePolicy::default_for_mode(crate::clawfs::AcceleratorMode::Direct),
+            RelayOutagePolicy::FailClosed
+        );
+    }
+
+    #[test]
+    fn outage_policy_decision_is_bounded() {
+        let now = Instant::now();
+
+        let fail_closed = RelayOutagePolicy::FailClosed.decide_on_failure(0, now);
+        assert_eq!(fail_closed.action, RelayOutageAction::FailClosed);
+        assert!(matches!(
+            fail_closed.state,
+            RelayOutageState::Blocked { .. }
+        ));
+        assert_eq!(fail_closed.queue_limit, None);
+
+        let fallback = RelayOutagePolicy::DirectWriteFallback.decide_on_failure(0, now);
+        assert_eq!(fallback.action, RelayOutageAction::DirectWriteFallback);
+        assert!(matches!(
+            fallback.state,
+            RelayOutageState::FallingBack { .. }
+        ));
+
+        let queued = RelayOutagePolicy::QueueAndRetry.decide_on_failure(0, now);
+        assert_eq!(queued.action, RelayOutageAction::QueueAndRetry);
+        assert!(matches!(
+            queued.state,
+            RelayOutageState::Queuing { depth: 1 }
+        ));
+        assert_eq!(queued.queue_limit, Some(super::DEFAULT_RELAY_QUEUE_DEPTH));
+
+        let saturated = RelayOutagePolicy::QueueAndRetry
+            .decide_on_failure(super::DEFAULT_RELAY_QUEUE_DEPTH, now);
+        assert_eq!(saturated.action, RelayOutageAction::FailClosed);
+        assert!(matches!(saturated.state, RelayOutageState::Blocked { .. }));
+        assert_eq!(
+            saturated.queue_limit,
+            Some(super::DEFAULT_RELAY_QUEUE_DEPTH)
+        );
     }
 }

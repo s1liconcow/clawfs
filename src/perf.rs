@@ -11,8 +11,9 @@ use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
+use crate::clawfs::AcceleratorMode;
 use crate::config::Config;
+use crate::relay::RelayOutagePolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +77,7 @@ pub enum AcceleratorRelayStatus {
     Active,
     Blocked,
     DirectFallback,
+    Queued,
     NotConfigured,
 }
 
@@ -85,6 +87,7 @@ impl AcceleratorRelayStatus {
             Self::Active => "active",
             Self::Blocked => "blocked",
             Self::DirectFallback => "direct_fallback",
+            Self::Queued => "queued",
             Self::NotConfigured => "not_configured",
         }
     }
@@ -106,9 +109,10 @@ impl AcceleratorStatus {
         let event_endpoint = env_var("CLAWFS_EVENT_ENDPOINT");
         let event_poll_interval_ms =
             env_var("CLAWFS_EVENT_POLL_INTERVAL_MS").and_then(|value| value.parse::<u64>().ok());
-        let relay_fallback_policy = env_var("CLAWFS_RELAY_FALLBACK_POLICY")
-            .and_then(|value| AcceleratorFallbackPolicy::from_str(&value).ok())
-            .or(config.accelerator_fallback_policy);
+        let relay_fallback_policy = config.relay_fallback_policy.or_else(|| {
+            env_var("CLAWFS_RELAY_FALLBACK_POLICY")
+                .and_then(|value| RelayOutagePolicy::from_str(&value).ok())
+        });
 
         Self::from_parts(
             config.accelerator_mode,
@@ -125,7 +129,7 @@ impl AcceleratorStatus {
         accelerator_endpoint: Option<&str>,
         event_endpoint: Option<&str>,
         event_poll_interval_ms: Option<u64>,
-        relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+        relay_fallback_policy: Option<RelayOutagePolicy>,
         disable_cleanup: bool,
     ) -> Self {
         let accelerator_mode_label = accelerator_mode
@@ -149,12 +153,14 @@ impl AcceleratorStatus {
             Some(AcceleratorMode::RelayWrite) => {
                 if accelerator_endpoint.is_none() {
                     AcceleratorRelayStatus::Blocked
-                } else if relay_fallback_policy
-                    == Some(AcceleratorFallbackPolicy::DirectWriteFallback)
-                {
-                    AcceleratorRelayStatus::DirectFallback
                 } else {
-                    AcceleratorRelayStatus::Active
+                    match relay_fallback_policy.unwrap_or(RelayOutagePolicy::FailClosed) {
+                        RelayOutagePolicy::FailClosed => AcceleratorRelayStatus::Active,
+                        RelayOutagePolicy::DirectWriteFallback => {
+                            AcceleratorRelayStatus::DirectFallback
+                        }
+                        RelayOutagePolicy::QueueAndRetry => AcceleratorRelayStatus::Queued,
+                    }
                 }
             }
         };
@@ -175,7 +181,10 @@ impl AcceleratorStatus {
                 if matches!(
                     coordination_status,
                     AcceleratorCoordinationStatus::PollingFallback
-                ) || matches!(relay_status, AcceleratorRelayStatus::DirectFallback) =>
+                ) || matches!(
+                    relay_status,
+                    AcceleratorRelayStatus::DirectFallback | AcceleratorRelayStatus::Queued
+                ) =>
             {
                 AcceleratorHealth::Degraded
             }
@@ -293,7 +302,7 @@ mod tests {
             Some("https://user:secret@example.com/path?token=abc#frag"),
             Some("https://events.example.com/stream"),
             Some(2500),
-            Some(crate::clawfs::AcceleratorFallbackPolicy::DirectWriteFallback),
+            Some(crate::relay::RelayOutagePolicy::DirectWriteFallback),
             true,
         );
 
@@ -307,6 +316,21 @@ mod tests {
         );
         assert_eq!(status.relay_status, AcceleratorRelayStatus::DirectFallback);
         assert_eq!(status.cleanup_owner, AcceleratorCleanupOwner::Hosted);
+        assert_eq!(status.accelerator_health, AcceleratorHealth::Degraded);
+    }
+
+    #[test]
+    fn accelerator_status_marks_queueing_as_degraded() {
+        let status = AcceleratorStatus::from_parts(
+            Some(AcceleratorMode::RelayWrite),
+            Some("https://accelerator.example.com"),
+            None,
+            None,
+            Some(crate::relay::RelayOutagePolicy::QueueAndRetry),
+            false,
+        );
+
+        assert_eq!(status.relay_status, AcceleratorRelayStatus::Queued);
         assert_eq!(status.accelerator_health, AcceleratorHealth::Degraded);
     }
 
