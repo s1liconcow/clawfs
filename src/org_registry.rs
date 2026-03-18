@@ -29,6 +29,7 @@ use crate::config::{Config, ObjectStoreProvider};
 use crate::maintenance::{CompactionConfig, MaintenanceSchedule};
 use crate::metadata::MetadataStore;
 use crate::org_policy::VolumeAcceleratorPolicy;
+use crate::relay::DEFAULT_RELAY_QUEUE_DEPTH;
 use crate::segment::{SegmentManager, segment_prefix};
 use crate::superblock::SuperblockManager;
 
@@ -101,6 +102,12 @@ pub struct VolumeContext {
     /// The org worker's relay handler must hold this before calling
     /// `relay_commit_pipeline`.
     pub relay_commit_lock: TokioMutex<()>,
+    /// Admission gate for queued relay write requests.
+    ///
+    /// At most `DEFAULT_RELAY_QUEUE_DEPTH` requests may wait for the commit
+    /// lock at a time.  Requests beyond this limit receive a 503 immediately
+    /// rather than piling up unboundedly in memory.
+    pub relay_admit_sem: Arc<tokio::sync::Semaphore>,
     /// Compaction config; currently a process-wide default but carried here
     /// so per-volume overrides can be wired in later.
     pub compaction_config: CompactionConfig,
@@ -393,6 +400,7 @@ impl OrgVolumeRegistry {
             relay_commit_lock: TokioMutex::new(()),
             compaction_config: CompactionConfig::default(),
             last_backlog_score: std::sync::atomic::AtomicU32::new(0),
+            relay_admit_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_RELAY_QUEUE_DEPTH)),
         })
     }
 

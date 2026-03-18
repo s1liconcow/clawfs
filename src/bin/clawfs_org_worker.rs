@@ -60,7 +60,10 @@ use clawfs::maintenance::{CompactionConfig, MaintenanceRoundContext, run_mainten
 use clawfs::metadata::create_object_store;
 use clawfs::org_policy::{PolicyLoadResult, VolumeAcceleratorPolicy, load_volume_policy};
 use clawfs::org_registry::{DiscoveredVolume, OrgVolumeRegistry, VolumeHealth, normalize_prefix};
-use clawfs::relay::{DedupStore, RelayWriteRequest, RelayWriteResponse, relay_commit_pipeline};
+use clawfs::relay::{
+    DEFAULT_RELAY_ATTEMPT_TIMEOUT, DedupStore, OwnershipAcquireResult, RelayWriteRequest,
+    RelayWriteResponse, acquire_relay_ownership, relay_commit_pipeline,
+};
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -176,9 +179,14 @@ struct AppState {
     dedup: Arc<DedupStore>,
     jwt_secret: Option<String>,
     replica_id: String,
-    advertise_url: Option<String>,
+    /// Own HTTP relay endpoint (empty when relay is disabled).
+    advertise_url: String,
     discovery_prefix: String,
     enable_relay: bool,
+    /// Object store for reading per-volume relay_owner.json records.
+    object_store: Arc<dyn object_store::ObjectStore>,
+    /// HTTP client for peer-to-peer forwarding (connection-pooled).
+    forward_client: reqwest::Client,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -240,20 +248,27 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Build the object store used for discovery and relay ownership checks.
+    let discovery_config = build_discovery_config(&cli);
+    let (discovery_store, _) =
+        create_object_store(&discovery_config).context("create discovery object store")?;
+
+    let forward_client = reqwest::Client::builder()
+        .timeout(DEFAULT_RELAY_ATTEMPT_TIMEOUT)
+        .build()
+        .context("build forward HTTP client")?;
+
     let state = AppState {
         registry: Arc::clone(&registry),
         dedup,
         jwt_secret: cli.jwt_secret.clone(),
         replica_id: replica_id.clone(),
-        advertise_url: cli.advertise_url.clone(),
+        advertise_url: cli.advertise_url.clone().unwrap_or_default(),
         discovery_prefix: discovery_prefix.clone(),
         enable_relay: cli.enable_relay,
+        object_store: Arc::clone(&discovery_store),
+        forward_client,
     };
-
-    // Build the object store used for discovery (using the discovery prefix).
-    let discovery_config = build_discovery_config(&cli);
-    let (discovery_store, _) =
-        create_object_store(&discovery_config).context("create discovery object store")?;
 
     info!(
         discovery_prefix = %discovery_prefix,
@@ -754,6 +769,16 @@ async fn handle_health_volume(
 
 // ── Relay handler ──────────────────────────────────────────────────────────
 
+/// Maximum number of hops before a forwarded relay request is rejected.
+/// Prevents infinite forwarding loops caused by misconfigured peer sets.
+const MAX_RELAY_HOP_COUNT: u8 = 2;
+
+/// Header used to carry the forwarding hop count between org-worker replicas.
+const RELAY_HOP_HEADER: &str = "x-relay-hop-count";
+
+/// Header advertising the forwarding replica's identity for diagnostics.
+const RELAY_FORWARDED_BY_HEADER: &str = "x-relay-forwarded-by";
+
 async fn handle_relay_write(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -767,7 +792,26 @@ async fn handle_relay_write(
             .into_response();
     }
 
-    // JWT auth (same prefix-scoped contract as clawfs_relay_executor).
+    // ── Loop-protection: reject over-hopped forwarded requests ───────────
+    let hop_count: u8 = headers
+        .get(RELAY_HOP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if hop_count >= MAX_RELAY_HOP_COUNT {
+        warn!(
+            hop_count,
+            volume_prefix = %request.volume_prefix,
+            "relay_write hop limit exceeded"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "relay hop limit exceeded"})),
+        )
+            .into_response();
+    }
+
+    // ── JWT auth ─────────────────────────────────────────────────────────
     if let Some(secret) = &state.jwt_secret
         && let Err(reason) = validate_relay_token(&headers, &request.volume_prefix, secret)
     {
@@ -779,7 +823,7 @@ async fn handle_relay_write(
             .into_response();
     }
 
-    // Scope check: request must be within the discovery prefix.
+    // ── Scope check ───────────────────────────────────────────────────────
     let normalized_vol = normalize_prefix(&request.volume_prefix);
     if !state.discovery_prefix.is_empty() && !normalized_vol.starts_with(&state.discovery_prefix) {
         warn!(
@@ -794,7 +838,7 @@ async fn handle_relay_write(
             .into_response();
     }
 
-    // Load volume context.
+    // ── Load volume context ───────────────────────────────────────────────
     let volume = DiscoveredVolume {
         prefix: normalized_vol.clone(),
     };
@@ -817,7 +861,7 @@ async fn handle_relay_write(
         }
     };
 
-    // Check relay is enabled for this volume.
+    // ── Per-volume relay policy check ─────────────────────────────────────
     if !ctx.policy.relay_enabled {
         return (
             StatusCode::FORBIDDEN,
@@ -826,9 +870,122 @@ async fn handle_relay_write(
             .into_response();
     }
 
-    // Serialize commits for this volume via the per-volume lock.
-    // If another commit is in-flight, this awaits until it completes.
+    // ── Ownership check ───────────────────────────────────────────────────
+    // Attempt to acquire or confirm ownership.  This either confirms we hold
+    // the lease (AlreadyOwned), freshly grants it (Acquired), or reveals who
+    // the current owner is (OwnedByOther) so we can forward the request.
+    let ownership = match acquire_relay_ownership(
+        state.object_store.as_ref(),
+        &normalized_vol,
+        &state.replica_id,
+        &state.advertise_url,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(error = %err, volume_prefix = %normalized_vol, "relay ownership check failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": format!("ownership check failed: {err}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match ownership {
+        // ── We own the volume — process locally ──────────────────────────
+        OwnershipAcquireResult::Acquired { record, .. }
+        | OwnershipAcquireResult::AlreadyOwned { record, .. } => {
+            process_relay_write_locally(state, ctx, record.epoch, request).await
+        }
+
+        // ── Another replica owns the volume — forward ─────────────────────
+        OwnershipAcquireResult::OwnedByOther(owner) => {
+            forward_relay_write(
+                &state.forward_client,
+                &owner.advertise_url,
+                &headers,
+                &request,
+                hop_count + 1,
+            )
+            .await
+        }
+    }
+}
+
+/// Process a relay write request as the volume owner.
+///
+/// Applies the admission gate, acquires the per-volume commit lock, verifies
+/// we still own the volume (lease-loss guard), reloads authoritative generation,
+/// and runs `relay_commit_pipeline`.
+async fn process_relay_write_locally(
+    state: AppState,
+    ctx: Arc<clawfs::org_registry::VolumeContext>,
+    owner_epoch: u64,
+    request: RelayWriteRequest,
+) -> axum::response::Response {
+    let normalized_vol = ctx.prefix.clone();
+
+    // ── Admission gate: bound the relay request queue depth ──────────────
+    // If the semaphore is exhausted (>= DEFAULT_RELAY_QUEUE_DEPTH requests
+    // already waiting), reject immediately with 503 rather than queuing
+    // without bound.
+    let _admit_permit = match ctx.relay_admit_sem.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(
+                volume_prefix = %normalized_vol,
+                "relay queue full — returning 503"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::http::HeaderMap::from_iter([(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("5"),
+                )]),
+                Json(serde_json::json!({"error": "relay queue full, retry later"})),
+            )
+                .into_response();
+        }
+    };
+
+    // ── Per-volume serialization: one commit pipeline at a time ──────────
+    // The commit lock ensures requests that cleared the admission gate are
+    // processed one-at-a-time in FIFO order for this volume.
     let _commit_guard = ctx.relay_commit_lock.lock().await;
+
+    // ── Lease-loss guard: verify we still own the volume ─────────────────
+    // The time between admission and lock acquisition may span TTL/2 in the
+    // worst case.  Re-check ownership so a replica that lost its lease while
+    // queued doesn't commit on behalf of the new owner.
+    match acquire_relay_ownership(
+        state.object_store.as_ref(),
+        &normalized_vol,
+        &state.replica_id,
+        &state.advertise_url,
+    )
+    .await
+    {
+        Ok(OwnershipAcquireResult::Acquired { record, .. })
+        | Ok(OwnershipAcquireResult::AlreadyOwned { record, .. })
+            if record.epoch == owner_epoch =>
+        {
+            // Still our epoch — proceed.
+        }
+        _ => {
+            // Lease lost while queued.  Caller should retry against new owner.
+            warn!(volume_prefix = %normalized_vol, "relay lease lost while queued");
+            let response = RelayWriteResponse {
+                status: clawfs::relay::RelayStatus::Failed,
+                committed_generation: None,
+                idempotency_key: request.idempotency_key,
+                error: Some("relay ownership lost while request was queued; retry".to_string()),
+                actual_generation: None,
+            };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response();
+        }
+    }
 
     match relay_commit_pipeline(
         &request,
@@ -857,6 +1014,64 @@ async fn handle_relay_write(
                 actual_generation: None,
             };
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
+/// Forward a relay write request to the current volume owner.
+///
+/// Copies the Authorization header and request body, increments the hop
+/// counter, and POSTs to `{owner_url}/relay_write`.  On failure returns a
+/// retryable 503 so the client can retry after a backoff.
+async fn forward_relay_write(
+    client: &reqwest::Client,
+    owner_url: &str,
+    original_headers: &HeaderMap,
+    request: &RelayWriteRequest,
+    new_hop_count: u8,
+) -> axum::response::Response {
+    let target = format!("{}/{}", owner_url.trim_end_matches('/'), "relay_write");
+
+    let mut builder = client.post(&target).json(request);
+
+    // Propagate the Authorization header.
+    if let Some(auth) = original_headers.get(axum::http::header::AUTHORIZATION)
+        && let Ok(v) = auth.to_str()
+    {
+        builder = builder.header(reqwest::header::AUTHORIZATION, v);
+    }
+
+    // Increment hop count and advertise the forwarding replica.
+    builder = builder
+        .header(RELAY_HOP_HEADER, new_hop_count.to_string())
+        .header(RELAY_FORWARDED_BY_HEADER, "org-worker");
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<RelayWriteResponse>().await {
+                Ok(body) => (
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(body),
+                )
+                    .into_response(),
+                Err(err) => {
+                    warn!(error = %err, target = %target, "relay forward response parse error");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({"error": "invalid response from owner"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(err) => {
+            warn!(error = %err, target = %target, "relay forward request failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": format!("forward failed: {err}")})),
+            )
+                .into_response()
         }
     }
 }
