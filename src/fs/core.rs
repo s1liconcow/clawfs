@@ -103,6 +103,7 @@ impl OsageFs {
         replay: Option<Arc<ReplayLogger>>,
         telemetry: Option<Arc<TelemetryClient>>,
         telemetry_session_id: Option<String>,
+        coordination_publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
     ) -> Self {
         let fsync_on_close = config.fsync_on_close;
         let flush_interval = if config.flush_interval_ms == 0 {
@@ -128,6 +129,7 @@ impl OsageFs {
             replay,
             telemetry,
             telemetry_session_id,
+            coordination_publisher,
             mount_ready_emitted: Arc::new(AtomicBool::new(false)),
             fsync_on_close,
             flush_interval,

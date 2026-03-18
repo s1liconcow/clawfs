@@ -25,6 +25,10 @@ use uuid::Uuid;
 use crate::clawfs as clawfs_runtime;
 use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
 use crate::config::Config;
+use crate::coordination::{
+    CoordinationPublisher, CoordinationSubscriber, CoordinationSubscriberHandle, HttpPublisher,
+    NoopPublisher,
+};
 use crate::fs::OsageFs;
 use crate::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use crate::journal::JournalManager;
@@ -270,6 +274,46 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
         );
     }
 
+    let coordination_subscriber: Option<CoordinationSubscriberHandle> =
+        if config.accelerator_mode == Some(AcceleratorMode::DirectPlusCache) {
+            hosted
+                .as_ref()
+                .and_then(|hosted| {
+                    hosted
+                        .event_endpoint
+                        .as_ref()
+                        .map(|endpoint| (hosted, endpoint))
+                })
+                .map(|(hosted, endpoint)| {
+                    let settings = hosted
+                        .event_settings
+                        .clone()
+                        .unwrap_or_else(|| EventSettings::from_poll_interval_ms(1_000));
+                    CoordinationSubscriber::spawn(
+                        &handle,
+                        endpoint.clone(),
+                        metadata.clone(),
+                        superblock.clone(),
+                        Duration::from_millis(settings.poll_interval_ms),
+                        Duration::from_millis(settings.reconnect_backoff_ms),
+                    )
+                })
+        } else {
+            None
+        };
+    let coordination_publisher: Option<Arc<dyn CoordinationPublisher>> =
+        if config.accelerator_mode == Some(AcceleratorMode::DirectPlusCache) {
+            hosted
+                .as_ref()
+                .and_then(|hosted| hosted.event_endpoint.as_ref())
+                .map(|endpoint| {
+                    Arc::new(HttpPublisher::new(endpoint.clone())) as Arc<dyn CoordinationPublisher>
+                })
+                .or_else(|| Some(Arc::new(NoopPublisher) as Arc<dyn CoordinationPublisher>))
+        } else {
+            Some(Arc::new(NoopPublisher) as Arc<dyn CoordinationPublisher>)
+        };
+
     let client_state = Arc::new(ClientStateManager::load(&config.state_path)?);
     let superblock_snapshot = superblock.snapshot();
     client_state.reconcile_with_minimums(
@@ -277,16 +321,35 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
         superblock_snapshot.next_segment,
     )?;
     let client_id = client_state.client_id();
-    if !config.disable_cleanup {
-        spawn_cleanup_worker(
-            handle.clone(),
-            metadata.clone(),
-            superblock.clone(),
-            segments.clone(),
-            client_id.clone(),
-        );
-    } else {
-        info!(target: "cleanup", "local cleanup worker disabled via --disable-cleanup");
+    {
+        use crate::maintenance::CleanupPolicy;
+        let cleanup_policy = CleanupPolicy::from_config(&config);
+        if config.disable_cleanup {
+            info!(
+                target: "cleanup",
+                "cleanup_policy={} local cleanup worker disabled via --disable-cleanup",
+                cleanup_policy.as_str()
+            );
+        } else if cleanup_policy.should_spawn_local_worker() {
+            info!(
+                target: "cleanup",
+                "cleanup_policy={} spawning local cleanup worker",
+                cleanup_policy.as_str()
+            );
+            spawn_cleanup_worker(
+                handle.clone(),
+                metadata.clone(),
+                superblock.clone(),
+                segments.clone(),
+                client_id.clone(),
+            );
+        } else {
+            info!(
+                target: "cleanup",
+                "cleanup_policy={} cleanup deferred to hosted worker; local cleanup worker suppressed",
+                cleanup_policy.as_str()
+            );
+        }
     }
 
     let perf_logger = if let Some(path) = config.perf_log.clone() {
@@ -352,6 +415,7 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
         replay_logger.clone(),
         telemetry.clone(),
         telemetry_session_id.clone(),
+        coordination_publisher,
     );
 
     let replayed = fs.replay_journal()?;
@@ -392,6 +456,9 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
     } else {
         fuser::mount2(fs, &config.mount_path, &options)
     };
+    if let Some(subscriber) = &coordination_subscriber {
+        subscriber.abort();
+    }
     if let Err(err) = mount_result {
         if let Some(client) = &telemetry {
             client.destination().emit_blocking(

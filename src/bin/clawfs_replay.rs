@@ -487,6 +487,7 @@ fn run_iteration(
         None,
         None,
         None,
+        None,
     );
     ensure_fresh_bootstrap(&fs, &config.home_prefix, user_name, uid, gid)?;
 

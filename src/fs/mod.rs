@@ -29,6 +29,7 @@ use crate::codec::{
     encode_inline_storage as encode_inline_payload_storage,
 };
 use crate::config::Config;
+use crate::coordination::CoordinationPublisher;
 use crate::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE, SegmentExtent};
 use crate::journal::{JournalManager, JournalPayload};
 use crate::metadata::MetadataStore;
@@ -73,6 +74,8 @@ pub struct OsageFs {
     replay: Option<Arc<ReplayLogger>>,
     telemetry: Option<Arc<TelemetryClient>>,
     telemetry_session_id: Option<String>,
+    #[allow(dead_code)] // used by task x8z.3.2 (publish coordination events)
+    coordination_publisher: Option<Arc<dyn CoordinationPublisher>>,
     mount_ready_emitted: Arc<AtomicBool>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,

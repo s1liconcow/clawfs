@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Parser, ValueEnum};
 
 use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
+use crate::relay::RelayOutagePolicy;
 
 /// Default directory name for the FUSE mount point (relative to cwd).
 pub const DEFAULT_MOUNT_DIR: &str = "clawfs-mnt";
@@ -253,6 +254,7 @@ pub struct Config {
     pub accelerator_mode: Option<AcceleratorMode>,
     pub accelerator_endpoint: Option<String>,
     pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub relay_fallback_policy: Option<RelayOutagePolicy>,
     pub object_prefix: String,
     pub telemetry_object_prefix: Option<String>,
     pub gcs_service_account: Option<PathBuf>,
@@ -310,6 +312,7 @@ impl Config {
             accelerator_mode: None,
             accelerator_endpoint: None,
             accelerator_fallback_policy: None,
+            relay_fallback_policy: None,
             object_prefix: String::new(),
             telemetry_object_prefix: None,
             gcs_service_account: None,
@@ -416,6 +419,7 @@ impl From<Cli> for Config {
             accelerator_mode: None,
             accelerator_endpoint: None,
             accelerator_fallback_policy: None,
+            relay_fallback_policy: None,
             object_prefix: cli.object_prefix,
             gcs_service_account: cli.gcs_service_account,
             aws_allow_http: cli.aws_allow_http,
@@ -504,6 +508,7 @@ mod tests {
         assert_eq!(config.accelerator_mode, None);
         assert_eq!(config.accelerator_endpoint, None);
         assert_eq!(config.accelerator_fallback_policy, None);
+        assert_eq!(config.relay_fallback_policy, None);
     }
 
     #[test]
@@ -519,6 +524,7 @@ mod tests {
         assert_eq!(config.accelerator_mode, None);
         assert_eq!(config.accelerator_endpoint, None);
         assert_eq!(config.accelerator_fallback_policy, None);
+        assert_eq!(config.relay_fallback_policy, None);
         assert_eq!(config.object_provider, super::ObjectStoreProvider::Local);
     }
 

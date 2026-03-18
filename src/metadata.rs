@@ -21,6 +21,7 @@ use tokio::runtime::Handle;
 
 use crate::clawfs;
 use crate::config::{Config, ObjectStoreProvider};
+use crate::coordination::InvalidationScope;
 use crate::inode::{
     ExternalObject, FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord,
     InodeShard, SegmentExtent,
@@ -785,6 +786,45 @@ impl MetadataStore {
     /// only need extents that were committed by a prior flush.
     pub fn get_cached_inode(&self, inode: u64) -> Option<InodeRecord> {
         self.cache.read().get(&inode).map(|e| e.record.clone())
+    }
+
+    pub fn invalidate_cached_inodes(&self, inodes: &[u64]) {
+        if inodes.is_empty() {
+            return;
+        }
+        let mut cache = self.cache.write();
+        let mut negative_cache = self.negative_cache.write();
+        for inode in inodes {
+            cache.remove(inode);
+            negative_cache.remove(inode);
+        }
+    }
+
+    pub fn invalidate_cached_prefix(&self, prefix: &str) {
+        if prefix.is_empty() {
+            self.invalidate_all_cached();
+            return;
+        }
+        {
+            let mut cache = self.cache.write();
+            cache.retain(|_, entry| !entry.record.path.starts_with(prefix));
+        }
+        self.shards.lock().clear();
+        self.negative_cache.write().clear();
+    }
+
+    pub fn invalidate_all_cached(&self) {
+        self.cache.write().clear();
+        self.shards.lock().clear();
+        self.negative_cache.write().clear();
+    }
+
+    pub fn invalidate_cached_scope(&self, scope: &InvalidationScope) {
+        match scope {
+            InvalidationScope::Full => self.invalidate_all_cached(),
+            InvalidationScope::Inodes(inodes) => self.invalidate_cached_inodes(inodes),
+            InvalidationScope::Prefix(prefix) => self.invalidate_cached_prefix(prefix),
+        }
     }
 
     /// Fast-path child lookup that avoids cloning the parent inode record.

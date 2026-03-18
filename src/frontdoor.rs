@@ -21,6 +21,7 @@ use crate::clawfs::STORAGE_MODE_ENV;
 use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
 use crate::config::{Cli, Config, ObjectStoreProvider};
 use crate::launch::{EventSettings, HostedControlPlane};
+use crate::relay::RelayOutagePolicy;
 use crate::telemetry::{set_telemetry_enabled, telemetry_status};
 
 const DEFAULT_VOLUME: &str = "default";
@@ -102,7 +103,7 @@ pub struct HostedVolumeConfig {
     pub accelerator_endpoint: Option<String>,
     pub accelerator_mode: Option<AcceleratorMode>,
     pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
-    pub relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub relay_fallback_policy: Option<RelayOutagePolicy>,
     pub event_endpoint: Option<String>,
     pub event_settings: Option<EventSettings>,
     pub accelerator_session_token: Option<String>,
@@ -859,19 +860,20 @@ fn parse_accelerator_fallback_policy(
 fn parse_relay_fallback_policy(
     value: Option<&str>,
     mode: AcceleratorMode,
-) -> Result<Option<AcceleratorFallbackPolicy>> {
+) -> Result<Option<RelayOutagePolicy>> {
     let Some(raw) = value else {
-        return Ok(None);
+        return Ok(match mode {
+            AcceleratorMode::RelayWrite => Some(RelayOutagePolicy::FailClosed),
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => None,
+        });
     };
     if mode != AcceleratorMode::RelayWrite {
         bail!("relay_fallback_policy is only valid when accelerator_mode is relay_write");
     }
-    let policy = raw
-        .parse::<AcceleratorFallbackPolicy>()
-        .unwrap_or_else(|err| {
-            warn!("invalid relay_fallback_policy {raw:?}: {err}; defaulting to fail_closed");
-            AcceleratorFallbackPolicy::FailClosed
-        });
+    let policy = raw.parse::<RelayOutagePolicy>().unwrap_or_else(|err| {
+        warn!("invalid relay_fallback_policy {raw:?}: {err}; defaulting to fail_closed");
+        RelayOutagePolicy::FailClosed
+    });
     Ok(Some(policy))
 }
 
@@ -939,6 +941,8 @@ fn apply_hosted_accelerator_env(command: &mut Command, hosted: &HostedVolumeConf
     }
     if let Some(policy) = hosted.relay_fallback_policy {
         command.env("CLAWFS_RELAY_FALLBACK_POLICY", policy.as_str());
+    } else {
+        command.env_remove("CLAWFS_RELAY_FALLBACK_POLICY");
     }
     if let Some(endpoint) = &hosted.event_endpoint {
         command.env("CLAWFS_EVENT_ENDPOINT", endpoint);
@@ -1316,6 +1320,7 @@ mod tests {
     };
     use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
     use crate::config::ObjectStoreProvider;
+    use crate::relay::RelayOutagePolicy;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -1417,7 +1422,7 @@ mod tests {
         );
         assert_eq!(
             hosted.relay_fallback_policy,
-            Some(AcceleratorFallbackPolicy::DirectWriteFallback)
+            Some(RelayOutagePolicy::DirectWriteFallback)
         );
         assert_eq!(
             hosted.event_settings,
@@ -1444,5 +1449,23 @@ mod tests {
 
         let err = parse_hosted_volume_config(summon).expect_err("invalid relay policy");
         assert!(err.to_string().contains("relay_fallback_policy"));
+    }
+
+    #[test]
+    fn relay_fallback_policy_defaults_to_fail_closed_for_relay_write() {
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{
+                "provider":"aws",
+                "bucket":"bucket-a",
+                "accelerator_mode":"relay_write"
+            }"#,
+        )
+        .expect("parse summon config");
+
+        let hosted = parse_hosted_volume_config(summon).expect("hosted config");
+        assert_eq!(
+            hosted.relay_fallback_policy,
+            Some(RelayOutagePolicy::FailClosed)
+        );
     }
 }

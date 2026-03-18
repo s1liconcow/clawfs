@@ -81,6 +81,7 @@ pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
         None,
         None,
         None,
+        None,
     );
 
     (runtime, fs)

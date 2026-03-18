@@ -270,6 +270,7 @@ fn do_full_init(config: &Config) -> Result<ClawfsRuntime> {
             replay_logger,
             None,
             None,
+            None,
         ));
 
         // Replay pending journal entries.

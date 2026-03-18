@@ -3,10 +3,58 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::clawfs::AcceleratorMode;
 use crate::inode::{FileStorage, InodeRecord, SegmentExtent};
 use crate::metadata::MetadataStore;
 use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload};
 use crate::superblock::{CleanupTaskKind, SuperblockManager};
+
+/// Determines whether the local cleanup worker should run or defer to a hosted worker.
+///
+/// Policy is derived from accelerator configuration. Callers must also check
+/// `config.disable_cleanup` before spawning: that flag suppresses local work
+/// regardless of the policy value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupPolicy {
+    /// Client runs cleanup locally (default for non-accelerated volumes).
+    Local,
+    /// Cleanup is deferred to a hosted worker; local cleanup is suppressed.
+    Hosted,
+    /// Hosted preferred, but client may run local cleanup when explicitly configured as fallback.
+    HostedWithLocalFallback,
+}
+
+impl CleanupPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hosted => "hosted",
+            Self::HostedWithLocalFallback => "hosted_with_local_fallback",
+        }
+    }
+
+    /// True if the local cleanup worker should be spawned (subject to `disable_cleanup`).
+    pub const fn should_spawn_local_worker(self) -> bool {
+        matches!(self, Self::Local | Self::HostedWithLocalFallback)
+    }
+
+    /// Derive cleanup policy from runtime config.
+    ///
+    /// The caller is responsible for checking `config.disable_cleanup` separately;
+    /// that flag is an explicit operator override that suppresses the local worker
+    /// regardless of what this method returns.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        match config.accelerator_mode {
+            None => Self::Local,
+            // Accelerator mode configured with a reachable endpoint → hosted worker owns cleanup.
+            Some(_) if config.accelerator_endpoint.is_some() => Self::Hosted,
+            // RelayWrite without an endpoint is misconfigured, but still implies hosted intent.
+            Some(AcceleratorMode::RelayWrite) => Self::Hosted,
+            // Direct/DirectPlusCache without an endpoint → degrade to local cleanup.
+            Some(AcceleratorMode::Direct) | Some(AcceleratorMode::DirectPlusCache) => Self::Local,
+        }
+    }
+}
 
 const DEFAULT_DELTA_COMPACT_THRESHOLD: usize = 128;
 const DEFAULT_DELTA_COMPACT_KEEP: usize = 32;
@@ -252,7 +300,20 @@ async fn compact_segment_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::CompactionConfig;
+    use std::path::PathBuf;
+
+    use super::{CleanupPolicy, CompactionConfig};
+    use crate::clawfs::AcceleratorMode;
+    use crate::config::Config;
+
+    fn base_config() -> Config {
+        Config::with_paths(
+            PathBuf::from("/tmp/mnt"),
+            PathBuf::from("/tmp/store"),
+            PathBuf::from("/tmp/cache"),
+            PathBuf::from("/tmp/state"),
+        )
+    }
 
     #[test]
     fn defaults_match_current_thresholds() {
@@ -263,5 +324,60 @@ mod tests {
         assert_eq!(config.segment_compact_batch, 8);
         assert_eq!(config.segment_compact_lag, 3);
         assert_eq!(config.lease_ttl_secs, 30);
+    }
+
+    #[test]
+    fn cleanup_policy_no_accelerator_is_local() {
+        let config = base_config();
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Local);
+        assert!(CleanupPolicy::Local.should_spawn_local_worker());
+    }
+
+    #[test]
+    fn cleanup_policy_direct_with_endpoint_is_hosted() {
+        let mut config = base_config();
+        config.accelerator_mode = Some(AcceleratorMode::Direct);
+        config.accelerator_endpoint = Some("https://accel.example.com".to_string());
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Hosted);
+        assert!(!CleanupPolicy::Hosted.should_spawn_local_worker());
+    }
+
+    #[test]
+    fn cleanup_policy_direct_plus_cache_with_endpoint_is_hosted() {
+        let mut config = base_config();
+        config.accelerator_mode = Some(AcceleratorMode::DirectPlusCache);
+        config.accelerator_endpoint = Some("https://accel.example.com".to_string());
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Hosted);
+    }
+
+    #[test]
+    fn cleanup_policy_relay_write_is_always_hosted() {
+        let mut config = base_config();
+        config.accelerator_mode = Some(AcceleratorMode::RelayWrite);
+        // Even without an endpoint, relay_write implies hosted cleanup.
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Hosted);
+
+        config.accelerator_endpoint = Some("https://relay.example.com".to_string());
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Hosted);
+    }
+
+    #[test]
+    fn cleanup_policy_direct_without_endpoint_degrades_to_local() {
+        let mut config = base_config();
+        config.accelerator_mode = Some(AcceleratorMode::Direct);
+        // No endpoint → degrade to local.
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Local);
+    }
+
+    #[test]
+    fn cleanup_policy_direct_plus_cache_without_endpoint_degrades_to_local() {
+        let mut config = base_config();
+        config.accelerator_mode = Some(AcceleratorMode::DirectPlusCache);
+        assert_eq!(CleanupPolicy::from_config(&config), CleanupPolicy::Local);
+    }
+
+    #[test]
+    fn hosted_with_local_fallback_spawns_worker() {
+        assert!(CleanupPolicy::HostedWithLocalFallback.should_spawn_local_worker());
     }
 }
