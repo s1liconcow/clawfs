@@ -349,11 +349,132 @@ Max forwarding hops before rejection: **2** (prevents infinite loops).
 
 ### Health endpoints
 
+The org-scoped worker exposes three health endpoints for observability and alerting:
+
 ```
-GET  /health                    → aggregate health JSON
-GET  /health/volumes            → per-volume health list
-GET  /health/volumes/<prefix>   → single volume detail (relay_enabled, maintenance_enabled, generation, shard_size)
+GET  /health                    → aggregate health across all volumes
+GET  /health/volumes            → per-volume health list with backlog metrics
+GET  /health/volumes/<prefix>   → detailed single volume health
 ```
+
+#### Aggregate health (`GET /health`)
+
+```json
+{
+  "status": "ok",
+  "replica_id": "replica-a",
+  "discovery_prefix": "orgs/myorg",
+  "discovered_volumes": 12,
+  "active_contexts": 12,
+  "unhealthy_count": 1,
+  "total_delta_backlog": 156,
+  "total_segment_backlog": 23,
+  "relay_enabled_count": 8,
+  "healthy_volumes_count": 11
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `discovered_volumes` | Number of volumes found under the discovery prefix |
+| `active_contexts` | Number of volumes currently loaded in memory |
+| `unhealthy_count` | Volumes with health state other than `healthy_idle`, `healthy_backlogged`, or `transient_lease_contention` |
+| `total_delta_backlog` | Sum of delta files pending compaction across all volumes |
+| `total_segment_backlog` | Sum of segment candidates pending compaction |
+| `relay_enabled_count` | Volumes with `relay_enabled: true` in their policy |
+| `healthy_volumes_count` | Volumes available for scheduling (healthy or transient lease contention) |
+
+#### Per-volume list (`GET /health/volumes`)
+
+```json
+[
+  {
+    "prefix": "orgs/myorg/vol_a",
+    "health": "healthy_backlogged",
+    "health_details": null,
+    "relay_enabled": true,
+    "maintenance_enabled": true,
+    "delta_backlog": 24,
+    "segment_backlog": 3,
+    "checkpoint_backlog": 0,
+    "last_maintenance_success": 1712345678,
+    "last_policy_refresh": 1712345600,
+    "relay_owner_replica_id": "replica-a"
+  }
+]
+```
+
+| Field | Description |
+| --- | --- |
+| `health` | One of: `healthy_idle`, `healthy_backlogged`, `unhealthy_policy`, `unhealthy_init`, `transient_lease_contention` |
+| `health_details` | Error message for `unhealthy_policy` or `unhealthy_init` states |
+| `delta_backlog` | Number of delta files from last maintenance round |
+| `segment_backlog` | Number of segment candidates from last maintenance round |
+| `checkpoint_backlog` | Number of checkpoints retained from last round |
+| `last_maintenance_success` | Unix timestamp of last successful maintenance round (null if never run) |
+| `last_policy_refresh` | Unix timestamp when policy was last refreshed from bucket |
+| `relay_owner_replica_id` | Current relay owner for this volume (null if unknown or relay disabled) |
+
+#### Single volume detail (`GET /health/volumes/<prefix>`)
+
+Returns the same fields as the list endpoint plus:
+
+```json
+{
+  "generation": 42,
+  "shard_size": 2048,
+  "relay_owner": {
+    "replica_id": "replica-a",
+    "advertise_url": "http://replica-a:8080",
+    "epoch": 7,
+    "lease_until": 1712345700
+  },
+  "last_checkpoint_age_secs": 3600,
+  "last_lifecycle_age_secs": 7200
+}
+```
+
+#### Health state meanings
+
+| State | Meaning | Operator action |
+| --- | --- | --- |
+| `healthy_idle` | Volume quiet, no pending work | None |
+| `healthy_backlogged` | Due work exists, being serviced | Monitor backlog trends |
+| `transient_lease_contention` | Another worker holds the lease temporarily | Normal in HA deployments, wait |
+| `unhealthy_policy` | `accelerator_policy.json` is invalid | Fix or remove the policy file in bucket |
+| `unhealthy_init` | Failed to load MetadataStore/SuperblockManager | Check volume superblock exists and is readable |
+
+### Metrics and structured logs
+
+The org worker emits structured JSON logs with the `target: "maintenance"` field for maintenance events:
+
+```
+delta_compaction_complete  deltas_pruned, delta_backlog, duration_ms
+segment_compaction_complete  segments_merged, bytes_rewritten, segment_backlog, duration_ms
+checkpoint_created  checkpoint_path, generation, next_inode, next_segment
+checkpoint_retention_enforced  checkpoints_deleted, checkpoints_kept
+volume_policy_invalid  volume_prefix, reason
+volume_context_load_failed  volume_prefix, error
+maintenance_scheduler_rebuilt  volume_count
+discovery_scan_complete  discovery_prefix, volumes_found
+```
+
+For relay operations:
+
+```
+relay_write  volume_prefix, status, duration_ms
+relay_forward  target_replica, volume_prefix, hop_count
+relay_ownership_acquired  volume_prefix, epoch, lease_until
+relay_ownership_taken_over  volume_prefix, old_replica, new_replica, epoch
+relay_queue_full  volume_prefix
+```
+
+All log lines include:
+- `timestamp` (RFC3339)
+- `level` (INFO, WARN, ERROR)
+- `target` (maintenance, relay, org_registry, etc.)
+- `volume_prefix` (when applicable)
+- `replica_id` (the worker's own identity)
 
 ### Per-volume policy override
 
@@ -387,6 +508,8 @@ Rollback: set `HOSTED_ACCELERATOR_BIN=clawfs_maintenance_worker` (or `clawfs_rel
 
 ## Alert Definitions
 
+### Single-volume alerts (per-volume mode)
+
 | Alert | Threshold | Duration | Severity | Response |
 | --- | --- | --- | --- | --- |
 | `maintenance_backlog_high` | Delta count greater than `2 x DELTA_COMPACT_THRESHOLD` | 1 hour | Warning | Check the worker, the lease owner, and object-store reachability |
@@ -394,7 +517,20 @@ Rollback: set `HOSTED_ACCELERATOR_BIN=clawfs_maintenance_worker` (or `clawfs_rel
 | `relay_write_blocked` | FailClosed policy engaged | 5 minutes | Critical | Restore relay availability or move the volume off relay-write |
 | `lease_contention_high` | Lease acquisition failure rate above 50% | 10 minutes | Warning | Look for a stuck worker or too many competing workers |
 
+### Org-scoped worker alerts
+
+| Alert | Threshold | Source | Severity | Response |
+| --- | --- | --- | --- | --- |
+| `org_worker_unhealthy_volumes` | `unhealthy_count > 0` | `GET /health` | Warning | Check `GET /health/volumes` for `unhealthy_policy` or `unhealthy_init` details |
+| `org_worker_total_backlog_high` | `total_delta_backlog > volumes * 256` (2x threshold per volume) | `GET /health` | Warning | Worker overloaded or object store unreachable; check logs for lease contention |
+| `org_worker_volume_stale` | `last_maintenance_success` > 1 hour ago for any volume | `GET /health/volumes` | Warning | Maintenance not running; check if policy has `maintenance_enabled: false` or lease is stuck |
+| `org_worker_policy_refresh_stale` | `last_policy_refresh` > 2x `scan_interval_secs` | `GET /health/volumes` | Warning | Discovery may be failing; check bucket list permissions |
+| `org_worker_relay_forwarding_failing` | HTTP 502/503 responses from forwarding hops | Structured logs | Critical | Replicas cannot reach each other; verify headless service or VPC peering |
+| `org_worker_relay_ownership_split` | Same volume shows different `relay_owner_replica_id` across replicas | `GET /health/volumes` on each replica | Critical | Split-brain or clock skew; investigate lease TTL and NTP sync |
+
 ## What To Check First
+
+### For per-volume workers
 
 When a managed volume looks unhealthy, check these signals in order:
 
@@ -405,4 +541,49 @@ When a managed volume looks unhealthy, check these signals in order:
 5. Lease acquisition and compaction logs
 6. The latest `benches/hosted.rs` report for the workload that regressed
 
+### For org-scoped workers
+
+When any volume in an org-scoped deployment is unhealthy:
+
+1. `GET /health` → check `unhealthy_count` and `total_delta_backlog`
+2. `GET /health/volumes` → identify which volumes are unhealthy and why
+3. For `unhealthy_policy`: check the `accelerator_policy.json` file in the bucket for that volume
+4. For `unhealthy_init`: verify the volume has a valid superblock at `<prefix>/metadata/superblock.bin`
+5. For `transient_lease_contention`: check if another worker legitimately holds the lease, or if a lease is stuck (see troubleshooting)
+6. For relay issues: check `relay_owner_replica_id` in the per-volume detail matches across all replicas
+7. For stale maintenance: check `last_maintenance_success` timestamp and look for `maintenance_scheduler_rebuilt` in logs
+
 If the system is safely degraded, the object store and superblock generation should still be authoritative. If the system is actively blocked, relay-write policy is usually the first place to look.
+
+## Troubleshooting: Org-Scoped Worker
+
+### Volume not appearing in health endpoints
+
+1. Verify discovery scan ran: look for `discovery_scan_complete` log with `volumes_found > 0`
+2. Check `last_policy_refresh` is recent (within `scan_interval_secs`)
+3. Verify the volume superblock exists at `<prefix>/metadata/superblock.bin`
+4. Check the volume prefix is within `--discovery-prefix` scope
+
+### Maintenance not running on a volume
+
+1. Check `maintenance_enabled` in the per-volume policy
+2. Verify `health` is not `unhealthy_init` (maintenance requires valid stores)
+3. Check `last_maintenance_success` timestamp — if null, no round has completed yet
+4. Look for `maintenance_scheduler_rebuilt` log to confirm volume is in the schedule
+5. For HA deployments: check if another replica holds the lease (look for `OwnedByOther` in logs)
+
+### Relay forwarding failures (HTTP 502/503)
+
+1. Verify pod-to-pod network: can replica A curl replica B's `--advertise-url`?
+2. Check `relay_owner` in per-volume detail shows the expected replica
+3. Verify `--advertise-url` is reachable from all replicas (not behind a public LB only)
+4. Check hop count not exceeded: look for `relay_write hop limit exceeded` in logs
+
+### Split-brain relay ownership
+
+Symptom: Different replicas report different `relay_owner_replica_id` for the same volume.
+
+1. Check clock sync across replicas (NTP)
+2. Verify `lease_until` timestamps are consistent with wall clock
+3. Look for `relay_ownership_taken_over` logs showing ownership changes
+4. Investigate if one replica's clock is skewed causing premature lease expiry

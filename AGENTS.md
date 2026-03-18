@@ -29,7 +29,8 @@ The repository also includes `clawfs-nfs-gateway/`, a standalone NFSv3 server th
 - [Shared-library / preload design](docs/clawfs-shared-library-design.md)
 - [ClawFS storage modes and hosted free-tier model](docs/clawfs-storage-modes.md)
 - [Testing, tooling, troubleshooting, and common commands](docs/clawfs-testing-and-operations.md)
-- [Hosted accelerator operator runbook](docs/hosted-accelerator-runbook.md)
+- [Hosted accelerator architecture](docs/clawfs-hosted-accelerator-codex.md)
+- [Hosted accelerator operator runbook](docs/hosted-accelerator-runbook.md) — includes org-scoped (`clawfs_org_worker`) and per-volume worker guidance
 - [Sprite workflow and privileged execution rules](docs/clawfs-sprites.md)
 
 ## Quick Pointers
