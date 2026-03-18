@@ -19,17 +19,30 @@
 //! - Relay outage policy is explicit: fail closed by default, direct fallback
 //!   only with operator opt-in, and queue-and-retry must remain bounded.
 
-use anyhow::{Result, bail};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use parking_lot::Mutex;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::str::FromStr;
-use std::time::Instant;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::clawfs::AcceleratorMode;
 use crate::inode::InodeRecord;
-use crate::segment::SegmentEntry;
+use crate::metadata::MetadataStore;
+use crate::segment::{SegmentEntry, SegmentManager};
+use crate::superblock::SuperblockManager;
 
 pub const DEFAULT_RELAY_QUEUE_DEPTH: usize = 32;
+pub const DEFAULT_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_RELAY_MAX_RETRIES: usize = 3;
+pub const DEFAULT_RELAY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+pub const DEFAULT_RELAY_WRITE_PATH: &str = "/relay-write";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +187,29 @@ pub struct RelayWriteRequest {
 }
 
 impl RelayWriteRequest {
+    pub fn new(
+        client_id: impl Into<String>,
+        volume_prefix: impl Into<String>,
+        journal_sequence: u64,
+        expected_parent_generation: u64,
+        segment_data: Vec<SegmentEntry>,
+        metadata_deltas: Vec<InodeRecord>,
+    ) -> Self {
+        let client_id = client_id.into();
+        let volume_prefix = volume_prefix.into();
+        let idempotency_key =
+            Self::derive_idempotency_key(&client_id, &volume_prefix, journal_sequence);
+        Self {
+            idempotency_key,
+            client_id,
+            volume_prefix,
+            journal_sequence,
+            segment_data,
+            metadata_deltas,
+            expected_parent_generation,
+        }
+    }
+
     pub fn derive_idempotency_key(
         client_id: &str,
         volume_prefix: &str,
@@ -186,6 +222,23 @@ impl RelayWriteRequest {
         hasher.update([0]);
         hasher.update(journal_sequence.to_string().as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expected = Self::derive_idempotency_key(
+            &self.client_id,
+            &self.volume_prefix,
+            self.journal_sequence,
+        );
+        if self.idempotency_key != expected {
+            bail!(
+                "relay write idempotency key mismatch for client={} volume_prefix={} sequence={}",
+                self.client_id,
+                self.volume_prefix,
+                self.journal_sequence
+            );
+        }
+        Ok(())
     }
 }
 
@@ -234,15 +287,358 @@ impl RelayWriteResponse {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RelayClient {
+    base_url: String,
+    client: reqwest::Client,
+    attempt_timeout: Duration,
+    max_retries: usize,
+    retry_backoff: Duration,
+}
+
+impl RelayClient {
+    pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        Self::with_retry_policy(
+            base_url,
+            DEFAULT_RELAY_ATTEMPT_TIMEOUT,
+            DEFAULT_RELAY_MAX_RETRIES,
+            DEFAULT_RELAY_RETRY_BACKOFF,
+        )
+    }
+
+    pub fn with_retry_policy(
+        base_url: impl Into<String>,
+        attempt_timeout: Duration,
+        max_retries: usize,
+        retry_backoff: Duration,
+    ) -> Result<Self> {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let client = reqwest::Client::builder()
+            .timeout(attempt_timeout)
+            .build()
+            .context("building relay client")?;
+        Ok(Self {
+            base_url,
+            client,
+            attempt_timeout,
+            max_retries,
+            retry_backoff,
+        })
+    }
+
+    pub async fn submit_relay_write(
+        &self,
+        request: RelayWriteRequest,
+    ) -> Result<RelayWriteResponse> {
+        request.validate()?;
+        let url = format!("{}{}", self.base_url, DEFAULT_RELAY_WRITE_PATH);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=self.max_retries {
+            let attempt_no = attempt + 1;
+            match self.client.post(&url).json(&request).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        let retryable = matches!(
+                            status,
+                            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                        ) || status.is_server_error();
+                        let err = anyhow::anyhow!(
+                            "relay write http {} on attempt {}: {}",
+                            status,
+                            attempt_no,
+                            body
+                        );
+                        if retryable && attempt < self.max_retries {
+                            warn!(
+                                target: "relay",
+                                idempotency_key = %request.idempotency_key,
+                                attempt = attempt_no,
+                                status = %status,
+                                "relay_write_http_retry"
+                            );
+                            last_err = Some(err);
+                            sleep(self.retry_backoff).await;
+                            continue;
+                        }
+                        return Err(err).context("relay write HTTP failure");
+                    }
+
+                    let response: RelayWriteResponse =
+                        resp.json().await.context("decoding relay write response")?;
+                    response.validate()?;
+                    if response.idempotency_key != request.idempotency_key {
+                        bail!(
+                            "relay response idempotency_key mismatch: expected {} got {}",
+                            request.idempotency_key,
+                            response.idempotency_key
+                        );
+                    }
+
+                    match response.status {
+                        RelayStatus::Accepted => {
+                            info!(
+                                target: "relay",
+                                idempotency_key = %request.idempotency_key,
+                                "relay_write_accepted"
+                            );
+                        }
+                        RelayStatus::Committed | RelayStatus::Duplicate => {
+                            info!(
+                                target: "relay",
+                                idempotency_key = %request.idempotency_key,
+                                committed_generation = ?response.committed_generation,
+                                "relay_write_confirmed"
+                            );
+                        }
+                        RelayStatus::Failed => {
+                            warn!(
+                                target: "relay",
+                                idempotency_key = %request.idempotency_key,
+                                "relay_write_failed"
+                            );
+                        }
+                    }
+
+                    return Ok(response);
+                }
+                Err(err) => {
+                    let wrapped = anyhow::Error::new(err)
+                        .context(format!("relay write attempt {} to {}", attempt_no, url));
+                    if attempt < self.max_retries {
+                        warn!(
+                            target: "relay",
+                            idempotency_key = %request.idempotency_key,
+                            attempt = attempt_no,
+                            timeout_ms = self.attempt_timeout.as_millis() as u64,
+                            "relay_write_retry"
+                        );
+                        last_err = Some(wrapped);
+                        sleep(self.retry_backoff).await;
+                        continue;
+                    }
+                    return Err(wrapped).context("relay write failed after retries");
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("relay write failed without error")))
+    }
+}
+
+/// Idempotency dedup store for the relay executor.
+///
+/// Records committed relay write results keyed by idempotency key.  Entries are
+/// evicted after `ttl` so the store stays bounded while remaining discoverable
+/// for retried requests within the retry window.
+pub struct DedupStore {
+    records: Mutex<HashMap<String, DedupRecord>>,
+    ttl: Duration,
+}
+
+struct DedupRecord {
+    committed_generation: u64,
+    committed_at: Instant,
+}
+
+impl DedupStore {
+    pub fn new(ttl: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            records: Mutex::new(HashMap::new()),
+            ttl,
+        })
+    }
+
+    /// Look up a previous committed result.  Returns `None` if the key has
+    /// never been committed or if the entry has expired.
+    pub fn lookup(&self, key: &str) -> Option<u64> {
+        let records = self.records.lock();
+        records.get(key).and_then(|r| {
+            if r.committed_at.elapsed() < self.ttl {
+                Some(r.committed_generation)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Record a newly committed result.
+    pub fn record(&self, key: String, committed_generation: u64) {
+        let mut records = self.records.lock();
+        records.insert(
+            key,
+            DedupRecord {
+                committed_generation,
+                committed_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Evict all entries older than the TTL.
+    pub fn evict_expired(&self) {
+        let mut records = self.records.lock();
+        let ttl = self.ttl;
+        records.retain(|_, r| r.committed_at.elapsed() < ttl);
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Execute a relay write commit in-region.
+///
+/// The pipeline:
+/// 1. Check `expected_parent_generation` matches current superblock.
+/// 2. Check dedup store — return `Duplicate` if already committed.
+/// 3. Write segment objects via `SegmentManager`.
+/// 4. Persist metadata deltas via `MetadataStore`.
+/// 5. CAS-commit the new generation via `SuperblockManager`.
+/// 6. Record result in `DedupStore`.
+///
+/// Failures at any step before step 6 are returned as `Failed`.
+/// The commit is atomic via CAS so partial state is never visible.
+pub async fn relay_commit_pipeline(
+    request: &RelayWriteRequest,
+    meta: &Arc<MetadataStore>,
+    segments: &Arc<SegmentManager>,
+    superblock: &Arc<SuperblockManager>,
+    dedup: &Arc<DedupStore>,
+    shard_size: u64,
+) -> Result<RelayWriteResponse> {
+    // --- Idempotency check ---
+    if let Some(prior_generation) = dedup.lookup(&request.idempotency_key) {
+        info!(
+            target: "relay",
+            idempotency_key = %request.idempotency_key,
+            committed_generation = prior_generation,
+            "relay_write_duplicate"
+        );
+        return Ok(RelayWriteResponse {
+            status: RelayStatus::Duplicate,
+            committed_generation: Some(prior_generation),
+            idempotency_key: request.idempotency_key.clone(),
+            error: None,
+        });
+    }
+
+    // --- Generation validation ---
+    let current = meta
+        .load_superblock()
+        .await?
+        .context("missing superblock for relay commit")?;
+    let current_generation = current.block.generation;
+
+    if request.expected_parent_generation != current_generation {
+        let msg = format!(
+            "generation mismatch: expected {} but current is {}",
+            request.expected_parent_generation, current_generation
+        );
+        warn!(
+            target: "relay",
+            client_id = %request.client_id,
+            expected = request.expected_parent_generation,
+            actual = current_generation,
+            "relay_write_generation_race"
+        );
+        return Ok(RelayWriteResponse {
+            status: RelayStatus::Failed,
+            committed_generation: None,
+            idempotency_key: request.idempotency_key.clone(),
+            error: Some(msg),
+        });
+    }
+
+    // --- Prepare a new generation ---
+    let new_generation = current_generation.saturating_add(1);
+    let snapshot = superblock
+        .prepare_dirty_generation()
+        .context("relay prepare_dirty_generation")?;
+    let prepared_generation = snapshot.generation;
+    assert_eq!(
+        prepared_generation, new_generation,
+        "generation must advance by 1"
+    );
+
+    // --- Write segments (if any) ---
+    if !request.segment_data.is_empty() {
+        let segment_id = current.block.next_segment;
+        segments
+            .write_batch(new_generation, segment_id, request.segment_data.clone())
+            .context("relay segment write_batch")?;
+    }
+
+    // --- Persist metadata deltas ---
+    if !request.metadata_deltas.is_empty() {
+        meta.persist_inodes_batch(&request.metadata_deltas, new_generation, shard_size, 512)
+            .await
+            .context("relay persist_inodes_batch")?;
+        meta.sync_metadata_writes()
+            .await
+            .context("relay sync_metadata_writes")?;
+    }
+
+    // --- CAS-commit the generation ---
+    if let Err(err) = superblock.commit_generation(prepared_generation).await {
+        superblock.abort_generation(prepared_generation);
+        warn!(
+            target: "relay",
+            client_id = %request.client_id,
+            generation = prepared_generation,
+            err = %err,
+            "relay_write_commit_failed"
+        );
+        return Ok(RelayWriteResponse {
+            status: RelayStatus::Failed,
+            committed_generation: None,
+            idempotency_key: request.idempotency_key.clone(),
+            error: Some(format!("commit_generation failed: {err}")),
+        });
+    }
+
+    // --- Record in dedup store ---
+    dedup.record(request.idempotency_key.clone(), new_generation);
+
+    info!(
+        target: "relay",
+        client_id = %request.client_id,
+        committed_generation = new_generation,
+        segments = request.segment_data.len(),
+        deltas = request.metadata_deltas.len(),
+        "relay_write_committed"
+    );
+
+    Ok(RelayWriteResponse {
+        status: RelayStatus::Committed,
+        committed_generation: Some(new_generation),
+        idempotency_key: request.idempotency_key.clone(),
+        error: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
-        RelayOutageAction, RelayOutagePolicy, RelayOutageState, RelayStatus, RelayWriteRequest,
-        RelayWriteResponse,
+        DEFAULT_RELAY_WRITE_PATH, DedupStore, RelayClient, RelayOutageAction, RelayOutagePolicy,
+        RelayOutageState, RelayStatus, RelayWriteRequest, RelayWriteResponse,
     };
     use crate::inode::InodeRecord;
+    use crate::segment::{SegmentEntry, SegmentPayload};
 
     #[test]
     fn idempotency_key_is_deterministic() {
@@ -289,6 +685,36 @@ mod tests {
             request.expected_parent_generation
         );
         assert_eq!(decoded.metadata_deltas.len(), 1);
+    }
+
+    #[test]
+    fn request_constructor_derives_idempotency_key() {
+        let request = RelayWriteRequest::new(
+            "client-a",
+            "/vol/prefix",
+            9,
+            11,
+            vec![SegmentEntry {
+                inode: 1,
+                path: "/name".to_string(),
+                logical_offset: 0,
+                payload: SegmentPayload::Bytes(vec![1, 2, 3]),
+            }],
+            vec![InodeRecord::new_file(
+                1,
+                2,
+                "name".to_string(),
+                "/name".to_string(),
+                1000,
+                1000,
+            )],
+        );
+
+        assert_eq!(
+            request.idempotency_key,
+            RelayWriteRequest::derive_idempotency_key("client-a", "/vol/prefix", 9)
+        );
+        request.validate().expect("request key is valid");
     }
 
     #[test]
@@ -417,5 +843,124 @@ mod tests {
             let decoded: RelayStatus = serde_json::from_str(&json).expect("deserialize status");
             assert_eq!(decoded, status);
         }
+    }
+
+    #[test]
+    fn relay_write_path_is_stable() {
+        assert_eq!(DEFAULT_RELAY_WRITE_PATH, "/relay-write");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_client_retries_after_http_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock relay server");
+        let addr = listener.local_addr().expect("listener address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_server = hits.clone();
+
+        thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                hits_for_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if attempt == 0 {
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(response).expect("write 500 response");
+                } else {
+                    let body = serde_json::to_string(&RelayWriteResponse {
+                        status: RelayStatus::Committed,
+                        committed_generation: Some(99),
+                        idempotency_key: RelayWriteRequest::derive_idempotency_key(
+                            "client-a",
+                            "/vol/prefix",
+                            7,
+                        ),
+                        error: None,
+                    })
+                    .expect("serialize response");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write committed response");
+                }
+            }
+        });
+
+        let client = RelayClient::with_retry_policy(
+            format!("http://{}", addr),
+            Duration::from_millis(100),
+            1,
+            Duration::from_millis(1),
+        )
+        .expect("build client");
+        let request = RelayWriteRequest::new(
+            "client-a",
+            "/vol/prefix",
+            7,
+            8,
+            vec![SegmentEntry {
+                inode: 1,
+                path: "/name".to_string(),
+                logical_offset: 0,
+                payload: SegmentPayload::Bytes(vec![1, 2, 3]),
+            }],
+            vec![InodeRecord::new_file(
+                1,
+                2,
+                "name".to_string(),
+                "/name".to_string(),
+                1000,
+                1000,
+            )],
+        );
+
+        let response = client
+            .submit_relay_write(request)
+            .await
+            .expect("submit write");
+        assert_eq!(response.status, RelayStatus::Committed);
+        assert_eq!(response.committed_generation, Some(99));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn dedup_store_records_and_lookups() {
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        assert!(dedup.lookup("key-a").is_none(), "new key returns None");
+        assert!(dedup.is_empty());
+
+        dedup.record("key-a".to_string(), 42);
+        assert_eq!(dedup.lookup("key-a"), Some(42));
+        assert_eq!(dedup.len(), 1);
+
+        // Different key not found.
+        assert!(dedup.lookup("key-b").is_none());
+    }
+
+    #[test]
+    fn dedup_store_expired_entries_return_none() {
+        // TTL of 0 means entries expire immediately.
+        let dedup = DedupStore::new(Duration::ZERO);
+        dedup.record("key-a".to_string(), 99);
+        // An immediately-expired entry should not be returned.
+        assert!(
+            dedup.lookup("key-a").is_none(),
+            "expired entry must not be returned"
+        );
+    }
+
+    #[test]
+    fn dedup_store_evict_removes_expired() {
+        let dedup = DedupStore::new(Duration::ZERO);
+        dedup.record("key-a".to_string(), 1);
+        dedup.record("key-b".to_string(), 2);
+        // After eviction with zero TTL all entries should be gone.
+        dedup.evict_expired();
+        assert!(dedup.is_empty(), "all expired entries should be evicted");
     }
 }

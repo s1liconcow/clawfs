@@ -2,6 +2,9 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use crate::clawfs::AcceleratorMode;
+use crate::relay::{RelayClient, RelayStatus};
+
 pub(crate) fn epoch_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -148,6 +151,77 @@ impl OsageFs {
         let Some(journal) = &self.journal else {
             return Ok(0);
         };
+
+        if self.config.accelerator_mode == Some(AcceleratorMode::RelayWrite)
+            && let Some(relay_state) = journal.relay_pending_state()
+        {
+            if relay_state.committed_generation.is_some() {
+                let entries = journal.load_entries()?;
+                for entry in &entries {
+                    journal.clear_entry(entry.record.inode)?;
+                }
+                journal.clear_relay_pending_state()?;
+                debug!(
+                    "replay_journal cleared committed relay state for {} entries",
+                    entries.len()
+                );
+                return Ok(entries.len());
+            }
+
+            let Some(endpoint) = self.config.accelerator_endpoint.clone() else {
+                log::error!("replay_journal relay_write configured without accelerator endpoint");
+                return Err(anyhow!(
+                    "relay_write replay requires an accelerator endpoint"
+                ));
+            };
+            let client = RelayClient::new(endpoint).map_err(|err| {
+                log::error!("replay_journal failed to build relay client: {err:#}");
+                anyhow!("failed to build relay client: {err:#}")
+            })?;
+            let response = self.block_on(client.submit_relay_write(relay_state.request.clone()));
+            match response {
+                Ok(response) => match response.status {
+                    RelayStatus::Committed | RelayStatus::Duplicate => {
+                        let committed_generation =
+                            response.committed_generation.ok_or_else(|| {
+                                anyhow!("relay write response missing committed_generation")
+                            })?;
+                        journal.mark_relay_committed(committed_generation)?;
+                        let entries = journal.load_entries()?;
+                        for entry in &entries {
+                            journal.clear_entry(entry.record.inode)?;
+                        }
+                        journal.clear_relay_pending_state()?;
+                        info!(
+                            "replay_journal committed relay state gen={} entries={}",
+                            committed_generation,
+                            entries.len()
+                        );
+                        return Ok(entries.len());
+                    }
+                    RelayStatus::Accepted => {
+                        log::warn!(
+                            "replay_journal relay_write accepted but not committed; leaving journal intact"
+                        );
+                        return Err(anyhow!(
+                            "relay_write accepted but not committed during replay"
+                        ));
+                    }
+                    RelayStatus::Failed => {
+                        let err = response
+                            .error
+                            .unwrap_or_else(|| "relay_write failed during replay".to_string());
+                        log::warn!("replay_journal relay_write failed: {err}");
+                        return Err(anyhow!(err));
+                    }
+                },
+                Err(err) => {
+                    log::warn!("replay_journal relay_write submit failed: {err:#}");
+                    return Err(anyhow!("relay_write replay failed: {err:#}"));
+                }
+            }
+        }
+
         let entries = journal.load_entries()?;
         if entries.is_empty() {
             return Ok(0);
