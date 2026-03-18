@@ -434,17 +434,16 @@ async fn handle_health(State(state): State<RelayState>) -> axum::response::Respo
 }
 
 fn start_relay_server(runtime: &Runtime, config: &Config) -> String {
-    let manager_runtime = Arc::new(Runtime::new().expect("relay manager runtime"));
-    let manager_handle = manager_runtime.handle().clone();
     let (metadata, segments, superblock, listener, addr) = runtime.block_on(async {
         let (store, meta_prefix) = create_object_store(config).expect("relay object store");
         let seg_prefix = segment_prefix(&config.object_prefix);
+        let handle = tokio::runtime::Handle::current();
         let metadata = Arc::new(
             MetadataStore::new_with_store(
                 store.clone(),
                 meta_prefix.clone(),
                 config,
-                manager_handle.clone(),
+                handle.clone(),
             )
             .await
             .expect("relay metadata"),
@@ -454,7 +453,7 @@ fn start_relay_server(runtime: &Runtime, config: &Config) -> String {
                 store.clone(),
                 seg_prefix.clone(),
                 config,
-                manager_handle.clone(),
+                handle.clone(),
             )
             .expect("relay segments"),
         );
@@ -479,7 +478,6 @@ fn start_relay_server(runtime: &Runtime, config: &Config) -> String {
         .route("/health", get(handle_health))
         .with_state(state);
     runtime.handle().spawn(async move {
-        let _keep_manager_runtime_alive = manager_runtime;
         let _ = axum::serve(listener, app).await;
     });
     format!("http://{addr}")
