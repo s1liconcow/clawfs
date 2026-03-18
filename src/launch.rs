@@ -30,6 +30,7 @@ use crate::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
 use crate::journal::JournalManager;
 use crate::metadata::MetadataStore;
 use crate::perf::PerfLogger;
+use crate::relay::RelayOutagePolicy;
 use crate::replay::ReplayLogger;
 use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload, SegmentPointer};
 use crate::source::SourceObjectStore;
@@ -70,7 +71,7 @@ pub struct HostedControlPlane {
     pub accelerator_endpoint: Option<String>,
     pub accelerator_mode: Option<AcceleratorMode>,
     pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
-    pub relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub relay_fallback_policy: Option<RelayOutagePolicy>,
     pub event_endpoint: Option<String>,
     pub event_settings: Option<EventSettings>,
     pub accelerator_session_token: Option<String>,
@@ -443,6 +444,14 @@ fn apply_hosted_runtime_config(config: &mut Config, hosted: &HostedControlPlane)
         .accelerator_fallback_policy
         .unwrap_or(mode.default_fallback_policy())
         .normalize_for_mode(mode);
+    let relay_policy = match mode {
+        AcceleratorMode::RelayWrite => Some(
+            hosted
+                .relay_fallback_policy
+                .unwrap_or(RelayOutagePolicy::FailClosed),
+        ),
+        AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => hosted.relay_fallback_policy,
+    };
     unsafe {
         env::set_var("CLAWFS_ACCELERATOR_MODE", mode.as_str());
         env::set_var("CLAWFS_ACCELERATOR_FALLBACK_POLICY", fallback.as_str());
@@ -452,9 +461,13 @@ fn apply_hosted_runtime_config(config: &mut Config, hosted: &HostedControlPlane)
             env::set_var("CLAWFS_ACCELERATOR_ENDPOINT", endpoint);
         }
     }
-    if let Some(policy) = hosted.relay_fallback_policy {
+    if let Some(policy) = relay_policy {
         unsafe {
             env::set_var("CLAWFS_RELAY_FALLBACK_POLICY", policy.as_str());
+        }
+    } else {
+        unsafe {
+            env::remove_var("CLAWFS_RELAY_FALLBACK_POLICY");
         }
     }
     if let Some(endpoint) = hosted.event_endpoint.as_deref() {
@@ -487,6 +500,7 @@ fn apply_hosted_runtime_config(config: &mut Config, hosted: &HostedControlPlane)
     config.accelerator_mode = Some(mode);
     config.accelerator_endpoint = hosted.accelerator_endpoint.clone();
     config.accelerator_fallback_policy = Some(fallback);
+    config.relay_fallback_policy = relay_policy;
 }
 
 fn apply_provisioned_credentials(config: &mut Config, creds: &ControlPlaneCredentials) {
@@ -1446,6 +1460,7 @@ mod tests {
     };
     use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
     use crate::config::Config;
+    use crate::relay::RelayOutagePolicy;
 
     fn test_config() -> Config {
         Config::with_paths(
@@ -1460,7 +1475,7 @@ mod tests {
         accelerator_mode: Option<AcceleratorMode>,
         accelerator_endpoint: Option<&str>,
         accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
-        relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+        relay_fallback_policy: Option<RelayOutagePolicy>,
         event_endpoint: Option<&str>,
         event_settings: Option<EventSettings>,
     ) -> HostedControlPlane {
@@ -1504,7 +1519,7 @@ mod tests {
             Some(AcceleratorMode::RelayWrite),
             Some("https://accelerator.example"),
             Some(AcceleratorFallbackPolicy::FailClosed),
-            Some(AcceleratorFallbackPolicy::DirectWriteFallback),
+            Some(RelayOutagePolicy::DirectWriteFallback),
             Some("https://events.example"),
             Some(EventSettings::from_poll_interval_ms(2500)),
         );
@@ -1519,6 +1534,30 @@ mod tests {
         assert_eq!(
             config.accelerator_fallback_policy,
             Some(AcceleratorFallbackPolicy::FailClosed)
+        );
+        assert_eq!(
+            config.relay_fallback_policy,
+            Some(RelayOutagePolicy::DirectWriteFallback)
+        );
+    }
+
+    #[test]
+    fn hosted_runtime_config_defaults_relay_policy_to_fail_closed() {
+        let mut config = test_config();
+        let hosted = hosted_control_plane(
+            Some(AcceleratorMode::RelayWrite),
+            Some("https://accelerator.example"),
+            Some(AcceleratorFallbackPolicy::FailClosed),
+            None,
+            None,
+            None,
+        );
+
+        apply_hosted_runtime_config(&mut config, &hosted);
+
+        assert_eq!(
+            config.relay_fallback_policy,
+            Some(RelayOutagePolicy::FailClosed)
         );
     }
 
