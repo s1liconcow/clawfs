@@ -892,9 +892,15 @@ impl SegmentManager {
         let path = self.segment_path(generation, segment_id);
         let path_clone = path.clone();
         let store = self.store.clone();
-        let delete_result = self
-            .handle
-            .block_on(async move { store.delete(&path_clone).await });
+        let delete_result = if Handle::try_current().is_ok() {
+            block_in_place(|| {
+                self.handle
+                    .block_on(async move { store.delete(&path_clone).await })
+            })
+        } else {
+            self.handle
+                .block_on(async move { store.delete(&path_clone).await })
+        };
         match delete_result {
             Ok(_) => {}
             Err(ObjectError::NotFound { .. }) => {
