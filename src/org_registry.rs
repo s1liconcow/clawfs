@@ -104,6 +104,10 @@ pub struct VolumeContext {
     /// Compaction config; currently a process-wide default but carried here
     /// so per-volume overrides can be wired in later.
     pub compaction_config: CompactionConfig,
+    /// Backlog score from the most recent maintenance round; used by the
+    /// weighted round-robin scheduler to prioritize backlogged volumes.
+    /// 0 = idle, positive = backlogged (higher → more work pending).
+    pub last_backlog_score: std::sync::atomic::AtomicU32,
 }
 
 impl VolumeContext {
@@ -127,6 +131,21 @@ impl VolumeContext {
     /// Update the health state.
     pub fn set_health(&self, health: VolumeHealth) {
         *self.health.lock() = health;
+    }
+
+    /// Scheduling weight for the weighted round-robin maintenance scheduler.
+    ///
+    /// Backlogged volumes receive higher weight (up to 4) so they are revisited
+    /// more frequently than idle volumes (weight 1).  Unhealthy volumes are
+    /// excluded from the schedule entirely (weight 0).
+    ///
+    /// weight = max(1, min(backlog_score, 4)) for healthy volumes, 0 otherwise.
+    pub fn scheduler_weight(&self) -> u32 {
+        if !self.health().is_healthy() {
+            return 0;
+        }
+        let score = self.last_backlog_score.load(Ordering::Relaxed);
+        score.clamp(1, 4)
     }
 }
 
@@ -373,6 +392,7 @@ impl OrgVolumeRegistry {
             maintenance_schedule: TokioMutex::new(MaintenanceSchedule::new()),
             relay_commit_lock: TokioMutex::new(()),
             compaction_config: CompactionConfig::default(),
+            last_backlog_score: std::sync::atomic::AtomicU32::new(0),
         })
     }
 

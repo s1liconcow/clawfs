@@ -408,6 +408,92 @@ pub async fn discover_volumes(
     found
 }
 
+// ── Weighted round-robin scheduler ─────────────────────────────────────────
+
+/// Fair weighted round-robin scheduler for per-volume maintenance dispatch.
+///
+/// Each volume participates in the schedule with a weight derived from its
+/// observed backlog (`scheduler_weight()`).  A weight-1 idle volume appears
+/// once per cycle; a weight-4 heavily-backlogged volume appears four times.
+/// A cursor advances through the flat slot list across ticks so that no
+/// volume is permanently starved: even idle volumes are serviced regularly.
+///
+/// Volume sets change dynamically as discovery finds new volumes.  The
+/// scheduler rebuilds the slot list whenever the known volume set changes,
+/// restarting the cursor from the beginning of the new cycle.
+struct OrgScheduler {
+    /// Cursor position into `slots`.
+    cursor: usize,
+    /// Flat list of volume prefixes, each repeated `weight` times.
+    slots: Vec<String>,
+    /// Sorted list of prefixes known to the current slot list (for detecting
+    /// volume-set changes between discovery scans).
+    known_prefixes: Vec<String>,
+}
+
+impl OrgScheduler {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            slots: Vec::new(),
+            known_prefixes: Vec::new(),
+        }
+    }
+
+    /// Rebuild the slot list from (prefix, weight) pairs.
+    ///
+    /// Called when the volume set changes.  Volumes are ordered by prefix for
+    /// stable, deterministic scheduling.  The cursor resets to 0.
+    fn rebuild(&mut self, volumes: &[(String, u32)]) {
+        // Sort by prefix for deterministic ordering.
+        let mut sorted = volumes.to_vec();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        self.slots.clear();
+        for (prefix, weight) in &sorted {
+            for _ in 0..*weight {
+                self.slots.push(prefix.clone());
+            }
+        }
+        self.known_prefixes = sorted.into_iter().map(|(p, _)| p).collect();
+        self.cursor = 0;
+    }
+
+    /// Return up to `n` volume prefixes for this tick, deduplicating across
+    /// the same cycle so each prefix is dispatched at most once per tick.
+    ///
+    /// The cursor advances by the number of unique volumes returned.  When it
+    /// wraps around the end of the slot list, it resets to 0 (new cycle).
+    fn next_batch(&mut self, n: usize) -> Vec<String> {
+        if self.slots.is_empty() {
+            return Vec::new();
+        }
+
+        let total = self.slots.len();
+        let mut result: Vec<String> = Vec::with_capacity(n);
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut steps = 0usize;
+
+        while result.len() < n && steps < total {
+            let idx = (self.cursor + steps) % total;
+            let prefix = &self.slots[idx];
+            if seen.insert(prefix.as_str()) {
+                result.push(prefix.clone());
+            }
+            steps += 1;
+        }
+
+        // Advance cursor by total steps taken (including duplicates skipped).
+        self.cursor = (self.cursor + steps) % total;
+        result
+    }
+
+    /// Returns true if the volume set (sorted prefixes) has changed.
+    fn volume_set_changed(&self, new_prefixes: &[String]) -> bool {
+        self.known_prefixes != new_prefixes
+    }
+}
+
 // ── Discovery + maintenance loop ───────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -424,18 +510,19 @@ async fn run_discovery_and_maintenance_loop(
 ) {
     let sem = Arc::new(tokio::sync::Semaphore::new(maintenance_concurrency));
     let compaction_config = CompactionConfig::default();
+    let mut scheduler = OrgScheduler::new();
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        // ── Discovery scan ─────────────────────────────────────────────
+        // ── Phase 1: Discovery — load contexts for all discovered volumes ──
         let volumes = discover_volumes(store.as_ref(), &discovery_prefix).await;
 
-        // Load (or touch) contexts for discovered volumes.
+        let mut loaded: Vec<Arc<clawfs::org_registry::VolumeContext>> = Vec::new();
         for volume in &volumes {
-            // Load policy first; if invalid mark unhealthy but continue.
+            // Load policy first; if invalid log and continue with defaults.
             let policy = match load_volume_policy(store.as_ref(), &volume.prefix).await {
                 PolicyLoadResult::Ok(p) => p,
                 PolicyLoadResult::Invalid(reason) => {
@@ -444,82 +531,114 @@ async fn run_discovery_and_maintenance_loop(
                         reason = %reason,
                         "volume_policy_invalid"
                     );
-                    // Still try to load with defaults so maintenance can run.
                     VolumeAcceleratorPolicy::default()
                 }
             };
 
-            let ctx = match registry.get_or_load(volume, policy).await {
-                Ok(c) => c,
+            match registry.get_or_load(volume, policy).await {
+                Ok(ctx) => loaded.push(ctx),
                 Err(err) => {
                     warn!(
                         volume_prefix = %volume.prefix,
                         error = %err,
                         "volume_context_load_failed"
                     );
-                    continue;
                 }
-            };
+            }
+        }
 
-            if !enable_maintenance || !ctx.policy.maintenance_enabled {
-                continue;
+        // ── Phase 2: Rebuild scheduler when volume set changes ────────────
+        if enable_maintenance {
+            let mut sorted_prefixes: Vec<String> = loaded
+                .iter()
+                .filter(|c| c.policy.maintenance_enabled)
+                .map(|c| c.prefix.clone())
+                .collect();
+            sorted_prefixes.sort_unstable();
+
+            if scheduler.volume_set_changed(&sorted_prefixes) {
+                // Build (prefix, weight) pairs from loaded contexts.
+                let weighted: Vec<(String, u32)> = loaded
+                    .iter()
+                    .filter(|c| c.policy.maintenance_enabled)
+                    .map(|c| (c.prefix.clone(), c.scheduler_weight()))
+                    .collect();
+                scheduler.rebuild(&weighted);
+                info!(
+                    volume_count = weighted.len(),
+                    "maintenance_scheduler_rebuilt"
+                );
             }
 
-            // ── Maintenance round ──────────────────────────────────────
-            // At most one round per volume in-flight; skip if locked.
-            let sem_permit = match sem.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    // Global concurrency cap hit; defer this volume.
-                    continue;
-                }
-            };
+            // ── Phase 3: Dispatch maintenance for this tick's batch ───────
+            let batch_prefixes = scheduler.next_batch(maintenance_concurrency);
 
-            // Only dispatch if not already running (try-lock the relay/commit
-            // mutex as a proxy for "in-flight maintenance").
-            // We use a dedicated maintenance_running flag via try_lock on the
-            // maintenance_schedule mutex.
-            let schedule_guard = match ctx.maintenance_schedule.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    // Another task is already running maintenance for this volume.
-                    drop(sem_permit);
-                    continue;
-                }
-            };
-            // Drop immediately — we just checked; the actual run holds it.
-            drop(schedule_guard);
-
-            let ctx2 = Arc::clone(&ctx);
-            let client_id2 = client_id.clone();
-            let cc2 = compaction_config;
-
-            tokio::spawn(async move {
-                let _permit = sem_permit;
-                let mut schedule = ctx2.maintenance_schedule.lock().await;
-                let checkpoint_config = ctx2.policy.checkpoint_config();
-                let lifecycle_policy = ctx2.policy.lifecycle_policy(ctx2.prefix.clone());
-
-                let round = run_maintenance_round(MaintenanceRoundContext {
-                    metadata: &ctx2.metadata,
-                    segments: &ctx2.segments,
-                    superblock: &ctx2.superblock,
-                    client_id: &client_id2,
-                    compaction_config: &cc2,
-                    checkpoint_config: checkpoint_config.as_ref(),
-                    lifecycle_policy: lifecycle_policy.as_ref(),
-                    schedule: &mut schedule,
-                })
-                .await;
-
-                // Update health based on backlog.
-                let health = if round.delta_backlog > 0 || round.segment_backlog > 0 {
-                    VolumeHealth::HealthyBacklogged
-                } else {
-                    VolumeHealth::HealthyIdle
+            for prefix in batch_prefixes {
+                let ctx = match loaded.iter().find(|c| c.prefix == prefix) {
+                    Some(c) => Arc::clone(c),
+                    None => continue,
                 };
-                ctx2.set_health(health);
-            });
+
+                // Skip unhealthy volumes.
+                if !ctx.health().is_healthy() {
+                    continue;
+                }
+
+                // Acquire global concurrency permit (non-blocking).
+                let sem_permit = match sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // All slots busy this tick; defer remaining batch.
+                        break;
+                    }
+                };
+
+                // Enforce per-volume exclusivity: skip if already in-flight.
+                let schedule_guard = match ctx.maintenance_schedule.try_lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        drop(sem_permit);
+                        continue;
+                    }
+                };
+                drop(schedule_guard);
+
+                let ctx2 = Arc::clone(&ctx);
+                let client_id2 = client_id.clone();
+                let cc2 = compaction_config;
+
+                tokio::spawn(async move {
+                    let _permit = sem_permit;
+                    let mut schedule = ctx2.maintenance_schedule.lock().await;
+                    let checkpoint_config = ctx2.policy.checkpoint_config();
+                    let lifecycle_policy = ctx2.policy.lifecycle_policy(ctx2.prefix.clone());
+
+                    let round = run_maintenance_round(MaintenanceRoundContext {
+                        metadata: &ctx2.metadata,
+                        segments: &ctx2.segments,
+                        superblock: &ctx2.superblock,
+                        client_id: &client_id2,
+                        compaction_config: &cc2,
+                        checkpoint_config: checkpoint_config.as_ref(),
+                        lifecycle_policy: lifecycle_policy.as_ref(),
+                        schedule: &mut schedule,
+                    })
+                    .await;
+
+                    // Store backlog score for the next scheduling cycle.
+                    let backlog = (round.delta_backlog + round.segment_backlog) as u32;
+                    ctx2.last_backlog_score
+                        .store(backlog, std::sync::atomic::Ordering::Relaxed);
+
+                    // Update health.
+                    let health = if backlog > 0 {
+                        VolumeHealth::HealthyBacklogged
+                    } else {
+                        VolumeHealth::HealthyIdle
+                    };
+                    ctx2.set_health(health);
+                });
+            }
         }
 
         // Evict idle contexts periodically.
@@ -854,5 +973,125 @@ mod tests {
     fn discovery_prefix_normalization_round_trips() {
         assert_eq!(normalize_prefix("/orgs/myorg/"), "orgs/myorg");
         assert_eq!(normalize_prefix("orgs/myorg"), "orgs/myorg");
+    }
+
+    // ── OrgScheduler unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn scheduler_empty_returns_empty_batch() {
+        let mut s = OrgScheduler::new();
+        assert!(s.next_batch(4).is_empty());
+    }
+
+    #[test]
+    fn scheduler_single_volume_always_returned() {
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[("vol1".to_string(), 1)]);
+        let b = s.next_batch(4);
+        assert_eq!(b, vec!["vol1"]);
+    }
+
+    #[test]
+    fn scheduler_deduplicates_within_batch() {
+        // A volume with weight=4 should appear only once per batch even though
+        // it occupies 4 slots.
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[("vol1".to_string(), 4)]);
+        let b = s.next_batch(4);
+        assert_eq!(b.len(), 1, "dedup should collapse weight=4 to 1 per tick");
+        assert_eq!(b[0], "vol1");
+    }
+
+    #[test]
+    fn scheduler_cursor_advances_across_ticks() {
+        // 3 volumes, weight 1 each.  With batch size 2, tick 1 returns
+        // [vol_a, vol_b], tick 2 returns [vol_c, vol_a], tick 3 returns
+        // [vol_b, vol_c], etc.
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[
+            ("vol_a".to_string(), 1),
+            ("vol_b".to_string(), 1),
+            ("vol_c".to_string(), 1),
+        ]);
+
+        let t1 = s.next_batch(2);
+        let t2 = s.next_batch(2);
+        let t3 = s.next_batch(2);
+
+        // Each tick advances the cursor; all three volumes appear across
+        // three ticks with no permanent starvation.
+        let all: Vec<&str> = t1
+            .iter()
+            .chain(t2.iter())
+            .chain(t3.iter())
+            .map(|s| s.as_str())
+            .collect();
+        assert!(all.contains(&"vol_a"), "vol_a must be scheduled");
+        assert!(all.contains(&"vol_b"), "vol_b must be scheduled");
+        assert!(all.contains(&"vol_c"), "vol_c must be scheduled");
+    }
+
+    #[test]
+    fn scheduler_backlogged_volume_appears_more_often_per_cycle() {
+        // vol_hot has weight=4, vol_cold has weight=1.
+        // In a full cycle of 5 slots, vol_hot occupies 4 and vol_cold 1.
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[("vol_cold".to_string(), 1), ("vol_hot".to_string(), 4)]);
+        assert_eq!(s.slots.len(), 5, "total cycle length = 1+4=5");
+
+        // Drain the full cycle in batches of 1.
+        let mut visit_hot = 0usize;
+        let mut visit_cold = 0usize;
+        for _ in 0..5 {
+            let b = s.next_batch(1);
+            for p in &b {
+                if p == "vol_hot" {
+                    visit_hot += 1;
+                } else {
+                    visit_cold += 1;
+                }
+            }
+        }
+        // vol_hot gets ~4x the slot opportunities vs vol_cold across 5 ticks.
+        assert!(
+            visit_hot >= visit_cold,
+            "backlogged volume should have more slots"
+        );
+    }
+
+    #[test]
+    fn scheduler_rebuilds_when_volume_set_changes() {
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[("vol_a".to_string(), 1), ("vol_b".to_string(), 1)]);
+
+        // Simulate discovery of a new volume.
+        let new_prefixes: Vec<String> = vec![
+            "vol_a".to_string(),
+            "vol_b".to_string(),
+            "vol_c".to_string(),
+        ];
+        assert!(s.volume_set_changed(&new_prefixes));
+
+        s.rebuild(&[
+            ("vol_a".to_string(), 1),
+            ("vol_b".to_string(), 1),
+            ("vol_c".to_string(), 1),
+        ]);
+        assert!(!s.volume_set_changed(&new_prefixes));
+    }
+
+    #[test]
+    fn scheduler_cursor_wraps_correctly() {
+        // 2 volumes, cursor should wrap around after a full cycle.
+        let mut s = OrgScheduler::new();
+        s.rebuild(&[("a".to_string(), 1), ("b".to_string(), 1)]);
+
+        // Full cycle.
+        let _t1 = s.next_batch(1); // cursor advances by 1
+        let _t2 = s.next_batch(1); // cursor advances by 1, wraps to 0
+
+        // After full cycle cursor is back at start; next batch starts from a.
+        let t3 = s.next_batch(1);
+        assert_eq!(t3, vec!["a"]);
     }
 }
