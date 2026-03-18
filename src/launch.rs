@@ -9,10 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use env_logger::Env;
 #[cfg(feature = "fuse")]
 use fuser::MountOption;
-use log::{LevelFilter, info, warn};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(unix)]
@@ -20,9 +19,11 @@ use std::os::unix::process::CommandExt;
 use tokio::runtime::Handle;
 use tokio::task;
 use tokio::time::sleep;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::clawfs as clawfs_runtime;
+use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
 use crate::config::Config;
 use crate::fs::OsageFs;
 use crate::inode::{FileStorage, InodeRecord, ROOT_INODE, SegmentExtent};
@@ -36,9 +37,7 @@ use crate::state::ClientStateManager;
 use crate::superblock::{CleanupTaskKind, SuperblockManager};
 use crate::telemetry::{TelemetryClient, set_panic_context};
 
-const DELTA_COMPACT_THRESHOLD: usize = 128;
 const DELTA_COMPACT_KEEP: usize = 32;
-const SEGMENT_COMPACT_BATCH: usize = 8;
 const SEGMENT_COMPACT_LAG: u64 = 3;
 const WELCOME_FILENAME: &str = "WELCOME.txt";
 const WELCOME_CONTENT: &str = "Welcome to ClawFS!\n\
@@ -68,6 +67,29 @@ pub struct HostedControlPlane {
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub storage_mode: Option<String>,
+    pub accelerator_endpoint: Option<String>,
+    pub accelerator_mode: Option<AcceleratorMode>,
+    pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub event_endpoint: Option<String>,
+    pub event_settings: Option<EventSettings>,
+    pub accelerator_session_token: Option<String>,
+    pub accelerator_session_expiry: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSettings {
+    pub poll_interval_ms: u64,
+    pub reconnect_backoff_ms: u64,
+}
+
+impl EventSettings {
+    pub fn from_poll_interval_ms(poll_interval_ms: u64) -> Self {
+        Self {
+            poll_interval_ms,
+            reconnect_backoff_ms: poll_interval_ms.max(1_000),
+        }
+    }
 }
 
 #[cfg(feature = "fuse")]
@@ -151,6 +173,10 @@ fn run_mount(mut config: Config, hosted: Option<HostedControlPlane>) -> Result<(
     init_logging(config.log_file.as_deref(), config.debug_log)?;
     std::fs::create_dir_all(&config.mount_path)?;
 
+    if let Some(hosted) = hosted.as_ref() {
+        apply_hosted_runtime_config(&mut config, hosted);
+    }
+    log_accelerator_startup_status(&config);
     let has_control_plane_creds = if let Some(hosted) = hosted.as_ref() {
         apply_hosted_credentials(&mut config, hosted)?
     } else {
@@ -403,14 +429,64 @@ fn apply_hosted_credentials(config: &mut Config, hosted: &HostedControlPlane) ->
             env::set_var("AWS_SECRET_ACCESS_KEY", secret_access_key);
         }
         has_control_plane_creds = true;
-    } else if let Some(creds) =
-        provision_credentials_from_control_plane(hosted, &config.state_path)?
-    {
+    } else if let Some(creds) = refresh_hosted_credentials(hosted, &config.state_path)? {
         apply_provisioned_credentials(config, &creds);
         has_control_plane_creds = true;
     }
 
     Ok(has_control_plane_creds)
+}
+
+fn apply_hosted_runtime_config(config: &mut Config, hosted: &HostedControlPlane) {
+    let mode = hosted.accelerator_mode.unwrap_or(AcceleratorMode::Direct);
+    let fallback = hosted
+        .accelerator_fallback_policy
+        .unwrap_or(mode.default_fallback_policy())
+        .normalize_for_mode(mode);
+    unsafe {
+        env::set_var("CLAWFS_ACCELERATOR_MODE", mode.as_str());
+        env::set_var("CLAWFS_ACCELERATOR_FALLBACK_POLICY", fallback.as_str());
+    }
+    if let Some(endpoint) = hosted.accelerator_endpoint.as_deref() {
+        unsafe {
+            env::set_var("CLAWFS_ACCELERATOR_ENDPOINT", endpoint);
+        }
+    }
+    if let Some(policy) = hosted.relay_fallback_policy {
+        unsafe {
+            env::set_var("CLAWFS_RELAY_FALLBACK_POLICY", policy.as_str());
+        }
+    }
+    if let Some(endpoint) = hosted.event_endpoint.as_deref() {
+        unsafe {
+            env::set_var("CLAWFS_EVENT_ENDPOINT", endpoint);
+        }
+    }
+    if let Some(settings) = &hosted.event_settings {
+        unsafe {
+            env::set_var(
+                "CLAWFS_EVENT_POLL_INTERVAL_MS",
+                settings.poll_interval_ms.to_string(),
+            );
+            env::set_var(
+                "CLAWFS_EVENT_RECONNECT_BACKOFF_MS",
+                settings.reconnect_backoff_ms.to_string(),
+            );
+        }
+    }
+    if let Some(token) = hosted.accelerator_session_token.as_deref() {
+        unsafe {
+            env::set_var("CLAWFS_ACCELERATOR_SESSION_TOKEN", token);
+        }
+    }
+    if let Some(expiry) = hosted.accelerator_session_expiry {
+        unsafe {
+            env::set_var("CLAWFS_ACCELERATOR_SESSION_EXPIRY", expiry.to_string());
+        }
+    }
+    config.accelerator_mode = Some(mode);
+    config.accelerator_endpoint = hosted.accelerator_endpoint.clone();
+    config.accelerator_fallback_policy = Some(fallback);
 }
 
 fn apply_provisioned_credentials(config: &mut Config, creds: &ControlPlaneCredentials) {
@@ -430,10 +506,51 @@ fn apply_provisioned_credentials(config: &mut Config, creds: &ControlPlaneCreden
     if config.object_prefix.is_empty() {
         config.object_prefix = creds.prefix.clone();
     }
+    if let Some(token) = creds.accelerator_session_token.as_deref() {
+        unsafe {
+            env::set_var("CLAWFS_ACCELERATOR_SESSION_TOKEN", token);
+        }
+    }
+    if let Some(expiry) = creds.accelerator_session_expiry {
+        unsafe {
+            env::set_var("CLAWFS_ACCELERATOR_SESSION_EXPIRY", expiry.to_string());
+        }
+    }
     info!(
         "Provisioned storage credentials from control plane (key={}...)",
         &creds.access_key_id[..creds.access_key_id.len().min(12)]
     );
+}
+
+fn log_accelerator_startup_status(config: &Config) {
+    let status = config.accelerator_status();
+    let accelerator_endpoint = status
+        .accelerator_endpoint
+        .as_deref()
+        .unwrap_or("not_configured");
+    if status.is_warnworthy() {
+        tracing::warn!(
+            target: "startup",
+            accelerator_mode = %status.accelerator_mode,
+            accelerator_endpoint = %accelerator_endpoint,
+            accelerator_health = %status.accelerator_health.as_str(),
+            cleanup_owner = %status.cleanup_owner.as_str(),
+            coordination_status = %status.coordination_status.as_str(),
+            relay_status = %status.relay_status.as_str(),
+            "accelerator_status"
+        );
+    } else {
+        tracing::info!(
+            target: "startup",
+            accelerator_mode = %status.accelerator_mode,
+            accelerator_endpoint = %accelerator_endpoint,
+            accelerator_health = %status.accelerator_health.as_str(),
+            cleanup_owner = %status.cleanup_owner.as_str(),
+            coordination_status = %status.coordination_status.as_str(),
+            relay_status = %status.relay_status.as_str(),
+            "accelerator_status"
+        );
+    }
 }
 
 fn log_boot_config(config: &Config, allow_other: bool) {
@@ -703,34 +820,59 @@ fn ensure_directory_path(
     Ok(())
 }
 
+struct TracingWriter {
+    file: Option<Arc<Mutex<BufWriter<std::fs::File>>>>,
+}
+
+impl Write for TracingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(buf)?;
+        if let Some(file) = &self.file {
+            let mut guard = file
+                .lock()
+                .map_err(|_| std::io::Error::other("log file lock poisoned"))?;
+            guard.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut stderr = std::io::stderr().lock();
+        stderr.flush()?;
+        if let Some(file) = &self.file {
+            let mut guard = file
+                .lock()
+                .map_err(|_| std::io::Error::other("log file lock poisoned"))?;
+            guard.flush()?;
+        }
+        Ok(())
+    }
+}
+
 fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result<()> {
-    let env = Env::default().default_filter_or("info");
-    let mut builder = env_logger::Builder::from_env(env);
-    if let Some(path) = log_path {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let writer = Arc::new(Mutex::new(BufWriter::new(file)));
-        builder.format(move |buf, record| {
-            let ts = buf.timestamp();
-            let line = format!(
-                "{} [{}] {} - {}",
-                ts,
-                record.level(),
-                record.target(),
-                record.args()
-            );
-            {
-                if let Ok(mut guard) = writer.lock() {
-                    let _ = writeln!(guard, "{}", line);
-                    let _ = guard.flush();
-                }
-            }
-            writeln!(buf, "{}", line)
-        });
-    }
-    if force_debug {
-        builder.filter_level(LevelFilter::Debug);
-    }
-    builder.try_init()?;
+    let file = if let Some(path) = log_path {
+        Some(Arc::new(Mutex::new(BufWriter::new(
+            OpenOptions::new().create(true).append(true).open(path)?,
+        ))))
+    } else {
+        None
+    };
+    let filter = if force_debug {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+    let _ = tracing_log::LogTracer::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(true)
+        .with_level(true)
+        .without_time()
+        .with_writer(move || TracingWriter { file: file.clone() })
+        .try_init()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     Ok(())
 }
 
@@ -780,10 +922,12 @@ fn spawn_cleanup_worker(
     segments: Arc<SegmentManager>,
     client_id: String,
 ) {
+    use crate::maintenance::{self, CompactionConfig};
+    let config = CompactionConfig::default();
     handle.spawn(async move {
-        let lease_ttl = Duration::from_secs(30);
         loop {
             let mut did_work = false;
+            // Pre-check delta count to avoid acquiring a lease when there is nothing to do.
             let delta_count = task::spawn_blocking({
                 let md = metadata.clone();
                 move || md.delta_file_count()
@@ -791,74 +935,56 @@ fn spawn_cleanup_worker(
             .await
             .unwrap_or(Ok(0))
             .unwrap_or(0);
-            if delta_count > DELTA_COMPACT_THRESHOLD
-                && superblock
-                    .try_acquire_cleanup(CleanupTaskKind::DeltaCompaction, &client_id, lease_ttl)
-                    .await
-                    .unwrap_or(false)
-            {
-                if let Err(err) = task::spawn_blocking({
-                    let md = metadata.clone();
-                    move || md.prune_deltas(DELTA_COMPACT_KEEP)
-                })
+            if delta_count > config.delta_compact_threshold
+                && maintenance::acquire_cleanup_lease(
+                    &superblock,
+                    CleanupTaskKind::DeltaCompaction,
+                    &client_id,
+                    &config,
+                )
                 .await
-                .unwrap_or(Ok(0))
-                {
-                    warn!("delta prune failed: {err:?}");
+                .unwrap_or(false)
+            {
+                if let Err(err) = maintenance::run_delta_compaction(&metadata, &config).await {
+                    warn!("delta compaction failed: {err:?}");
                 }
-                if let Err(err) = superblock
-                    .complete_cleanup(CleanupTaskKind::DeltaCompaction, &client_id)
-                    .await
+                if let Err(err) = maintenance::release_cleanup_lease(
+                    &superblock,
+                    CleanupTaskKind::DeltaCompaction,
+                    &client_id,
+                )
+                .await
                 {
                     warn!("cleanup lease release failed: {err:?}");
                 }
                 did_work = true;
             }
             if !did_work {
+                // Pre-check volume age to avoid acquiring a lease on a brand-new volume.
                 let current_generation = superblock.snapshot().generation;
-                let cutoff_generation = current_generation.saturating_sub(SEGMENT_COMPACT_LAG);
-                if cutoff_generation == 0 {
-                    continue;
-                }
-                let candidates = task::spawn_blocking({
-                    let md = metadata.clone();
-                    move || md.segment_candidates(SEGMENT_COMPACT_BATCH)
-                })
-                .await
-                .unwrap_or(Ok(Vec::new()))
-                .unwrap_or_default();
-                let filtered: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|record| {
-                        record
-                            .segment_pointer()
-                            .map(|ptr| ptr.generation < cutoff_generation)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                if filtered.len() >= 2
-                    && superblock
-                        .try_acquire_cleanup(
-                            CleanupTaskKind::SegmentCompaction,
-                            &client_id,
-                            lease_ttl,
-                        )
-                        .await
-                        .unwrap_or(false)
-                {
-                    if let Err(err) = perform_segment_compaction(
-                        metadata.clone(),
-                        superblock.clone(),
-                        segments.clone(),
-                        filtered,
+                let cutoff_generation =
+                    current_generation.saturating_sub(config.segment_compact_lag);
+                if cutoff_generation > 0
+                    && maintenance::acquire_cleanup_lease(
+                        &superblock,
+                        CleanupTaskKind::SegmentCompaction,
+                        &client_id,
+                        &config,
                     )
                     .await
+                    .unwrap_or(false)
+                {
+                    if let Err(err) =
+                        maintenance::run_segment_compaction(&metadata, &segments, &config).await
                     {
                         warn!("segment compaction failed: {err:?}");
                     }
-                    if let Err(err) = superblock
-                        .complete_cleanup(CleanupTaskKind::SegmentCompaction, &client_id)
-                        .await
+                    if let Err(err) = maintenance::release_cleanup_lease(
+                        &superblock,
+                        CleanupTaskKind::SegmentCompaction,
+                        &client_id,
+                    )
+                    .await
                     {
                         warn!("cleanup lease release failed: {err:?}");
                     }
@@ -977,6 +1103,10 @@ pub(crate) struct ControlPlaneCredentials {
     pub(crate) region: String,
     pub(crate) prefix: String,
     #[serde(default)]
+    pub(crate) accelerator_session_token: Option<String>,
+    #[serde(default)]
+    pub(crate) accelerator_session_expiry: Option<i64>,
+    #[serde(default)]
     pub(crate) expires_at: Option<String>,
 }
 
@@ -1069,11 +1199,15 @@ pub(crate) fn fetch_credentials_from_api(
         endpoint: body["endpoint"].as_str().unwrap_or_default().to_string(),
         region: body["region"].as_str().unwrap_or("auto").to_string(),
         prefix: body["prefix"].as_str().unwrap_or_default().to_string(),
+        accelerator_session_token: body["accelerator_session_token"]
+            .as_str()
+            .map(|value| value.to_string()),
+        accelerator_session_expiry: body["accelerator_session_expiry"].as_i64(),
         expires_at: body["expires_at"].as_str().map(|value| value.to_string()),
     })
 }
 
-fn provision_credentials_from_control_plane(
+fn refresh_hosted_credentials(
     hosted: &HostedControlPlane,
     state_path: &Path,
 ) -> Result<Option<ControlPlaneCredentials>> {
@@ -1110,6 +1244,7 @@ pub fn run_compact_entry(
     clawfs_runtime::apply_env_runtime_spec(&mut config)?;
     init_logging(config.log_file.as_deref(), config.debug_log)?;
 
+    apply_hosted_runtime_config(&mut config, hosted);
     let has_control_plane_creds = apply_hosted_credentials(&mut config, hosted)?;
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -1302,4 +1437,113 @@ async fn run_compact_tasks(
 fn sanitize_error(error: String) -> String {
     let first_line = error.lines().next().unwrap_or("unknown error").trim();
     first_line.chars().take(160).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ControlPlaneCredentials, EventSettings, HostedControlPlane, apply_hosted_runtime_config,
+    };
+    use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
+    use crate::config::Config;
+
+    fn test_config() -> Config {
+        Config::with_paths(
+            "/tmp/clawfs-mnt-test".into(),
+            "/tmp/clawfs-store-test".into(),
+            "/tmp/clawfs-cache-test".into(),
+            "/tmp/clawfs-state-test".into(),
+        )
+    }
+
+    fn hosted_control_plane(
+        accelerator_mode: Option<AcceleratorMode>,
+        accelerator_endpoint: Option<&str>,
+        accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
+        relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+        event_endpoint: Option<&str>,
+        event_settings: Option<EventSettings>,
+    ) -> HostedControlPlane {
+        HostedControlPlane {
+            api_url: "https://api.example".to_string(),
+            api_token: "token".to_string(),
+            volume_slug: "volume-a".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            storage_mode: Some("byob_paid".to_string()),
+            accelerator_endpoint: accelerator_endpoint.map(str::to_string),
+            accelerator_mode,
+            accelerator_fallback_policy,
+            relay_fallback_policy,
+            event_endpoint: event_endpoint.map(str::to_string),
+            event_settings,
+            accelerator_session_token: None,
+            accelerator_session_expiry: None,
+        }
+    }
+
+    #[test]
+    fn hosted_runtime_config_defaults_to_direct_mode() {
+        let mut config = test_config();
+        let hosted = hosted_control_plane(None, None, None, None, None, None);
+
+        apply_hosted_runtime_config(&mut config, &hosted);
+
+        assert_eq!(config.accelerator_mode, Some(AcceleratorMode::Direct));
+        assert_eq!(config.accelerator_endpoint, None);
+        assert_eq!(
+            config.accelerator_fallback_policy,
+            Some(AcceleratorFallbackPolicy::PollAndDirect)
+        );
+    }
+
+    #[test]
+    fn hosted_runtime_config_propagates_explicit_accelerator_state() {
+        let mut config = test_config();
+        let hosted = hosted_control_plane(
+            Some(AcceleratorMode::RelayWrite),
+            Some("https://accelerator.example"),
+            Some(AcceleratorFallbackPolicy::FailClosed),
+            Some(AcceleratorFallbackPolicy::DirectWriteFallback),
+            Some("https://events.example"),
+            Some(EventSettings::from_poll_interval_ms(2500)),
+        );
+
+        apply_hosted_runtime_config(&mut config, &hosted);
+
+        assert_eq!(config.accelerator_mode, Some(AcceleratorMode::RelayWrite));
+        assert_eq!(
+            config.accelerator_endpoint.as_deref(),
+            Some("https://accelerator.example")
+        );
+        assert_eq!(
+            config.accelerator_fallback_policy,
+            Some(AcceleratorFallbackPolicy::FailClosed)
+        );
+    }
+
+    #[test]
+    fn control_plane_credentials_round_trip_keeps_session_fields() {
+        let creds = ControlPlaneCredentials {
+            access_key_id: "access".to_string(),
+            secret_access_key: "secret".to_string(),
+            bucket: "bucket".to_string(),
+            endpoint: "endpoint".to_string(),
+            region: "auto".to_string(),
+            prefix: "prefix".to_string(),
+            accelerator_session_token: Some("session-token".to_string()),
+            accelerator_session_expiry: Some(1_700_000_000),
+            expires_at: Some("2026-03-18T00:00:00Z".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&creds).expect("serialize creds");
+        let decoded: ControlPlaneCredentials =
+            serde_json::from_str(&encoded).expect("deserialize creds");
+
+        assert_eq!(
+            decoded.accelerator_session_token.as_deref(),
+            Some("session-token")
+        );
+        assert_eq!(decoded.accelerator_session_expiry, Some(1_700_000_000));
+    }
 }

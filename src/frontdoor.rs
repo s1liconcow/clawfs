@@ -11,14 +11,16 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, ValueEnum};
+use log::warn;
 
 use crate::auth::{
     API_BASE_URL_ENV, AuthProfile, LoginArgs, WhoamiArgs, clear_profile, load_profile,
     store_profile, user_config_root,
 };
 use crate::clawfs::STORAGE_MODE_ENV;
+use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
 use crate::config::{Cli, Config, ObjectStoreProvider};
-use crate::launch::HostedControlPlane;
+use crate::launch::{EventSettings, HostedControlPlane};
 use crate::telemetry::{set_telemetry_enabled, telemetry_status};
 
 const DEFAULT_VOLUME: &str = "default";
@@ -67,6 +69,22 @@ struct SummonApiConfig {
     #[serde(default)]
     storage_mode: Option<String>,
     #[serde(default)]
+    accelerator_endpoint: Option<String>,
+    #[serde(default)]
+    accelerator_mode: Option<String>,
+    #[serde(default)]
+    accelerator_fallback_policy: Option<String>,
+    #[serde(default)]
+    event_endpoint: Option<String>,
+    #[serde(default)]
+    event_poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    relay_fallback_policy: Option<String>,
+    #[serde(default)]
+    accelerator_session_token: Option<String>,
+    #[serde(default)]
+    accelerator_session_expiry: Option<i64>,
+    #[serde(default)]
     object_prefix: Option<String>,
     #[serde(default)]
     telemetry_object_prefix: Option<String>,
@@ -81,6 +99,14 @@ pub struct HostedVolumeConfig {
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub storage_mode: Option<String>,
+    pub accelerator_endpoint: Option<String>,
+    pub accelerator_mode: Option<AcceleratorMode>,
+    pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub relay_fallback_policy: Option<AcceleratorFallbackPolicy>,
+    pub event_endpoint: Option<String>,
+    pub event_settings: Option<EventSettings>,
+    pub accelerator_session_token: Option<String>,
+    pub accelerator_session_expiry: Option<i64>,
     pub object_prefix: Option<String>,
     pub telemetry_object_prefix: Option<String>,
 }
@@ -482,6 +508,14 @@ fn build_mount_invocation(args: MountArgs) -> Result<HostedMountInvocation> {
             access_key_id: hosted.config.access_key_id,
             secret_access_key: hosted.config.secret_access_key,
             storage_mode: hosted.config.storage_mode,
+            accelerator_endpoint: hosted.config.accelerator_endpoint,
+            accelerator_mode: hosted.config.accelerator_mode,
+            accelerator_fallback_policy: hosted.config.accelerator_fallback_policy,
+            relay_fallback_policy: hosted.config.relay_fallback_policy,
+            event_endpoint: hosted.config.event_endpoint,
+            event_settings: hosted.config.event_settings,
+            accelerator_session_token: hosted.config.accelerator_session_token,
+            accelerator_session_expiry: hosted.config.accelerator_session_expiry,
         },
     })
 }
@@ -612,6 +646,7 @@ fn run_up(args: UpArgs) -> Result<()> {
         object_provider_name(hosted.config.provider),
     );
     command.env("CLAWFS_BUCKET", &hosted.config.bucket);
+    apply_hosted_accelerator_env(&mut command, &hosted.config);
     if let Some(region) = hosted.config.region {
         command.env("CLAWFS_REGION", region);
     }
@@ -661,6 +696,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .arg(object_provider_name(hosted.config.provider))
         .arg("--bucket")
         .arg(&hosted.config.bucket);
+    apply_hosted_accelerator_env(&mut command, &hosted.config);
     if let Some(region) = hosted.config.region {
         command.arg("--region").arg(region);
     }
@@ -720,6 +756,14 @@ fn run_compact(args: CompactArgs) -> Result<()> {
         access_key_id: hosted.config.access_key_id,
         secret_access_key: hosted.config.secret_access_key,
         storage_mode: hosted.config.storage_mode,
+        accelerator_endpoint: hosted.config.accelerator_endpoint,
+        accelerator_mode: hosted.config.accelerator_mode,
+        accelerator_fallback_policy: hosted.config.accelerator_fallback_policy,
+        relay_fallback_policy: hosted.config.relay_fallback_policy,
+        event_endpoint: hosted.config.event_endpoint,
+        event_settings: hosted.config.event_settings,
+        accelerator_session_token: hosted.config.accelerator_session_token,
+        accelerator_session_expiry: hosted.config.accelerator_session_expiry,
     };
 
     crate::launch::run_compact_entry(
@@ -738,22 +782,13 @@ fn resolve_hosted_volume(volume: &str) -> Result<HostedVolume> {
         .context("failed to create async runtime")?
         .block_on(fetch_summon_config(&api_base_url, &api_token, volume))
         .context("failed to fetch summon configuration")?;
+    let config = parse_hosted_volume_config(summon)?;
 
     Ok(HostedVolume {
         api_base_url,
         api_token,
         volume_slug: sanitize_volume_name(volume)?,
-        config: HostedVolumeConfig {
-            provider: provider_from_api(&summon.provider),
-            bucket: summon.bucket,
-            region: summon.region,
-            endpoint: summon.endpoint,
-            access_key_id: summon.access_key_id,
-            secret_access_key: summon.secret_access_key,
-            storage_mode: summon.storage_mode,
-            object_prefix: summon.object_prefix,
-            telemetry_object_prefix: summon.telemetry_object_prefix,
-        },
+        config,
     })
 }
 
@@ -788,6 +823,91 @@ fn provider_from_api(provider: &str) -> ObjectStoreProvider {
     }
 }
 
+fn parse_accelerator_mode(value: Option<&str>) -> AcceleratorMode {
+    match value {
+        None => AcceleratorMode::Direct,
+        Some(raw) => match raw.parse::<AcceleratorMode>() {
+            Ok(mode) => mode,
+            Err(err) => {
+                warn!("invalid accelerator_mode {raw:?}: {err}; defaulting to direct");
+                AcceleratorMode::Direct
+            }
+        },
+    }
+}
+
+fn parse_accelerator_fallback_policy(
+    value: Option<&str>,
+    mode: AcceleratorMode,
+) -> AcceleratorFallbackPolicy {
+    let policy = match value {
+        None => mode.default_fallback_policy(),
+        Some(raw) => match raw.parse::<AcceleratorFallbackPolicy>() {
+            Ok(policy) => policy,
+            Err(err) => {
+                warn!(
+                    "invalid accelerator_fallback_policy {raw:?}: {err}; defaulting to {:?}",
+                    mode.default_fallback_policy()
+                );
+                mode.default_fallback_policy()
+            }
+        },
+    };
+    policy.normalize_for_mode(mode)
+}
+
+fn parse_relay_fallback_policy(
+    value: Option<&str>,
+    mode: AcceleratorMode,
+) -> Result<Option<AcceleratorFallbackPolicy>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if mode != AcceleratorMode::RelayWrite {
+        bail!("relay_fallback_policy is only valid when accelerator_mode is relay_write");
+    }
+    let policy = raw
+        .parse::<AcceleratorFallbackPolicy>()
+        .unwrap_or_else(|err| {
+            warn!("invalid relay_fallback_policy {raw:?}: {err}; defaulting to fail_closed");
+            AcceleratorFallbackPolicy::FailClosed
+        });
+    Ok(Some(policy))
+}
+
+fn parse_event_settings(event_poll_interval_ms: Option<u64>) -> Option<EventSettings> {
+    event_poll_interval_ms.map(EventSettings::from_poll_interval_ms)
+}
+
+fn parse_hosted_volume_config(summon: SummonApiConfig) -> Result<HostedVolumeConfig> {
+    let accelerator_mode = parse_accelerator_mode(summon.accelerator_mode.as_deref());
+    let accelerator_fallback_policy = parse_accelerator_fallback_policy(
+        summon.accelerator_fallback_policy.as_deref(),
+        accelerator_mode,
+    );
+    let relay_fallback_policy =
+        parse_relay_fallback_policy(summon.relay_fallback_policy.as_deref(), accelerator_mode)?;
+    Ok(HostedVolumeConfig {
+        provider: provider_from_api(&summon.provider),
+        bucket: summon.bucket,
+        region: summon.region,
+        endpoint: summon.endpoint,
+        access_key_id: summon.access_key_id,
+        secret_access_key: summon.secret_access_key,
+        storage_mode: summon.storage_mode,
+        accelerator_endpoint: summon.accelerator_endpoint,
+        accelerator_mode: Some(accelerator_mode),
+        accelerator_fallback_policy: Some(accelerator_fallback_policy),
+        relay_fallback_policy,
+        event_endpoint: summon.event_endpoint,
+        event_settings: parse_event_settings(summon.event_poll_interval_ms),
+        accelerator_session_token: summon.accelerator_session_token,
+        accelerator_session_expiry: summon.accelerator_session_expiry,
+        object_prefix: summon.object_prefix,
+        telemetry_object_prefix: summon.telemetry_object_prefix,
+    })
+}
+
 pub fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolumeConfig) {
     args.push(OsString::from("--object-provider"));
     args.push(OsString::from(object_provider_name(hosted.provider)));
@@ -804,6 +924,41 @@ pub fn append_hosted_storage_args(args: &mut Vec<OsString>, hosted: &HostedVolum
     if let Some(object_prefix) = &hosted.object_prefix {
         args.push(OsString::from("--object-prefix"));
         args.push(OsString::from(object_prefix));
+    }
+}
+
+fn apply_hosted_accelerator_env(command: &mut Command, hosted: &HostedVolumeConfig) {
+    if let Some(endpoint) = &hosted.accelerator_endpoint {
+        command.env("CLAWFS_ACCELERATOR_ENDPOINT", endpoint);
+    }
+    if let Some(mode) = hosted.accelerator_mode {
+        command.env("CLAWFS_ACCELERATOR_MODE", mode.as_str());
+    }
+    if let Some(policy) = hosted.accelerator_fallback_policy {
+        command.env("CLAWFS_ACCELERATOR_FALLBACK_POLICY", policy.as_str());
+    }
+    if let Some(policy) = hosted.relay_fallback_policy {
+        command.env("CLAWFS_RELAY_FALLBACK_POLICY", policy.as_str());
+    }
+    if let Some(endpoint) = &hosted.event_endpoint {
+        command.env("CLAWFS_EVENT_ENDPOINT", endpoint);
+    }
+    if let Some(settings) = &hosted.event_settings {
+        command
+            .env(
+                "CLAWFS_EVENT_POLL_INTERVAL_MS",
+                settings.poll_interval_ms.to_string(),
+            )
+            .env(
+                "CLAWFS_EVENT_RECONNECT_BACKOFF_MS",
+                settings.reconnect_backoff_ms.to_string(),
+            );
+    }
+    if let Some(token) = &hosted.accelerator_session_token {
+        command.env("CLAWFS_ACCELERATOR_SESSION_TOKEN", token);
+    }
+    if let Some(expiry) = hosted.accelerator_session_expiry {
+        command.env("CLAWFS_ACCELERATOR_SESSION_EXPIRY", expiry.to_string());
     }
 }
 
@@ -1156,9 +1311,10 @@ fn format_candidates(candidates: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        manual_cli_hint, object_provider_name, print_version, provider_from_api,
-        resolve_mount_path, resolve_prefix_path, sanitize_volume_name,
+        manual_cli_hint, object_provider_name, parse_hosted_volume_config, print_version,
+        provider_from_api, resolve_mount_path, resolve_prefix_path, sanitize_volume_name,
     };
+    use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
     use crate::config::ObjectStoreProvider;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1216,5 +1372,77 @@ mod tests {
         let version_fn: fn() = print_version;
         let _ = version_fn;
         assert_eq!(env!("CARGO_PKG_VERSION"), super::CLI_VERSION);
+    }
+
+    #[test]
+    fn summon_config_defaults_to_direct_accelerator_mode() {
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{"provider":"aws","bucket":"bucket-a","storage_mode":"byob_paid"}"#,
+        )
+        .expect("parse summon config");
+        let hosted = parse_hosted_volume_config(summon).expect("hosted config");
+
+        assert_eq!(hosted.accelerator_mode, Some(AcceleratorMode::Direct));
+        assert_eq!(
+            hosted.accelerator_fallback_policy,
+            Some(AcceleratorFallbackPolicy::PollAndDirect)
+        );
+        assert_eq!(hosted.relay_fallback_policy, None);
+        assert_eq!(hosted.event_settings, None);
+    }
+
+    #[test]
+    fn summon_config_propagates_explicit_accelerator_fields() {
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{
+                "provider":"aws",
+                "bucket":"bucket-a",
+                "accelerator_endpoint":"https://accelerator.example",
+                "accelerator_mode":"relay_write",
+                "accelerator_fallback_policy":"fail_closed",
+                "event_endpoint":"https://events.example",
+                "event_poll_interval_ms":2500,
+                "relay_fallback_policy":"direct_write_fallback",
+                "accelerator_session_token":"token-123",
+                "accelerator_session_expiry":1700000000
+            }"#,
+        )
+        .expect("parse summon config");
+        let hosted = parse_hosted_volume_config(summon).expect("hosted config");
+
+        assert_eq!(hosted.accelerator_mode, Some(AcceleratorMode::RelayWrite));
+        assert_eq!(
+            hosted.accelerator_fallback_policy,
+            Some(AcceleratorFallbackPolicy::FailClosed)
+        );
+        assert_eq!(
+            hosted.relay_fallback_policy,
+            Some(AcceleratorFallbackPolicy::DirectWriteFallback)
+        );
+        assert_eq!(
+            hosted.event_settings,
+            Some(super::EventSettings::from_poll_interval_ms(2500))
+        );
+        assert_eq!(
+            hosted.accelerator_session_token.as_deref(),
+            Some("token-123")
+        );
+        assert_eq!(hosted.accelerator_session_expiry, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn relay_fallback_policy_rejects_non_relay_modes() {
+        let summon: super::SummonApiConfig = serde_json::from_str(
+            r#"{
+                "provider":"aws",
+                "bucket":"bucket-a",
+                "accelerator_mode":"direct_plus_cache",
+                "relay_fallback_policy":"direct_write_fallback"
+            }"#,
+        )
+        .expect("parse summon config");
+
+        let err = parse_hosted_volume_config(summon).expect_err("invalid relay policy");
+        assert!(err.to_string().contains("relay_fallback_policy"));
     }
 }

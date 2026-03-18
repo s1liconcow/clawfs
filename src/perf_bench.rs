@@ -103,6 +103,9 @@ pub fn perf_config(root: &Path) -> Config {
         segment_cache_bytes: 0,
         imap_delta_batch: 16,
         fuse_threads: 0,
+        accelerator_mode: None,
+        accelerator_endpoint: None,
+        accelerator_fallback_policy: None,
         ..Config::with_paths(
             root.join("mnt"),
             root.join("store"),

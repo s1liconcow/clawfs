@@ -139,6 +139,9 @@ impl ClawfsRuntime {
             dir_cache_ttl_ms: 1000,
             foreground: true,
             fuse_threads: 0,
+            accelerator_mode: None,
+            accelerator_endpoint: None,
+            accelerator_fallback_policy: None,
             ..Config::with_paths(
                 PathBuf::from("/clawfs-preload"),
                 PathBuf::from(&store_path),

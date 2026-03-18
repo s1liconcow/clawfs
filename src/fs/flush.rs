@@ -638,6 +638,7 @@ impl OsageFs {
             }
             let finalize_journal_phase_duration = finalize_journal_phase_start.elapsed();
             let finalize_duration = finalize_start.elapsed();
+            let accelerator_status = self.config.accelerator_status();
             self.log_perf(
                 "flush_pending",
                 start.elapsed(),
@@ -675,8 +676,48 @@ impl OsageFs {
                     "finalize_journal_clear_ms": finalize_journal_clear_duration.as_secs_f64() * 1000.0,
                     "journal_cleared_inodes": journal_cleared_inodes,
                     "pending_remaining": pending_remaining,
+                    "accelerator_mode": accelerator_status.accelerator_mode,
+                    "accelerator_endpoint": accelerator_status.accelerator_endpoint,
+                    "accelerator_health": accelerator_status.accelerator_health.as_str(),
+                    "cleanup_owner": accelerator_status.cleanup_owner.as_str(),
+                    "coordination_status": accelerator_status.coordination_status.as_str(),
+                    "relay_status": accelerator_status.relay_status.as_str(),
+                    "accelerator_status": accelerator_status.clone(),
                 }),
             );
+            if self.config.accelerator_mode.is_some() {
+                let accelerator_endpoint = accelerator_status
+                    .accelerator_endpoint
+                    .as_deref()
+                    .unwrap_or("not_configured");
+                if accelerator_status.is_warnworthy() {
+                    tracing::warn!(
+                        target: "status",
+                        scope = scope,
+                        pending_remaining = pending_remaining,
+                        accelerator_mode = %accelerator_status.accelerator_mode,
+                        accelerator_endpoint = %accelerator_endpoint,
+                        accelerator_health = %accelerator_status.accelerator_health.as_str(),
+                        cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
+                        coordination_status = %accelerator_status.coordination_status.as_str(),
+                        relay_status = %accelerator_status.relay_status.as_str(),
+                        "accelerator_status"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "status",
+                        scope = scope,
+                        pending_remaining = pending_remaining,
+                        accelerator_mode = %accelerator_status.accelerator_mode,
+                        accelerator_endpoint = %accelerator_endpoint,
+                        accelerator_health = %accelerator_status.accelerator_health.as_str(),
+                        cleanup_owner = %accelerator_status.cleanup_owner.as_str(),
+                        coordination_status = %accelerator_status.coordination_status.as_str(),
+                        relay_status = %accelerator_status.relay_status.as_str(),
+                        "accelerator_status"
+                    );
+                }
+            }
             debug!(
                 "flush_pending pid={} tid={} scope={} gen={} inline_files={} segment_files={} metadata_only={} inline_bytes={} segment_bytes={} pending_remaining={}",
                 pid,

@@ -10,7 +10,9 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:git.kernel.org)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:man7.org)"
+      "WebFetch(domain:man7.org)",
+      "mcp__mcp-agent-mail__*",
+      "mcp__mcp-agent-mail__acknowledge_message"
     ]
   }
 }

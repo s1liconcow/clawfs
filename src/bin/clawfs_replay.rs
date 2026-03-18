@@ -433,6 +433,9 @@ fn build_config(
         foreground: true,
         imap_delta_batch: effective.imap_delta_batch,
         fuse_threads: 0,
+        accelerator_mode: None,
+        accelerator_endpoint: None,
+        accelerator_fallback_policy: None,
         ..Config::with_paths(
             PathBuf::from("/tmp/clawfs-replay-unused-mount"),
             store_path.to_path_buf(),

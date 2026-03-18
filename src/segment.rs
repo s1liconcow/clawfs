@@ -35,6 +35,7 @@ pub struct SegmentPointer {
     pub length: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentEntry {
     pub inode: u64,
     pub path: String,
@@ -42,6 +43,8 @@ pub struct SegmentEntry {
     pub payload: SegmentPayload,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SegmentPayload {
     Bytes(Vec<u8>),
     SharedBytes(Arc<Vec<u8>>),
@@ -1267,6 +1270,9 @@ mod tests {
             segment_cache_bytes: 0,
             imap_delta_batch: 32,
             fuse_threads: 0,
+            accelerator_mode: None,
+            accelerator_endpoint: None,
+            accelerator_fallback_policy: None,
             ..Config::with_paths(
                 root.join("mnt"),
                 root.join("data"),

@@ -39,6 +39,69 @@ The repository also includes `clawfs-nfs-gateway/`, a standalone NFSv3 server th
 
 Keep this file focused. Put detailed implementation notes, workflow specifics, and troubleshooting expansions in the linked `docs/` files.
 
+## Project Structure (key files by responsibility)
+
+| File | Lines (approx) | Responsibility |
+|------|----------------|----------------|
+| `src/config.rs` | ~470 | CLI/env config parsing. `Cli` struct (line 11), `Config` struct (line 232), `ObjectStoreProvider` enum (line 468) |
+| `src/clawfs.rs` | ~330 | Storage modes, runtime spec. `StorageMode` enum (line 27), `RuntimeSpec` (line 56), `apply_env_runtime_spec()` (line 105) |
+| `src/frontdoor.rs` | ~800+ | Hosted volume bootstrap. `SummonApiConfig` (line 56), `HostedVolumeConfig` (line 76), `HostedVolume` (line 89), `DispatchAction` enum (line 141) |
+| `src/launch.rs` | ~1300 | Mount setup, cleanup worker, credentials. `HostedControlPlane` (line 64), `run_mount()` (line 141), `apply_hosted_credentials()` (line 394), `spawn_cleanup_worker()` (line 776), `perform_segment_compaction()` (line 872), `ControlPlaneCredentials` (line 972), `refresh_hosted_credentials()` (line 1035) |
+| `src/superblock.rs` | ~258 | Superblock, leases, generation. `Superblock` (line 18), `CleanupTaskKind` enum (line 42), `CleanupLease` (line 48), `try_acquire_cleanup()` (line 225), `complete_cleanup()` (line 248) |
+| `src/metadata.rs` | ~1400+ | Inode caching, shards, deltas. `get_inode_with_ttl()` (line 809), `persist_inodes_batch()` (line 943), `store_superblock_conditional()` (line 679), `apply_external_deltas()` (line 1350), `delta_file_count()` (line 1354), `segment_candidates()` (line 1394) |
+| `src/segment.rs` | ~400+ | Immutable segment I/O. `SegmentPointer` (line 31), `SegmentEntry` (line 38), `SegmentManager` (line 65), `write_batch()`, `read_pointer()`, `delete_segment()` |
+| `src/journal.rs` | ~300+ | Write-ahead log. `JournalPayload` enum (line 53), `JournalEntry` (line 61), `JournalManager` (line 78), `persist_entry()` (line 102), `sync_entries()` (line 127) |
+| `src/fs/flush.rs` | ~400+ | Flush pipeline. `flush_pending()` (line 18), `flush_pending_selected()` (line 96) — drain pending → write segments → create deltas → commit superblock → clear journal |
+| `src/fs/ops.rs` | | Filesystem operations (new behavior starts here) |
+| `src/fs/fuse.rs` | | FUSE transport layer |
+| `src/fs/nfs.rs` | | NFS transport layer |
+| `src/perf.rs` | | Structured performance logging |
+| `src/replay.rs` | | Replay capture |
+
+**Cleanup constants** (src/launch.rs): `DELTA_COMPACT_THRESHOLD=128` (line 39), `DELTA_COMPACT_KEEP=32` (line 40), `SEGMENT_COMPACT_BATCH=8` (line 41), `SEGMENT_COMPACT_LAG=3` (line 42), lease TTL=30s.
+
+**Key design docs:**
+- `docs/clawfs-hosted-accelerator-codex.md` — Full hosted accelerator design (modes, phases, failure handling)
+- `docs/CLEANUP_AGENT.md` — Near-bucket cleanup deployment pattern
+- `docs/clawfs-project-reference.md` — Architecture internals
+
+## Writing Good Beads (Task Descriptions)
+
+When creating or updating task beads, follow this structure so an agent can implement the task without guidance:
+
+```
+<title>: Short imperative description
+
+<description body>:
+Context:
+Part of EPIC: <parent epic name and ID>. Depends on <dependencies with IDs>.
+Brief explanation of why this task exists and what it enables.
+
+What to Do:
+1. Step-by-step implementation instructions
+2. Reference specific files, structs, functions, and line numbers
+3. Name the types/functions to create or modify
+4. Specify defaults and edge cases
+
+Acceptance Criteria:
+- Testable, concrete outcomes
+- What behavior must exist
+- What must NOT change (regression safety)
+
+Files to Modify:
+- path/to/file.rs: What to change and where (~line N)
+```
+
+Key rules:
+- Always include specific file paths and approximate line numbers
+- Name the structs, enums, and functions to create or modify
+- Include defaults and edge-case behavior
+- Specify what must NOT change (existing behavior preservation)
+- Reference the Project Structure table above for current locations
+- Use `br update <id> --description "..."` to update descriptions
+- Use `br update <id> --acceptance-criteria "..."` for acceptance criteria (separate field)
+- Use `br comments add <id> "..."` for additional context or implementation notes
+
 # Agent Tools
 
 # Beads Workflow Integration
@@ -237,3 +300,35 @@ git push                # Push to remote
 ```
 
 <!-- end-bv-agent-instructions -->
+---
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   br sync --flush-only
+   git add .beads/
+   git commit -m "Update beads"
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+
+---
+

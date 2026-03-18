@@ -363,6 +363,9 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
  "uuid",
 ]
 

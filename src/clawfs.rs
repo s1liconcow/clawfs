@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ObjectStoreProvider};
 
@@ -40,6 +41,183 @@ impl FromStr for StorageMode {
                 "unsupported {STORAGE_MODE_ENV} value {other:?}; expected hosted_free or byob_paid"
             ),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceleratorMode {
+    #[default]
+    Direct,
+    DirectPlusCache,
+    RelayWrite,
+}
+
+impl AcceleratorMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::DirectPlusCache => "direct_plus_cache",
+            Self::RelayWrite => "relay_write",
+        }
+    }
+}
+
+impl AcceleratorMode {
+    pub const fn default_fallback_policy(self) -> AcceleratorFallbackPolicy {
+        match self {
+            Self::Direct | Self::DirectPlusCache => AcceleratorFallbackPolicy::PollAndDirect,
+            Self::RelayWrite => AcceleratorFallbackPolicy::FailClosed,
+        }
+    }
+
+    pub const fn default_journal_clearing(self) -> AcceleratorJournalClearingRule {
+        match self {
+            Self::Direct | Self::DirectPlusCache => {
+                AcceleratorJournalClearingRule::AfterLocalCommit
+            }
+            Self::RelayWrite => AcceleratorJournalClearingRule::AfterCommittedGeneration,
+        }
+    }
+}
+
+impl FromStr for AcceleratorMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "direct_plus_cache" => Ok(Self::DirectPlusCache),
+            "relay_write" => Ok(Self::RelayWrite),
+            other => bail!(
+                "unsupported accelerator mode {other:?}; expected direct, direct_plus_cache, or relay_write"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceleratorFallbackPolicy {
+    #[default]
+    PollAndDirect,
+    FailClosed,
+    DirectWriteFallback,
+}
+
+impl AcceleratorFallbackPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PollAndDirect => "poll_and_direct",
+            Self::FailClosed => "fail_closed",
+            Self::DirectWriteFallback => "direct_write_fallback",
+        }
+    }
+}
+
+impl AcceleratorFallbackPolicy {
+    pub const fn normalize_for_mode(self, mode: AcceleratorMode) -> Self {
+        match mode {
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => {
+                AcceleratorFallbackPolicy::PollAndDirect
+            }
+            AcceleratorMode::RelayWrite => match self {
+                AcceleratorFallbackPolicy::DirectWriteFallback => {
+                    AcceleratorFallbackPolicy::DirectWriteFallback
+                }
+                _ => AcceleratorFallbackPolicy::FailClosed,
+            },
+        }
+    }
+}
+
+impl FromStr for AcceleratorFallbackPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "poll_and_direct" => Ok(Self::PollAndDirect),
+            "fail_closed" => Ok(Self::FailClosed),
+            "direct_write_fallback" => Ok(Self::DirectWriteFallback),
+            other => bail!(
+                "unsupported accelerator fallback policy {other:?}; expected poll_and_direct, fail_closed, or direct_write_fallback"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceleratorAuthorityBoundary {
+    pub object_store_authoritative: bool,
+    pub superblock_generation_authoritative: bool,
+    pub caches_advisory: bool,
+    pub event_streams_advisory: bool,
+}
+
+impl AcceleratorAuthorityBoundary {
+    pub const fn new() -> Self {
+        Self {
+            object_store_authoritative: true,
+            superblock_generation_authoritative: true,
+            caches_advisory: true,
+            event_streams_advisory: true,
+        }
+    }
+}
+
+impl Default for AcceleratorAuthorityBoundary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceleratorJournalClearingRule {
+    #[default]
+    AfterLocalCommit,
+    AfterCommittedGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceleratorContract {
+    pub mode: AcceleratorMode,
+    pub fallback_policy: AcceleratorFallbackPolicy,
+    pub authority: AcceleratorAuthorityBoundary,
+    pub journal_clearing: AcceleratorJournalClearingRule,
+}
+
+impl AcceleratorContract {
+    pub const fn for_mode(mode: AcceleratorMode) -> Self {
+        Self {
+            mode,
+            fallback_policy: mode.default_fallback_policy(),
+            authority: AcceleratorAuthorityBoundary::new(),
+            journal_clearing: mode.default_journal_clearing(),
+        }
+    }
+
+    pub const fn with_fallback_policy(
+        mut self,
+        fallback_policy: AcceleratorFallbackPolicy,
+    ) -> Self {
+        self.fallback_policy = fallback_policy;
+        self
+    }
+
+    pub const fn normalized(self) -> Self {
+        Self {
+            mode: self.mode,
+            fallback_policy: self.fallback_policy.normalize_for_mode(self.mode),
+            authority: AcceleratorAuthorityBoundary::new(),
+            journal_clearing: self.mode.default_journal_clearing(),
+        }
+    }
+}
+
+impl Default for AcceleratorContract {
+    fn default() -> Self {
+        Self::for_mode(AcceleratorMode::default())
     }
 }
 
@@ -231,9 +409,10 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BUCKET_ENV, MAX_PENDING_BYTES_ENV, MAX_SEGMENT_CACHE_BYTES_ENV, OBJECT_PREFIX_ENV,
-        OBJECT_PROVIDER_ENV, STORAGE_MODE_ENV, StorageMode, apply_env_runtime_spec,
-        load_runtime_spec_from_env,
+        AcceleratorAuthorityBoundary, AcceleratorContract, AcceleratorFallbackPolicy,
+        AcceleratorJournalClearingRule, AcceleratorMode, BUCKET_ENV, MAX_PENDING_BYTES_ENV,
+        MAX_SEGMENT_CACHE_BYTES_ENV, OBJECT_PREFIX_ENV, OBJECT_PROVIDER_ENV, STORAGE_MODE_ENV,
+        StorageMode, apply_env_runtime_spec, load_runtime_spec_from_env,
     };
     use crate::config::{Cli, Config};
 
@@ -300,6 +479,76 @@ mod tests {
         assert!(
             err.to_string().contains(OBJECT_PREFIX_ENV),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn accelerator_mode_defaults_and_round_trip() {
+        let direct = AcceleratorContract::for_mode(AcceleratorMode::Direct);
+        let direct_plus_cache = AcceleratorContract::for_mode(AcceleratorMode::DirectPlusCache);
+        let relay_write = AcceleratorContract::for_mode(AcceleratorMode::RelayWrite);
+
+        assert_eq!(AcceleratorMode::default(), AcceleratorMode::Direct);
+        assert_eq!(
+            direct.fallback_policy,
+            AcceleratorFallbackPolicy::PollAndDirect
+        );
+        assert_eq!(
+            direct_plus_cache.fallback_policy,
+            AcceleratorFallbackPolicy::PollAndDirect
+        );
+        assert_eq!(
+            relay_write.fallback_policy,
+            AcceleratorFallbackPolicy::FailClosed
+        );
+        assert_eq!(
+            direct.journal_clearing,
+            AcceleratorJournalClearingRule::AfterLocalCommit
+        );
+        assert_eq!(
+            relay_write.journal_clearing,
+            AcceleratorJournalClearingRule::AfterCommittedGeneration
+        );
+        assert_eq!(direct.authority, AcceleratorAuthorityBoundary::default());
+
+        let encoded = serde_json::to_string(&relay_write).expect("serialize contract");
+        let decoded: AcceleratorContract =
+            serde_json::from_str(&encoded).expect("deserialize contract");
+        assert_eq!(decoded, relay_write);
+    }
+
+    #[test]
+    fn accelerator_fallback_normalizes_to_mode_semantics() {
+        assert_eq!(
+            AcceleratorFallbackPolicy::FailClosed.normalize_for_mode(AcceleratorMode::Direct),
+            AcceleratorFallbackPolicy::PollAndDirect
+        );
+        assert_eq!(
+            AcceleratorFallbackPolicy::DirectWriteFallback
+                .normalize_for_mode(AcceleratorMode::DirectPlusCache),
+            AcceleratorFallbackPolicy::PollAndDirect
+        );
+        assert_eq!(
+            AcceleratorFallbackPolicy::PollAndDirect
+                .normalize_for_mode(AcceleratorMode::RelayWrite),
+            AcceleratorFallbackPolicy::FailClosed
+        );
+        assert_eq!(
+            AcceleratorFallbackPolicy::DirectWriteFallback
+                .normalize_for_mode(AcceleratorMode::RelayWrite),
+            AcceleratorFallbackPolicy::DirectWriteFallback
+        );
+
+        let contract = AcceleratorContract::for_mode(AcceleratorMode::RelayWrite)
+            .with_fallback_policy(AcceleratorFallbackPolicy::PollAndDirect);
+        let normalized = contract.normalized();
+        assert_eq!(
+            normalized.fallback_policy,
+            AcceleratorFallbackPolicy::FailClosed
+        );
+        assert_eq!(
+            normalized.journal_clearing,
+            AcceleratorJournalClearingRule::AfterCommittedGeneration
         );
     }
 
