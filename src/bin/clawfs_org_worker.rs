@@ -550,8 +550,13 @@ async fn run_discovery_and_maintenance_loop(
                 }
             };
 
-            match registry.get_or_load(volume, policy).await {
-                Ok(ctx) => loaded.push(ctx),
+            match registry.get_or_load(volume, policy.clone()).await {
+                Ok(ctx) => {
+                    // Refresh policy on existing contexts so policy file changes
+                    // in the bucket are noticed without requiring context eviction.
+                    registry.update_policy(&volume.prefix, policy);
+                    loaded.push(ctx);
+                }
                 Err(err) => {
                     warn!(
                         volume_prefix = %volume.prefix,
