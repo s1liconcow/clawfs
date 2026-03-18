@@ -1,3 +1,7 @@
+// Test utilities shared across integration tests.
+// Items are conditionally used based on which tests are compiled.
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
