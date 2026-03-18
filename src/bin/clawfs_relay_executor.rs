@@ -174,6 +174,7 @@ async fn handle_relay_write(
                 committed_generation: None,
                 idempotency_key: request.idempotency_key,
                 error: Some(format!("internal error: {err}")),
+                actual_generation: None,
             };
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }

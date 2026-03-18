@@ -42,7 +42,7 @@ pub const DEFAULT_RELAY_QUEUE_DEPTH: usize = 32;
 pub const DEFAULT_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_RELAY_MAX_RETRIES: usize = 3;
 pub const DEFAULT_RELAY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
-pub const DEFAULT_RELAY_WRITE_PATH: &str = "/relay-write";
+pub const DEFAULT_RELAY_WRITE_PATH: &str = "/relay_write";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,6 +248,11 @@ pub struct RelayWriteResponse {
     pub committed_generation: Option<u64>,
     pub idempotency_key: String,
     pub error: Option<String>,
+    /// Server's current generation at the time of the response.  Set on
+    /// `Failed` responses caused by generation mismatch so that clients can
+    /// distinguish "generation advanced past our write" from other failures.
+    #[serde(default)]
+    pub actual_generation: Option<u64>,
 }
 
 impl RelayWriteResponse {
@@ -284,6 +289,50 @@ impl RelayWriteResponse {
             }
         }
         Ok(())
+    }
+}
+
+/// Decision produced by the client-side relay replay reconciliation check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayReplayDecision {
+    /// Proceed with relay retry — the generation is still at or one past the
+    /// expected value, so a retry (or dedup hit) can resolve the write.
+    Retry,
+    /// The remote generation has advanced more than one step past the
+    /// `expected_parent_generation`.  This write can never be committed;
+    /// the journal should be cleared as permanently stale.
+    ClearStale {
+        remote_generation: u64,
+        expected_parent: u64,
+    },
+}
+
+/// Determine what the client should do when replaying a pending relay write.
+///
+/// Called after learning the current remote generation (e.g. from a Failed
+/// response or from an explicit superblock fetch at mount time).
+///
+/// Rules:
+/// - If the write has already been committed (`committed_generation.is_some()`),
+///   the caller should just clear the journal — this function is not needed.
+/// - If `remote_generation > expected_parent_generation + 1`, the generation
+///   has advanced past our write by more than one step.  Another client (or a
+///   previous attempt) committed a different generation in between.  The write
+///   is permanently unrecoverable → `ClearStale`.
+/// - Otherwise (`remote_generation <= expected_parent_generation + 1`),
+///   a retry may still succeed (exact match) or the dedup store on the server
+///   will return a `Duplicate` if our previous attempt was already committed.
+pub fn relay_replay_reconcile(
+    remote_generation: u64,
+    expected_parent_generation: u64,
+) -> RelayReplayDecision {
+    if remote_generation > expected_parent_generation.saturating_add(1) {
+        RelayReplayDecision::ClearStale {
+            remote_generation,
+            expected_parent: expected_parent_generation,
+        }
+    } else {
+        RelayReplayDecision::Retry
     }
 }
 
@@ -339,70 +388,101 @@ impl RelayClient {
             match self.client.post(&url).json(&request).send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    if !status.is_success() {
-                        let body = resp.text().await.unwrap_or_default();
-                        let retryable = matches!(
-                            status,
-                            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-                        ) || status.is_server_error();
-                        let err = anyhow::anyhow!(
-                            "relay write http {} on attempt {}: {}",
-                            status,
-                            attempt_no,
-                            body
-                        );
-                        if retryable && attempt < self.max_retries {
-                            warn!(
-                                target: "relay",
-                                idempotency_key = %request.idempotency_key,
-                                attempt = attempt_no,
-                                status = %status,
-                                "relay_write_http_retry"
-                            );
-                            last_err = Some(err);
-                            sleep(self.retry_backoff).await;
-                            continue;
-                        }
-                        return Err(err).context("relay write HTTP failure");
-                    }
+                    let body = resp
+                        .text()
+                        .await
+                        .context("reading relay write response body")?;
+                    let retryable = matches!(
+                        status,
+                        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                    ) || status.is_server_error();
 
-                    let response: RelayWriteResponse =
-                        resp.json().await.context("decoding relay write response")?;
-                    response.validate()?;
-                    if response.idempotency_key != request.idempotency_key {
-                        bail!(
-                            "relay response idempotency_key mismatch: expected {} got {}",
-                            request.idempotency_key,
-                            response.idempotency_key
-                        );
-                    }
+                    match serde_json::from_str::<RelayWriteResponse>(&body) {
+                        Ok(response) => {
+                            response.validate()?;
+                            if response.idempotency_key != request.idempotency_key {
+                                bail!(
+                                    "relay response idempotency_key mismatch: expected {} got {}",
+                                    request.idempotency_key,
+                                    response.idempotency_key
+                                );
+                            }
 
-                    match response.status {
-                        RelayStatus::Accepted => {
-                            info!(
-                                target: "relay",
-                                idempotency_key = %request.idempotency_key,
-                                "relay_write_accepted"
-                            );
+                            match response.status {
+                                RelayStatus::Accepted => {
+                                    info!(
+                                        target: "relay",
+                                        idempotency_key = %request.idempotency_key,
+                                        "relay_write_accepted"
+                                    );
+                                }
+                                RelayStatus::Committed | RelayStatus::Duplicate => {
+                                    info!(
+                                        target: "relay",
+                                        idempotency_key = %request.idempotency_key,
+                                        committed_generation = ?response.committed_generation,
+                                        "relay_write_confirmed"
+                                    );
+                                }
+                                RelayStatus::Failed => {
+                                    warn!(
+                                        target: "relay",
+                                        idempotency_key = %request.idempotency_key,
+                                        "relay_write_failed"
+                                    );
+                                }
+                            }
+
+                            if status.is_success()
+                                || (status == StatusCode::CONFLICT
+                                    && matches!(response.status, RelayStatus::Failed))
+                            {
+                                return Ok(response);
+                            }
+
+                            if retryable && attempt < self.max_retries {
+                                warn!(
+                                    target: "relay",
+                                    idempotency_key = %request.idempotency_key,
+                                    attempt = attempt_no,
+                                    status = %status,
+                                    "relay_write_http_retry"
+                                );
+                                last_err = Some(anyhow::anyhow!(
+                                    "relay write http {} on attempt {}: {}",
+                                    status,
+                                    attempt_no,
+                                    body
+                                ));
+                                sleep(self.retry_backoff).await;
+                                continue;
+                            }
+
+                            return Ok(response);
                         }
-                        RelayStatus::Committed | RelayStatus::Duplicate => {
-                            info!(
-                                target: "relay",
-                                idempotency_key = %request.idempotency_key,
-                                committed_generation = ?response.committed_generation,
-                                "relay_write_confirmed"
-                            );
-                        }
-                        RelayStatus::Failed => {
-                            warn!(
-                                target: "relay",
-                                idempotency_key = %request.idempotency_key,
-                                "relay_write_failed"
-                            );
+                        Err(parse_err) => {
+                            let err = anyhow::anyhow!(
+                                "relay write http {} on attempt {}: {}",
+                                status,
+                                attempt_no,
+                                body
+                            )
+                            .context(parse_err);
+                            if retryable && attempt < self.max_retries {
+                                warn!(
+                                    target: "relay",
+                                    idempotency_key = %request.idempotency_key,
+                                    attempt = attempt_no,
+                                    status = %status,
+                                    "relay_write_http_retry"
+                                );
+                                last_err = Some(err);
+                                sleep(self.retry_backoff).await;
+                                continue;
+                            }
+                            return Err(err).context("relay write HTTP failure");
                         }
                     }
-
-                    return Ok(response);
                 }
                 Err(err) => {
                     let wrapped = anyhow::Error::new(err)
@@ -525,6 +605,7 @@ pub async fn relay_commit_pipeline(
             committed_generation: Some(prior_generation),
             idempotency_key: request.idempotency_key.clone(),
             error: None,
+            actual_generation: None,
         });
     }
 
@@ -552,6 +633,11 @@ pub async fn relay_commit_pipeline(
             committed_generation: None,
             idempotency_key: request.idempotency_key.clone(),
             error: Some(msg),
+            // Provide the server's actual generation so the client can determine
+            // whether the write is permanently stale (actual > expected + 1) or
+            // might have been committed on a cold-restart dedup-store miss
+            // (actual == expected + 1).
+            actual_generation: Some(current_generation),
         });
     }
 
@@ -599,6 +685,7 @@ pub async fn relay_commit_pipeline(
             committed_generation: None,
             idempotency_key: request.idempotency_key.clone(),
             error: Some(format!("commit_generation failed: {err}")),
+            actual_generation: None,
         });
     }
 
@@ -619,6 +706,7 @@ pub async fn relay_commit_pipeline(
         committed_generation: Some(new_generation),
         idempotency_key: request.idempotency_key.clone(),
         error: None,
+        actual_generation: None,
     })
 }
 
@@ -724,6 +812,7 @@ mod tests {
             committed_generation: Some(9),
             idempotency_key: "abc".to_string(),
             error: None,
+            actual_generation: None,
         };
         committed.validate().expect("committed response is valid");
 
@@ -732,6 +821,7 @@ mod tests {
             committed_generation: Some(9),
             idempotency_key: "abc".to_string(),
             error: None,
+            actual_generation: None,
         };
         duplicate.validate().expect("duplicate response is valid");
 
@@ -740,6 +830,7 @@ mod tests {
             committed_generation: None,
             idempotency_key: "abc".to_string(),
             error: None,
+            actual_generation: None,
         };
         accepted.validate().expect("accepted response is valid");
 
@@ -748,6 +839,7 @@ mod tests {
             committed_generation: None,
             idempotency_key: "abc".to_string(),
             error: Some("boom".to_string()),
+            actual_generation: None,
         };
         failed.validate().expect("failed response is valid");
 
@@ -756,6 +848,7 @@ mod tests {
             committed_generation: Some(9),
             idempotency_key: "abc".to_string(),
             error: None,
+            actual_generation: None,
         };
         assert!(invalid.validate().is_err());
     }
@@ -847,7 +940,7 @@ mod tests {
 
     #[test]
     fn relay_write_path_is_stable() {
-        assert_eq!(DEFAULT_RELAY_WRITE_PATH, "/relay-write");
+        assert_eq!(DEFAULT_RELAY_WRITE_PATH, "/relay_write");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -876,6 +969,7 @@ mod tests {
                             7,
                         ),
                         error: None,
+                        actual_generation: None,
                     })
                     .expect("serialize response");
                     let response = format!(
@@ -962,5 +1056,85 @@ mod tests {
         // After eviction with zero TTL all entries should be gone.
         dedup.evict_expired();
         assert!(dedup.is_empty(), "all expired entries should be evicted");
+    }
+
+    // ── relay_replay_reconcile ────────────────────────────────────────────
+
+    #[test]
+    fn reconcile_returns_retry_when_generation_matches() {
+        // Server is still at the expected generation — no advance, normal retry.
+        let decision = super::relay_replay_reconcile(5, 5);
+        assert_eq!(decision, super::RelayReplayDecision::Retry);
+    }
+
+    #[test]
+    fn reconcile_returns_retry_when_generation_advanced_by_one() {
+        // Server advanced by exactly 1 — could be our write on a cold dedup
+        // restart; proceed with retry so dedup logic can confirm.
+        let decision = super::relay_replay_reconcile(6, 5);
+        assert_eq!(decision, super::RelayReplayDecision::Retry);
+    }
+
+    #[test]
+    fn reconcile_returns_clear_stale_when_generation_advanced_by_more_than_one() {
+        // Server is at 8 but we expected 5 → generation advanced 3 past us.
+        // The write can never be committed.
+        let decision = super::relay_replay_reconcile(8, 5);
+        assert_eq!(
+            decision,
+            super::RelayReplayDecision::ClearStale {
+                remote_generation: 8,
+                expected_parent: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_handles_zero_generation() {
+        // Edge case: fresh volume with expected_parent = 0, server at 0 → retry.
+        assert_eq!(
+            super::relay_replay_reconcile(0, 0),
+            super::RelayReplayDecision::Retry
+        );
+        // And 1 past 0 → still retry.
+        assert_eq!(
+            super::relay_replay_reconcile(1, 0),
+            super::RelayReplayDecision::Retry
+        );
+        // Two past 0 → stale.
+        assert_eq!(
+            super::relay_replay_reconcile(2, 0),
+            super::RelayReplayDecision::ClearStale {
+                remote_generation: 2,
+                expected_parent: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_response_includes_actual_generation() {
+        let response = super::RelayWriteResponse {
+            status: RelayStatus::Failed,
+            committed_generation: None,
+            idempotency_key: "key".to_string(),
+            error: Some("generation mismatch".to_string()),
+            actual_generation: Some(10),
+        };
+        response
+            .validate()
+            .expect("failed response with actual_generation is valid");
+        assert_eq!(response.actual_generation, Some(10));
+    }
+
+    #[test]
+    fn actual_generation_defaults_to_none_on_committed() {
+        // Verify backward-compat: committed responses omit actual_generation.
+        let json = r#"{"status":"committed","committed_generation":5,"idempotency_key":"abc","error":null}"#;
+        let resp: super::RelayWriteResponse =
+            serde_json::from_str(json).expect("deserialize committed");
+        assert_eq!(
+            resp.actual_generation, None,
+            "old response format should default to None"
+        );
     }
 }
