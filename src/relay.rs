@@ -1352,11 +1352,15 @@ impl WriteBackBuffer {
             });
         }
 
-        let permit = self
-            .admit_sem
-            .acquire()
-            .await
-            .map_err(|_| WriteBackError::WalWriterGone)?;
+        let permit = match self.admit_sem.try_acquire() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(WriteBackError::BufferFull);
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(WriteBackError::WalWriterGone);
+            }
+        };
         permit.forget();
 
         let mut state = self.state.lock().await;
@@ -2596,6 +2600,37 @@ mod tests {
         )
         .await;
         assert!(timed_out.is_err(), "buffer should block when full");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_assign_and_buffer_returns_buffer_full_when_saturated() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().to_path_buf();
+        let (buffer, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 1, 1)
+            .await
+            .expect("create buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        let first = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 1, vec![], vec![]);
+        let generation = buffer
+            .assign_and_buffer(first, &dedup)
+            .await
+            .expect("first assignment");
+        assert_eq!(generation, 2);
+        assert_eq!(buffer.buffer_depth().await, 1);
+
+        let second = RelayWriteRequest::new("client-a", "/vol/prefix", 2, 2, vec![], vec![]);
+        let err = buffer
+            .assign_and_buffer(second, &dedup)
+            .await
+            .expect_err("buffer should reject when saturated");
+        assert!(matches!(err, WriteBackError::BufferFull));
+
+        drop(buffer);
+        writer_handle.abort();
+        let _ = writer_handle.await;
     }
 
     #[test]
