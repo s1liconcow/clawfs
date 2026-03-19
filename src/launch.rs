@@ -113,6 +113,20 @@ pub fn run_mount_entry(
 
 #[cfg(feature = "fuse")]
 fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
+    let existing_mounts = current_mount_count(mount_path);
+    if existing_mounts > 0 {
+        anyhow::bail!(
+            "mount path {} is already mounted ({} {}); unmount it before starting a background mount",
+            mount_path.display(),
+            existing_mounts,
+            if existing_mounts == 1 {
+                "entry"
+            } else {
+                "entries"
+            }
+        );
+    }
+
     let exe = env::current_exe()?;
     let mut child_args: Vec<_> = args.iter().skip(1).cloned().collect();
     child_args.push("--foreground".into());
@@ -134,7 +148,6 @@ fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
     }
 
     let mut child = command.spawn()?;
-    let mount_str = mount_path.to_string_lossy().to_string();
 
     for _ in 0..50 {
         match child.try_wait()? {
@@ -148,9 +161,7 @@ fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
             }
             _ => {}
         }
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-            && mounts.lines().any(|line| line.contains(&mount_str))
-        {
+        if current_mount_count(mount_path) > existing_mounts {
             println!("Mounted at {:?}", mount_path);
             return Ok(());
         }
@@ -162,6 +173,31 @@ fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
         child.id()
     );
     Ok(())
+}
+
+#[cfg(feature = "fuse")]
+fn current_mount_count(mount_path: &Path) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let mount_str = mount_path.to_string_lossy();
+        if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+            return count_mounts_for_target(&mountinfo, mount_str.as_ref(), 4);
+        }
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            return count_mounts_for_target(&mounts, mount_str.as_ref(), 1);
+        }
+    }
+
+    0
+}
+
+#[cfg(feature = "fuse")]
+fn count_mounts_for_target(contents: &str, mount_target: &str, field_index: usize) -> usize {
+    contents
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(field_index))
+        .filter(|field| *field == mount_target)
+        .count()
 }
 
 #[cfg(feature = "fuse")]
@@ -910,7 +946,7 @@ struct TracingWriter {
 impl Write for TracingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut stderr = std::io::stderr().lock();
-        stderr.write_all(buf)?;
+        ignore_broken_pipe(stderr.write_all(buf))?;
         if let Some(file) = &self.file {
             let mut guard = file
                 .lock()
@@ -922,7 +958,7 @@ impl Write for TracingWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         let mut stderr = std::io::stderr().lock();
-        stderr.flush()?;
+        ignore_broken_pipe(stderr.flush())?;
         if let Some(file) = &self.file {
             let mut guard = file
                 .lock()
@@ -930,6 +966,13 @@ impl Write for TracingWriter {
             guard.flush()?;
         }
         Ok(())
+    }
+}
+
+fn ignore_broken_pipe(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
     }
 }
 
@@ -1535,7 +1578,7 @@ fn sanitize_error(error: String) -> String {
 mod tests {
     use super::{
         ControlPlaneCredentials, EventSettings, HostedControlPlane, apply_hosted_runtime_config,
-        init_logging,
+        count_mounts_for_target, ignore_broken_pipe, init_logging,
     };
     use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
     use crate::config::Config;
@@ -1674,5 +1717,38 @@ mod tests {
         init_logging(None, false).expect("first init_logging call should succeed");
         init_logging(None, false)
             .expect("second init_logging call should be a no-op, not an error");
+    }
+
+    #[test]
+    fn count_mounts_for_target_matches_mountinfo_target_field() {
+        let mountinfo = "\
+101 35 0:48 / / rw,relatime - ext4 /dev/root rw\n\
+202 101 0:90 / /tmp/clawfs rw,nosuid,nodev,relatime - fuse.clawfs clawfs rw,user_id=1000\n\
+203 101 0:91 / /tmp/clawfs rw,nosuid,nodev,relatime - fuse.clawfs clawfs rw,user_id=1000\n\
+204 101 0:92 / /tmp/other rw,nosuid,nodev,relatime - fuse.clawfs clawfs rw,user_id=1000\n";
+
+        assert_eq!(count_mounts_for_target(mountinfo, "/tmp/clawfs", 4), 2);
+        assert_eq!(count_mounts_for_target(mountinfo, "/tmp/missing", 4), 0);
+    }
+
+    #[test]
+    fn ignore_broken_pipe_treats_epipe_as_non_fatal() {
+        assert!(ignore_broken_pipe(Ok(())).is_ok());
+        assert!(
+            ignore_broken_pipe(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            )))
+            .is_ok()
+        );
+        assert_eq!(
+            ignore_broken_pipe(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )))
+            .expect_err("non-broken pipe errors should be preserved")
+            .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 }
