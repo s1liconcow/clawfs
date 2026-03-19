@@ -23,6 +23,7 @@ pub struct Superblock {
     pub version: u32,
     pub state: FilesystemState,
     pub cleanup_leases: Vec<CleanupLease>,
+    pub last_idempotency_key: Option<String>,
 }
 
 impl Superblock {
@@ -35,6 +36,7 @@ impl Superblock {
             version: 1,
             state: FilesystemState::Clean,
             cleanup_leases: Vec::new(),
+            last_idempotency_key: None,
         }
     }
 }
@@ -198,6 +200,14 @@ impl SuperblockManager {
     }
 
     pub async fn commit_generation(&self, generation: u64) -> Result<()> {
+        self.commit_generation_idempotent(generation, None).await
+    }
+
+    pub async fn commit_generation_idempotent(
+        &self,
+        generation: u64,
+        idempotency_key: Option<String>,
+    ) -> Result<()> {
         loop {
             let (expected_version, snapshot) = {
                 let mut guard = self.state.lock();
@@ -208,6 +218,7 @@ impl SuperblockManager {
                 let expected_version = guard.version.clone();
                 guard.block.generation = generation;
                 guard.block.state = FilesystemState::Clean;
+                guard.block.last_idempotency_key = idempotency_key.clone();
                 (expected_version, guard.block.clone())
             };
 

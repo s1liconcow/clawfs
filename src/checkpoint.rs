@@ -250,6 +250,7 @@ fn deserialize_checkpoint_fb(data: &[u8]) -> Result<CheckpointData> {
             version: sb_version,
             state,
             cleanup_leases,
+            last_idempotency_key: None,
         },
     })
 }

@@ -500,6 +500,10 @@ impl MockRelayExecutor {
         *self.state.first_response_delay_ms.lock() = Some(delay);
     }
 
+    pub fn clear_dedup(&self) {
+        self.state.dedup.clear();
+    }
+
     pub fn request_count(&self) -> u64 {
         self.state.request_count.load(Ordering::Relaxed)
     }
@@ -610,7 +614,9 @@ async fn handle_relay_write(
     .await
     {
         Ok(response) => {
-            state.commit_count.fetch_add(1, Ordering::Relaxed);
+            if response.status == RelayStatus::Committed {
+                state.commit_count.fetch_add(1, Ordering::Relaxed);
+            }
             let first_response_delay = if state.request_count.load(Ordering::Relaxed) == 1 {
                 state.first_response_delay_ms.lock().take()
             } else {

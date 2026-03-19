@@ -454,3 +454,54 @@ fn relay_generation_race_commits_once_and_rejects_stale_request() -> Result<()> 
     assert!(harness.volume.superblock.snapshot().generation >= 2);
     Ok(())
 }
+
+#[test]
+fn relay_takeover_after_commit_reconciles_successfully() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let harness = HostedTestHarness::new("failure-relay-takeover")?;
+    let server = MockRelayExecutor::spawn(&harness.volume.runtime, &harness.volume)?;
+    server.delay_first_response_after_commit(Duration::from_secs(2));
+
+    let initial_generation = harness.volume.superblock.snapshot().generation;
+    let expected_generation = initial_generation + 1;
+
+    let client = RelayClient::with_retry_policy(
+        server.url.clone(),
+        Duration::from_millis(500), // Short timeout to trigger retry
+        2,                          // Allow a few retries
+        Duration::from_millis(5),
+        None,
+    )?;
+    let request = build_relay_write_request(&harness.volume, "relay-takeover-client", 1);
+
+    // First attempt will commit but timeout
+    let first_attempt_handle = harness.volume.runtime.handle().spawn({
+        let client = client.clone();
+        let request = request.clone();
+        async move { client.submit_relay_write(request).await }
+    });
+
+    // Wait for commit to happen on server
+    while server.commit_count() < 1 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Now clear dedup store to simulate takeover
+    server.clear_dedup();
+
+    // The second attempt (retry from client) should happen now.
+    // It should receive RelayStatus::Duplicate because current_gen == expected + 1
+
+    let response = harness
+        .volume
+        .runtime
+        .block_on(async { client.submit_relay_write(request.clone()).await })?;
+
+    assert_eq!(response.status, RelayStatus::Duplicate);
+    assert_eq!(response.committed_generation, Some(expected_generation));
+    assert_eq!(server.commit_count(), 1); // Should NOT have committed again
+
+    let _ = harness.volume.runtime.block_on(first_attempt_handle)?;
+
+    Ok(())
+}

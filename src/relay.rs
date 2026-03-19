@@ -579,6 +579,12 @@ impl DedupStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Clear all entries (simulating a fresh takeover by a new owner).
+    pub fn clear(&self) {
+        let mut records = self.records.lock();
+        records.clear();
+    }
 }
 
 // ── Relay ownership ─────────────────────────────────────────────────────────
@@ -932,6 +938,30 @@ pub async fn relay_commit_pipeline(
     let current_generation = current.block.generation;
 
     if request.expected_parent_generation != current_generation {
+        // If the current generation is exactly one step ahead of the expected
+        // generation, this write might have been committed by a previous owner
+        // before a takeover (which cleared the in-memory DedupStore).
+        //
+        // If the superblock's last_idempotency_key matches ours, then it IS a duplicate.
+        if current_generation == request.expected_parent_generation.saturating_add(1)
+            && current.block.last_idempotency_key.as_ref() == Some(&request.idempotency_key)
+        {
+            info!(
+                target: "relay",
+                idempotency_key = %request.idempotency_key,
+                current_generation,
+                expected = request.expected_parent_generation,
+                "relay_write_duplicate_takeover_match"
+            );
+            return Ok(RelayWriteResponse {
+                status: RelayStatus::Duplicate,
+                committed_generation: Some(current_generation),
+                idempotency_key: request.idempotency_key.clone(),
+                error: None,
+                actual_generation: Some(current_generation),
+            });
+        }
+
         let msg = format!(
             "generation mismatch: expected {} but current is {}",
             request.expected_parent_generation, current_generation
@@ -986,7 +1016,10 @@ pub async fn relay_commit_pipeline(
     }
 
     // --- CAS-commit the generation ---
-    if let Err(err) = superblock.commit_generation(prepared_generation).await {
+    if let Err(err) = superblock
+        .commit_generation_idempotent(prepared_generation, Some(request.idempotency_key.clone()))
+        .await
+    {
         superblock.abort_generation(prepared_generation);
         warn!(
             target: "relay",
