@@ -347,6 +347,20 @@ VPC-internal ALB listener in ECS/Cloud Run.
 
 Max forwarding hops before rejection: **2** (prevents infinite loops).
 
+### Relay Takeover and Idempotency
+
+When an org-scoped worker replica takes over a volume (due to lease expiry or
+scale-up), its in-memory `DedupStore` is initially empty.  If a client retries a
+write that was already committed by the previous owner, the new owner will
+detect this via generation mismatch.
+
+- If `current_generation == expected_parent_generation + 1`, the new owner
+  returns `RelayStatus::Duplicate`. This is logged as `relay_write_duplicate_generation_match`.
+- The client receives this and can safely clear its local journal and move
+  forward.
+- This ensures that failover doesn't lead to infinite retry loops or spurious
+  errors when the previous owner committed but died before responding.
+
 ### Health endpoints
 
 The org-scoped worker exposes three health endpoints for observability and alerting:

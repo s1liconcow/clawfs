@@ -313,7 +313,7 @@ git push                # Push to remote
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, and `cargo build --release --bin clawfsd`
+2. **Run quality gates** (if code changed) - Tests `cargo test`, linters, and `cargo build --bin clawfsd`
 3. **Fresh eyes review** Carefully read over all of the new code you just wrote and other existing code you just modified with "fresh eyes" looking super carefully for any obvious bugs, errors, problems, issues, confusion, etc. Carefully fix anything you uncover. Use ultrathink.
 4. **Update issue status** - Close finished work, update in-progress items
 5. **PUSH TO REMOTE** - This is MANDATORY:

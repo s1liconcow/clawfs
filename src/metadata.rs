@@ -660,6 +660,16 @@ impl MetadataStore {
         }
     }
 
+    /// Centralized cache insertion that ensures negative cache coherence.
+    /// Any time we add an entry to the positive cache (from external metadata
+    /// or local writes), we must clear the corresponding negative cache entry
+    /// to prevent stale negative lookups.
+    fn insert_cache_entry(&self, inode: u64, entry: CacheEntry) {
+        let mut cache = self.cache.write();
+        cache.insert(inode, entry);
+        self.negative_cache.write().remove(&inode);
+    }
+
     pub async fn load_superblock(&self) -> Result<Option<VersionedSuperblock>> {
         let path = self.superblock_path();
         let result = self.store.get(&path).await;
@@ -901,7 +911,7 @@ impl MetadataStore {
             if let Some(entry) = hosted.get_inode(inode, min_gen).await {
                 let record = entry.record.clone();
                 // Populate the local cache so TTL-based sibling lookups are fast.
-                self.cache.write().insert(
+                self.insert_cache_entry(
                     inode,
                     CacheEntry {
                         record,
@@ -1078,6 +1088,7 @@ impl MetadataStore {
                 touched_shard_ids.insert(shard_id);
                 if matches!(record.kind, InodeKind::Tombstone) {
                     entry.shard.inodes.remove(&record.inode);
+                    // neg.remove() already called above; manual insert ok.
                     cache.insert(
                         record.inode,
                         CacheEntry::with_generation(record.clone(), generation),
@@ -1088,6 +1099,7 @@ impl MetadataStore {
                     normalized.normalize_storage();
                     let for_cache = normalized.clone();
                     entry.shard.inodes.insert(normalized.inode, normalized);
+                    // neg.remove() already called above; manual insert ok.
                     cache.insert(
                         record.inode,
                         CacheEntry {
@@ -1368,6 +1380,7 @@ impl MetadataStore {
         }
 
         let mut cache = self.cache.write();
+        let mut neg = self.negative_cache.write();
         let mut shard_map = self.shards.lock();
         for (shard_id, stored) in loaded_shards {
             let mut shard = InodeShard::new(shard_id);
@@ -1379,6 +1392,7 @@ impl MetadataStore {
                     *ino,
                     CacheEntry::with_generation(record.clone(), stored.generation),
                 );
+                neg.remove(ino);
             }
             max_generation = max_generation.max(stored.generation);
             shard_map.insert(
@@ -1445,6 +1459,7 @@ impl MetadataStore {
                             record.inode,
                             CacheEntry::with_generation(record.clone(), generation),
                         );
+                        self.negative_cache.write().remove(&record.inode);
                         updated_records.push(record.clone());
                     }
                 }
@@ -1567,6 +1582,7 @@ impl MetadataStore {
                 shard.inodes.insert(ino, record);
             }
             let mut cache = self.cache.write();
+            let mut neg = self.negative_cache.write();
             for (ino, record) in &shard.inodes {
                 // Only update the cache if this shard reload is at least as
                 // fresh as the existing entry.  A concurrent
@@ -1583,6 +1599,7 @@ impl MetadataStore {
                         *ino,
                         CacheEntry::with_generation(record.clone(), generation),
                     );
+                    neg.remove(ino);
                 }
             }
             let mut shard_map = self.shards.lock();
