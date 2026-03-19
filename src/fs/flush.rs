@@ -208,6 +208,19 @@ impl OsageFs {
             let target_generation = snapshot.generation;
             let prepare_duration = prepare_start.elapsed();
             prepared_generation = Some(target_generation);
+            if snapshot.relay_required
+                && self.config.accelerator_mode != Some(AcceleratorMode::RelayWrite)
+            {
+                log::error!(
+                    "flush_pending relay_required=true but accelerator_mode={:?}; refusing direct write to prevent write-back buffer bypass. Configure accelerator_endpoint and accelerator_mode=relay_write (returned by the control plane summon-config API). pid={} tid={} scope={}",
+                    self.config.accelerator_mode,
+                    pid,
+                    tid,
+                    scope
+                );
+                self.superblock.abort_generation(target_generation);
+                return Err(EIO);
+            }
             let mut segment_entries = Vec::new();
             let mut segment_data_inodes = HashSet::new();
             // Map from inode -> base committed extents captured when pending data

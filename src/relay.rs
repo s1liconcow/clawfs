@@ -1281,6 +1281,12 @@ impl WriteBackBuffer {
         self.flusher_halted.load(Ordering::Acquire)
     }
 
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn force_halt_flusher_for_tests(&self) {
+        self.flusher_halted.store(true, Ordering::Release);
+    }
+
     /// Number of WAL-written entries waiting for object-store commit.
     pub async fn buffer_depth(&self) -> usize {
         self.state.lock().await.pending.len()

@@ -414,11 +414,43 @@ async fn handle_relay_write(
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let generation = state.superblock.snapshot().generation;
-    Json(serde_json::json!({
-        "status": "ok",
+    let halted = state
+        .write_back
+        .as_ref()
+        .map(|wb| wb.is_flusher_halted())
+        .unwrap_or(false);
+
+    let mut body = serde_json::json!({
+        "status": if halted { "degraded" } else { "ok" },
         "generation": generation,
         "dedup_entries": state.dedup.len(),
-    }))
+        "mode": if state.write_back.is_some() { "write_back" } else { "synchronous" },
+    });
+
+    if let Some(wb) = &state.write_back {
+        let buffer_depth = wb.buffer_depth().await;
+        let logical_gen = wb.logical_gen().await;
+        let flush_lag = wb.flush_lag().await;
+        body["write_back"] = serde_json::json!({
+            "buffer_depth": buffer_depth,
+            "logical_gen": logical_gen,
+            "committed_gen": wb.committed_gen(),
+            "flush_lag": flush_lag,
+            "flusher_halted": halted,
+        });
+    }
+
+    // Operators should alert on:
+    // - flush_lag > 100 (flusher is falling behind)
+    // - flusher_halted == true (critical: acknowledged writes are not durable upstream)
+    // - HTTP 503 from this endpoint (same as flusher_halted)
+    let status = if halted {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+
+    (status, Json(body)).into_response()
 }
 
 fn build_config(cli: &Cli) -> Config {
@@ -466,7 +498,84 @@ mod tests {
     use super::*;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
+
+    struct HealthHarness {
+        _root: tempfile::TempDir,
+        state: AppState,
+    }
+
+    async fn make_health_harness(halt_flusher: bool) -> HealthHarness {
+        let root = tempdir().unwrap();
+        let store_path = root.path().join("store");
+        let cache_path = root.path().join("cache");
+        let state_path = root.path().join("state");
+        let mount_path = root.path().join("mnt");
+
+        let cli = Cli {
+            object_provider: ObjectStoreProvider::Local,
+            store_path: Some(store_path.clone()),
+            bucket: None,
+            object_prefix: "test".to_string(),
+            region: None,
+            endpoint: None,
+            shard_size: 2048,
+            listen: "127.0.0.1:0".to_string(),
+            dedup_ttl_secs: 60,
+            log_storage_io: false,
+            jwt_secret: None,
+            nvme_path: None,
+            wal_segment_bytes: 64 * 1024 * 1024,
+            flush_interval_ms: 50,
+            max_buffer_entries: 8,
+            relay_required: false,
+        };
+
+        let mut config = build_config(&cli);
+        config.mount_path = mount_path;
+        config.store_path = store_path;
+        config.local_cache_path = cache_path;
+        config.state_path = state_path;
+
+        let handle = tokio::runtime::Handle::current();
+        let metadata = Arc::new(MetadataStore::new(&config, handle.clone()).await.unwrap());
+        let superblock = Arc::new(
+            SuperblockManager::load_or_init(metadata.clone(), config.shard_size)
+                .await
+                .unwrap(),
+        );
+        let segments = Arc::new(SegmentManager::new(&config, handle.clone()).unwrap());
+        let dedup = DedupStore::new(Duration::from_secs(60));
+
+        let write_back = if halt_flusher {
+            let (buffer, _wal_rx) =
+                WriteBackBuffer::new(root.path().join("wal"), 8, superblock.snapshot().generation)
+                    .await
+                    .unwrap();
+            buffer.as_ref().force_halt_flusher_for_tests();
+            Some(buffer)
+        } else {
+            let (buffer, _wal_rx) =
+                WriteBackBuffer::new(root.path().join("wal"), 8, superblock.snapshot().generation)
+                    .await
+                    .unwrap();
+            Some(buffer)
+        };
+
+        HealthHarness {
+            _root: root,
+            state: AppState {
+                metadata,
+                segments,
+                superblock,
+                dedup,
+                write_back,
+                shard_size: config.shard_size,
+                jwt_secret: None,
+            },
+        }
+    }
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -548,5 +657,48 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
         assert!(validate_relay_token(&headers, "orgs/myorg/volumes/myvol", "secret").is_err());
+    }
+
+    #[tokio::test]
+    async fn health_exposes_write_back_metrics() {
+        let harness = make_health_harness(false).await;
+        let response = handle_health(State(harness.state.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["mode"], "write_back");
+        assert_eq!(json["generation"].as_u64(), Some(1));
+        assert_eq!(json["dedup_entries"].as_u64(), Some(0));
+        let write_back = json["write_back"].as_object().expect("write_back metrics");
+        assert_eq!(write_back["buffer_depth"].as_u64(), Some(0));
+        assert_eq!(write_back["logical_gen"].as_u64(), Some(2));
+        assert_eq!(write_back["committed_gen"].as_u64(), Some(1));
+        assert_eq!(write_back["flush_lag"].as_u64(), Some(0));
+        assert_eq!(write_back["flusher_halted"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_when_flusher_halted() {
+        let harness = make_health_harness(true).await;
+        let response = handle_health(State(harness.state.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["mode"], "write_back");
+        assert_eq!(json["write_back"]["flusher_halted"].as_bool(), Some(true));
     }
 }

@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
 
+use crate::clawfs::AcceleratorMode;
 use crate::config::{ObjectStoreProvider, SourceStoreConfig};
 use crate::journal::JournalManager;
 use crate::source::SourceObjectStore;
@@ -2193,6 +2194,66 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
         content, payload,
         "stale Inline([]) storage overwrote correct Segments pointer — data lost"
     );
+}
+
+#[test]
+fn flush_pending_returns_eio_when_relay_required_and_client_is_direct() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "relay_required_eio.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+        cfg.inline_threshold = 512;
+        cfg.accelerator_mode = Some(AcceleratorMode::Direct);
+    });
+    let fs = &harness.fs;
+
+    let payload = vec![0x5Au8; 8 * 1024];
+    let file = fs
+        .nfs_create(ROOT_INODE, "relay_required.bin", 1000, 1000)
+        .unwrap();
+    fs.nfs_write(file.inode, 0, &payload).unwrap();
+
+    harness
+        .runtime
+        .block_on(fs.superblock.set_relay_required(true))
+        .unwrap();
+
+    let err = fs
+        .flush_pending()
+        .expect_err("flush must fail closed when relay_required=true");
+    assert_eq!(err, EIO, "relay_required guard must surface EIO");
+    assert!(
+        fs.pending_inodes.contains(&file.inode),
+        "failed flush must restore the pending write"
+    );
+}
+
+#[test]
+fn flush_pending_still_succeeds_when_relay_required_is_false() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "relay_optional_ok.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+        cfg.inline_threshold = 512;
+        cfg.accelerator_mode = Some(AcceleratorMode::Direct);
+    });
+    let fs = &harness.fs;
+
+    let payload = vec![0xC3u8; 8 * 1024];
+    let file = fs
+        .nfs_create(ROOT_INODE, "relay_optional.bin", 1000, 1000)
+        .unwrap();
+    fs.nfs_write(file.inode, 0, &payload).unwrap();
+
+    fs.flush_pending()
+        .expect("flush must still succeed when relay_required=false");
+
+    assert!(
+        !fs.pending_inodes.contains(&file.inode),
+        "successful flush must clear pending state"
+    );
+    let content = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+    assert_eq!(content, payload, "normal flush path must remain unchanged");
 }
 
 /// Regression test for the FIO seq_write_1m EIO bug.
