@@ -1426,44 +1426,53 @@ impl MetadataStore {
 
         files.sort_by_key(|(generation, _)| *generation);
         let mut updated_records = Vec::new();
-        for (generation, path) in files {
+        let mut idx = 0;
+        while idx < files.len() {
+            let generation = files[idx].0;
             if generation <= newest {
+                idx += 1;
                 continue;
             }
-            let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredDelta = deserialize_delta(&bytes)?;
-            anyhow::ensure!(
-                stored.version == METADATA_FORMAT_VERSION,
-                "unsupported delta version {}",
-                stored.version
-            );
-            for record in stored.records {
-                if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                    let mut cache = self.cache.write();
-                    let dominated = cache
-                        .get(&record.inode)
-                        .map(|existing| existing.generation > generation)
-                        .unwrap_or(false);
-                    if !dominated {
-                        cache.remove(&record.inode);
-                        self.negative_cache.write().remove(&record.inode);
-                    }
-                } else {
-                    let mut cache = self.cache.write();
-                    let dominated = cache
-                        .get(&record.inode)
-                        .map(|existing| existing.generation > generation)
-                        .unwrap_or(false);
-                    if !dominated {
-                        cache.insert(
-                            record.inode,
-                            CacheEntry::with_generation(record.clone(), generation),
-                        );
-                        self.negative_cache.write().remove(&record.inode);
-                        updated_records.push(record.clone());
+
+            while idx < files.len() && files[idx].0 == generation {
+                let (_, path) = &files[idx];
+                let bytes = self.store.get(path).await?.bytes().await?;
+                let stored: StoredDelta = deserialize_delta(&bytes)?;
+                anyhow::ensure!(
+                    stored.version == METADATA_FORMAT_VERSION,
+                    "unsupported delta version {}",
+                    stored.version
+                );
+                for record in stored.records {
+                    if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
+                        let mut cache = self.cache.write();
+                        let dominated = cache
+                            .get(&record.inode)
+                            .map(|existing| existing.generation > generation)
+                            .unwrap_or(false);
+                        if !dominated {
+                            cache.remove(&record.inode);
+                            self.negative_cache.write().remove(&record.inode);
+                        }
+                    } else {
+                        let mut cache = self.cache.write();
+                        let dominated = cache
+                            .get(&record.inode)
+                            .map(|existing| existing.generation > generation)
+                            .unwrap_or(false);
+                        if !dominated {
+                            cache.insert(
+                                record.inode,
+                                CacheEntry::with_generation(record.clone(), generation),
+                            );
+                            self.negative_cache.write().remove(&record.inode);
+                            updated_records.push(record.clone());
+                        }
                     }
                 }
+                idx += 1;
             }
+
             newest = newest.max(generation);
         }
         *self.last_delta_generation.lock() = newest;
@@ -1776,6 +1785,7 @@ mod tests {
     use crate::clawfs::AcceleratorMode;
     use crate::config::Config;
     use crate::hosted_cache::CachedMetadataEntry;
+    use crate::inode::ROOT_INODE;
 
     fn test_config(root: &std::path::Path) -> Config {
         Config {
@@ -2102,6 +2112,69 @@ mod tests {
             FileStorage::Inline(bytes) => assert_eq!(bytes, b"hello".to_vec()),
             other => panic!("expected inline storage after delta replay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_store_replays_all_delta_files_for_same_generation() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let runtime = Runtime::new().unwrap();
+
+        let mut root = InodeRecord::new_directory(
+            ROOT_INODE,
+            ROOT_INODE,
+            String::new(),
+            "/".to_string(),
+            1000,
+            1000,
+        );
+        let file = InodeRecord::new_file(
+            ROOT_INODE + 1,
+            ROOT_INODE,
+            "file.txt".to_string(),
+            "/file.txt".to_string(),
+            1000,
+            1000,
+        );
+        if let Some(children) = root.children_mut() {
+            children.insert("file.txt".to_string(), file.inode);
+        }
+
+        runtime.block_on(async {
+            let metadata = MetadataStore::new(&config, runtime.handle().clone())
+                .await
+                .unwrap();
+            metadata
+                .persist_inode(&root, 1, config.shard_size)
+                .await
+                .unwrap();
+            metadata
+                .write_delta_ref(2, std::slice::from_ref(&file))
+                .await
+                .unwrap();
+            metadata.write_delta_ref(2, &[root.clone()]).await.unwrap();
+        });
+
+        let reloaded = runtime
+            .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+            .unwrap();
+        let stored_root = runtime
+            .block_on(reloaded.get_inode(ROOT_INODE))
+            .unwrap()
+            .expect("root should exist after replay");
+        let stored_file = runtime
+            .block_on(reloaded.get_inode(file.inode))
+            .unwrap()
+            .expect("file should exist after replay");
+
+        assert_eq!(stored_file.inode, file.inode);
+        assert_eq!(
+            stored_root
+                .children()
+                .and_then(|children| children.get("file.txt"))
+                .copied(),
+            Some(file.inode)
+        );
     }
 
     #[test]

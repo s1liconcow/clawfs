@@ -141,6 +141,7 @@ fn coordination_refreshes_metadata_and_recovers_after_disconnect() -> Result<()>
     let harness = HostedTestHarness::new("coordination-a")?;
     let peer = harness.open_peer_client("coordination-b")?;
     let endpoint = MockCoordinationEndpoint::spawn(&harness.volume.runtime)?;
+    let first_inode = harness.volume.superblock.snapshot().next_inode;
 
     let subscriber = CoordinationSubscriber::new_with_staleness_timeout(
         endpoint.url.clone(),
@@ -158,7 +159,7 @@ fn coordination_refreshes_metadata_and_recovers_after_disconnect() -> Result<()>
     assert!(root_before.is_dir());
     assert!(
         peer.runtime
-            .block_on(async { peer.metadata.get_inode(2).await })?
+            .block_on(async { peer.metadata.get_inode(first_inode).await })?
             .is_none(),
         "peer should not see the first file before refresh"
     );
@@ -176,11 +177,24 @@ fn coordination_refreshes_metadata_and_recovers_after_disconnect() -> Result<()>
     peer.runtime.block_on(async {
         assert_generation_advanced(&peer.metadata, committed_generation).await
     })?;
+    let root_after_first = peer
+        .runtime
+        .block_on(async { peer.metadata.get_inode(clawfs::inode::ROOT_INODE).await })?
+        .context("missing root inode after first refresh")?;
+    let first_name = format!("delta-{:04}.txt", 0);
     assert!(
         peer.runtime
-            .block_on(async { peer.metadata.get_inode(2).await })?
+            .block_on(async { peer.metadata.get_inode(first_inode).await })?
             .is_some(),
         "peer should see the first file after refresh"
+    );
+    assert_eq!(
+        root_after_first
+            .children()
+            .and_then(|children| children.get(&first_name))
+            .copied(),
+        Some(first_inode),
+        "root should map the first file name to the refreshed inode"
     );
     assert_eq!(subscriber.last_applied_generation(), committed_generation);
 
@@ -193,6 +207,7 @@ fn coordination_refreshes_metadata_and_recovers_after_disconnect() -> Result<()>
         "expected polling failure while endpoint is down"
     );
 
+    let second_inode = harness.volume.superblock.snapshot().next_inode;
     harness.create_test_volume_with_deltas(1)?;
     let next_generation = harness.volume.superblock.snapshot().generation;
     endpoint.set_available(true);
@@ -205,11 +220,24 @@ fn coordination_refreshes_metadata_and_recovers_after_disconnect() -> Result<()>
         .block_on(async { subscriber.apply_events(events).await })?;
     peer.runtime
         .block_on(async { assert_generation_advanced(&peer.metadata, next_generation).await })?;
+    let root_after_second = peer
+        .runtime
+        .block_on(async { peer.metadata.get_inode(clawfs::inode::ROOT_INODE).await })?
+        .context("missing root inode after reconnect")?;
+    let second_name = format!("delta-{:04}.txt", 1);
     assert!(
         peer.runtime
-            .block_on(async { peer.metadata.get_inode(3).await })?
+            .block_on(async { peer.metadata.get_inode(second_inode).await })?
             .is_some(),
         "peer should see the second file after reconnect"
+    );
+    assert_eq!(
+        root_after_second
+            .children()
+            .and_then(|children| children.get(&second_name))
+            .copied(),
+        Some(second_inode),
+        "root should map the second file name after reconnect"
     );
     Ok(())
 }
