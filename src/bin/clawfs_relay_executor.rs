@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen: String,
 
+    /// Optional path to write the bound listen address for integration tests.
+    #[arg(long, env = "CLAWFS_RELAY_LISTEN_FILE")]
+    listen_addr_file: Option<PathBuf>,
+
     /// Idempotency key TTL in seconds.
     #[arg(long, default_value_t = DEFAULT_DEDUP_TTL_SECS)]
     dedup_ttl_secs: u64,
@@ -258,6 +262,9 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
+    if let Some(path) = &cli.listen_addr_file {
+        tokio::fs::write(path, listener.local_addr()?.to_string()).await?;
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -522,6 +529,7 @@ mod tests {
             endpoint: None,
             shard_size: 2048,
             listen: "127.0.0.1:0".to_string(),
+            listen_addr_file: None,
             dedup_ttl_secs: 60,
             log_storage_io: false,
             jwt_secret: None,

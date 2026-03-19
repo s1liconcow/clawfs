@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,16 +19,9 @@ impl Drop for RelayExecutorGuard {
     }
 }
 
-async fn free_port() -> Result<u16> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("bind ephemeral port")?;
-    Ok(listener.local_addr().context("read ephemeral port")?.port())
-}
-
-fn relay_executor_path() -> Result<PathBuf> {
+fn relay_executor_path() -> Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_clawfs_relay_executor") {
-        return Ok(PathBuf::from(path));
+        return Ok(std::path::PathBuf::from(path));
     }
 
     let mut path = std::env::current_exe().context("locate integration test binary")?;
@@ -42,7 +34,10 @@ fn relay_executor_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn spawn_relay_executor(port: u16, root: TempDir) -> Result<RelayExecutorGuard> {
+fn spawn_relay_executor(
+    root: TempDir,
+    listen_addr_file: &std::path::Path,
+) -> Result<RelayExecutorGuard> {
     let exe = relay_executor_path()?;
     let store_path = root.path().join("store");
     let wal_path = root.path().join("wal");
@@ -58,7 +53,8 @@ fn spawn_relay_executor(port: u16, root: TempDir) -> Result<RelayExecutorGuard> 
         .arg("--object-prefix")
         .arg("test")
         .arg("--listen")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
+        .env("CLAWFS_RELAY_LISTEN_FILE", listen_addr_file)
         .arg("--nvme-path")
         .arg(&wal_path)
         .arg("--flush-interval-ms")
@@ -94,17 +90,33 @@ async fn wait_for_health(client: &Client, base_url: &str) -> Result<Value> {
     }
 }
 
+async fn wait_for_listen_addr(path: &std::path::Path) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(addr) = tokio::fs::read_to_string(path).await {
+            let addr = addr.trim().to_string();
+            if !addr.is_empty() {
+                return Ok(addr);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for relay executor listen address");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_writeback_acks_before_flush() -> Result<()> {
     let root = tempfile::tempdir().context("create temp root")?;
-    let port = free_port().await?;
-    let _guard = spawn_relay_executor(port, root)?;
+    let listen_addr_file = root.path().join("listen.addr");
+    let _guard = spawn_relay_executor(root, &listen_addr_file)?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .context("build reqwest client")?;
-    let base_url = format!("http://127.0.0.1:{port}");
+    let base_url = format!("http://{}", wait_for_listen_addr(&listen_addr_file).await?);
 
     let health = wait_for_health(&client, &base_url).await?;
     assert_eq!(health["status"], "ok");
