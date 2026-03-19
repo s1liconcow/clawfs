@@ -27,7 +27,10 @@ use tracing::{info, warn};
 
 use clawfs::config::{Config, ObjectStoreProvider};
 use clawfs::metadata::MetadataStore;
-use clawfs::relay::{DedupStore, RelayWriteRequest, RelayWriteResponse, relay_commit_pipeline};
+use clawfs::relay::{
+    DedupStore, RelayStatus, RelayWriteRequest, RelayWriteResponse, WriteBackBuffer,
+    WriteBackError, relay_commit_pipeline, run_flusher, run_wal_writer,
+};
 use clawfs::segment::{SegmentManager, segment_prefix};
 use clawfs::superblock::SuperblockManager;
 
@@ -86,6 +89,28 @@ struct Cli {
     /// When unset, requests are accepted without authentication (dev/test mode).
     #[arg(long, env = "CLAWFS_RELAY_JWT_SECRET")]
     jwt_secret: Option<String>,
+
+    /// Path to NVMe/local SSD for write-back WAL directory.
+    /// When set, the executor can run in write-back mode and acknowledge writes
+    /// after WAL fsync instead of waiting for object-store commit.
+    #[arg(long, env = "CLAWFS_RELAY_NVME_PATH")]
+    nvme_path: Option<PathBuf>,
+
+    /// WAL segment rotation threshold in bytes.
+    #[arg(long, default_value_t = 67_108_864)]
+    wal_segment_bytes: u64,
+
+    /// Background flusher wake interval in milliseconds.
+    #[arg(long, default_value_t = 50)]
+    flush_interval_ms: u64,
+
+    /// Maximum buffered write-back entries before backpressure is applied.
+    #[arg(long, default_value_t = 256)]
+    max_buffer_entries: usize,
+
+    /// Stamp relay_required=true on the volume superblock at startup.
+    #[arg(long, default_value_t = false)]
+    relay_required: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +119,8 @@ struct AppState {
     segments: Arc<SegmentManager>,
     superblock: Arc<SuperblockManager>,
     dedup: Arc<DedupStore>,
+    #[allow(dead_code)]
+    write_back: Option<Arc<WriteBackBuffer>>,
     shard_size: u64,
     jwt_secret: Option<String>,
 }
@@ -118,13 +145,91 @@ async fn main() -> Result<()> {
     let superblock =
         Arc::new(SuperblockManager::load_or_init(metadata.clone(), config.shard_size).await?);
 
+    let dedup = DedupStore::new(Duration::from_secs(cli.dedup_ttl_secs));
+
+    if cli.relay_required {
+        let current_snapshot = superblock.snapshot();
+        if !current_snapshot.relay_required {
+            superblock.set_relay_required(true).await.map_err(|err| {
+                anyhow::anyhow!("stamping relay_required=true on superblock: {err}")
+            })?;
+            info!(
+                generation = superblock.snapshot().generation,
+                "relay_required=true committed to superblock on startup"
+            );
+        } else {
+            info!("relay_required=true already set in superblock; no update needed");
+        }
+    }
+
+    let write_back: Option<Arc<WriteBackBuffer>> = if let Some(nvme_path) = &cli.nvme_path {
+        let committed_gen = superblock.snapshot().generation;
+        info!(
+            committed_gen,
+            nvme_path = %nvme_path.display(),
+            max_buffer_entries = cli.max_buffer_entries,
+            flush_interval_ms = cli.flush_interval_ms,
+            "initializing write-back buffer"
+        );
+
+        let (buffer, wal_rx) =
+            WriteBackBuffer::new(nvme_path.clone(), cli.max_buffer_entries, committed_gen)
+                .await
+                .map_err(|err| anyhow::anyhow!("initializing WriteBackBuffer: {err}"))?;
+
+        let buffer_depth = buffer.buffer_depth().await;
+        info!(
+            buffer_depth,
+            "write-back buffer initialized (recovered {} pending entries)", buffer_depth
+        );
+
+        {
+            let wal_dir = nvme_path.clone();
+            let seg_bytes = cli.wal_segment_bytes;
+            tokio::spawn(async move {
+                run_wal_writer(wal_rx, wal_dir, seg_bytes).await;
+                warn!("run_wal_writer exited; write-back mode disabled until restart");
+            });
+        }
+
+        {
+            let buffer = buffer.clone();
+            let metadata = metadata.clone();
+            let segments = segments.clone();
+            let superblock = superblock.clone();
+            let dedup = dedup.clone();
+            let shard_size = config.shard_size;
+            let flush_interval = Duration::from_millis(cli.flush_interval_ms);
+            tokio::spawn(async move {
+                run_flusher(
+                    buffer,
+                    metadata,
+                    segments,
+                    superblock,
+                    dedup,
+                    shard_size,
+                    flush_interval,
+                )
+                .await;
+                warn!("run_flusher exited; write-back mode disabled until restart");
+            });
+        }
+
+        Some(buffer)
+    } else {
+        if cli.relay_required {
+            warn!(
+                "--relay-required is set but --nvme-path is not; relay_required=true has been stamped on the superblock but write-back cache is disabled"
+            );
+        }
+        None
+    };
+
     info!(
         generation = superblock.snapshot().generation,
         listen = %cli.listen,
         "relay executor ready"
     );
-
-    let dedup = DedupStore::new(Duration::from_secs(cli.dedup_ttl_secs));
 
     // Periodic dedup eviction (every hour).
     {
@@ -142,6 +247,7 @@ async fn main() -> Result<()> {
         segments,
         superblock,
         dedup,
+        write_back,
         shard_size: config.shard_size,
         jwt_secret: cli.jwt_secret.clone(),
     };
@@ -208,6 +314,73 @@ async fn handle_relay_write(
         )
             .into_response();
     }
+    if let Some(wb) = &state.write_back {
+        let idempotency_key = request.idempotency_key.clone();
+        return match wb.assign_and_buffer(request, &state.dedup).await {
+            Ok(generation) => (
+                StatusCode::OK,
+                Json(RelayWriteResponse {
+                    status: RelayStatus::Committed,
+                    committed_generation: Some(generation),
+                    idempotency_key,
+                    error: None,
+                    actual_generation: None,
+                }),
+            )
+                .into_response(),
+            Err(WriteBackError::Duplicate {
+                committed_generation,
+            }) => (
+                StatusCode::OK,
+                Json(RelayWriteResponse {
+                    status: RelayStatus::Duplicate,
+                    committed_generation: Some(committed_generation),
+                    idempotency_key,
+                    error: None,
+                    actual_generation: None,
+                }),
+            )
+                .into_response(),
+            Err(WriteBackError::GenerationMismatch { expected, actual }) => (
+                StatusCode::CONFLICT,
+                Json(RelayWriteResponse {
+                    status: RelayStatus::Failed,
+                    committed_generation: None,
+                    idempotency_key,
+                    error: Some(format!(
+                        "generation mismatch: expected parent {} but logical_gen-1 is {}",
+                        expected, actual
+                    )),
+                    actual_generation: Some(actual),
+                }),
+            )
+                .into_response(),
+            Err(WriteBackError::BufferFull) => {
+                warn!("write_back buffer full; returning 429 to client");
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "write-back buffer full; retry"})),
+                )
+                    .into_response()
+            }
+            Err(WriteBackError::WalWriterGone) => {
+                warn!("WAL writer task has exited; write-back mode is broken");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "WAL writer unavailable; service restart required"})),
+                )
+                    .into_response()
+            }
+            Err(WriteBackError::WalIo(err)) => {
+                warn!(error = %err, "WAL I/O error in assign_and_buffer");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("WAL I/O error: {err}")})),
+                )
+                    .into_response()
+            }
+        };
+    }
     match relay_commit_pipeline(
         &request,
         &state.metadata,
@@ -220,7 +393,7 @@ async fn handle_relay_write(
     {
         Ok(response) => {
             let status = match response.status {
-                clawfs::relay::RelayStatus::Failed => StatusCode::CONFLICT,
+                RelayStatus::Failed => StatusCode::CONFLICT,
                 _ => StatusCode::OK,
             };
             (status, Json(response)).into_response()
@@ -228,7 +401,7 @@ async fn handle_relay_write(
         Err(err) => {
             warn!(error = %err, "relay_write internal error");
             let response = RelayWriteResponse {
-                status: clawfs::relay::RelayStatus::Failed,
+                status: RelayStatus::Failed,
                 committed_generation: None,
                 idempotency_key: request.idempotency_key,
                 error: Some(format!("internal error: {err}")),

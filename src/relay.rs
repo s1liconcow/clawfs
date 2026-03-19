@@ -1236,7 +1236,7 @@ pub struct WriteBackBuffer {
 impl WriteBackBuffer {
     /// Initialize the write-back buffer from the on-disk WAL state.
     #[allow(dead_code)]
-    pub(crate) async fn new(
+    pub async fn new(
         wal_dir: PathBuf,
         max_buffer_entries: usize,
         committed_gen: u64,
