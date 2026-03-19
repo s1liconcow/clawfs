@@ -23,6 +23,12 @@ pub struct Superblock {
     pub version: u32,
     pub state: FilesystemState,
     pub cleanup_leases: Vec<CleanupLease>,
+    /// Idempotency key of the most recently committed relay write, persisted
+    /// in the superblock so a new owner can detect takeover duplicates even
+    /// after its in-memory DedupStore is empty.  `#[serde(default)]` makes
+    /// this field backward-compatible with superblocks stored before it was
+    /// added — missing values deserialise as `None`.
+    #[serde(default)]
     pub last_idempotency_key: Option<String>,
 }
 
@@ -273,5 +279,52 @@ impl SuperblockManager {
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Superblocks stored before `last_idempotency_key` was added did not
+    /// include that field in their JSON.  Without `#[serde(default)]` the
+    /// deserializer would reject them with a missing-field error.  This test
+    /// asserts that such payloads round-trip to `None`.
+    #[test]
+    fn superblock_deserializes_without_last_idempotency_key() {
+        let json = r#"{
+            "generation": 42,
+            "next_inode": 100,
+            "next_segment": 5,
+            "shard_size": 8,
+            "version": 1,
+            "state": "Clean",
+            "cleanup_leases": []
+        }"#;
+        let sb: Superblock = serde_json::from_str(json)
+            .expect("superblock without last_idempotency_key must deserialize");
+        assert_eq!(sb.generation, 42);
+        assert_eq!(
+            sb.last_idempotency_key, None,
+            "missing field must default to None"
+        );
+    }
+
+    /// A superblock that *does* include the field must preserve it.
+    #[test]
+    fn superblock_preserves_last_idempotency_key() {
+        let original = Superblock {
+            generation: 7,
+            next_inode: 10,
+            next_segment: 2,
+            shard_size: 8,
+            version: 1,
+            state: FilesystemState::Clean,
+            cleanup_leases: Vec::new(),
+            last_idempotency_key: Some("abc123".to_string()),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: Superblock = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.last_idempotency_key, Some("abc123".to_string()));
     }
 }
