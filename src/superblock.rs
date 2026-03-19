@@ -30,6 +30,10 @@ pub struct Superblock {
     /// added — missing values deserialise as `None`.
     #[serde(default)]
     pub last_idempotency_key: Option<String>,
+    /// When true, clients must use the relay write-back path and direct writes
+    /// must fail closed.
+    #[serde(default)]
+    pub relay_required: bool,
 }
 
 impl Superblock {
@@ -43,6 +47,7 @@ impl Superblock {
             state: FilesystemState::Clean,
             cleanup_leases: Vec::new(),
             last_idempotency_key: None,
+            relay_required: false,
         }
     }
 }
@@ -205,6 +210,14 @@ impl SuperblockManager {
         .await
     }
 
+    pub async fn set_relay_required(&self, required: bool) -> Result<()> {
+        self.update_with_retry(|block| {
+            block.relay_required = required;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn commit_generation(&self, generation: u64) -> Result<()> {
         self.commit_generation_idempotent(generation, None).await
     }
@@ -310,6 +323,25 @@ mod tests {
         );
     }
 
+    /// Superblocks stored before `relay_required` was added should deserialize
+    /// with the default permissive value.
+    #[test]
+    fn superblock_deserializes_without_relay_required() {
+        let json = r#"{
+            "generation": 42,
+            "next_inode": 100,
+            "next_segment": 5,
+            "shard_size": 8,
+            "version": 1,
+            "state": "Clean",
+            "cleanup_leases": [],
+            "last_idempotency_key": null
+        }"#;
+        let sb: Superblock =
+            serde_json::from_str(json).expect("superblock without relay_required must deserialize");
+        assert!(!sb.relay_required);
+    }
+
     /// A superblock that *does* include the field must preserve it.
     #[test]
     fn superblock_preserves_last_idempotency_key() {
@@ -322,9 +354,11 @@ mod tests {
             state: FilesystemState::Clean,
             cleanup_leases: Vec::new(),
             last_idempotency_key: Some("abc123".to_string()),
+            relay_required: true,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded: Superblock = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.last_idempotency_key, Some("abc123".to_string()));
+        assert!(decoded.relay_required);
     }
 }

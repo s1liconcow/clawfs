@@ -19,23 +19,32 @@
 //! - Relay outage policy is explicit: fail closed by default, direct fallback
 //!   only with operator opt-in, and queue-and-retry must remain bounded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use parking_lot::Mutex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::clawfs::AcceleratorMode;
 use crate::inode::InodeRecord;
 use crate::metadata::MetadataStore;
+use crate::metadata::fvt;
 use crate::segment::{SegmentEntry, SegmentManager};
 use crate::superblock::SuperblockManager;
 
@@ -587,6 +596,827 @@ impl DedupStore {
     }
 }
 
+// ── Write-back buffer skeleton ─────────────────────────────────────────────
+
+/// Magic bytes for write-back WAL records.
+pub const WB_WAL_MAGIC: &[u8; 6] = b"CLWBE1";
+/// WAL segment rotation threshold.
+pub const WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// In-flight WAL submission from the HTTP handler to the WAL writer task.
+#[allow(dead_code)]
+pub struct WalSubmission {
+    fb_bytes: Vec<u8>,
+    generation: u64,
+    ack: oneshot::Sender<std::result::Result<(), io::Error>>,
+}
+
+/// One entry buffered in memory (WAL-written, not yet object-store committed).
+#[derive(Clone, Debug)]
+pub struct WBEntry {
+    pub assigned_generation: u64,
+    pub request: RelayWriteRequest,
+}
+
+/// State protected by an async mutex.
+///
+/// Held only for generation assignment and queue push, never across I/O.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct WBState {
+    logical_gen: u64,
+    pending: VecDeque<WBEntry>,
+}
+
+/// Errors surfaced by the write-back buffer pipeline.
+#[derive(Debug)]
+pub enum WriteBackError {
+    GenerationMismatch { expected: u64, actual: u64 },
+    Duplicate { committed_generation: u64 },
+    BufferFull,
+    WalWriterGone,
+    WalIo(io::Error),
+}
+
+impl fmt::Display for WriteBackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GenerationMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "write-back generation mismatch: expected {expected}, actual {actual}"
+                )
+            }
+            Self::Duplicate {
+                committed_generation,
+            } => {
+                write!(
+                    f,
+                    "write-back duplicate committed at generation {committed_generation}"
+                )
+            }
+            Self::BufferFull => write!(f, "write-back buffer is full"),
+            Self::WalWriterGone => write!(f, "write-back WAL writer task is not available"),
+            Self::WalIo(err) => write!(f, "write-back WAL I/O error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteBackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WalIo(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for WriteBackError {
+    fn from(value: io::Error) -> Self {
+        Self::WalIo(value)
+    }
+}
+
+// ── WAL record codec ──────────────────────────────────────────────────────
+
+/// Serialize a relay write into the FlatBuffer WAL record format.
+#[allow(dead_code)]
+pub(crate) fn build_wal_record_fb(generation: u64, request: &RelayWriteRequest) -> Vec<u8> {
+    let segment_payload =
+        bincode::serialize(&request.segment_data).expect("serialize segment_data for WAL record");
+    let delta_payload = bincode::serialize(&request.metadata_deltas)
+        .expect("serialize metadata_deltas for WAL record");
+
+    let capacity = 512
+        + request.idempotency_key.len()
+        + request.client_id.len()
+        + request.volume_prefix.len()
+        + segment_payload.len()
+        + delta_payload.len();
+    let mut fbb = FlatBufferBuilder::with_capacity(capacity);
+
+    let idempotency_key_wip = fbb.create_string(&request.idempotency_key);
+    let client_id_wip = fbb.create_string(&request.client_id);
+    let volume_prefix_wip = fbb.create_string(&request.volume_prefix);
+    let segment_payload_wip = fbb.create_vector(segment_payload.as_slice());
+    let delta_payload_wip = fbb.create_vector(delta_payload.as_slice());
+
+    let start = fbb.start_table();
+    fbb.push_slot_always::<u64>(fvt(0), generation);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(1), idempotency_key_wip);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(2), client_id_wip);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(3), volume_prefix_wip);
+    fbb.push_slot_always::<u64>(fvt(4), request.journal_sequence);
+    fbb.push_slot_always::<u64>(fvt(5), request.expected_parent_generation);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(6), segment_payload_wip);
+    fbb.push_slot_always::<WIPOffset<_>>(fvt(7), delta_payload_wip);
+    let root = fbb.end_table(start);
+    fbb.finish_minimal(root);
+    fbb.finished_data().to_vec()
+}
+
+/// Decode a relay write-back record from raw FlatBuffer bytes.
+#[allow(dead_code)]
+pub(crate) fn read_wal_record_fb(bytes: &[u8]) -> Result<WBEntry> {
+    let table = unsafe { flatbuffers::root_unchecked::<flatbuffers::Table<'_>>(bytes) };
+
+    let generation = unsafe { table.get::<u64>(fvt(0), Some(0)) }.unwrap_or(0);
+    anyhow::ensure!(generation != 0, "corrupt WAL record: generation=0");
+
+    let idempotency_key = unsafe { table.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(1), None) }
+        .context("missing WAL record idempotency_key")?
+        .to_string();
+    let client_id = unsafe { table.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(2), None) }
+        .context("missing WAL record client_id")?
+        .to_string();
+    let volume_prefix = unsafe { table.get::<flatbuffers::ForwardsUOffset<&str>>(fvt(3), None) }
+        .context("missing WAL record volume_prefix")?
+        .to_string();
+    let journal_sequence = unsafe { table.get::<u64>(fvt(4), Some(0)) }.unwrap_or(0);
+    let expected_parent_generation = unsafe { table.get::<u64>(fvt(5), Some(0)) }.unwrap_or(0);
+
+    let segment_payload_bytes = unsafe {
+        table.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(6), None)
+    }
+    .context("missing WAL record segment_payload")?
+    .bytes();
+    let delta_payload_bytes = unsafe {
+        table.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(fvt(7), None)
+    }
+    .context("missing WAL record delta_payload")?
+    .bytes();
+
+    let segment_data: Vec<SegmentEntry> = bincode::deserialize(segment_payload_bytes)
+        .context("deserializing segment_data from WAL record")?;
+    let metadata_deltas: Vec<InodeRecord> = bincode::deserialize(delta_payload_bytes)
+        .context("deserializing metadata_deltas from WAL record")?;
+
+    let request = RelayWriteRequest {
+        idempotency_key,
+        client_id,
+        volume_prefix,
+        journal_sequence,
+        segment_data,
+        metadata_deltas,
+        expected_parent_generation,
+    };
+
+    Ok(WBEntry {
+        assigned_generation: generation,
+        request,
+    })
+}
+
+/// List WAL segment files as `(sequence, path)` pairs sorted by sequence.
+#[allow(dead_code)]
+pub(crate) async fn list_wal_segments(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let mut segments = Vec::new();
+    let mut dir = match fs::read_dir(wal_dir).await {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading WAL directory {}", wal_dir.display()));
+        }
+    };
+
+    while let Some(entry) = dir
+        .next_entry()
+        .await
+        .with_context(|| format!("iterating WAL directory {}", wal_dir.display()))?
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(hex_seq) = name
+            .strip_prefix("seg_")
+            .and_then(|rest| rest.strip_suffix(".fb"))
+        else {
+            continue;
+        };
+        let Ok(seq) = u64::from_str_radix(hex_seq, 16) else {
+            continue;
+        };
+        segments.push((seq, path));
+    }
+
+    segments.sort_by_key(|(seq, _)| *seq);
+    Ok(segments)
+}
+
+/// Create a new WAL segment and write the magic header.
+#[allow(dead_code)]
+pub(crate) async fn create_new_wal_segment(wal_dir: &Path, seq: u64) -> Result<File> {
+    fs::create_dir_all(wal_dir)
+        .await
+        .with_context(|| format!("creating WAL directory {}", wal_dir.display()))?;
+
+    let path = wal_dir.join(format!("seg_{seq:016x}.fb"));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("opening WAL segment {}", path.display()))?;
+    file.write_all(WB_WAL_MAGIC)
+        .await
+        .with_context(|| format!("writing WAL magic to {}", path.display()))?;
+    file.sync_data()
+        .await
+        .with_context(|| format!("syncing WAL magic header {}", path.display()))?;
+    Ok(file)
+}
+
+/// Open the active WAL segment for append, creating the first one if needed.
+#[allow(dead_code)]
+pub(crate) async fn open_active_wal_segment(wal_dir: &Path) -> Result<(File, u64, u64)> {
+    let segments = list_wal_segments(wal_dir).await?;
+    if segments.is_empty() {
+        let file = create_new_wal_segment(wal_dir, 1).await?;
+        return Ok((file, 1, WB_WAL_MAGIC.len() as u64));
+    }
+
+    let (seq, path) = segments
+        .last()
+        .cloned()
+        .expect("segments are non-empty after empty check");
+    let file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("opening active WAL segment {}", path.display()))?;
+    let bytes_written = fs::metadata(&path)
+        .await
+        .with_context(|| format!("reading WAL segment metadata {}", path.display()))?
+        .len();
+    Ok((file, seq, bytes_written))
+}
+
+/// Recover pending WAL entries from existing segments.
+#[allow(dead_code)]
+pub(crate) async fn recover_from_wal(
+    wal_dir: &Path,
+    committed_gen: u64,
+) -> Result<(VecDeque<WBEntry>, u64)> {
+    let segments = list_wal_segments(wal_dir).await?;
+    if segments.is_empty() {
+        return Ok((VecDeque::new(), committed_gen));
+    }
+
+    let mut pending = VecDeque::new();
+
+    for (seq, path) in segments {
+        let mut file = match File::open(&path).await {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(seq, path = %path.display(), error = %err, "corrupt WAL segment open failed, skipping");
+                continue;
+            }
+        };
+
+        let mut magic = [0u8; WB_WAL_MAGIC.len()];
+        if let Err(err) = file.read_exact(&mut magic).await {
+            warn!(seq, path = %path.display(), error = %err, "corrupt WAL segment truncated before magic, skipping");
+            continue;
+        }
+        if magic != *WB_WAL_MAGIC {
+            warn!(seq, path = %path.display(), "corrupt WAL segment bad magic, skipping");
+            continue;
+        }
+
+        loop {
+            let mut first = [0u8; 1];
+            match file.read(&mut first).await {
+                Ok(0) => break,
+                Ok(1) => {}
+                Ok(_) => unreachable!(),
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "truncated WAL length prefix, skipping rest of segment");
+                    break;
+                }
+            }
+
+            let mut len_buf = [0u8; 4];
+            len_buf[0] = first[0];
+            if let Err(err) = file.read_exact(&mut len_buf[1..]).await {
+                warn!(seq, path = %path.display(), error = %err, "truncated WAL length prefix, skipping rest of segment");
+                break;
+            }
+
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut record_bytes = vec![0u8; len];
+            if let Err(err) = file.read_exact(&mut record_bytes).await {
+                warn!(seq, path = %path.display(), error = %err, "truncated WAL record body, skipping rest of segment");
+                break;
+            }
+
+            match read_wal_record_fb(&record_bytes) {
+                Ok(entry) => {
+                    if entry.assigned_generation > committed_gen {
+                        pending.push_back(entry);
+                    }
+                }
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "corrupt WAL record, skipping rest of segment");
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut expected = committed_gen.saturating_add(1);
+    let mut truncate_at = pending.len();
+    for (idx, entry) in pending.iter().enumerate() {
+        if entry.assigned_generation != expected {
+            warn!(
+                expected,
+                found = entry.assigned_generation,
+                "WAL generation gap detected during recovery"
+            );
+            truncate_at = idx;
+            break;
+        }
+        expected = expected.saturating_add(1);
+    }
+    if truncate_at < pending.len() {
+        pending.truncate(truncate_at);
+    }
+
+    let highest_gen = pending
+        .back()
+        .map(|entry| entry.assigned_generation)
+        .unwrap_or(committed_gen);
+    Ok((pending, highest_gen))
+}
+
+fn notify_batch_error(batch: Vec<WalSubmission>, kind: io::ErrorKind, message: String) {
+    for sub in batch {
+        let _ = sub.ack.send(Err(io::Error::new(kind, message.clone())));
+    }
+}
+
+/// Drain WAL submissions, batch them, fsync once, and wake the waiters.
+pub async fn run_wal_writer(
+    mut rx: mpsc::Receiver<WalSubmission>,
+    wal_dir: PathBuf,
+    segment_bytes: u64,
+) {
+    let (file, mut current_seq, mut bytes_written) = open_active_wal_segment(&wal_dir)
+        .await
+        .expect("WAL segment open failed");
+    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+
+    loop {
+        let Some(first) = rx.recv().await else {
+            if let Err(err) = writer.flush().await {
+                error!(error = %err, "WAL writer flush failed on shutdown");
+            } else if let Err(err) = writer.get_mut().sync_data().await {
+                error!(error = %err, "WAL writer sync_data failed on shutdown");
+            }
+            break;
+        };
+
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+
+        let mut total_bytes = 0u64;
+        for sub in &batch {
+            let len = sub.fb_bytes.len() as u32;
+            if let Err(err) = writer.write_all(&len.to_le_bytes()).await {
+                error!(error = %err, "WAL write failed (length prefix)");
+                notify_batch_error(
+                    batch,
+                    io::ErrorKind::BrokenPipe,
+                    "WAL write failed".to_string(),
+                );
+                return;
+            }
+            if let Err(err) = writer.write_all(&sub.fb_bytes).await {
+                error!(error = %err, "WAL write failed (record bytes)");
+                notify_batch_error(
+                    batch,
+                    io::ErrorKind::BrokenPipe,
+                    "WAL write failed".to_string(),
+                );
+                return;
+            }
+            total_bytes += 4 + sub.fb_bytes.len() as u64;
+        }
+
+        if let Err(err) = writer.flush().await {
+            error!(error = %err, "WAL BufWriter flush failed");
+            notify_batch_error(batch, err.kind(), err.to_string());
+            return;
+        }
+        if let Err(err) = writer.get_mut().sync_data().await {
+            error!(error = %err, "WAL sync_data failed");
+            notify_batch_error(batch, io::ErrorKind::Other, err.to_string());
+            return;
+        }
+
+        bytes_written = bytes_written.saturating_add(total_bytes);
+
+        if bytes_written >= segment_bytes {
+            let new_seq = current_seq.saturating_add(1);
+            match create_new_wal_segment(&wal_dir, new_seq).await {
+                Ok(new_file) => {
+                    writer = tokio::io::BufWriter::with_capacity(1024 * 1024, new_file);
+                    current_seq = new_seq;
+                    bytes_written = WB_WAL_MAGIC.len() as u64;
+                    info!(seq = new_seq, "WAL segment rotated");
+                }
+                Err(err) => {
+                    error!(error = %err, "WAL segment rotation failed");
+                    notify_batch_error(batch, io::ErrorKind::Other, err.to_string());
+                    return;
+                }
+            }
+        }
+
+        for sub in batch {
+            let _ = sub.ack.send(Ok(()));
+        }
+    }
+}
+
+/// Delete committed WAL segments while keeping the active tail segment.
+#[allow(dead_code)]
+async fn gc_committed_wal_segments(wal_dir: &Path, committed_gen: u64) -> Result<()> {
+    let segments = list_wal_segments(wal_dir).await?;
+    if segments.len() <= 1 {
+        return Ok(());
+    }
+
+    for (seq, path) in segments.iter().take(segments.len() - 1) {
+        let mut file = match File::open(&path).await {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(seq, path = %path.display(), error = %err, "wal_segment_open_failed");
+                continue;
+            }
+        };
+
+        let mut magic = [0u8; WB_WAL_MAGIC.len()];
+        if let Err(err) = file.read_exact(&mut magic).await {
+            warn!(seq, path = %path.display(), error = %err, "wal_segment_magic_read_failed");
+            continue;
+        }
+        if magic != *WB_WAL_MAGIC {
+            warn!(seq, path = %path.display(), "wal_segment_bad_magic");
+            continue;
+        }
+
+        let mut max_generation = 0u64;
+        loop {
+            let mut len_buf = [0u8; 4];
+            match file.read_exact(&mut len_buf).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "wal_segment_length_read_failed");
+                    break;
+                }
+            }
+
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut record_bytes = vec![0u8; len];
+            match file.read_exact(&mut record_bytes).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "wal_segment_record_read_failed");
+                    break;
+                }
+            }
+
+            match read_wal_record_fb(&record_bytes) {
+                Ok(entry) => {
+                    max_generation = max_generation.max(entry.assigned_generation);
+                }
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "wal_segment_record_decode_failed");
+                    break;
+                }
+            }
+        }
+
+        if max_generation <= committed_gen {
+            match fs::remove_file(&path).await {
+                Ok(()) => {
+                    info!(seq, path = %path.display(), "wal_segment_deleted");
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(seq, path = %path.display(), error = %err, "wal_segment_delete_failed");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Drain the in-memory pending queue by committing each entry in order.
+pub async fn run_flusher(
+    buffer: Arc<WriteBackBuffer>,
+    meta: Arc<MetadataStore>,
+    segments: Arc<SegmentManager>,
+    superblock: Arc<SuperblockManager>,
+    dedup: Arc<DedupStore>,
+    shard_size: u64,
+    flush_interval: Duration,
+) {
+    loop {
+        tokio::select! {
+            _ = buffer.flush_notify.notified() => {}
+            _ = tokio::time::sleep(flush_interval) => {}
+        }
+
+        let Some(entry) = ({
+            let state = buffer.state.lock().await;
+            state.pending.front().cloned()
+        }) else {
+            continue;
+        };
+
+        match relay_commit_pipeline(
+            &entry.request,
+            &meta,
+            &segments,
+            &superblock,
+            &dedup,
+            shard_size,
+        )
+        .await
+        {
+            Ok(response) => match response.status {
+                RelayStatus::Committed | RelayStatus::Duplicate => {
+                    if let Some(committed_generation) = response.committed_generation {
+                        buffer
+                            .committed_gen
+                            .store(committed_generation, Ordering::Release);
+                    } else {
+                        buffer
+                            .committed_gen
+                            .store(entry.assigned_generation, Ordering::Release);
+                    }
+
+                    {
+                        let mut state = buffer.state.lock().await;
+                        state.pending.pop_front();
+                    }
+
+                    buffer.admit_sem.add_permits(1);
+
+                    if let Err(e) =
+                        gc_committed_wal_segments(&buffer.wal_dir, entry.assigned_generation).await
+                    {
+                        warn!(
+                            error = %e,
+                            gen = entry.assigned_generation,
+                            "wal_gc_failed"
+                        );
+                    }
+
+                    let has_more = {
+                        let state = buffer.state.lock().await;
+                        state.pending.front().is_some()
+                    };
+                    if has_more {
+                        buffer.flush_notify.notify_one();
+                    }
+                }
+                RelayStatus::Failed => {
+                    error!(
+                        gen = entry.assigned_generation,
+                        error = ?response.error,
+                        actual_gen = ?response.actual_generation,
+                        "flusher_halted: relay_required invariant violated - generation mismatch indicates direct write bypass"
+                    );
+                    buffer.flusher_halted.store(true, Ordering::Release);
+                    return;
+                }
+                RelayStatus::Accepted => {
+                    warn!(
+                        gen = entry.assigned_generation,
+                        "unexpected Accepted from relay_commit_pipeline; retrying"
+                    );
+                    tokio::time::sleep(flush_interval).await;
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    gen = entry.assigned_generation,
+                    "flusher_commit_failed; retrying after backoff"
+                );
+                tokio::time::sleep(flush_interval).await;
+            }
+        }
+    }
+}
+
+/// Shared write-back state for relay writes.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct WriteBackBuffer {
+    state: AsyncMutex<WBState>,
+    wal_tx: mpsc::Sender<WalSubmission>,
+    flush_notify: Notify,
+    admit_sem: Semaphore,
+    max_buffer_entries: usize,
+    committed_gen: AtomicU64,
+    wal_dir: PathBuf,
+    flusher_halted: AtomicBool,
+}
+
+impl WriteBackBuffer {
+    /// Initialize the write-back buffer from the on-disk WAL state.
+    #[allow(dead_code)]
+    pub(crate) async fn new(
+        wal_dir: PathBuf,
+        max_buffer_entries: usize,
+        committed_gen: u64,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<WalSubmission>)> {
+        fs::create_dir_all(&wal_dir)
+            .await
+            .with_context(|| format!("creating WAL dir {}", wal_dir.display()))?;
+
+        let (pending, highest_gen) = recover_from_wal(&wal_dir, committed_gen).await?;
+        let logical_gen = highest_gen.saturating_add(1);
+        let initial_permits = max_buffer_entries.saturating_sub(pending.len());
+        let (wal_tx, wal_rx) = mpsc::channel(max_buffer_entries.saturating_mul(2).max(16));
+
+        let buffer = Arc::new(Self {
+            state: AsyncMutex::new(WBState {
+                logical_gen,
+                pending,
+            }),
+            wal_tx,
+            flush_notify: Notify::new(),
+            admit_sem: Semaphore::new(initial_permits),
+            max_buffer_entries,
+            committed_gen: AtomicU64::new(committed_gen),
+            wal_dir,
+            flusher_halted: AtomicBool::new(false),
+        });
+
+        if !buffer.state.lock().await.pending.is_empty() {
+            buffer.flush_notify.notify_one();
+        }
+
+        Ok((buffer, wal_rx))
+    }
+
+    /// Last generation acknowledged by the object store.
+    pub fn committed_gen(&self) -> u64 {
+        self.committed_gen.load(Ordering::Acquire)
+    }
+
+    /// True when the flusher has halted after a relay-required violation.
+    pub fn is_flusher_halted(&self) -> bool {
+        self.flusher_halted.load(Ordering::Acquire)
+    }
+
+    /// Number of WAL-written entries waiting for object-store commit.
+    pub async fn buffer_depth(&self) -> usize {
+        self.state.lock().await.pending.len()
+    }
+
+    /// Next generation that will be assigned to an incoming request.
+    pub async fn logical_gen(&self) -> u64 {
+        self.state.lock().await.logical_gen
+    }
+
+    /// Number of acknowledged generations that are not yet durable upstream.
+    pub async fn flush_lag(&self) -> u64 {
+        let logical = self.state.lock().await.logical_gen;
+        let committed = self.committed_gen();
+        logical.saturating_sub(1).saturating_sub(committed)
+    }
+
+    /// Assign the next generation and stage the request in memory.
+    #[allow(dead_code)]
+    async fn assign_generation(
+        &self,
+        request: RelayWriteRequest,
+        dedup: &Arc<DedupStore>,
+    ) -> Result<(WBEntry, Vec<u8>), WriteBackError> {
+        if let Some(committed_generation) = dedup.lookup(&request.idempotency_key) {
+            return Err(WriteBackError::Duplicate {
+                committed_generation,
+            });
+        }
+
+        let permit = self
+            .admit_sem
+            .acquire()
+            .await
+            .map_err(|_| WriteBackError::WalWriterGone)?;
+        permit.forget();
+
+        let mut state = self.state.lock().await;
+        let last_assigned = state.logical_gen.saturating_sub(1);
+        if request.expected_parent_generation != last_assigned {
+            self.admit_sem.add_permits(1);
+            return Err(WriteBackError::GenerationMismatch {
+                expected: request.expected_parent_generation,
+                actual: last_assigned,
+            });
+        }
+
+        let assigned_generation = state.logical_gen;
+        state.logical_gen = state.logical_gen.saturating_add(1);
+
+        let fb_bytes = build_wal_record_fb(assigned_generation, &request);
+        let entry = WBEntry {
+            assigned_generation,
+            request,
+        };
+        state.pending.push_back(entry.clone());
+
+        Ok((entry, fb_bytes))
+    }
+
+    async fn assign_generation_and_wal(
+        &self,
+        request: RelayWriteRequest,
+        dedup: &Arc<DedupStore>,
+    ) -> Result<u64, WriteBackError> {
+        if let Some(committed_generation) = dedup.lookup(&request.idempotency_key) {
+            return Err(WriteBackError::Duplicate {
+                committed_generation,
+            });
+        }
+
+        let permit = self
+            .admit_sem
+            .acquire()
+            .await
+            .map_err(|_| WriteBackError::WalWriterGone)?;
+        permit.forget();
+
+        let mut state = self.state.lock().await;
+        let last_assigned = state.logical_gen.saturating_sub(1);
+        if request.expected_parent_generation != last_assigned {
+            self.admit_sem.add_permits(1);
+            return Err(WriteBackError::GenerationMismatch {
+                expected: request.expected_parent_generation,
+                actual: last_assigned,
+            });
+        }
+
+        let assigned_generation = state.logical_gen;
+        state.logical_gen = state.logical_gen.saturating_add(1);
+
+        let fb_bytes = build_wal_record_fb(assigned_generation, &request);
+        let entry = WBEntry {
+            assigned_generation,
+            request,
+        };
+        state.pending.push_back(entry);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .wal_tx
+            .send(WalSubmission {
+                fb_bytes,
+                generation: assigned_generation,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            state.pending.pop_back();
+            state.logical_gen = assigned_generation;
+            self.admit_sem.add_permits(1);
+            return Err(WriteBackError::WalWriterGone);
+        }
+        drop(state);
+
+        ack_rx
+            .await
+            .map_err(|_| WriteBackError::WalWriterGone)?
+            .map_err(WriteBackError::WalIo)?;
+
+        Ok(assigned_generation)
+    }
+
+    /// Public write-back hot path: stage, fsync the WAL, and wake the flusher.
+    pub async fn assign_and_buffer(
+        &self,
+        request: RelayWriteRequest,
+        dedup: &Arc<DedupStore>,
+    ) -> Result<u64, WriteBackError> {
+        let generation = self.assign_generation_and_wal(request, dedup).await?;
+        self.flush_notify.notify_one();
+        Ok(generation)
+    }
+}
+
 // ── Relay ownership ─────────────────────────────────────────────────────────
 
 /// TTL for relay ownership leases (seconds).  Matches the cleanup-lease TTL
@@ -1069,13 +1899,53 @@ mod tests {
     };
     use std::thread;
     use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::runtime::Handle;
+    use tokio::runtime::Runtime;
 
     use super::{
         DEFAULT_RELAY_WRITE_PATH, DedupStore, RelayClient, RelayOutageAction, RelayOutagePolicy,
-        RelayOutageState, RelayStatus, RelayWriteRequest, RelayWriteResponse,
+        RelayOutageState, RelayStatus, RelayWriteRequest, RelayWriteResponse, WAL_SEGMENT_BYTES,
+        WB_WAL_MAGIC, WalSubmission, WriteBackBuffer, WriteBackError, build_wal_record_fb,
+        create_new_wal_segment, gc_committed_wal_segments, list_wal_segments,
+        open_active_wal_segment, read_wal_record_fb, recover_from_wal, run_flusher, run_wal_writer,
     };
+    use crate::config::Config;
     use crate::inode::InodeRecord;
+    use crate::metadata::MetadataStore;
+    use crate::segment::SegmentManager;
     use crate::segment::{SegmentEntry, SegmentPayload};
+    use crate::superblock::SuperblockManager;
+
+    fn assert_inode_record_round_trips(expected: &InodeRecord, actual: &InodeRecord) {
+        assert_eq!(actual.inode, expected.inode);
+        assert_eq!(actual.parent, expected.parent);
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.path, expected.path);
+        assert_eq!(actual.size, expected.size);
+        assert_eq!(actual.mode, expected.mode);
+        assert_eq!(actual.uid, expected.uid);
+        assert_eq!(actual.gid, expected.gid);
+        assert_eq!(actual.atime, expected.atime);
+        assert_eq!(actual.mtime, expected.mtime);
+        assert_eq!(actual.ctime, expected.ctime);
+        assert_eq!(actual.link_count, expected.link_count);
+        assert_eq!(actual.rdev, expected.rdev);
+        match (&expected.storage, &actual.storage) {
+            (
+                crate::inode::FileStorage::Inline(expected_bytes),
+                crate::inode::FileStorage::Inline(actual_bytes),
+            ) => {
+                assert_eq!(actual_bytes, expected_bytes);
+            }
+            _ => panic!("expected inline storage to round-trip"),
+        }
+    }
+
+    fn make_test_request(parent_gen: u64) -> RelayWriteRequest {
+        RelayWriteRequest::new("test-client", "test/prefix", 1, parent_gen, vec![], vec![])
+    }
 
     #[test]
     fn idempotency_key_is_deterministic() {
@@ -1122,6 +1992,610 @@ mod tests {
             request.expected_parent_generation
         );
         assert_eq!(decoded.metadata_deltas.len(), 1);
+    }
+
+    #[test]
+    fn wal_record_round_trips_through_flatbuffer_codec() {
+        let request = RelayWriteRequest::new(
+            "client-a",
+            "/vol/prefix",
+            9,
+            11,
+            vec![SegmentEntry {
+                inode: 1,
+                path: "/name".to_string(),
+                logical_offset: 0,
+                payload: SegmentPayload::Bytes(vec![1, 2, 3, 4]),
+            }],
+            vec![InodeRecord::new_file(
+                1,
+                2,
+                "name".to_string(),
+                "/name".to_string(),
+                1000,
+                1000,
+            )],
+        );
+
+        let bytes = build_wal_record_fb(77, &request);
+        let entry = read_wal_record_fb(&bytes).expect("decode WAL record");
+
+        assert_eq!(entry.assigned_generation, 77);
+        assert_eq!(entry.request.idempotency_key, request.idempotency_key);
+        assert_eq!(entry.request.client_id, request.client_id);
+        assert_eq!(entry.request.volume_prefix, request.volume_prefix);
+        assert_eq!(entry.request.journal_sequence, request.journal_sequence);
+        assert_eq!(
+            entry.request.expected_parent_generation,
+            request.expected_parent_generation
+        );
+        assert_eq!(entry.request.segment_data.len(), 1);
+        assert_eq!(entry.request.metadata_deltas.len(), 1);
+        assert_eq!(
+            entry.request.segment_data[0].inode,
+            request.segment_data[0].inode
+        );
+        assert_eq!(
+            entry.request.segment_data[0].path,
+            request.segment_data[0].path
+        );
+        assert_eq!(
+            entry.request.segment_data[0].logical_offset,
+            request.segment_data[0].logical_offset
+        );
+        match (
+            &entry.request.segment_data[0].payload,
+            &request.segment_data[0].payload,
+        ) {
+            (SegmentPayload::Bytes(actual), SegmentPayload::Bytes(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            _ => panic!("expected byte payload to round-trip"),
+        }
+        assert_inode_record_round_trips(
+            &request.metadata_deltas[0],
+            &entry.request.metadata_deltas[0],
+        );
+    }
+
+    #[test]
+    fn wal_record_round_trips_with_empty_payloads() {
+        let request =
+            RelayWriteRequest::new("client-1", "orgs/acme/volumes/vol1", 42, 99, vec![], vec![]);
+
+        let fb_bytes = build_wal_record_fb(100, &request);
+        assert!(!fb_bytes.is_empty());
+
+        let entry = read_wal_record_fb(&fb_bytes).expect("roundtrip should succeed");
+        assert_eq!(entry.assigned_generation, 100);
+        assert_eq!(entry.request.client_id, "client-1");
+        assert_eq!(entry.request.volume_prefix, "orgs/acme/volumes/vol1");
+        assert_eq!(entry.request.journal_sequence, 42);
+        assert_eq!(entry.request.expected_parent_generation, 99);
+        assert_eq!(entry.request.idempotency_key, request.idempotency_key);
+        assert!(entry.request.segment_data.is_empty());
+        assert!(entry.request.metadata_deltas.is_empty());
+    }
+
+    #[test]
+    fn wal_record_rejects_zero_generation() {
+        let request = RelayWriteRequest::new("c", "p", 1, 0, vec![], vec![]);
+        let fb_bytes = build_wal_record_fb(0, &request);
+        assert!(read_wal_record_fb(&fb_bytes).is_err());
+    }
+
+    #[test]
+    fn wal_segment_helpers_create_list_and_reopen() {
+        let rt = Runtime::new().expect("create runtime");
+        rt.block_on(async {
+            let dir = tempdir().expect("create tempdir");
+            let wal_dir = dir.path();
+
+            assert!(
+                list_wal_segments(wal_dir)
+                    .await
+                    .expect("list segments")
+                    .is_empty()
+            );
+
+            let (mut file, seq, bytes_written) = open_active_wal_segment(wal_dir)
+                .await
+                .expect("open active segment");
+            assert_eq!(seq, 1);
+            assert_eq!(bytes_written, WB_WAL_MAGIC.len() as u64);
+
+            file.write_all(b"abc").await.expect("append payload");
+            file.sync_data().await.expect("sync payload");
+
+            let segments = list_wal_segments(wal_dir).await.expect("list segments");
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].0, 1);
+
+            let (_file2, seq2, bytes2) = open_active_wal_segment(wal_dir)
+                .await
+                .expect("reopen active segment");
+            assert_eq!(seq2, 1);
+            assert!(bytes2 >= WB_WAL_MAGIC.len() as u64 + 3);
+
+            let _ = create_new_wal_segment(wal_dir, 2)
+                .await
+                .expect("create second segment");
+            let segments = list_wal_segments(wal_dir).await.expect("list segments");
+            assert_eq!(segments.len(), 2);
+            assert_eq!(segments[1].0, 2);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_segment_rotation_lists_active_segments_in_order() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path();
+
+        let _ = open_active_wal_segment(wal_dir)
+            .await
+            .expect("open active segment");
+        let _ = create_new_wal_segment(wal_dir, 2)
+            .await
+            .expect("create second segment");
+
+        let segments = list_wal_segments(wal_dir).await.expect("list segments");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].0, 1);
+        assert_eq!(segments[1].0, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_segment_rotation_uses_expected_file_name() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path();
+
+        let _ = create_new_wal_segment(wal_dir, 0xDEADBEEF)
+            .await
+            .expect("create named segment");
+        let segments = list_wal_segments(wal_dir).await.expect("list segments");
+        let filename = segments[0].1.file_name().unwrap().to_str().unwrap();
+        assert_eq!(filename, "seg_00000000deadbeef.fb");
+    }
+
+    #[test]
+    fn recover_from_wal_skips_committed_and_truncates_gaps() {
+        let rt = Runtime::new().expect("create runtime");
+        rt.block_on(async {
+            let dir = tempdir().expect("create tempdir");
+            let wal_dir = dir.path();
+
+            let request = |seq: u64| {
+                RelayWriteRequest::new(
+                    "client-a",
+                    "/vol/prefix",
+                    seq,
+                    seq.saturating_sub(1),
+                    vec![SegmentEntry {
+                        inode: seq,
+                        path: format!("/name-{seq}"),
+                        logical_offset: 0,
+                        payload: SegmentPayload::Bytes(vec![seq as u8]),
+                    }],
+                    vec![InodeRecord::new_file(
+                        seq,
+                        2,
+                        format!("name-{seq}"),
+                        format!("/name-{seq}"),
+                        1000,
+                        1000,
+                    )],
+                )
+            };
+
+            let mut file = create_new_wal_segment(wal_dir, 1)
+                .await
+                .expect("create segment");
+            for generation in [1_u64, 2, 4] {
+                let record = build_wal_record_fb(generation, &request(generation));
+                let len = (record.len() as u32).to_le_bytes();
+                file.write_all(&len).await.expect("write length");
+                file.write_all(&record).await.expect("write record");
+            }
+            file.flush().await.expect("flush wal segment");
+            file.sync_data().await.expect("sync wal segment");
+
+            let (pending, highest_gen) = recover_from_wal(wal_dir, 1).await.expect("recover wal");
+            assert_eq!(highest_gen, 2);
+            assert_eq!(pending.len(), 1);
+            let entry = pending.front().expect("pending entry");
+            assert_eq!(entry.assigned_generation, 2);
+            assert_eq!(entry.request.journal_sequence, 2);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_finds_pending_entries_after_crash() {
+        let dir = tempdir().expect("create tempdir");
+        let committed_gen = 5u64;
+        let wal_dir = dir.path().to_path_buf();
+        let (buf, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 16, committed_gen)
+            .await
+            .expect("create buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        for parent_gen in committed_gen..(committed_gen + 3) {
+            let req = RelayWriteRequest::new("c", "p", parent_gen, parent_gen, vec![], vec![]);
+            let assigned_gen = buf
+                .assign_and_buffer(req, &dedup)
+                .await
+                .expect("assign and buffer");
+            assert_eq!(assigned_gen, parent_gen + 1);
+        }
+
+        assert_eq!(buf.buffer_depth().await, 3);
+        drop(buf);
+        writer_handle.await.expect("writer task");
+
+        let (buf2, wal_rx2) = WriteBackBuffer::new(wal_dir.clone(), 16, committed_gen)
+            .await
+            .expect("recover buffer");
+        drop(wal_rx2);
+        assert_eq!(
+            buf2.buffer_depth().await,
+            3,
+            "should recover 3 pending entries"
+        );
+        assert_eq!(
+            buf2.logical_gen().await,
+            committed_gen + 4,
+            "logical_gen should be committed_gen + 3 entries + 1"
+        );
+        assert_eq!(
+            buf2.committed_gen(),
+            committed_gen,
+            "committed_gen starts at superblock.generation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_skips_committed_entries_after_partial_flush() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().to_path_buf();
+        let (buf, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 16, 1)
+            .await
+            .expect("create buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        for parent_gen in 1u64..6 {
+            let req = RelayWriteRequest::new("c", "p", parent_gen, parent_gen, vec![], vec![]);
+            buf.assign_and_buffer(req, &dedup)
+                .await
+                .expect("assign and buffer");
+        }
+        drop(buf);
+        writer_handle.await.expect("writer task");
+
+        let (buf2, wal_rx2) = WriteBackBuffer::new(wal_dir.clone(), 16, 4)
+            .await
+            .expect("recover buffer");
+        drop(wal_rx2);
+        assert_eq!(
+            buf2.buffer_depth().await,
+            2,
+            "only gens 5 and 6 should be recovered"
+        );
+        assert_eq!(buf2.logical_gen().await, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_handles_truncated_wal_suffix() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().to_path_buf();
+        let (buf, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 16, 1)
+            .await
+            .expect("create buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        let req = RelayWriteRequest::new("c", "p", 1, 1, vec![], vec![]);
+        buf.assign_and_buffer(req, &dedup)
+            .await
+            .expect("assign and buffer");
+        drop(buf);
+        writer_handle.await.expect("writer task");
+
+        let segs = list_wal_segments(&wal_dir)
+            .await
+            .expect("list wal segments");
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&segs[0].1)
+            .await
+            .expect("open wal segment");
+        f.write_all(&[0xFF, 0xFF]).await.expect("append garbage");
+        drop(f);
+
+        let (buf2, wal_rx2) = WriteBackBuffer::new(wal_dir.clone(), 16, 1)
+            .await
+            .expect("recover buffer");
+        drop(wal_rx2);
+        assert_eq!(
+            buf2.buffer_depth().await,
+            1,
+            "one valid entry should be recovered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gc_committed_wal_segments_deletes_committed_segments_but_keeps_active_tail() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path();
+
+        let mut first = create_new_wal_segment(wal_dir, 1)
+            .await
+            .expect("create first wal segment");
+        for generation in [2_u64, 3] {
+            let record = build_wal_record_fb(generation, &make_test_request(generation - 1));
+            first
+                .write_all(&(record.len() as u32).to_le_bytes())
+                .await
+                .expect("write length");
+            first.write_all(&record).await.expect("write record");
+        }
+        first.flush().await.expect("flush first segment");
+        first.sync_data().await.expect("sync first segment");
+
+        let mut second = create_new_wal_segment(wal_dir, 2)
+            .await
+            .expect("create second wal segment");
+        let record = build_wal_record_fb(4, &make_test_request(3));
+        second
+            .write_all(&(record.len() as u32).to_le_bytes())
+            .await
+            .expect("write length");
+        second.write_all(&record).await.expect("write record");
+        second.flush().await.expect("flush second segment");
+        second.sync_data().await.expect("sync second segment");
+
+        gc_committed_wal_segments(wal_dir, 3)
+            .await
+            .expect("gc committed wal segments");
+
+        let segments = list_wal_segments(wal_dir).await.expect("list segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_wal_writer_persists_and_replays_batches() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().to_path_buf();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let writer_handle = tokio::spawn(run_wal_writer(rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+
+        let mut acks = Vec::new();
+        for i in 1u64..=20 {
+            let request = RelayWriteRequest::new("client-a", "/vol/prefix", i, i, vec![], vec![]);
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            tx.send(WalSubmission {
+                fb_bytes: build_wal_record_fb(i + 1, &request),
+                generation: i + 1,
+                ack: ack_tx,
+            })
+            .await
+            .expect("send wal submission");
+            acks.push(ack_rx);
+        }
+
+        for ack_rx in acks {
+            assert!(ack_rx.await.expect("batch ack").is_ok());
+        }
+
+        drop(tx);
+        writer_handle.await.expect("writer task");
+
+        let (pending, highest_gen) = recover_from_wal(&wal_dir, 1).await.expect("recover wal");
+        assert_eq!(pending.len(), 20);
+        assert_eq!(highest_gen, 21);
+        let gens: Vec<u64> = pending
+            .iter()
+            .map(|entry| entry.assigned_generation)
+            .collect();
+        let expected: Vec<u64> = (2u64..=21).collect();
+        assert_eq!(gens, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_assign_generation_tracks_state_and_metrics() {
+        let dir = tempdir().expect("create tempdir");
+        let buffer = WriteBackBuffer::new(dir.path().to_path_buf(), 4, 5)
+            .await
+            .expect("create buffer")
+            .0;
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        assert_eq!(buffer.committed_gen(), 5);
+        assert!(!buffer.is_flusher_halted());
+        assert_eq!(buffer.buffer_depth().await, 0);
+        assert_eq!(buffer.logical_gen().await, 6);
+        assert_eq!(buffer.flush_lag().await, 0);
+
+        let request = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 5, vec![], vec![]);
+        let (entry, fb_bytes) = buffer
+            .assign_generation(request, &dedup)
+            .await
+            .expect("assign generation");
+
+        assert_eq!(entry.assigned_generation, 6);
+        assert!(!fb_bytes.is_empty());
+        assert_eq!(buffer.buffer_depth().await, 1);
+        assert_eq!(buffer.logical_gen().await, 7);
+        assert_eq!(buffer.flush_lag().await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_assign_and_buffer_commits_through_writer() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().to_path_buf();
+        let (buffer, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 4, 1)
+            .await
+            .expect("create buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        let request = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 1, vec![], vec![]);
+        let generation = buffer
+            .assign_and_buffer(request, &dedup)
+            .await
+            .expect("assign and buffer");
+        assert_eq!(generation, 2);
+        assert_eq!(buffer.buffer_depth().await, 1);
+
+        drop(buffer);
+        writer_handle.await.expect("writer task");
+        let (pending, highest_gen) = recover_from_wal(&wal_dir, 1).await.expect("recover wal");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(highest_gen, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_flusher_commits_pending_entries_and_releases_backpressure() {
+        let dir = tempdir().expect("create tempdir");
+        let wal_dir = dir.path().join("wal");
+        let store_path = dir.path().join("store");
+        let cache_path = dir.path().join("cache");
+        let state_path = dir.path().join("state");
+        let mount_path = dir.path().join("mnt");
+        let config = Config::with_paths(mount_path, store_path, cache_path, state_path);
+        let handle = Handle::current();
+
+        let metadata = Arc::new(
+            MetadataStore::new(&config, handle.clone())
+                .await
+                .expect("create metadata store"),
+        );
+        let segments =
+            Arc::new(SegmentManager::new(&config, handle).expect("create segment manager"));
+        let superblock = Arc::new(
+            SuperblockManager::load_or_init(metadata.clone(), config.shard_size)
+                .await
+                .expect("create superblock manager"),
+        );
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+        let (buffer, wal_rx) = WriteBackBuffer::new(wal_dir.clone(), 4, 1)
+            .await
+            .expect("create write-back buffer");
+        let writer_handle =
+            tokio::spawn(run_wal_writer(wal_rx, wal_dir.clone(), WAL_SEGMENT_BYTES));
+        let flusher_handle = tokio::spawn(run_flusher(
+            buffer.clone(),
+            metadata.clone(),
+            segments.clone(),
+            superblock.clone(),
+            dedup.clone(),
+            config.shard_size,
+            Duration::from_millis(10),
+        ));
+
+        let request = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 1, vec![], vec![]);
+        let generation = buffer
+            .assign_and_buffer(request, &dedup)
+            .await
+            .expect("assign and buffer");
+        assert_eq!(generation, 2);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if buffer.committed_gen() >= 2 && buffer.buffer_depth().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flusher should commit the pending entry");
+
+        assert_eq!(buffer.committed_gen(), 2);
+        assert_eq!(buffer.buffer_depth().await, 0);
+        assert_eq!(buffer.flush_lag().await, 0);
+        assert_eq!(superblock.snapshot().generation, 2);
+
+        flusher_handle.abort();
+        writer_handle.abort();
+        let _ = flusher_handle.await;
+        let _ = writer_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_assign_generation_rejects_duplicates_and_mismatch() {
+        let dir = tempdir().expect("create tempdir");
+        let buffer = WriteBackBuffer::new(dir.path().to_path_buf(), 4, 5)
+            .await
+            .expect("create buffer")
+            .0;
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        dedup.record("some-idem-key".to_string(), 42);
+        let duplicate = RelayWriteRequest {
+            idempotency_key: "some-idem-key".to_string(),
+            client_id: "c".to_string(),
+            volume_prefix: "p".to_string(),
+            journal_sequence: 1,
+            segment_data: vec![],
+            metadata_deltas: vec![],
+            expected_parent_generation: 5,
+        };
+        let err = buffer
+            .assign_generation(duplicate, &dedup)
+            .await
+            .expect_err("duplicate should be rejected");
+        assert!(matches!(
+            err,
+            WriteBackError::Duplicate {
+                committed_generation: 42
+            }
+        ));
+
+        let mismatch = RelayWriteRequest::new("client-a", "/vol/prefix", 2, 3, vec![], vec![]);
+        let err = buffer
+            .assign_generation(mismatch, &dedup)
+            .await
+            .expect_err("mismatch should be rejected");
+        assert!(matches!(
+            err,
+            WriteBackError::GenerationMismatch {
+                expected: 3,
+                actual: 5
+            }
+        ));
+        assert_eq!(buffer.buffer_depth().await, 0);
+        assert_eq!(buffer.logical_gen().await, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writeback_assign_generation_applies_backpressure() {
+        let dir = tempdir().expect("create tempdir");
+        let buffer = WriteBackBuffer::new(dir.path().to_path_buf(), 1, 1)
+            .await
+            .expect("create buffer")
+            .0;
+        let dedup = DedupStore::new(Duration::from_secs(3600));
+
+        let first = RelayWriteRequest::new("client-a", "/vol/prefix", 1, 1, vec![], vec![]);
+        let (entry, _) = buffer
+            .assign_generation(first, &dedup)
+            .await
+            .expect("first assignment");
+        assert_eq!(entry.assigned_generation, 2);
+
+        let second = RelayWriteRequest::new("client-a", "/vol/prefix", 2, 2, vec![], vec![]);
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(100),
+            buffer.assign_generation(second, &dedup),
+        )
+        .await;
+        assert!(timed_out.is_err(), "buffer should block when full");
     }
 
     #[test]
