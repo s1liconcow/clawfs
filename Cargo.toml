@@ -4,8 +4,14 @@ version = "0.2.9"
 edition = "2024"
 
 [workspace]
-members = [".", "clawfs-preload", "clawfs-nfs-gateway"]
-default-members = [".", "clawfs-preload"]
+members = [
+    ".",
+    "clawfs-preload",
+    "clawfs-nfs-gateway",
+    "crates/clawfs-core",
+    "crates/clawfs-private",
+]
+default-members = [".", "crates/clawfs-core", "crates/clawfs-private"]
 
 [features]
 default = ["fuse"]

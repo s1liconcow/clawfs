@@ -29,6 +29,12 @@ The preload/shared-library path is aimed at agent launchers that want normal
 file APIs without requiring a host mount. It currently targets Linux-style
 `LD_PRELOAD` flows.
 
+The workspace now includes split-prep facade crates:
+- `crates/clawfs-core`: public OSS-facing API surface for the filesystem engine
+- `crates/clawfs-private`: private/business-facing facade used by preload and gateway
+
+Those facades are the dependency boundaries intended for the later multi-repo split.
+
 For the hosted demo/free journey, the intended product flow is:
 - `clawfs login`
 - sign in with email, Google, or GitHub

@@ -1,4 +1,4 @@
-use clawfs::inode::{InodeRecord, ROOT_INODE};
+use clawfs_private::inode::{InodeRecord, ROOT_INODE};
 use time::OffsetDateTime;
 
 use crate::fd_table::FdEntry;
@@ -400,11 +400,26 @@ pub fn dispatch_chdir_lazy(
     dispatch_chdir(rt, cwd, full_path, inner)
 }
 
-/// Dispatch `readdir` via nfs_readdir_plus, caching results (with d_type) in the FdEntry.
+/// Dispatch `readdir`, deriving `d_type` via `nfs_getattr`, and cache results in the FdEntry.
 pub fn dispatch_readdir_fill(rt: &ClawfsRuntime, entry: &FdEntry) -> Result<(), i32> {
     let mut dir = entry.dir_entries.lock();
     if dir.is_none() {
-        let entries = rt.fs.nfs_readdir_plus(entry.inode)?;
+        let entries = rt
+            .fs
+            .nfs_readdir(entry.inode)?
+            .into_iter()
+            .map(|(inode, name)| {
+                let record = rt.fs.nfs_getattr(inode)?;
+                let d_type = if record.is_dir() {
+                    libc::DT_DIR
+                } else if record.is_symlink() {
+                    libc::DT_LNK
+                } else {
+                    libc::DT_REG
+                };
+                Ok((inode, d_type, name))
+            })
+            .collect::<Result<Vec<_>, i32>>()?;
         *dir = Some((entries, 0));
     }
     Ok(())

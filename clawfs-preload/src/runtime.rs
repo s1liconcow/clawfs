@@ -3,15 +3,15 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 
-use clawfs::config::{Config, ObjectStoreProvider};
-use clawfs::fs::OsageFs;
-use clawfs::inode::{FileStorage, InodeRecord, ROOT_INODE};
-use clawfs::journal::JournalManager;
-use clawfs::metadata::MetadataStore;
-use clawfs::replay::ReplayLogger;
-use clawfs::segment::SegmentManager;
-use clawfs::state::ClientStateManager;
-use clawfs::superblock::SuperblockManager;
+use clawfs_private::config::{Config, ObjectStoreProvider};
+use clawfs_private::fs::OsageFs;
+use clawfs_private::inode::{FileStorage, InodeRecord, ROOT_INODE};
+use clawfs_private::journal::JournalManager;
+use clawfs_private::metadata::MetadataStore;
+use clawfs_private::replay::ReplayLogger;
+use clawfs_private::segment::SegmentManager;
+use clawfs_private::state::ClientStateManager;
+use clawfs_private::superblock::SuperblockManager;
 
 use crate::cwd::CwdTracker;
 use crate::fd_table::FdTable;
@@ -150,7 +150,8 @@ impl ClawfsRuntime {
             )
         };
 
-        clawfs::clawfs::apply_env_runtime_spec(&mut config).context("applying env runtime spec")?;
+        clawfs_private::clawfs::apply_env_runtime_spec(&mut config)
+            .context("applying env runtime spec")?;
 
         // Ensure local directories exist (fast, local-only I/O).
         if matches!(config.object_provider, ObjectStoreProvider::Local) {
@@ -210,8 +211,8 @@ fn do_full_init(config: &Config) -> Result<ClawfsRuntime> {
     let handle = tokio_rt.handle().clone();
 
     // Create a single shared object store for both metadata and segments.
-    let (shared_store, meta_prefix) = clawfs::metadata::create_object_store(config)?;
-    let seg_prefix = clawfs::segment::segment_prefix(&config.object_prefix);
+    let (shared_store, meta_prefix) = clawfs_private::metadata::create_object_store(config)?;
+    let seg_prefix = clawfs_private::segment::segment_prefix(&config.object_prefix);
 
     let fs = tokio_rt.block_on(async {
         let metadata = Arc::new(

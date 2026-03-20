@@ -1,0 +1,11 @@
+[package]
+name = "clawfs-core"
+version = "0.2.9"
+edition = "2024"
+
+[features]
+default = []
+fuse = ["clawfs/fuse"]
+
+[dependencies]
+clawfs = { path = "../..", default-features = false }

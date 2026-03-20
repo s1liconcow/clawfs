@@ -34,6 +34,8 @@ The repository also includes `clawfs-nfs-gateway/`, a standalone NFSv3 server th
 - [Sprite workflow and privileged execution rules](docs/clawfs-sprites.md)
 
 ## Quick Pointers
+- Repo split scaffolding:
+  `crates/clawfs-core` is the public/OSS facade crate and `crates/clawfs-private` is the private facade crate used by preload and gateway during the migration.
 - Add new filesystem behavior in `src/fs/ops.rs` first, then adapt transport-specific layers in `src/fs/fuse.rs` or `src/fs/nfs.rs` if needed.
 - `src/config.rs` maps CLI flags into runtime config.
 - `src/metadata.rs` owns inode caching, shard snapshots, delta logs, and superblock CAS updates.

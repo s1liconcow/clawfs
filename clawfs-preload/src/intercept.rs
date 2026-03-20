@@ -1221,7 +1221,7 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exit(status: i32) -> ! {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        clawfs::fs::set_process_exiting(true);
+        clawfs_private::fs::set_process_exiting(true);
         if let Some(rt) = ClawfsRuntime::get() {
             let _ = rt.fs.nfs_flush();
         }
@@ -1234,7 +1234,7 @@ pub unsafe extern "C" fn exit(status: i32) -> ! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _exit(status: i32) -> ! {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        clawfs::fs::set_process_exiting(true);
+        clawfs_private::fs::set_process_exiting(true);
         if let Some(rt) = ClawfsRuntime::get() {
             let _ = rt.fs.nfs_flush();
         }
@@ -1247,7 +1247,7 @@ pub unsafe extern "C" fn _exit(status: i32) -> ! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _Exit(status: i32) -> ! {
     if let Some(_guard) = ReentrancyGuard::enter() {
-        clawfs::fs::set_process_exiting(true);
+        clawfs_private::fs::set_process_exiting(true);
         if let Some(rt) = ClawfsRuntime::get() {
             let _ = rt.fs.nfs_flush();
         }

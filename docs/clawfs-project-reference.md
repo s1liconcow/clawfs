@@ -14,6 +14,8 @@
 - `clawfs-nfs-gateway/` is a standalone NFSv3 server. NFSv4 is Enterprise-only.
 
 ## Key Components
+- `crates/clawfs-core`: OSS facade crate for the filesystem/runtime surface that is intended to move into the public repo.
+- `crates/clawfs-private`: private facade crate for hosted/business functionality and private consumers such as preload and the NFS gateway.
 - `src/config.rs`: CLI to `Config` mapping.
 - `src/perf.rs`: JSONL perf logger for `stage_file` and `flush_pending` events.
 - `src/replay.rs`: compressed replay logger (`.jsonl.gz`) for FUSE and NFS traces.

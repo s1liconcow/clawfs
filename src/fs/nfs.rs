@@ -100,6 +100,44 @@ impl OsageFs {
         result
     }
 
+    /// Non-FUSE fallback for callers that still need d_type metadata.
+    /// This resolves each child inode through `nfs_getattr` and derives the
+    /// directory-entry type from the inode record.
+    #[cfg(not(feature = "fuse"))]
+    pub fn nfs_readdir_plus(&self, ino: u64) -> std::result::Result<Vec<(u64, u8, String)>, i32> {
+        use crate::compat::{DT_DIR, DT_LNK, DT_REG};
+
+        let replay = self.replay_start();
+        let result = self.op_readdir_nfs(ino).and_then(|entries| {
+            let mut enriched = Vec::with_capacity(entries.len());
+            for (child_ino, name) in entries {
+                let record = self.nfs_getattr(child_ino)?;
+                let dt = if record.is_dir() {
+                    DT_DIR
+                } else if record.is_symlink() {
+                    DT_LNK
+                } else {
+                    DT_REG
+                };
+                enriched.push((child_ino, dt, name));
+            }
+            Ok(enriched)
+        });
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "readdir_plus",
+                replay,
+                errno,
+                json!({ "ino": ino, "entries": result.as_ref().ok().map_or(0usize, |e: &Vec<(u64, u8, String)>| e.len()) }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "readdir_plus", errno);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn nfs_setattr(
         &self,

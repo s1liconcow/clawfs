@@ -6,16 +6,16 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use clawfs::clawfs as clawfs_runtime;
-use clawfs::config::{Config, ObjectStoreProvider};
-use clawfs::fs::OsageFs;
-use clawfs::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
-use clawfs::journal::JournalManager;
-use clawfs::metadata::MetadataStore;
-use clawfs::replay::ReplayLogger;
-use clawfs::segment::SegmentManager;
-use clawfs::state::ClientStateManager;
-use clawfs::superblock::SuperblockManager;
+use clawfs_private::clawfs as clawfs_runtime;
+use clawfs_private::config::{Config, ObjectStoreProvider};
+use clawfs_private::fs::OsageFs;
+use clawfs_private::inode::{FileStorage, InodeKind, InodeRecord, ROOT_INODE};
+use clawfs_private::journal::JournalManager;
+use clawfs_private::metadata::MetadataStore;
+use clawfs_private::replay::ReplayLogger;
+use clawfs_private::segment::SegmentManager;
+use clawfs_private::state::ClientStateManager;
+use clawfs_private::superblock::SuperblockManager;
 use serde_json::json;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
@@ -885,8 +885,8 @@ async fn ensure_root(
     superblock: Arc<SuperblockManager>,
     config: &Config,
 ) -> Result<()> {
-    let uid = clawfs::compat::current_uid();
-    let gid = clawfs::compat::current_gid();
+    let uid = clawfs_private::compat::current_uid();
+    let gid = clawfs_private::compat::current_gid();
     let desired_mode = 0o40777;
 
     if let Some(mut existing) = metadata.get_inode(ROOT_INODE).await? {
@@ -990,7 +990,7 @@ async fn ensure_welcome_file(
 }
 
 fn map_errno(code: i32) -> nfsstat3 {
-    use clawfs::compat;
+    use clawfs_private::compat;
     match code {
         compat::ENOENT => nfsstat3::NFS3ERR_NOENT,
         compat::EPERM => nfsstat3::NFS3ERR_PERM,

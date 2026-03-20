@@ -425,13 +425,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawfs-core"
+version = "0.2.9"
+dependencies = [
+ "clawfs",
+]
+
+[[package]]
 name = "clawfs-nfs-gateway"
 version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
  "clap",
- "clawfs",
+ "clawfs-private",
  "dashmap 5.5.3",
  "serde",
  "serde_json",
@@ -450,7 +457,7 @@ name = "clawfs-preload"
 version = "0.2.9"
 dependencies = [
  "anyhow",
- "clawfs",
+ "clawfs-private",
  "ctor",
  "dashmap 6.1.0",
  "env_logger 0.11.9",
@@ -460,6 +467,13 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "clawfs-private"
+version = "0.2.9"
+dependencies = [
+ "clawfs",
 ]
 
 [[package]]
