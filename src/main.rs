@@ -1,34 +1,26 @@
 use std::env;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use clap::Parser;
 
-use clawfs::frontdoor::{self, DispatchAction};
+use clawfs::config::{Cli, Config};
 #[cfg(feature = "fuse")]
 use clawfs::launch;
-use clawfs::nfs_mount;
 use clawfs::telemetry::install_panic_hook;
 
 fn main() -> Result<()> {
     install_panic_hook();
     let args: Vec<_> = env::args_os().collect();
-    match frontdoor::dispatch(&args)? {
-        DispatchAction::Handled => Ok(()),
-        #[cfg(feature = "fuse")]
-        DispatchAction::Mount(invocation) => {
-            let invocation = *invocation;
-            launch::run_mount_entry(invocation.config, &args, Some(&invocation.hosted))
-        }
-        #[cfg(not(feature = "fuse"))]
-        DispatchAction::Mount(_) => {
-            bail!("FUSE support is not available in this build. Use --transport nfs instead.")
-        }
-        DispatchAction::NfsMount(invocation) => nfs_mount::run_nfs_mount(*invocation),
-        DispatchAction::FallThrough => {
-            if let Some(hint) = frontdoor::manual_cli_hint(&args) {
-                bail!("{hint}");
-            }
-            frontdoor::print_general_help();
-            Ok(())
-        }
+    #[cfg(feature = "fuse")]
+    {
+        let cli = Cli::parse();
+        let config: Config = cli.into();
+        launch::run_mount_entry(config, &args, None)
+    }
+    #[cfg(not(feature = "fuse"))]
+    {
+        anyhow::bail!(
+            "FUSE support is not available in this build. Rebuild with the `fuse` feature enabled."
+        )
     }
 }

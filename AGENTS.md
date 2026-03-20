@@ -22,20 +22,15 @@ ClawFS is a FUSE-based log-structured filesystem that stages writes locally, flu
 
 Close-time durability uses a local journal under `$STORE/journal`. Pending writes are buffered per inode and flushed asynchronously with coalescing; a flush writes a segment, emits delta logs, rewrites touched shards, and advances the superblock generation. Large writes stage under `$STORE/segment_stage`, metadata caches follow NFS-like TTLs, and each client keeps local identity and allocation state via `--state-path`.
 
-The repository also includes `clawfs-nfs-gateway/`, a standalone NFSv3 server that serves the same storage model without a FUSE mount.
-
 ## Table Of Contents
 - [Project internals and architecture](docs/clawfs-project-reference.md)
-- [Shared-library / preload design](docs/clawfs-shared-library-design.md)
 - [ClawFS storage modes and hosted free-tier model](docs/clawfs-storage-modes.md)
 - [Testing, tooling, troubleshooting, and common commands](docs/clawfs-testing-and-operations.md)
-- [Hosted accelerator architecture](docs/clawfs-hosted-accelerator-codex.md)
-- [Hosted accelerator operator runbook](docs/hosted-accelerator-runbook.md) — includes org-scoped (`clawfs_org_worker`) and per-volume worker guidance
 - [Sprite workflow and privileged execution rules](docs/clawfs-sprites.md)
 
 ## Quick Pointers
 - Repo split scaffolding:
-  `crates/clawfs-core` is the public/OSS facade crate and `crates/clawfs-private` is the private facade crate used by preload and gateway during the migration.
+  `crates/clawfs-core` is the public/OSS facade crate used for the public repository split.
 - Add new filesystem behavior in `src/fs/ops.rs` first, then adapt transport-specific layers in `src/fs/fuse.rs` or `src/fs/nfs.rs` if needed.
 - `src/config.rs` maps CLI flags into runtime config.
 - `src/metadata.rs` owns inode caching, shard snapshots, delta logs, and superblock CAS updates.
@@ -50,7 +45,6 @@ Keep this file focused. Put detailed implementation notes, workflow specifics, a
 |------|----------------|----------------|
 | `src/config.rs` | ~470 | CLI/env config parsing. `Cli` struct (line 11), `Config` struct (line 232), `ObjectStoreProvider` enum (line 468) |
 | `src/clawfs.rs` | ~330 | Storage modes, runtime spec. `StorageMode` enum (line 27), `RuntimeSpec` (line 56), `apply_env_runtime_spec()` (line 105) |
-| `src/frontdoor.rs` | ~800+ | Hosted volume bootstrap. `SummonApiConfig` (line 56), `HostedVolumeConfig` (line 76), `HostedVolume` (line 89), `DispatchAction` enum (line 141) |
 | `src/launch.rs` | ~1300 | Mount setup, cleanup worker, credentials. `HostedControlPlane` (line 64), `run_mount()` (line 141), `apply_hosted_credentials()` (line 394), `spawn_cleanup_worker()` (line 776), `perform_segment_compaction()` (line 872), `ControlPlaneCredentials` (line 972), `refresh_hosted_credentials()` (line 1035) |
 | `src/superblock.rs` | ~258 | Superblock, leases, generation. `Superblock` (line 18), `CleanupTaskKind` enum (line 42), `CleanupLease` (line 48), `try_acquire_cleanup()` (line 225), `complete_cleanup()` (line 248) |
 | `src/metadata.rs` | ~1400+ | Inode caching, shards, deltas. `get_inode_with_ttl()` (line 809), `persist_inodes_batch()` (line 943), `store_superblock_conditional()` (line 679), `apply_external_deltas()` (line 1350), `delta_file_count()` (line 1354), `segment_candidates()` (line 1394) |
@@ -66,9 +60,6 @@ Keep this file focused. Put detailed implementation notes, workflow specifics, a
 **Cleanup constants** (src/launch.rs): `DELTA_COMPACT_THRESHOLD=128` (line 39), `DELTA_COMPACT_KEEP=32` (line 40), `SEGMENT_COMPACT_BATCH=8` (line 41), `SEGMENT_COMPACT_LAG=3` (line 42), lease TTL=30s.
 
 **Key design docs:**
-- `docs/clawfs-hosted-accelerator-codex.md` — Full hosted accelerator design (modes, phases, failure handling)
-- `docs/hosted-accelerator-runbook.md` — Operator-facing deployment, rollout, SLO, and incident guide
-- `docs/CLEANUP_AGENT.md` — Near-bucket cleanup deployment pattern
 - `docs/clawfs-project-reference.md` — Architecture internals
 
 ## Writing Good Beads (Task Descriptions)

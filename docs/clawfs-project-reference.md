@@ -11,11 +11,9 @@
 - Metadata and list caches follow NFS-like TTLs. A background poller applies newer generations and prefetches segments. Metadata flushes batch up to `--imap-delta-batch` inodes per delta object.
 - Cleanup uses short leases in the superblock for `DeltaCompaction` and `SegmentCompaction`. Use `--disable-cleanup` when far from the bucket.
 - Each client maintains a local state file (`--state-path`) for `client_id`, inode pool, and segment pool.
-- `clawfs-nfs-gateway/` is a standalone NFSv3 server. NFSv4 is Enterprise-only.
 
 ## Key Components
 - `crates/clawfs-core`: OSS facade crate for the filesystem/runtime surface that is intended to move into the public repo.
-- `crates/clawfs-private`: private facade crate for hosted/business functionality and private consumers such as preload and the NFS gateway.
 - `src/config.rs`: CLI to `Config` mapping.
 - `src/perf.rs`: JSONL perf logger for `stage_file` and `flush_pending` events.
 - `src/replay.rs`: compressed replay logger (`.jsonl.gz`) for FUSE and NFS traces.
@@ -31,7 +29,7 @@
 - `src/fs/fuse.rs`: FUSE adapter.
 - `src/fs/nfs.rs`: NFS adapter.
 - `src/bin/clawfs_replay.rs`: direct API replayer with brute-force mode (`--iterations N`, `--seed`, chaos knobs).
-- Main scripts: `linux_kernel_perf.sh`, `fio_workloads.sh`, `cleanup.sh`, `stress_e2e.sh`, `micro_workflows.sh`, `checkpoint.sh`, `run_clawfs.sh`, `run_nfs_gateway.sh`, `sprite_validate_parallel.sh`, `common.sh`.
+- Main scripts: `linux_kernel_perf.sh`, `fio_workloads.sh`, `cleanup.sh`, `stress_e2e.sh`, `micro_workflows.sh`, `checkpoint.sh`, `run_clawfs.sh`, `sprite_validate_parallel.sh`, `common.sh`.
 
 ## Architecture Decisions
 - Flush uses per-inode `try_lock` for non-blocking draining; contended inodes are skipped for that cycle.

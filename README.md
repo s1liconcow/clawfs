@@ -22,27 +22,12 @@ in their object name so clients can skip unrelated updates with list-only scans.
 
 ClawFS supports access through:
 - FUSE mounts on hosts that can expose a normal filesystem mountpoint
-- user-mode NFS for networked or remote clients
-- a preload shared library for tighter in-process agent integration
+- direct object-store backed local and shared filesystem workflows
 
-The preload/shared-library path is aimed at agent launchers that want normal
-file APIs without requiring a host mount. It currently targets Linux-style
-`LD_PRELOAD` flows.
-
-The workspace now includes split-prep facade crates:
+The workspace now includes the public split-prep facade crate:
 - `crates/clawfs-core`: public OSS-facing API surface for the filesystem engine
-- `crates/clawfs-private`: private/business-facing facade used by preload and gateway
 
-Those facades are the dependency boundaries intended for the later multi-repo split.
-
-For the hosted demo/free journey, the intended product flow is:
-- `clawfs login`
-- sign in with email, Google, or GitHub
-- receive and store a `CLAWFS_API_TOKEN`
-- `clawfs summon demo -- <command>`
-
-That auth step exists to tie hosted demo volumes to a real account and reduce
-abuse. Purely local usage does not need the hosted auth path.
+Private/business functionality now lives in the separate private repository.
 
 ## Comparison matrix
 
@@ -355,23 +340,6 @@ To prevent remote clients from accidentally shipping maintenance data across
 regions, pass `--disable-cleanup` when mounting. A separate cleanup agent (see
 `docs/CLEANUP_AGENT.md`) can run next to the bucket and take the leases on their
 behalf.
-
-### NFS gateway
-
-Run `clawfs-nfs-gateway` when you want to export ClawFS over NFS without
-running a FUSE mount. The default `--protocol v3` backend talks to ClawFS
-metadata/segments directly and serves them over NFS. It uses the
-[`nfsserve`](https://github.com/xetdata/nfsserve) user-mode NFSv3 server so it
-works with the Windows built-in client. Example:
-
-```
-cargo run --manifest-path clawfs-nfs-gateway/Cargo.toml -- \
-  --store-path /tmp/clawfs-store \
-  --listen 0.0.0.0:2049
-```
-
-Windows clients can mount via `mount -o anon,nolock,vers=3 \\10.0.0.5\\ X:`.
-NFSv4 support is part of the Enterprise offering.
 
 ### Remote cleanup agents
 

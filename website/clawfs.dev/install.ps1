@@ -1,10 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Install ClawFS for Windows (NFS-only build).
+    Install the public ClawFS CLI for Windows.
 .DESCRIPTION
     Downloads the latest (or specified) ClawFS Windows release and installs
-    clawfs.exe and clawfs-nfs-gateway.exe to a local directory.
+    clawfs.exe to a local directory.
 .EXAMPLE
     iwr https://clawfs.dev/install.ps1 -UseBasicParsing | iex
 .EXAMPLE
@@ -53,7 +53,6 @@ try {
     # Install
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item (Join-Path $TmpDir "clawfs.exe") $InstallDir -Force
-    Copy-Item (Join-Path $TmpDir "clawfs-nfs-gateway.exe") $InstallDir -Force
 
     Write-Host ""
     Write-Host "Installed ClawFS to $InstallDir"
@@ -70,13 +69,8 @@ try {
 
     Write-Host ""
     Write-Host "Next steps:"
-    Write-Host "  clawfs login"
-    Write-Host "  clawfs whoami"
-    Write-Host "  clawfs mount --volume default"
-    Write-Host ""
-    Write-Host "Note: NFS mount requires Windows Services for NFS (NFS Client) to be enabled."
-    Write-Host "  Enable it via: Settings > Apps > Optional Features > Add a feature > Services for NFS"
-    Write-Host "  Or in PowerShell (admin): Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly"
+    Write-Host "  clawfs --help"
+    Write-Host "  clawfs --mount-path C:\clawfs-mnt --store-path C:\clawfs-store"
 } finally {
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 }

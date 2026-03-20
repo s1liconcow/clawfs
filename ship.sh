@@ -103,14 +103,9 @@ main() {
   fi
 
   replace_manifest_version Cargo.toml "$version"
-  replace_manifest_version clawfs-nfs-gateway/Cargo.toml "$version"
-  replace_manifest_version clawfs-preload/Cargo.toml "$version"
-
   replace_lock_version clawfs "$version"
-  replace_lock_version clawfs-nfs-gateway "$version"
-  replace_lock_version clawfs-preload "$version"
 
-  git add Cargo.toml Cargo.lock clawfs-nfs-gateway/Cargo.toml clawfs-preload/Cargo.toml
+  git add Cargo.toml Cargo.lock
   git commit -m "release: $tag"
   git tag "$tag"
   git push origin "$branch"

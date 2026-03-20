@@ -2,7 +2,7 @@
 
 ## Validation And Benchmarking
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
-- The repo root is a Cargo workspace; `cargo build --release` from the root builds both `clawfs` and `clawfs-preload`, which is required for `clawfs up`.
+- The repo root is a Cargo workspace; `cargo build --release` from the root builds the public `clawfs` packages.
 - Local performance suite: `CLAWFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`.
 - `CLAWFS_PERF_PROFILE=fast` in `benches/perf_local_criterion.rs` keeps `sample_size=20` and increases `measurement_time` to 13s to avoid Criterion sample warnings on slower hosts.
 - Perf guard uses `scripts/perf_guard.sh` together with `CLAWFS_BENCH_METRICS_FILE`, which is emitted as JSONL by `benches/perf_local_criterion.rs`.
@@ -56,4 +56,3 @@
 - Replay capture: `REPLAY_LOG_PATH=/work/clawfs/replay.jsonl.gz ./scripts/run_clawfs.sh`
 - Direct replay: `cargo run --release --bin clawfs_replay -- --trace-path replay.jsonl.gz --store-path /tmp/clawfs-replay-store --local-cache-path /tmp/clawfs-replay-cache --state-path /tmp/clawfs-replay-state.bin --layer fuse --speed 1.0`
 - Checkpoint create or restore: `cargo run --bin clawfs_checkpoint -- create/restore --store-path ... --checkpoint-path ...`
-- NFS export: `cargo run --manifest-path clawfs-nfs-gateway/Cargo.toml -- --store-path /tmp/clawfs-store --listen 0.0.0.0:2049`

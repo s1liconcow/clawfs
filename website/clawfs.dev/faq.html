@@ -71,12 +71,12 @@
           <article class="card faq-card">
             <h3>What OS do you support?</h3>
             <p>
-              The intended support matrix is Windows via user-mode NFS, macOS via the preload shared-library path and
-              user-mode NFS, and Linux via preload, user-mode NFS, and FUSE.
+              The public CLI is centered on local filesystem mounts. Linux with FUSE is the primary supported path in
+              this repo, and managed product-specific launch modes live outside the OSS tree.
             </p>
             <p>
-              In other words: Linux gets every mode, macOS gets the agent-friendly launch paths without depending on
-              FUSE, and Windows is aimed at the NFS route.
+              In other words: treat the public repo as the filesystem engine and mount flow, not the full hosted
+              product surface.
             </p>
           </article>
 
@@ -95,13 +95,11 @@
           <article class="card faq-card">
             <h3>What launch modes exist?</h3>
             <p>
-              There are three main paths: <code>clawfs up</code> for preload-based launches, <code>clawfs mount</code>
-              for mounts over FUSE or NFS, and <code>clawfs serve</code> for launching an explicit NFS server.
+              The public path is the CLI-driven mount flow around the filesystem engine plus the supporting checkpoint
+              and replay tools.
             </p>
             <p>
-              Use <code>up</code> for the simplest agent launch path, <code>mount</code> when you want the CLI to mount
-              the volume with <code>--transport auto|fuse|nfs</code>, and <code>serve</code> when you want a standalone
-              NFS server process.
+              Managed launch modes, preload workflows, and hosted coordination now live outside the public repo.
             </p>
           </article>
 
@@ -211,11 +209,11 @@
           <article class="card faq-card">
             <h3>What does the runtime surface look like?</h3>
             <p>
-              The core behavior lives in the shared filesystem layer, then gets exposed through transport-specific paths:
-              FUSE, NFS, and a preload-based shared-library route for process injection.
+              The core behavior lives in the shared filesystem layer and is exposed publicly through the FUSE-oriented
+              mount flow in this repo.
             </p>
             <p>
-              The storage model stays the same across those access paths.
+              The storage model stays the same even as private product surfaces are split into separate repositories.
             </p>
           </article>
 

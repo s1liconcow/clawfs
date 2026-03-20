@@ -20,7 +20,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::auth::user_config_root;
 use crate::clawfs;
 use crate::config::{Config, ObjectStoreProvider};
 
@@ -311,7 +310,22 @@ fn write_telemetry_file(path: &PathBuf, file: &TelemetryFile) -> Result<()> {
 }
 
 fn telemetry_config_path() -> Result<PathBuf> {
-    Ok(user_config_root()?.join(TELEMETRY_CONFIG_FILE))
+    Ok(default_user_config_root().join(TELEMETRY_CONFIG_FILE))
+}
+
+fn default_user_config_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("clawfs");
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("APPDATA") {
+        return PathBuf::from(path).join("clawfs");
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("clawfs")
 }
 
 fn default_telemetry_file() -> TelemetryFile {

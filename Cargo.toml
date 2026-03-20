@@ -6,12 +6,9 @@ edition = "2024"
 [workspace]
 members = [
     ".",
-    "clawfs-preload",
-    "clawfs-nfs-gateway",
     "crates/clawfs-core",
-    "crates/clawfs-private",
 ]
-default-members = [".", "crates/clawfs-core", "crates/clawfs-private"]
+default-members = [".", "crates/clawfs-core"]
 
 [features]
 default = ["fuse"]
@@ -57,14 +54,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "perf_local_criterion"
-harness = false
-
-[[bench]]
-name = "bench_hosted"
-harness = false
-
-[[bench]]
-name = "hosted"
 harness = false
 
 [profile.release]

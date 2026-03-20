@@ -5,7 +5,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 WORKDIR_REMOTE="${WORKDIR_REMOTE:-/work/clawfs}"
 SYNC_REPO=1
 SKIP_BOOTSTRAP=0
-TASKS_CSV="xfstests,linux,pjdfstest"
+TASKS_CSV="linux,pjdfstest"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/validation-results-$(date +%Y%m%d-%H%M%S)}"
 
 usage() {
@@ -13,12 +13,11 @@ usage() {
 Usage: scripts/sprite_validate_parallel.sh [options]
 
 Run validation suites in parallel on dedicated sprites:
-  - xfstests
   - linux kernel compile perf script
   - pjdfstest
 
 Options:
-  --tasks <csv>        Comma-separated list: xfstests,linux,pjdfstest
+  --tasks <csv>        Comma-separated list: linux,pjdfstest
   --no-sync            Skip tar sync into sprites (assume /work/clawfs is current)
   --skip-bootstrap     Skip apt/bootstrap steps inside sprites
   --log-dir <path>     Local directory for per-task logs
@@ -26,7 +25,7 @@ Options:
 
 Examples:
   scripts/sprite_validate_parallel.sh
-  scripts/sprite_validate_parallel.sh --tasks xfstests,linux
+  scripts/sprite_validate_parallel.sh --tasks linux,pjdfstest
   scripts/sprite_validate_parallel.sh --no-sync --skip-bootstrap
 USAGE
 }
@@ -106,118 +105,6 @@ sudo apt-get install -y \
   make gcc g++ binutils bc bison flex perl rsync cpio pv time ripgrep strace \
   fio fuse3 util-linux sudo
 echo "user_allow_other" | sudo tee -a /etc/fuse.conf >/dev/null || true
-EOF
-}
-
-run_xfstests_cmd() {
-  cat <<EOF
-set -euo pipefail
-cd '$WORKDIR_REMOTE'
-if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
-  $(bootstrap_common_cmd)
-  sudo apt-get install -y \
-    acl attr automake dbench dump e2fsprogs gawk indent \
-    libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
-    liburing-dev libuuid1 lvm2 quota sed uuid-dev uuid-runtime xfsprogs \
-    sqlite3 libgdbm-compat-dev systemd-coredump systemd jq pkg-config \
-    nfs-common \
-    exfatprogs f2fs-tools ocfs2-tools udftools xfsdump xfslibs-dev || true
-fi
-
-if [[ ! -d /tmp/xfstests ]]; then
-  git clone https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
-  (cd /tmp/xfstests && make && sudo make install)
-fi
-
-(cd clawfs-nfs-gateway && cargo build --release)
-
-# Clean up from prior runs.
-sudo rm -rf /tmp/clawfs-test-store /tmp/clawfs-scratch-store
-sudo rm -rf /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
-mkdir -p /tmp/clawfs-test-store /tmp/clawfs-scratch-store
-mkdir -p /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
-sudo mkdir -p /mnt/test /mnt/scratch
-
-# Start ClawFS NFS gateway (TEST instance)
-target/release/clawfs-nfs-gateway \
-  --store-path /tmp/clawfs-test-store \
-  --local-cache-path /tmp/clawfs-test-cache \
-  --state-path /tmp/clawfs-test-state.bin \
-  --object-provider local \
-  --disable-journal \
-  --listen 127.0.0.1:2049 &
-echo \$! > /tmp/clawfs-test.pid
-
-for _ in \$(seq 1 30); do
-  nc -z 127.0.0.1 2049 && break
-  sleep 1
-done
-nc -z 127.0.0.1 2049 || { echo "TEST NFS instance failed to start"; exit 1; }
-
-# Start ClawFS NFS gateway (SCRATCH instance)
-target/release/clawfs-nfs-gateway \
-  --store-path /tmp/clawfs-scratch-store \
-  --local-cache-path /tmp/clawfs-scratch-cache \
-  --state-path /tmp/clawfs-scratch-state.bin \
-  --object-provider local \
-  --disable-journal \
-  --listen 127.0.0.1:20499 &
-echo \$! > /tmp/clawfs-scratch.pid
-
-for _ in \$(seq 1 30); do
-  nc -z 127.0.0.1 20499 && break
-  sleep 1
-done
-nc -z 127.0.0.1 20499 || { echo "SCRATCH NFS instance failed to start"; exit 1; }
-
-cd /tmp/xfstests
-cat > local.config <<'LOCALCFG'
-export FSTYP=nfs
-
-export TEST_DEV=localhost:/
-export TEST_DIR=/mnt/test
-export SCRATCH_DEV=127.0.0.1:/
-export SCRATCH_MNT=/mnt/scratch
-
-export TEST_FS_MOUNT_OPTS="-o nolock,tcp,port=2049,mountport=2049,vers=3,hard"
-export NFS_MOUNT_OPTIONS="-o nolock,tcp,port=20499,mountport=20499,vers=3,hard"
-LOCALCFG
-
-cat > excludes <<'EX'
-generic/003
-generic/013
-generic/035
-generic/069
-generic/075
-generic/091
-generic/112
-generic/113
-generic/126
-generic/169
-generic/184
-generic/394
-generic/467
-generic/263
-generic/759
-generic/760
-generic/477
-generic/564
-generic/633
-generic/696
-generic/591
-generic/615
-generic/087
-EX
-
-sudo ./check -E excludes \
-  generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 \
-  generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
-
-# Cleanup NFS instances
-sudo umount /mnt/test || true
-sudo umount /mnt/scratch || true
-kill \$(cat /tmp/clawfs-test.pid) || true
-kill \$(cat /tmp/clawfs-scratch.pid) || true
 EOF
 }
 
@@ -301,7 +188,7 @@ declare -A SPRITE_BY_TASK
 declare -A PID_BY_TASK
 declare -A LOG_BY_TASK
 
-for task in xfstests linux pjdfstest; do
+for task in linux pjdfstest; do
   if ! contains_task "$task"; then
     continue
   fi
@@ -324,7 +211,6 @@ launch_task() {
   local log_path="$3"
   local cmd=""
   case "$task" in
-    xfstests) cmd="$(run_xfstests_cmd)" ;;
     linux) cmd="$(run_linux_cmd)" ;;
     pjdfstest) cmd="$(run_pjdfstest_cmd)" ;;
     *) echo "Unknown task $task" >&2; return 1 ;;

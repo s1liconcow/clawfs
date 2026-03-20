@@ -4,9 +4,6 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
-NFS_LOG_FILE="${NFS_LOG_FILE:-$PWD/clawfs-nfs-gateway.log}"
-NFS_GATEWAY_PID_FILE="${NFS_GATEWAY_PID_FILE:-/tmp/clawfs-nfs-gateway.pid}"
-
 is_mounted() {
   local path="$1"
   if mountpoint -q "$path" 2>/dev/null; then
@@ -57,9 +54,6 @@ kill_pidfile_process() {
   fi
 }
 
-kill_pidfile_process "$NFS_GATEWAY_PID_FILE" "clawfs-nfs-gateway"
-pkill -f clawfs-nfs-gateway 2>/dev/null || true
-
 if is_mounted "$MOUNT_PATH"; then
   echo "Unmounting $MOUNT_PATH ..."
   fstype="$(mount_fstype "$MOUNT_PATH")"
@@ -93,11 +87,6 @@ if [[ -f "$STATE_PATH" ]]; then
 fi
 
 
-
-if [[ -f "$NFS_LOG_FILE" ]]; then
-  echo "Removing NFS log files $NFS_LOG_FILE ..."
-  rm -f "$NFS_LOG_FILE"
-fi
 
 if [[ -d "$MOUNT_PATH" ]]; then
   echo "Removing mount dir $MOUNT_PATH ..."

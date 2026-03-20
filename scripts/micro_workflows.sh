@@ -11,12 +11,8 @@ source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 osage_set_defaults
 
 PID_FILE="${PID_FILE:-/tmp/clawfs-micro.pid}"
-TRANSPORT="${TRANSPORT:-fuse}" # fuse|nfs
-if [[ "$TRANSPORT" == "nfs" ]]; then
-  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_nfs_gateway.sh}"
-else
-  OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_clawfs.sh}"
-fi
+TRANSPORT="${TRANSPORT:-fuse}" # public repo supports fuse only
+OSAGE_RUNNER="${OSAGE_RUNNER:-$ROOT_DIR/scripts/run_clawfs.sh}"
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/micro-results-$(date +%Y%m%d-%H%M%S)}"
 LOCAL_BASE="${LOCAL_BASE:-/tmp/clawfs-micro-local}"
@@ -25,11 +21,6 @@ MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 MODE="${MODE:-both}" # both|osage|local
 WORKFLOW_PROFILE="${WORKFLOW_PROFILE:-quick}" # quick|realistic|all
 TEST_FILTER="${TEST_FILTER:-}" # comma-separated test names from TEST_NAMES
-
-# NFS transport knobs
-NFS_LISTEN="${NFS_LISTEN:-0.0.0.0:2049}"
-NFS_MOUNT_PATH="${NFS_MOUNT_PATH:-$MOUNT_PATH}"
-NFS_LOG_FILE="${NFS_LOG_FILE:-$ROOT_DIR/clawfs-nfs-gateway.log}"
 
 # Workload knobs (default to moderate intensity for clearer perf signal)
 SMALLFILE_COUNT="${SMALLFILE_COUNT:-5000}"
