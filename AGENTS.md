@@ -45,7 +45,7 @@ Keep this file focused. Put detailed implementation notes, workflow specifics, a
 |------|----------------|----------------|
 | `src/config.rs` | ~470 | CLI/env config parsing. `Cli` struct (line 11), `Config` struct (line 232), `ObjectStoreProvider` enum (line 468) |
 | `src/clawfs.rs` | ~330 | Storage modes, runtime spec. `StorageMode` enum (line 27), `RuntimeSpec` (line 56), `apply_env_runtime_spec()` (line 105) |
-| `src/launch.rs` | ~1300 | Mount setup, cleanup worker, credentials. `HostedControlPlane` (line 64), `run_mount()` (line 141), `apply_hosted_credentials()` (line 394), `spawn_cleanup_worker()` (line 776), `perform_segment_compaction()` (line 872), `ControlPlaneCredentials` (line 972), `refresh_hosted_credentials()` (line 1035) |
+| `src/launch.rs` | ~700 | Public mount bootstrap, logging, root initialization, metadata polling, and local cleanup-worker startup |
 | `src/superblock.rs` | ~258 | Superblock, leases, generation. `Superblock` (line 18), `CleanupTaskKind` enum (line 42), `CleanupLease` (line 48), `try_acquire_cleanup()` (line 225), `complete_cleanup()` (line 248) |
 | `src/metadata.rs` | ~1400+ | Inode caching, shards, deltas. `get_inode_with_ttl()` (line 809), `persist_inodes_batch()` (line 943), `store_superblock_conditional()` (line 679), `apply_external_deltas()` (line 1350), `delta_file_count()` (line 1354), `segment_candidates()` (line 1394) |
 | `src/segment.rs` | ~400+ | Immutable segment I/O. `SegmentPointer` (line 31), `SegmentEntry` (line 38), `SegmentManager` (line 65), `write_batch()`, `read_pointer()`, `delete_segment()` |

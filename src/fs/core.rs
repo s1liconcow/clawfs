@@ -2,21 +2,11 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use crate::clawfs::AcceleratorMode;
-use crate::relay::{RelayClient, RelayReplayDecision, RelayStatus, relay_replay_reconcile};
-
 pub(crate) fn epoch_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn relay_pending_state_is_reflected_by_superblock(
-    current_generation: u64,
-    expected_generation: u64,
-) -> bool {
-    current_generation >= expected_generation
 }
 
 impl OsageFs {
@@ -113,7 +103,6 @@ impl OsageFs {
         replay: Option<Arc<ReplayLogger>>,
         telemetry: Option<Arc<TelemetryClient>>,
         telemetry_session_id: Option<String>,
-        coordination_publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
     ) -> Self {
         let fsync_on_close = config.fsync_on_close;
         let flush_interval = if config.flush_interval_ms == 0 {
@@ -139,7 +128,6 @@ impl OsageFs {
             replay,
             telemetry,
             telemetry_session_id,
-            coordination_publisher,
             mount_ready_emitted: Arc::new(AtomicBool::new(false)),
             fsync_on_close,
             flush_interval,
@@ -158,182 +146,6 @@ impl OsageFs {
         let Some(journal) = &self.journal else {
             return Ok(0);
         };
-
-        if self.config.accelerator_mode == Some(AcceleratorMode::RelayWrite)
-            && let Some(relay_state) = journal.relay_pending_state()
-        {
-            if relay_state.committed_generation.is_some() {
-                let entries = journal.load_entries()?;
-                for entry in &entries {
-                    journal.clear_entry(entry.record.inode)?;
-                }
-                journal.clear_relay_pending_state()?;
-                debug!(
-                    "replay_journal cleared committed relay state for {} entries",
-                    entries.len()
-                );
-                return Ok(entries.len());
-            }
-
-            let current_generation = self.superblock.snapshot().generation;
-            let expected_generation = relay_state.request.expected_parent_generation + 1;
-            if relay_pending_state_is_reflected_by_superblock(
-                current_generation,
-                expected_generation,
-            ) {
-                let entries = journal.load_entries()?;
-                for entry in &entries {
-                    if let Err(err) = journal.clear_entry(entry.record.inode) {
-                        log::warn!(
-                            "replay_journal locally committed relay clear failed ino={} err={err:#}",
-                            entry.record.inode
-                        );
-                    }
-                }
-                if let Err(err) = journal.clear_relay_pending_state() {
-                    log::warn!(
-                        "replay_journal failed to clear locally committed relay pending state: {err:#}"
-                    );
-                }
-                info!(
-                    "replay_journal cleared relay state already reflected by superblock current_generation={} expected_generation={} entries={}",
-                    current_generation,
-                    expected_generation,
-                    entries.len()
-                );
-                return Ok(entries.len());
-            }
-
-            let snapshot = self.superblock.prepare_dirty_generation()?;
-            let target_generation = snapshot.generation;
-            if target_generation != expected_generation {
-                self.superblock.abort_generation(target_generation);
-                return Err(anyhow!(
-                    "relay_write replay generation mismatch: prepared {} expected {}",
-                    target_generation,
-                    expected_generation
-                ));
-            }
-            let Some(endpoint) = self.config.accelerator_endpoint.clone() else {
-                self.superblock.abort_generation(target_generation);
-                log::error!("replay_journal relay_write configured without accelerator endpoint");
-                return Err(anyhow!(
-                    "relay_write replay requires an accelerator endpoint"
-                ));
-            };
-            let client = RelayClient::new(endpoint, self.config.relay_session_token.clone())
-                .map_err(|err| {
-                    self.superblock.abort_generation(target_generation);
-                    log::error!("replay_journal failed to build relay client: {err:#}");
-                    anyhow!("failed to build relay client: {err:#}")
-                })?;
-            let response = self.block_on(client.submit_relay_write(relay_state.request.clone()));
-            match response {
-                Ok(response) => match response.status {
-                    RelayStatus::Committed | RelayStatus::Duplicate => {
-                        let committed_generation =
-                            response.committed_generation.ok_or_else(|| {
-                                anyhow!("relay write response missing committed_generation")
-                            })?;
-                        if committed_generation != target_generation {
-                            self.superblock.abort_generation(target_generation);
-                            return Err(anyhow!(
-                                "relay_write replay committed generation mismatch: prepared {} committed {}",
-                                target_generation,
-                                committed_generation
-                            ));
-                        }
-                        self.block_on(self.superblock.commit_generation(committed_generation))?;
-                        if let Err(err) = self.metadata.apply_external_deltas() {
-                            log::warn!(
-                                "replay_journal failed to refresh metadata after relay commit: {err:#}"
-                            );
-                        }
-                        let entries = journal.load_entries()?;
-                        if let Err(err) = journal.mark_relay_committed(committed_generation) {
-                            log::warn!(
-                                "replay_journal failed to mark relay state committed: {err:#}"
-                            );
-                        }
-                        for entry in &entries {
-                            if let Err(err) = journal.clear_entry(entry.record.inode) {
-                                log::warn!(
-                                    "replay_journal failed to clear relay journal ino={} err={err:#}",
-                                    entry.record.inode
-                                );
-                            }
-                        }
-                        if let Err(err) = journal.clear_relay_pending_state() {
-                            log::warn!(
-                                "replay_journal failed to clear relay pending state: {err:#}"
-                            );
-                        }
-                        info!(
-                            "replay_journal committed relay state gen={} entries={}",
-                            committed_generation,
-                            entries.len()
-                        );
-                        return Ok(entries.len());
-                    }
-                    RelayStatus::Accepted => {
-                        self.superblock.abort_generation(target_generation);
-                        log::warn!(
-                            "replay_journal relay_write accepted but not committed; leaving journal intact"
-                        );
-                        return Err(anyhow!(
-                            "relay_write accepted but not committed during replay"
-                        ));
-                    }
-                    RelayStatus::Failed => {
-                        self.superblock.abort_generation(target_generation);
-                        let err_msg = response
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "relay_write failed during replay".to_string());
-                        // If the server provided its actual generation, check
-                        // whether the pending write is permanently stale
-                        // (generation advanced past it by more than one step).
-                        // In that case clear the journal rather than blocking
-                        // startup indefinitely.
-                        if let Some(actual_gen) = response.actual_generation {
-                            let expected = relay_state.request.expected_parent_generation;
-                            match relay_replay_reconcile(actual_gen, expected) {
-                                RelayReplayDecision::ClearStale {
-                                    remote_generation,
-                                    expected_parent,
-                                } => {
-                                    let entries = journal.load_entries()?;
-                                    for entry in &entries {
-                                        if let Err(e) = journal.clear_entry(entry.record.inode) {
-                                            log::warn!(
-                                                "replay_journal stale clear failed ino={} err={e:#}",
-                                                entry.record.inode
-                                            );
-                                        }
-                                    }
-                                    let _ = journal.clear_relay_pending_state();
-                                    log::warn!(
-                                        "replay_journal_stale_cleared remote_generation={} expected_parent={} entries={}",
-                                        remote_generation,
-                                        expected_parent,
-                                        entries.len()
-                                    );
-                                    return Ok(entries.len());
-                                }
-                                RelayReplayDecision::Retry => {}
-                            }
-                        }
-                        log::warn!("replay_journal relay_write failed: {err_msg}");
-                        return Err(anyhow!(err_msg));
-                    }
-                },
-                Err(err) => {
-                    self.superblock.abort_generation(target_generation);
-                    log::warn!("replay_journal relay_write submit failed: {err:#}");
-                    return Err(anyhow!("relay_write replay failed: {err:#}"));
-                }
-            }
-        }
 
         let entries = journal.load_entries()?;
         if entries.is_empty() {
@@ -1503,17 +1315,5 @@ impl OsageFs {
             candidate = inode.parent;
         }
         Ok(false)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::relay_pending_state_is_reflected_by_superblock;
-
-    #[test]
-    fn relay_pending_state_is_reflected_once_superblock_reaches_expected_generation() {
-        assert!(!relay_pending_state_is_reflected_by_superblock(12, 13));
-        assert!(relay_pending_state_is_reflected_by_superblock(13, 13));
-        assert!(relay_pending_state_is_reflected_by_superblock(14, 13));
     }
 }

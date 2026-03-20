@@ -20,9 +20,8 @@ pub fn perf_osagefs(root: &Path) -> (Runtime, OsageFs) {
 
 /// Create a fully-initialized OsageFs from a custom benchmark config.
 ///
-/// This is useful when a benchmark wants to vary accelerator mode, cache
-/// sizing, or hosted endpoint wiring while still reusing the standard
-/// bootstrap path.
+/// This is useful when a benchmark wants to vary cache sizing or write-path
+/// behavior while still reusing the standard bootstrap path.
 pub fn perf_osagefs_with_config(config: Config) -> (Runtime, OsageFs) {
     let (runtime, metadata, superblock, segments, client_state) =
         perf_runtime_components(config.clone());
@@ -36,7 +35,6 @@ pub fn perf_osagefs_with_config(config: Config) -> (Runtime, OsageFs) {
         None,
         runtime.handle().clone(),
         client_state,
-        None,
         None,
         None,
         None,
@@ -132,9 +130,6 @@ pub fn perf_config(root: &Path) -> Config {
         segment_cache_bytes: 0,
         imap_delta_batch: 16,
         fuse_threads: 0,
-        accelerator_mode: None,
-        accelerator_endpoint: None,
-        accelerator_fallback_policy: None,
         ..Config::with_paths(
             root.join("mnt"),
             root.join("store"),

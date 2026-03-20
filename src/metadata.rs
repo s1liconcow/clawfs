@@ -19,10 +19,8 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
-use crate::clawfs::{self, AcceleratorMode};
+use crate::clawfs;
 use crate::config::{Config, ObjectStoreProvider};
-use crate::coordination::InvalidationScope;
-use crate::hosted_cache::HostedMetadataCache;
 use crate::inode::{
     ExternalObject, FileStorage, InlinePayload, InlinePayloadCodec, InodeKind, InodeRecord,
     InodeShard, SegmentExtent,
@@ -557,10 +555,6 @@ pub struct MetadataStore {
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
     negative_cache: RwLock<HashMap<u64, Instant>>,
     handle: Handle,
-    /// Optional hosted metadata cache for `direct_plus_cache` mode.  When
-    /// present, inode lookups try this service before falling back to the
-    /// object store.  Purely advisory — any miss or error is silently ignored.
-    hosted_cache: Option<Arc<HostedMetadataCache>>,
 }
 
 impl MetadataStore {
@@ -575,14 +569,6 @@ impl MetadataStore {
         config: &Config,
         handle: Handle,
     ) -> Result<Self> {
-        let hosted_cache = if config.accelerator_mode == Some(AcceleratorMode::DirectPlusCache) {
-            config
-                .accelerator_endpoint
-                .as_deref()
-                .map(HostedMetadataCache::from_endpoint)
-        } else {
-            None
-        };
         let store = Self {
             store,
             root_prefix: prefix,
@@ -593,13 +579,12 @@ impl MetadataStore {
             log_storage_io: config.log_storage_io,
             negative_cache: RwLock::new(HashMap::new()),
             handle,
-            hosted_cache,
         };
 
         store.load_latest_imaps().await?;
         // A fresh process can observe a shard generation that lags behind
         // recently committed deltas. Replay those deltas immediately so
-        // short-lived preload sessions see the latest namespace changes.
+        // short-lived clients see the latest namespace changes.
         let _ = store.apply_external_deltas_async().await?;
         Ok(store)
     }
@@ -658,16 +643,6 @@ impl MetadataStore {
         } else {
             ObjectPath::from(format!("{}/metadata/imap_deltas", base))
         }
-    }
-
-    /// Centralized cache insertion that ensures negative cache coherence.
-    /// Any time we add an entry to the positive cache (from external metadata
-    /// or local writes), we must clear the corresponding negative cache entry
-    /// to prevent stale negative lookups.
-    fn insert_cache_entry(&self, inode: u64, entry: CacheEntry) {
-        let mut cache = self.cache.write();
-        cache.insert(inode, entry);
-        self.negative_cache.write().remove(&inode);
     }
 
     pub async fn load_superblock(&self) -> Result<Option<VersionedSuperblock>> {
@@ -860,14 +835,6 @@ impl MetadataStore {
         self.negative_cache.write().clear();
     }
 
-    pub fn invalidate_cached_scope(&self, scope: &InvalidationScope) {
-        match scope {
-            InvalidationScope::Full => self.invalidate_all_cached(),
-            InvalidationScope::Inodes(inodes) => self.invalidate_cached_inodes(inodes),
-            InvalidationScope::Prefix(prefix) => self.invalidate_cached_prefix(prefix),
-        }
-    }
-
     /// Fast-path child lookup that avoids cloning the parent inode record.
     /// Returns `Some(result)` when the parent is present in the positive cache,
     /// otherwise `None` so callers can fall back to normal load/reload logic.
@@ -903,26 +870,6 @@ impl MetadataStore {
             }
         }
 
-        // Advisory hosted metadata cache: consult before the object store so
-        // that hot-path lookups can be served without a shard fetch.  On any
-        // miss or error we fall through to the authoritative object store path.
-        if let Some(ref hosted) = self.hosted_cache {
-            let min_gen = *self.last_delta_generation.lock();
-            if let Some(entry) = hosted.get_inode(inode, min_gen).await {
-                let record = entry.record.clone();
-                // Populate the local cache so TTL-based sibling lookups are fast.
-                self.insert_cache_entry(
-                    inode,
-                    CacheEntry {
-                        record,
-                        refreshed: Instant::now(),
-                        generation: entry.generation,
-                    },
-                );
-                return Ok(Some(entry.record));
-            }
-        }
-
         // Negative cache: skip shard load if we recently confirmed ENOENT.
         {
             let neg = self.negative_cache.read();
@@ -954,23 +901,6 @@ impl MetadataStore {
     pub async fn get_inode(&self, inode: u64) -> Result<Option<InodeRecord>> {
         self.get_inode_with_ttl(inode, Duration::ZERO, Duration::ZERO)
             .await
-    }
-
-    /// Invalidate entries in the hosted metadata cache based on the scope of
-    /// a coordination invalidation event.  No-op if no hosted cache is
-    /// configured.
-    pub fn invalidate_hosted_cache(&self, scope: &InvalidationScope) {
-        let Some(ref hosted) = self.hosted_cache else {
-            return;
-        };
-        match scope {
-            InvalidationScope::Full | InvalidationScope::Prefix(_) => {
-                hosted.invalidate_all();
-            }
-            InvalidationScope::Inodes(inodes) => {
-                hosted.invalidate_inodes(inodes);
-            }
-        }
     }
 
     /// Batch-load multiple inodes from the cache, reloading shards as needed
@@ -1773,18 +1703,10 @@ fn normalize_prefix(user_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::Path;
-    use axum::routing::get;
-    use axum::{Json, Router};
-    use std::net::SocketAddr;
-    use std::time::{Duration, Instant};
     use tempfile::tempdir;
-    use tokio::net::TcpListener;
     use tokio::runtime::Runtime;
 
-    use crate::clawfs::AcceleratorMode;
     use crate::config::Config;
-    use crate::hosted_cache::CachedMetadataEntry;
     use crate::inode::ROOT_INODE;
 
     fn test_config(root: &std::path::Path) -> Config {
@@ -1805,9 +1727,6 @@ mod tests {
             segment_cache_bytes: 0,
             imap_delta_batch: 32,
             fuse_threads: 0,
-            accelerator_mode: None,
-            accelerator_endpoint: None,
-            accelerator_fallback_policy: None,
             ..Config::with_paths(
                 root.join("mnt"),
                 root.join("store"),
@@ -2253,56 +2172,5 @@ mod tests {
             FileStorage::Inline(bytes) => assert_eq!(bytes, b"newest!".to_vec()),
             other => panic!("expected inline storage from newest shard, got {other:?}"),
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hosted_cache_is_checked_before_negative_cache() {
-        let dir = tempdir().unwrap();
-        let record = InodeRecord::new_file(
-            99,
-            1,
-            "cached.txt".to_string(),
-            "/cached.txt".to_string(),
-            1000,
-            1000,
-        );
-        let entry = CachedMetadataEntry {
-            inode: 99,
-            record: record.clone(),
-            generation: 7,
-        };
-        let app_entry = entry.clone();
-        let app = Router::new().route(
-            "/inode/{inode}",
-            get(move |Path(_inode): Path<u64>| {
-                let entry = app_entry.clone();
-                async move { Json(entry) }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let mut config = test_config(dir.path());
-        config.accelerator_mode = Some(AcceleratorMode::DirectPlusCache);
-        config.accelerator_endpoint = Some(format!("http://{addr}"));
-
-        let metadata = MetadataStore::new(&config, tokio::runtime::Handle::current())
-            .await
-            .unwrap();
-        metadata
-            .negative_cache
-            .write()
-            .insert(99, Instant::now() + Duration::from_secs(60));
-
-        let fetched = metadata.get_inode(99).await.unwrap();
-        let fetched = fetched.expect("hosted cache hit should bypass negative cache");
-        assert_eq!(fetched.inode, 99);
-        assert_eq!(fetched.name, record.name);
-        assert_eq!(fetched.path, record.path);
-
-        server.abort();
     }
 }

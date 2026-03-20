@@ -6,7 +6,6 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
 
-use crate::clawfs::AcceleratorMode;
 use crate::config::{ObjectStoreProvider, SourceStoreConfig};
 use crate::journal::JournalManager;
 use crate::source::SourceObjectStore;
@@ -24,19 +23,6 @@ impl TestHarness {
     }
 
     fn with_config<F>(root: &Path, state_name: &str, pending_bytes: u64, tweak: F) -> Self
-    where
-        F: FnOnce(&mut Config),
-    {
-        Self::with_config_and_publisher(root, state_name, pending_bytes, tweak, None)
-    }
-
-    fn with_config_and_publisher<F>(
-        root: &Path,
-        state_name: &str,
-        pending_bytes: u64,
-        tweak: F,
-        publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
-    ) -> Self
     where
         F: FnOnce(&mut Config),
     {
@@ -83,7 +69,6 @@ impl TestHarness {
             None,
             None,
             None,
-            publisher,
         );
         Self {
             runtime,
@@ -110,9 +95,6 @@ fn test_config(root: &Path, state_name: &str, pending_bytes: u64) -> Config {
         segment_cache_bytes: 0,
         imap_delta_batch: 32,
         fuse_threads: 0,
-        accelerator_mode: None,
-        accelerator_endpoint: None,
-        accelerator_fallback_policy: None,
         ..Config::with_paths(
             root.join("mnt"),
             root.join("store"),
@@ -2196,66 +2178,6 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
     );
 }
 
-#[test]
-fn flush_pending_returns_eio_when_relay_required_and_client_is_direct() {
-    let dir = tempdir().unwrap();
-    let harness = TestHarness::with_config(dir.path(), "relay_required_eio.bin", 1 << 20, |cfg| {
-        cfg.disable_journal = true;
-        cfg.flush_interval_ms = 0;
-        cfg.inline_threshold = 512;
-        cfg.accelerator_mode = Some(AcceleratorMode::Direct);
-    });
-    let fs = &harness.fs;
-
-    let payload = vec![0x5Au8; 8 * 1024];
-    let file = fs
-        .nfs_create(ROOT_INODE, "relay_required.bin", 1000, 1000)
-        .unwrap();
-    fs.nfs_write(file.inode, 0, &payload).unwrap();
-
-    harness
-        .runtime
-        .block_on(fs.superblock.set_relay_required(true))
-        .unwrap();
-
-    let err = fs
-        .flush_pending()
-        .expect_err("flush must fail closed when relay_required=true");
-    assert_eq!(err, EIO, "relay_required guard must surface EIO");
-    assert!(
-        fs.pending_inodes.contains(&file.inode),
-        "failed flush must restore the pending write"
-    );
-}
-
-#[test]
-fn flush_pending_still_succeeds_when_relay_required_is_false() {
-    let dir = tempdir().unwrap();
-    let harness = TestHarness::with_config(dir.path(), "relay_optional_ok.bin", 1 << 20, |cfg| {
-        cfg.disable_journal = true;
-        cfg.flush_interval_ms = 0;
-        cfg.inline_threshold = 512;
-        cfg.accelerator_mode = Some(AcceleratorMode::Direct);
-    });
-    let fs = &harness.fs;
-
-    let payload = vec![0xC3u8; 8 * 1024];
-    let file = fs
-        .nfs_create(ROOT_INODE, "relay_optional.bin", 1000, 1000)
-        .unwrap();
-    fs.nfs_write(file.inode, 0, &payload).unwrap();
-
-    fs.flush_pending()
-        .expect("flush must still succeed when relay_required=false");
-
-    assert!(
-        !fs.pending_inodes.contains(&file.inode),
-        "successful flush must clear pending state"
-    );
-    let content = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
-    assert_eq!(content, payload, "normal flush path must remain unchanged");
-}
-
 /// Regression test for the FIO seq_write_1m EIO bug.
 ///
 /// Before the fix, writing to a large file at offset 0 after it had been
@@ -4058,95 +3980,6 @@ fn readdir_batch_large_directory() {
 // ---------------------------------------------------------------------------
 // Coordination publisher tests
 // ---------------------------------------------------------------------------
-
-use crate::coordination::{CoordinationPublisher, GenerationHint, InvalidationEvent};
-
-struct MockPublisher {
-    generation_hints: Arc<Mutex<Vec<GenerationHint>>>,
-    invalidations: Arc<Mutex<Vec<InvalidationEvent>>>,
-}
-
-type SharedHints = Arc<Mutex<Vec<GenerationHint>>>;
-type SharedInvs = Arc<Mutex<Vec<InvalidationEvent>>>;
-
-impl MockPublisher {
-    fn new() -> (Arc<Self>, SharedHints, SharedInvs) {
-        let hints = Arc::new(Mutex::new(Vec::new()));
-        let invs = Arc::new(Mutex::new(Vec::new()));
-        let publisher = Arc::new(Self {
-            generation_hints: hints.clone(),
-            invalidations: invs.clone(),
-        });
-        (publisher, hints, invs)
-    }
-}
-
-#[async_trait::async_trait]
-impl CoordinationPublisher for MockPublisher {
-    async fn publish_generation_advance(&self, hint: GenerationHint) -> anyhow::Result<()> {
-        self.generation_hints.lock().push(hint);
-        Ok(())
-    }
-
-    async fn publish_invalidation(&self, event: InvalidationEvent) -> anyhow::Result<()> {
-        self.invalidations.lock().push(event);
-        Ok(())
-    }
-}
-
-#[test]
-fn flush_emits_coordination_events_after_commit() {
-    let tmp = tempdir().unwrap();
-    let (publisher, hints_arc, invs_arc) = MockPublisher::new();
-
-    let harness = TestHarness::with_config_and_publisher(
-        tmp.path(),
-        "coord_publisher",
-        1 << 20,
-        |_| {},
-        Some(publisher as Arc<dyn CoordinationPublisher>),
-    );
-    let fs = &harness.fs;
-
-    // Stage a file so that flush_pending has something to commit.
-    let inode = stage_named_file(&harness, "coord_test.txt", b"hello coordination".to_vec());
-    assert!(inode > 0);
-
-    // Flush — this should trigger post-commit event emission.
-    fs.flush_pending().expect("flush_pending should succeed");
-
-    // Give the spawned async tasks a moment to execute in the runtime.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let hints = hints_arc.lock();
-    let invs = invs_arc.lock();
-
-    assert!(
-        !hints.is_empty(),
-        "expected at least one GenerationHint after flush"
-    );
-    assert!(
-        !invs.is_empty(),
-        "expected at least one InvalidationEvent after flush"
-    );
-
-    // All events must reference the same generation and it must be > 0.
-    for hint in hints.iter() {
-        assert!(hint.generation > 0, "generation must be positive");
-    }
-    for inv in invs.iter() {
-        assert!(
-            inv.generation > 0,
-            "invalidation generation must be positive"
-        );
-        // The affected inodes must include the inode we staged.
-        let affected = inv.affected_inodes.as_deref().unwrap_or(&[]);
-        assert!(
-            affected.contains(&inode) || affected.contains(&ROOT_INODE),
-            "flushed inode should appear in InvalidationEvent"
-        );
-    }
-}
 
 #[test]
 fn flush_without_publisher_succeeds_silently() {

@@ -20,10 +20,8 @@ use uuid::Uuid;
 
 use lru::LruCache;
 
-use crate::clawfs::AcceleratorMode;
 use crate::codec::{EncodedBytes, InlineCodecConfig, decode_bytes, encode_bytes};
 use crate::config::Config;
-use crate::hosted_cache::{HostedSegmentCache, SegmentCacheConfig};
 use crate::inode::{InlinePayloadCodec, SegmentExtent};
 
 const SEGMENT_MAGIC_V2: &[u8; 4] = b"OSG2";
@@ -86,11 +84,6 @@ pub struct SegmentManager {
     /// wrapped in `Arc` so that callers can slice without copying the full
     /// extent on every FUSE read.
     decoded_cache: Mutex<DecodedExtentCache>,
-    /// Advisory near-bucket hosted segment cache.  Present only when the
-    /// volume is configured with `direct_plus_cache` and an accelerator
-    /// endpoint is set.  Segments are immutable by identity so no
-    /// invalidation is required.
-    hosted_segment_cache: Option<Arc<HostedSegmentCache>>,
 }
 
 struct EncodedSegmentEntry {
@@ -182,22 +175,6 @@ impl SegmentManager {
         } else {
             DECODED_CACHE_DEFAULT_BYTES
         };
-        let hosted_segment_cache =
-            if config.accelerator_mode == Some(AcceleratorMode::DirectPlusCache) {
-                config
-                    .accelerator_endpoint
-                    .as_deref()
-                    .filter(|ep| !ep.is_empty())
-                    .map(|ep| {
-                        HostedSegmentCache::new(SegmentCacheConfig {
-                            cache_endpoint: ep.to_string(),
-                            enabled: true,
-                            ..SegmentCacheConfig::default()
-                        })
-                    })
-            } else {
-                None
-            };
         Ok(Self {
             store,
             handle,
@@ -212,7 +189,6 @@ impl SegmentManager {
             segment_compression: config.segment_compression,
             segment_encryption_key: config.segment_encryption_key.clone(),
             decoded_cache: Mutex::new(DecodedExtentCache::new(decoded_budget)),
-            hosted_segment_cache,
         })
     }
 
@@ -564,34 +540,6 @@ impl SegmentManager {
                 .offset
                 .checked_add(pointer.length)
                 .context("segment pointer range overflow")?;
-
-            // Advisory hosted segment cache: try before the object store so
-            // that repeated hot reads can be served from a near-bucket service.
-            // Segments are immutable by identity — no invalidation needed.
-            if let Some(ref hosted) = self.hosted_segment_cache {
-                let cached_opt = self.handle.block_on(hosted.get_segment(
-                    pointer.generation,
-                    pointer.segment_id,
-                    pointer.offset,
-                    pointer.length,
-                ));
-                if let Some(cached_bytes) = cached_opt {
-                    match self.decode_pointer_entry(cached_bytes.as_ref()) {
-                        Ok(decoded) => {
-                            let arc = Arc::new(decoded);
-                            self.decoded_cache.lock().put(key, arc.clone());
-                            return Ok(arc);
-                        }
-                        Err(err) => {
-                            warn!(
-                                "hosted_segment_cache_decode_error gen={} seg={}: {err:#}",
-                                pointer.generation, pointer.segment_id
-                            );
-                            // Fall through to object store.
-                        }
-                    }
-                }
-            }
 
             let entry = self.fetch_segment_range(
                 pointer.generation,
@@ -1332,9 +1280,6 @@ mod tests {
             segment_cache_bytes: 0,
             imap_delta_batch: 32,
             fuse_threads: 0,
-            accelerator_mode: None,
-            accelerator_endpoint: None,
-            accelerator_fallback_policy: None,
             ..Config::with_paths(
                 root.join("mnt"),
                 root.join("data"),

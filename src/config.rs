@@ -2,9 +2,6 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, ValueEnum};
 
-use crate::clawfs::{AcceleratorFallbackPolicy, AcceleratorMode};
-use crate::relay::RelayOutagePolicy;
-
 /// Default directory name for the FUSE mount point (relative to cwd).
 pub const DEFAULT_MOUNT_DIR: &str = "clawfs-mnt";
 
@@ -251,10 +248,6 @@ pub struct Config {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
-    pub accelerator_mode: Option<AcceleratorMode>,
-    pub accelerator_endpoint: Option<String>,
-    pub accelerator_fallback_policy: Option<AcceleratorFallbackPolicy>,
-    pub relay_fallback_policy: Option<RelayOutagePolicy>,
     pub object_prefix: String,
     pub telemetry_object_prefix: Option<String>,
     pub gcs_service_account: Option<PathBuf>,
@@ -281,7 +274,6 @@ pub struct Config {
     pub fuse_threads: usize,
     pub entry_ttl_secs: u64,
     pub fuse_fsname: String,
-    pub relay_session_token: Option<String>,
 }
 
 impl Config {
@@ -310,10 +302,6 @@ impl Config {
             bucket: None,
             region: None,
             endpoint: None,
-            accelerator_mode: None,
-            accelerator_endpoint: None,
-            accelerator_fallback_policy: None,
-            relay_fallback_policy: None,
             object_prefix: String::new(),
             telemetry_object_prefix: None,
             gcs_service_account: None,
@@ -340,12 +328,7 @@ impl Config {
             fuse_threads: default_fuse_threads(),
             entry_ttl_secs: 5,
             fuse_fsname: "clawfs".to_string(),
-            relay_session_token: None,
         }
-    }
-
-    pub fn accelerator_status(&self) -> crate::perf::AcceleratorStatus {
-        crate::perf::AcceleratorStatus::from_config(self)
     }
 }
 
@@ -418,10 +401,6 @@ impl From<Cli> for Config {
             bucket: cli.bucket,
             region: cli.region,
             endpoint: cli.endpoint,
-            accelerator_mode: None,
-            accelerator_endpoint: None,
-            accelerator_fallback_policy: None,
-            relay_fallback_policy: None,
             object_prefix: cli.object_prefix,
             gcs_service_account: cli.gcs_service_account,
             aws_allow_http: cli.aws_allow_http,
@@ -499,22 +478,7 @@ mod tests {
     use super::{Cli, Config};
 
     #[test]
-    fn with_paths_defaults_do_not_enable_accelerator_state() {
-        let config = Config::with_paths(
-            "/tmp/clawfs-mnt-test".into(),
-            "/tmp/clawfs-store-test".into(),
-            "/tmp/clawfs-cache-test".into(),
-            "/tmp/clawfs-state-test".into(),
-        );
-
-        assert_eq!(config.accelerator_mode, None);
-        assert_eq!(config.accelerator_endpoint, None);
-        assert_eq!(config.accelerator_fallback_policy, None);
-        assert_eq!(config.relay_fallback_policy, None);
-    }
-
-    #[test]
-    fn cli_config_defaults_do_not_enable_accelerator_state() {
+    fn cli_config_defaults_use_local_provider() {
         let config = Config::from(Cli::parse_from([
             "clawfs",
             "--mount-path",
@@ -523,28 +487,6 @@ mod tests {
             "/tmp/clawfs-store",
         ]));
 
-        assert_eq!(config.accelerator_mode, None);
-        assert_eq!(config.accelerator_endpoint, None);
-        assert_eq!(config.accelerator_fallback_policy, None);
-        assert_eq!(config.relay_fallback_policy, None);
         assert_eq!(config.object_provider, super::ObjectStoreProvider::Local);
-    }
-
-    #[test]
-    fn accelerator_status_defaults_to_not_configured() {
-        let config = Config::with_paths(
-            "/tmp/clawfs-mnt-test".into(),
-            "/tmp/clawfs-store-test".into(),
-            "/tmp/clawfs-cache-test".into(),
-            "/tmp/clawfs-state-test".into(),
-        );
-        let status = config.accelerator_status();
-
-        assert_eq!(status.accelerator_mode, "not_configured");
-        assert_eq!(status.accelerator_endpoint, None);
-        assert_eq!(status.accelerator_health.as_str(), "not_configured");
-        assert_eq!(status.cleanup_owner.as_str(), "local");
-        assert_eq!(status.coordination_status.as_str(), "disabled");
-        assert_eq!(status.relay_status.as_str(), "not_configured");
     }
 }

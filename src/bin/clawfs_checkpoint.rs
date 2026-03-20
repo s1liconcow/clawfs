@@ -104,9 +104,6 @@ fn build_config(store_path: PathBuf, shard_size: u64, log_storage_io: bool) -> C
         segment_cache_bytes: 0,
         imap_delta_batch: 32,
         fuse_threads: 0,
-        accelerator_mode: None,
-        accelerator_endpoint: None,
-        accelerator_fallback_policy: None,
         ..Config::with_paths(
             PathBuf::from("/tmp/clawfs_checkpoint_mnt"),
             store_path,

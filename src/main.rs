@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     {
         let cli = Cli::parse();
         let config: Config = cli.into();
-        launch::run_mount_entry(config, &args, None)
+        launch::run_mount_entry(config, &args)
     }
     #[cfg(not(feature = "fuse"))]
     {

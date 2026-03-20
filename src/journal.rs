@@ -19,11 +19,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
 use crate::inode::{InodeKind, InodeRecord};
 use crate::metadata::{build_inode_record_fb, fvt, read_inode_record_fb2};
-use crate::relay::RelayWriteRequest;
 use crate::segment::StagedChunk;
 
 const JOURNAL_VERSION: u32 = 1;
@@ -65,32 +63,6 @@ pub struct JournalEntry {
     pub payload: JournalPayload,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelayPendingState {
-    pub request: RelayWriteRequest,
-    #[serde(default)]
-    pub committed_generation: Option<u64>,
-}
-
-impl RelayPendingState {
-    pub fn new(request: RelayWriteRequest) -> Self {
-        Self {
-            request,
-            committed_generation: None,
-        }
-    }
-
-    pub fn with_committed_generation(
-        request: RelayWriteRequest,
-        committed_generation: u64,
-    ) -> Self {
-        Self {
-            request,
-            committed_generation: Some(committed_generation),
-        }
-    }
-}
-
 // ── WAL state held under the lock ─────────────────────────────────────────
 
 struct WalState {
@@ -106,8 +78,6 @@ struct WalState {
 pub struct JournalManager {
     dir: PathBuf,
     wal_path: PathBuf,
-    relay_pending_path: PathBuf,
-    relay_pending_state: Mutex<Option<RelayPendingState>>,
     state: Mutex<WalState>,
 }
 
@@ -117,15 +87,9 @@ impl JournalManager {
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating journal dir {}", dir.display()))?;
         let wal_path = dir.join("wal.bin");
-        let relay_pending_path = dir.join("relay_pending.json");
-        let relay_pending_state = Mutex::new(Self::load_relay_pending_state_from_disk(
-            &relay_pending_path,
-        )?);
         Ok(Self {
             dir,
             wal_path,
-            relay_pending_path,
-            relay_pending_state,
             state: Mutex::new(WalState {
                 writer: None,
                 live_count: 0,
@@ -166,33 +130,6 @@ impl JournalManager {
             writer.flush().context("flushing WAL buffer")?;
             writer.get_ref().sync_data().context("fdatasync WAL file")?;
         }
-        self.sync_dir()
-    }
-
-    pub fn relay_pending_state(&self) -> Option<RelayPendingState> {
-        self.relay_pending_state.lock().clone()
-    }
-
-    pub fn store_relay_pending_state(&self, state: RelayPendingState) -> Result<()> {
-        self.write_relay_pending_state(&state)?;
-        *self.relay_pending_state.lock() = Some(state);
-        Ok(())
-    }
-
-    pub fn mark_relay_committed(&self, committed_generation: u64) -> Result<()> {
-        let mut guard = self.relay_pending_state.lock();
-        let Some(mut state) = guard.clone() else {
-            return Ok(());
-        };
-        state.committed_generation = Some(committed_generation);
-        self.write_relay_pending_state(&state)?;
-        *guard = Some(state);
-        Ok(())
-    }
-
-    pub fn clear_relay_pending_state(&self) -> Result<()> {
-        let _ = fs::remove_file(&self.relay_pending_path);
-        *self.relay_pending_state.lock() = None;
         self.sync_dir()
     }
 
@@ -372,44 +309,6 @@ impl JournalManager {
         dir.sync_all()
             .with_context(|| format!("syncing journal dir {}", self.dir.display()))
     }
-
-    fn load_relay_pending_state_from_disk(
-        relay_pending_path: &Path,
-    ) -> Result<Option<RelayPendingState>> {
-        if !relay_pending_path.exists() {
-            return Ok(None);
-        }
-        let raw = fs::read(relay_pending_path)
-            .with_context(|| format!("reading {}", relay_pending_path.display()))?;
-        let state: RelayPendingState = serde_json::from_slice(&raw)
-            .with_context(|| format!("decoding {}", relay_pending_path.display()))?;
-        Ok(Some(state))
-    }
-
-    fn write_relay_pending_state(&self, state: &RelayPendingState) -> Result<()> {
-        let tmp_path = self.relay_pending_path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(state).context("encoding relay pending state")?;
-        {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .with_context(|| format!("opening {}", tmp_path.display()))?;
-            file.write_all(&bytes)
-                .with_context(|| format!("writing {}", tmp_path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("syncing {}", tmp_path.display()))?;
-        }
-        fs::rename(&tmp_path, &self.relay_pending_path).with_context(|| {
-            format!(
-                "renaming {} to {}",
-                tmp_path.display(),
-                self.relay_pending_path.display()
-            )
-        })?;
-        self.sync_dir()
-    }
 }
 
 // ── FlatBuffer journal serialization (OSGJN2) ────────────────────────────────
@@ -557,65 +456,4 @@ fn deserialize_journal_fb2(data: &[u8]) -> Option<(InodeRecord, JournalPayload)>
 }
 
 #[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::{JournalManager, RelayPendingState};
-    use crate::inode::InodeRecord;
-    use crate::relay::RelayWriteRequest;
-    use crate::segment::{SegmentEntry, SegmentPayload};
-
-    #[test]
-    fn relay_pending_state_round_trips_through_sidecar() {
-        let dir = tempdir().expect("tempdir");
-        let journal = JournalManager::new(dir.path()).expect("journal manager");
-        let request = RelayWriteRequest::new(
-            "client-a",
-            "/vol/prefix",
-            12,
-            13,
-            vec![SegmentEntry {
-                inode: 1,
-                path: "/name".to_string(),
-                logical_offset: 0,
-                payload: SegmentPayload::Bytes(vec![1, 2, 3]),
-            }],
-            vec![InodeRecord::new_file(
-                1,
-                2,
-                "name".to_string(),
-                "/name".to_string(),
-                1000,
-                1000,
-            )],
-        );
-        let state = RelayPendingState {
-            request: request.clone(),
-            committed_generation: None,
-        };
-
-        journal
-            .store_relay_pending_state(state.clone())
-            .expect("store relay pending");
-        let loaded = journal
-            .relay_pending_state()
-            .expect("state should be cached");
-        assert_eq!(
-            loaded.request.idempotency_key,
-            state.request.idempotency_key
-        );
-        assert_eq!(loaded.committed_generation, None);
-
-        journal.mark_relay_committed(77).expect("mark committed");
-        let committed = journal
-            .relay_pending_state()
-            .expect("committed state should exist");
-        assert_eq!(committed.committed_generation, Some(77));
-
-        journal.clear_relay_pending_state().expect("clear state");
-        assert!(journal.relay_pending_state().is_none());
-
-        let reloaded = JournalManager::new(dir.path()).expect("reload journal manager");
-        assert!(reloaded.relay_pending_state().is_none());
-    }
-}
+mod tests {}
