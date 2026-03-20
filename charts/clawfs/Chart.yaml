@@ -1,0 +1,17 @@
+apiVersion: v2
+name: clawfs
+description: A Helm chart for ClawFS - On-demand persistent shared volumes for agents
+type: application
+version: 0.1.0
+appVersion: "0.2.9"
+keywords:
+  - clawfs
+  - persistent-volumes
+  - csi
+  - kubernetes
+home: https://clawfs.dev
+sources:
+  - https://github.com/s1liconcow/clawfs
+maintainers:
+  - name: ClawFS Contributors
+    email: info@clawfs.dev

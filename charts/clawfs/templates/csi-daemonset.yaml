@@ -1,0 +1,98 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "clawfs-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "clawfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-node
+spec:
+  selector:
+    matchLabels:
+      {{- include "clawfs-csi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: csi-node
+  template:
+    metadata:
+      labels:
+        {{- include "clawfs-csi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: csi-node
+    spec:
+      serviceAccountName: {{ include "clawfs-csi.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      
+      containers:
+        - name: csi-node
+          image: "{{ .Values.csi.image.repository }}:{{ .Values.csi.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+          
+          args:
+            - "--endpoint=unix:///csi/csi.sock"
+            - "--node-id=$(KUBE_NODE_NAME)"
+            - "--log-level=info"
+          
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          
+          volumeMounts:
+            - name: csi-socket
+              mountPath: /csi
+            - name: host-root
+              mountPath: /host
+              mountPropagation: Bidirectional
+            - name: sys
+              mountPath: /sys
+            - name: dev
+              mountPath: /dev
+          
+          resources:
+            {{- toYaml .Values.csi.resources | nindent 12 }}
+        
+        - name: driver-registrar
+          image: "{{ .Values.csi.registrar.image.repository }}:{{ .Values.csi.registrar.image.tag }}"
+          imagePullPolicy: {{ .Values.csi.registrar.image.pullPolicy }}
+          
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path={{ .Values.csi.kubeletRegistrationPath }}"
+          
+          volumeMounts:
+            - name: csi-socket
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          
+          resources:
+            {{- toYaml .Values.csi.registrar.resources | nindent 12 }}
+      
+      volumes:
+        - name: csi-socket
+          emptyDir: {}
+        - name: host-root
+          hostPath:
+            path: /
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+      
+      nodeSelector:
+        {{- toYaml .Values.csi.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.csi.tolerations | nindent 8 }}

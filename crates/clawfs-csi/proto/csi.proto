@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package csi.v1;
+
+option go_package = "github.com/container-storage-interface/spec/lib/go/csi";
+option java_package = "com.github.container_storage_interface.v1";
+option java_outer_classname = "Csi";
+
+service Identity {
+  rpc GetPluginInfo(GetPluginInfoRequest) returns (GetPluginInfoResponse) {}
+  rpc GetPluginCapabilities(GetPluginCapabilitiesRequest) returns (GetPluginCapabilitiesResponse) {}
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {}
+}
+
+message GetPluginInfoRequest {}
+
+message GetPluginInfoResponse {
+  string name = 1;
+  string vendor_version = 2;
+  map<string, string> manifest = 3;
+}
+
+message GetPluginCapabilitiesRequest {}
+
+message PluginCapability {
+  message Service {
+    enum Type {
+      UNKNOWN = 0;
+      CONTROLLER_SERVICE = 1;
+      VOLUME_ACCESSIBILITY_CONSTRAINTS = 2;
+      GROUP_CONTROLLER_SERVICE = 3;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    Service service = 1;
+  }
+}
+
+message GetPluginCapabilitiesResponse {
+  repeated PluginCapability capabilities = 1;
+}
+
+message ProbeRequest {}
+
+message ProbeResponse {
+  bool ready = 1;
+}
+
+service Node {
+  rpc NodeStageVolume(NodeStageVolumeRequest) returns (NodeStageVolumeResponse) {}
+  rpc NodeUnstageVolume(NodeUnstageVolumeRequest) returns (NodeUnstageVolumeResponse) {}
+  rpc NodePublishVolume(NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
+  rpc NodeUnpublishVolume(NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
+  rpc NodeGetCapabilities(NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
+  rpc NodeGetInfo(NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
+}
+
+message NodeStageVolumeRequest {
+  string volume_id = 1;
+  map<string, string> publish_context = 2;
+  string staging_target_path = 3;
+  map<string, string> volume_attributes = 4;
+}
+
+message NodeStageVolumeResponse {}
+
+message NodeUnstageVolumeRequest {
+  string volume_id = 1;
+  string staging_target_path = 2;
+}
+
+message NodeUnstageVolumeResponse {}
+
+message NodePublishVolumeRequest {
+  string volume_id = 1;
+  map<string, string> publish_context = 2;
+  string staging_target_path = 3;
+  string target_path = 4;
+  VolumeCapability volume_capability = 5;
+  bool readonly = 6;
+  map<string, string> volume_attributes = 7;
+}
+
+message NodePublishVolumeResponse {}
+
+message NodeUnpublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+}
+
+message NodeUnpublishVolumeResponse {}
+
+message VolumeCapability {
+  message AccessMode {
+    enum Mode {
+      UNKNOWN = 0;
+      SINGLE_NODE_WRITER = 1;
+      SINGLE_NODE_READER_ONLY = 2;
+      MULTI_NODE_READER_ONLY = 3;
+      MULTI_NODE_SINGLE_WRITER = 4;
+      MULTI_NODE_MULTI_WRITER = 5;
+      SINGLE_NODE_MULTI_WRITER = 6;
+    }
+    Mode mode = 1;
+  }
+  
+  message Filesystem {
+    string fs_type = 1;
+    repeated string mount_flags = 2;
+  }
+  
+  oneof access_type {
+    Filesystem mount = 1;
+  }
+  
+  AccessMode access_mode = 2;
+}
+
+message NodeGetCapabilitiesRequest {}
+
+message NodeServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      STAGE_UNSTAGE_VOLUME = 1;
+      GET_VOLUME_STATS = 2;
+      EXPAND_VOLUME = 3;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message NodeGetCapabilitiesResponse {
+  repeated NodeServiceCapability capabilities = 1;
+}
+
+message NodeGetInfoRequest {}
+
+message NodeGetInfoResponse {
+  string node_id = 1;
+}

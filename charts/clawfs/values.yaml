@@ -1,0 +1,66 @@
+# Default values for clawfs-csi
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+csi:
+  # Node driver image
+  image:
+    repository: clawfs-csi
+    pullPolicy: IfNotPresent
+    tag: "0.2.9"
+  
+  # Driver registrar sidecar
+  registrar:
+    image:
+      repository: k8s.gcr.io/sig-storage/csi-node-driver-registrar
+      tag: v2.9.1
+      pullPolicy: IfNotPresent
+    resources:
+      limits:
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 20Mi
+  
+  # Kubelet registration path (typically /var/lib/kubelet/plugins/clawfs.dev/csi.sock)
+  kubeletRegistrationPath: /var/lib/kubelet/plugins/clawfs.dev/csi.sock
+  
+  # Node driver resources
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+  
+  # Node selector for the DaemonSet
+  nodeSelector: {}
+  
+  # Tolerations for the DaemonSet
+  tolerations: []
+  
+  # Volume attributes for PVCs
+  volumeAttributes:
+    # Example: provide state-path once the daemon is running
+    # state-path: /var/lib/clawfs
+    # host: localhost
+    # port: "3049"
+
+storageClass:
+  create: true
+  name: clawfs
+  isDefault: false
+
+# Daemon configuration (if deploying clawfsd alongside)
+daemon:
+  enabled: false
+  # Image for clawfsd
+  image:
+    repository: clawfs
+    tag: "0.2.9"
+    pullPolicy: IfNotPresent

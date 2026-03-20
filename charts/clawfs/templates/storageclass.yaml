@@ -1,0 +1,12 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: clawfs
+provisioner: clawfs.dev
+parameters:
+  # Example parameters for mounting a ClawFS volume
+  # state-path: Path on the node where ClawFS state is stored
+  # host: ClawFS daemon host (defaults to localhost)
+  # port: ClawFS daemon port (defaults to 3049)
+volumeBindingMode: WaitForFirstConsumer
