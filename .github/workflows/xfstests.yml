@@ -8,7 +8,7 @@ on:
 
 jobs:
   xfstests:
-    name: Run xfstests NFS Test Suite
+    name: Run xfstests FUSE Test Suite
     runs-on: ubuntu-latest
 
     steps:
@@ -27,7 +27,7 @@ jobs:
             gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
             libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
             uuid-dev uuid-runtime xfsprogs sqlite3 \
-            libgdbm-compat-dev nfs-common
+            libgdbm-compat-dev fuse3
           sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
             xfslibs-dev || true
           sudo apt-get install -y systemd-coredump systemd jq pkg-config
@@ -41,65 +41,89 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build ClawFS NFS gateway
+      - name: Build ClawFS daemon
         run: |
-          cd clawfs-nfs-gateway
-          cargo build --release
+          cargo build --release --bin clawfsd
 
       - name: Create data directories
         run: |
           mkdir -p /tmp/clawfs-test-store /tmp/clawfs-scratch-store
           mkdir -p /tmp/clawfs-test-cache /tmp/clawfs-scratch-cache
 
-      - name: Start ClawFS NFS gateway (TEST instance)
+      - name: Install FUSE mount helper
         run: |
-          target/release/clawfs-nfs-gateway \
-            --store-path /tmp/clawfs-test-store \
-            --local-cache-path /tmp/clawfs-test-cache \
-            --state-path /tmp/clawfs-test-state.bin \
-            --object-provider local \
-            --disable-journal \
-            --listen 127.0.0.1:2049 &
-          echo $! > /tmp/clawfs-test.pid
+          sudo tee /sbin/mount.fuse.clawfs >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-          echo "Waiting for TEST instance..."
-          for i in $(seq 1 30); do
-            if nc -z 127.0.0.1 2049; then
-              echo "TEST instance is ready"
-              break
-            fi
-            sleep 1
+          source_dev=""
+          target=""
+          mount_opts=""
+
+          while (($#)); do
+            case "$1" in
+              -o)
+                mount_opts="${2:-}"
+                shift 2
+                ;;
+              -*)
+                shift
+                ;;
+              *)
+                if [[ -z "$source_dev" ]]; then
+                  source_dev="$1"
+                elif [[ -z "$target" ]]; then
+                  target="$1"
+                fi
+                shift
+                ;;
+            esac
           done
 
-          if ! nc -z 127.0.0.1 2049; then
-            echo "TEST instance failed to start"
+          if [[ -z "$source_dev" || -z "$target" ]]; then
+            echo "mount.fuse.clawfs requires source and target" >&2
             exit 1
           fi
 
-      - name: Start ClawFS NFS gateway (SCRATCH instance)
-        run: |
-          target/release/clawfs-nfs-gateway \
-            --store-path /tmp/clawfs-scratch-store \
-            --local-cache-path /tmp/clawfs-scratch-cache \
-            --state-path /tmp/clawfs-scratch-state.bin \
-            --object-provider local \
-            --disable-journal \
-            --listen 127.0.0.1:20499 &
-          echo $! > /tmp/clawfs-scratch.pid
+          store_path="$source_dev"
+          local_cache_path="${target%/}.cache"
+          state_path="${target%/}.state.bin"
+          fuse_fsname="clawfs"
+          allow_other=0
 
-          echo "Waiting for SCRATCH instance..."
-          for i in $(seq 1 30); do
-            if nc -z 127.0.0.1 20499; then
-              echo "SCRATCH instance is ready"
-              break
-            fi
-            sleep 1
+          IFS=',' read -r -a opt_array <<< "$mount_opts"
+          for opt in "${opt_array[@]}"; do
+            case "$opt" in
+              source=*) store_path="${opt#source=}" ;;
+              local_cache_path=*) local_cache_path="${opt#local_cache_path=}" ;;
+              state_path=*) state_path="${opt#state_path=}" ;;
+              fuse_fsname=*) fuse_fsname="${opt#fuse_fsname=}" ;;
+              allow_other) allow_other=1 ;;
+            esac
           done
 
-          if ! nc -z 127.0.0.1 20499; then
-            echo "SCRATCH instance failed to start"
-            exit 1
+          mkdir -p "$store_path" "$local_cache_path" "$(dirname "$state_path")" "$target"
+
+          cmd=(
+            "__CLAWFSD_BIN__"
+            --mount-path "$target"
+            --store-path "$store_path"
+            --local-cache-path "$local_cache_path"
+            --state-path "$state_path"
+            --object-provider local
+            --disable-journal
+            --fuse-fsname "$fuse_fsname"
+          )
+
+          if [[ "$allow_other" == "1" ]]; then
+            cmd+=(--allow-other)
           fi
+
+          "${cmd[@]}"
+          EOF
+          sudo sed -i "s|__CLAWFSD_BIN__|$GITHUB_WORKSPACE/target/release/clawfsd|" /sbin/mount.fuse.clawfs
+          sudo chmod +x /sbin/mount.fuse.clawfs
+          echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
 
       - name: Create mount points
         run: |
@@ -109,15 +133,16 @@ jobs:
         working-directory: /tmp/xfstests
         run: |
           cat > local.config << 'EOF'
-          export FSTYP=nfs
+          export FSTYP=fuse
+          export FUSE_SUBTYP=clawfs
 
-          export TEST_DEV=localhost:/
+          export TEST_DEV=/tmp/clawfs-test-store
           export TEST_DIR=/mnt/test
-          export SCRATCH_DEV=127.0.0.1:/
+          export SCRATCH_DEV=/tmp/clawfs-scratch-store
           export SCRATCH_MNT=/mnt/scratch
 
-          export TEST_FS_MOUNT_OPTS="-o nolock,tcp,port=2049,mountport=2049,vers=3,hard"
-          export NFS_MOUNT_OPTIONS="-o nolock,tcp,port=20499,mountport=20499,vers=3,hard"
+          export TEST_FS_MOUNT_OPTS="-o source=/tmp/clawfs-test-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-test-cache,state_path=/tmp/clawfs-test-state.bin,fuse_fsname=clawfs-test"
+          export MOUNT_OPTIONS="-o source=/tmp/clawfs-scratch-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-scratch-cache,state_path=/tmp/clawfs-scratch-state.bin,fuse_fsname=clawfs-scratch"
           EOF
 
           cat > excludes << 'EOF'
@@ -163,13 +188,7 @@ jobs:
         if: always()
         run: |
           cd /tmp
-          sudo umount /mnt/test || true
-          sudo umount /mnt/scratch || true
-
-          if [ -f /tmp/clawfs-test.pid ]; then
-            kill $(cat /tmp/clawfs-test.pid) || true
-          fi
-          if [ -f /tmp/clawfs-scratch.pid ]; then
-            kill $(cat /tmp/clawfs-scratch.pid) || true
-          fi
-          pkill -f clawfs-nfs-gateway || true
+          sudo fusermount3 -u /mnt/test || sudo umount /mnt/test || true
+          sudo fusermount3 -u /mnt/scratch || sudo umount /mnt/scratch || true
+          pkill -f "target/release/clawfsd --mount-path /mnt/test" || true
+          pkill -f "target/release/clawfsd --mount-path /mnt/scratch" || true
