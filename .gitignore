@@ -1,6 +1,6 @@
 /target
-osagefs-nfs-gateway/target
 clawfs-preload/target
+clawfs-nfs-gateway/target
 loopback-bench/target
 *.log
 *.jsonl
@@ -11,7 +11,6 @@ micro-results-*
 pjdfstest_*
 fio-results-*
 scripts/__pycache__
-clawfs-nfs-gateway/target
 
 # bv (beads viewer) local config and caches
 .bv/
