@@ -134,7 +134,7 @@ jobs:
         run: |
           cat > local.config << 'EOF'
           export FSTYP=fuse
-          export FUSE_SUBTYP=clawfs
+          export FUSE_SUBTYP=.clawfs
 
           export TEST_DEV=/tmp/clawfs-test-store
           export TEST_DIR=/mnt/test
