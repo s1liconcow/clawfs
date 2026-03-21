@@ -12,10 +12,10 @@
     </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ClawFS Access | Hosted App And OSS CLI</title>
+    <title>ClawFS Sign In | Access Your ClawFS Workspace</title>
     <meta
       name="description"
-      content="Use the hosted ClawFS app for managed access, or install the OSS CLI locally for direct filesystem mounts."
+      content="Sign in to ClawFS with email, Google, or GitHub to access your hosted workspace and connect the CLI."
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -49,60 +49,59 @@
 
     <main>
       <section class="hero reveal" data-delay="0">
-        <p class="eyebrow">Access</p>
-        <h1>Hosted App Access And OSS CLI Install</h1>
+        <p class="eyebrow">Account Access</p>
+        <h1>Sign In to ClawFS and Connect Your Workspace</h1>
         <p class="hero-copy">
-          The public repo now ships the open-source filesystem and FUSE mount flow. Managed account access continues in
-          the hosted app.
+          Install ClawFS, continue to the hosted app, and sign in with email, Google, or GitHub. Once connected, you
+          can access your workspace from the web app or the CLI and pick up where the last run left off.
         </p>
         <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash</code></div>
         <div class="hero-cta">
-          <a class="btn btn-primary" href="#methods">Open Hosted App</a>
-          <a class="btn btn-secondary" href="getting-started.html">See OSS Setup</a>
+          <a class="btn btn-primary" href="#methods">Choose a Sign-In Method</a>
+          <a class="btn btn-secondary" href="getting-started.html">See the CLI Flow</a>
         </div>
       </section>
 
       <section id="methods" class="feature-grid reveal" data-delay="100">
         <div class="section-title">
           <p class="eyebrow">Methods</p>
-          <h2>Hosted App Or Local Mount</h2>
+          <h2>Email, Google, or GitHub</h2>
         </div>
         <article class="card stack">
-          <h3>Choose the path you need:</h3>
+          <h3>Create an account to continue:</h3>
           <div class="auth-actions">
-            <a class="auth-button" href="https://app.clawfs.dev">Open Hosted App</a>
-            <a class="auth-button" href="getting-started.html">Read OSS Getting Started</a>
-            <a class="auth-button" href="https://github.com/s1liconcow/clawfs">Browse Public Repo</a>
+            <a class="auth-button" href="https://app.clawfs.dev/login/email">Continue with Email</a>
+            <a class="auth-button" href="https://app.clawfs.dev/login/google">Continue with Google</a>
+            <a class="auth-button" href="https://app.clawfs.dev/login/github">Continue with GitHub</a>
           </div>
-          <p class="footnote">Hosted account flows live in the app. The public repo covers local install, configuration, and mounting.</p>
+          <p class="footnote">Use the hosted app to sign in, review your account, and connect the CLI.</p>
         </article>
       </section>
 
       <section class="feature-grid reveal" data-delay="180">
         <div class="section-title">
-          <p class="eyebrow">OSS CLI</p>
-          <h2>Mount A Local ClawFS Workspace</h2>
+          <p class="eyebrow">CLI Flow</p>
+          <h2>CLI Sign In</h2>
         </div>
         <div class="cards two-up">
           <article class="card">
-            <h3>Install + Inspect</h3>
+            <h3>Install + Sign In</h3>
             <div class="code-block"><code>curl -fsSL https://clawfs.dev/install.sh | bash
-clawfs --help</code></div>
-            <p class="footnote">Use the public CLI to inspect flags, configure a backing store, and mount a workspace locally.</p>
+clawfs login
+clawfs whoami</code></div>
+            <p class="footnote">The CLI opens the hosted app, completes sign-in, and links your local environment to your ClawFS account.</p>
           </article>
           <article class="card">
-            <h3>First Mount</h3>
-            <div class="code-block"><code>clawfs --mount-path /tmp/clawfs-mnt \
-  --store-path ~/.clawfs/store \
-  --local-cache-path ~/.clawfs/cache</code></div>
-            <p class="footnote">That gives you the open-source filesystem path directly, without the hosted account workflow.</p>
+            <h3>Launch Your First Workspace</h3>
+            <div class="code-block"><code>clawfs up --volume demo -- python3 your_agent.py</code></div>
+            <p class="footnote">After sign-in, you can launch a workspace from the CLI and return to it later from another run or machine.</p>
           </article>
         </div>
       </section>
 
       <section class="cta reveal" data-delay="300">
-        <h2>Use the hosted app for managed access, or run the OSS CLI directly.</h2>
-        <p>Both paths start from the same install page, but the public repo is now focused on the filesystem itself.</p>
+        <h2>Install the CLI, sign in once, and start building on a persistent workspace.</h2>
+        <p>ClawFS gives you a straightforward path from first evaluation to repeatable day-to-day use.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="pricing.html">See Plans</a>
           <a class="btn btn-secondary" href="getting-started.html">Back to Getting Started</a>
@@ -112,7 +111,7 @@ clawfs --help</code></div>
 
     <footer class="site-footer">
       <p>© <span id="year"></span> ClawFS</p>
-      <p>Hosted app access plus OSS CLI install for the public ClawFS filesystem</p>
+      <p>Email, Google, GitHub, and CLI access for hosted ClawFS workspaces</p>
     </footer>
 
     <script src="main.js"></script>

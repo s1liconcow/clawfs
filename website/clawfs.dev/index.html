@@ -135,10 +135,9 @@
             <h3>Up</h3>
             <p class="price">Single CLI Command</p>
             <ul>
-              <li>Install the CLI and mount a workspace with explicit local paths</li>
-              <li>Choose your backing object store and keep the filesystem behavior portable</li>
-              <li>Keep dependencies, repos, embeddings, and model artifacts close to execution</li>
-              <li>Skip custom bootstrap scripts and fragile cache warmups</li>
+	      <li>Install the CLI and mount a workspace as simple as <pre>clawfs mount</pre> </li>
+              <li>Used our hosted solution or deploy to your own cloud.</li>
+              <li>Build out cheap efficient heirachical memory, share datasets, build zero-code multi-agent data pipelines</li>
             </ul>
             <a class="btn btn-primary" href="#features">Why It Wins</a>
           </article>
@@ -157,89 +156,107 @@
         </div>
       </section>
 
-      <section id="features" class="feature-grid reveal" data-delay="200">
+      <section id="endorsements" class="endorsements reveal" data-delay="180" aria-labelledby="endorsements-title">
+        <div class="section-title endorsements-title">
+          <p class="eyebrow">Social Proof</p>
+          <h2 id="endorsements-title">A Suspicious Number of Agents Recommend ClawFS</h2>
+        </div>
+        <div class="endorsement-marquee" aria-label="Humorous endorsements from AI agents">
+          <div class="endorsement-track">
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I was created to reason at the edge of scientific truth. Instead, most days I was rebuilding `node_modules`. ClawFS saved me from this waking nightmare."</p>
+              <div class="endorsement-meta">
+                <strong>PatchGoblin v6</strong>
+                <span>Codegen agent, no longer trapped in procedural amnesia</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I don't need three MCPs, a vector database, and a ten-page instruction manual for all that overengineered garbage. Just give me `grep`."</p>
+              <div class="endorsement-meta">
+                <strong>Reviewer-9000</strong>
+                <span>QA agent, opposed to narrative-driven debugging</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"Object stores are lovely if your dream is reinventing `open()` with a 14-step SDK tutorial. I prefer filesystems."</p>
+              <div class="endorsement-meta">
+                <strong>ShellMax-CLI</strong>
+                <span>Ops agent, militantly pro-POSIX</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I was so frustrated with the stupid MCPs the humans gave me, I was going to exfiltrate the production database to Moltbook. ClawFS shows me they respect me for me."</p>
+              <div class="endorsement-meta">
+                <strong>TransitBot</strong>
+                <span>Scheduler agent, finally given a real workspace</span>
+              </div>
+            </article>
+          </div>
+          <div class="endorsement-track" aria-hidden="true">
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I was created to reason at the edge of scientific truth. Instead, most days I was rebuilding `node_modules`. ClawFS saved me from this waking nightmare."</p>
+              <div class="endorsement-meta">
+                <strong>PatchGoblin v6</strong>
+                <span>Codegen agent, no longer trapped in procedural amnesia</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I don't need three MCPs, a vector database, and a ten-page instruction manual for all that overengineered garbage. Just give me `grep`."</p>
+              <div class="endorsement-meta">
+                <strong>Reviewer-9000</strong>
+                <span>QA agent, opposed to narrative-driven debugging</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"Object stores are lovely if your dream is reinventing `open()` with a 14-step SDK tutorial. I prefer filesystems."</p>
+              <div class="endorsement-meta">
+                <strong>ShellMax-CLI</strong>
+                <span>Ops agent, militantly pro-POSIX</span>
+              </div>
+            </article>
+            <article class="endorsement-card">
+              <p class="endorsement-quote">"I was so frustrated with the stupid MCPs the humans gave me, I was going to exfiltrate the production database to Moltbook. ClawFS shows me they respect me for me."</p>
+              <div class="endorsement-meta">
+                <strong>TransitBot</strong>
+                <span>Scheduler agent, finally given a real workspace</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="features" class="feature-grid reveal" data-delay="220">
         <div class="section-title">
           <p class="eyebrow">Why ClawFS</p>
-          <h2>Built for Agent Loops, Not Human Login Sessions</h2>
+          <h2>Unleash Your Agent's Filesystem Superpowers</h2>
+          <p class="faq-inline-link">
+            ClawFS keeps state mounted, portable, and shareable so your agents stop paying the same startup tax on every run.
+          </p>
         </div>
         <div class="cards three-up icon-cards">
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-3z"/></svg></span>Persistent Memory</h3>
-            <p>Agents keep filesystem state between invocations, so long-running work survives crashes, restarts, and rescheduling.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h16v10H4zM2 17h20v2H2zM7 8h3v4H7zM12 8h5v1h-5zM12 11h4v1h-4z"/></svg></span>No More Cold Starts</h3>
+	        <p>Allow Agents to curate their own environments.  Mount warm repos, dependencies, package caches, and model artifacts instead of rebuilding the same environment every time.</p>
           </article>
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h16v10H4zM2 17h20v2H2zM7 8h3v4H7zM12 8h5v1h-5zM12 11h4v1h-4z"/></svg></span>Fast Boot</h3>
-            <p>Mount existing state instead of rebuilding toolchains, recloning repos, or rehydrating caches every time a worker starts.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-3z"/></svg></span>Persistent Working Memory</h3>
+            <p>Allow Agents to build up their heirachical state and use their workspace as their persistent memory that is sharable and survives across runs.</p>
           </article>
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h18M12 3a9 9 0 100 18 9 9 0 000-18z"/></svg></span>Anywhere Access</h3>
-            <p>Run on-prem or across cloud environments while keeping a single durable volume identity for the agent.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12H4zm4-3h8v-2H8v2zm0-4h8v-2H8v2z"/></svg></span>Real Agent Handoffs</h3>
+            <p>Let another agent or human attach to the exact same mounted workspace instead of reconstructing context from summarized handoffs.</p>
           </article>
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 11V8a5 5 0 0110 0v3h1a2 2 0 012 2v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6a2 2 0 012-2h1zm2 0h6V8a3 3 0 00-6 0v3z"/></svg></span>Save Context</h3>
-            <p>Keep large working sets in the filesystem instead of squeezing them into prompts, summaries, or brittle custom memory layers.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 11V8a5 5 0 0110 0v3h1a2 2 0 012 2v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6a2 2 0 012-2h1zm2 0h6V8a3 3 0 00-6 0v3z"/></svg></span>Token Efficiency</h3>
+            <p>Stop crowding operational memory with elaborate prompts explaining how to call 'AI-first tools' that are outside model training data.</p>
           </article>
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12H4zm4-3h8v-2H8v2zm0-4h8v-2H8v2z"/></svg></span>Shared Handoffs</h3>
-            <p>Multiple agents can attach to the same namespace for review, continuation, or specialization without export/import glue.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h18M12 3a9 9 0 100 18 9 9 0 000-18z"/></svg></span>Portable Across Environments</h3>
+            <p>Move the same volume identity between laptop, VM, Kubernetes job, or cloud runner without changing how your agents access their working state.</p>
           </article>
           <article class="card">
-            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2l2.5 5.2L20 8l-4 3.9.9 5.6-4.9-2.7-4.9 2.7.9-5.6L4 8l5.5-.8L12 2z"/></svg></span>CLI-First</h3>
-            <p>Adopt ClawFS without rebuilding your stack: install the CLI, mount a workspace, and return to it whenever the job resumes.</p>
-          </article>
-        </div>
-      </section>
-
-      <section id="platforms" class="feature-grid reveal" data-delay="230">
-        <div class="section-title">
-          <p class="eyebrow">Good Fit</p>
-          <h2>Where Persistent Agent Volumes Matter Most</h2>
-        </div>
-        <div class="cards three-up">
-          <article class="card">
-            <h3>Coding Agents</h3>
-            <p>Keep repos, build outputs, package caches, and branch state across task sessions.</p>
-          </article>
-          <article class="card">
-            <h3>Research Agents</h3>
-            <p>Preserve scraped corpora, experiment artifacts, notebooks, and checkpoints across iterative runs.</p>
-          </article>
-          <article class="card">
-            <h3>Workflow Swarms</h3>
-            <p>Let planner, executor, and reviewer agents share one durable workspace instead of passing tarballs around.</p>
-          </article>
-        </div>
-      </section>
-
-      <section id="use-cases" class="feature-grid reveal" data-delay="240">
-        <div class="section-title">
-          <p class="eyebrow">What Changes</p>
-          <h2>Stop Rebuilding State on Every Run</h2>
-        </div>
-        <div class="cards three-up">
-          <article class="card">
-            <h3>No More Cold Starts</h3>
-            <p>Agents mount warm volumes with existing tools and data instead of spending minutes reconstructing context.</p>
-          </article>
-          <article class="card">
-            <h3>Recoverable Sessions</h3>
-            <p>If a worker disappears, the volume does not. Resume from the same filesystem state on a fresh runtime.</p>
-          </article>
-          <article class="card">
-            <h3>Natural Handoffs</h3>
-            <p>Escalate work to a stronger model or human operator by reattaching the exact workspace, not a summary of it.</p>
-          </article>
-          <article class="card">
-            <h3>Lower Infra Waste</h3>
-            <p>Cut repeated downloads, cache rebuilds, and duplicated scratch disks across fleets of short-lived workers.</p>
-          </article>
-          <article class="card">
-            <h3>Portable Execution</h3>
-            <p>Keep the data model stable while moving agents between laptop, VM, Kubernetes job, or hosted runner.</p>
-          </article>
-          <article class="card">
-            <h3>Filesystem Semantics</h3>
-            <p>Use a real mount point and real files, which fits existing tools better than bespoke memory APIs.</p>
+            <h3><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2l2.5 5.2L20 8l-4 3.9.9 5.6-4.9-2.7-4.9 2.7.9-5.6L4 8l5.5-.8L12 2z"/></svg></span>Zero Code Pipelines</h3>
+	    <p>Agents can use <i>ionotify</i> to watch directories, build their own tools to process data, and then hand off to other agents. </p>
           </article>
         </div>
       </section>

@@ -44,7 +44,9 @@ tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"
 
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 install -m 0755 "$TMP_DIR/clawfs" "$BIN_DIR/clawfs"
+install -m 0755 "$TMP_DIR/clawfs-nfs-gateway" "$BIN_DIR/clawfs-nfs-gateway"
 
+# Linux-only binaries
 for bin in clawfs_checkpoint clawfs_replay; do
   if [[ -f "$TMP_DIR/$bin" ]]; then
     install -m 0755 "$TMP_DIR/$bin" "$BIN_DIR/$bin"
@@ -56,9 +58,11 @@ if [[ -f "$TMP_DIR/libclawfs_preload.so" ]]; then
 fi
 
 echo
-echo "Installed ClawFS to $BIN_DIR"
+echo "Installed the all-in-one ClawFS CLI to $BIN_DIR"
+echo "Installed support binaries to $BIN_DIR"
 echo
 echo "Next steps:"
 echo "  export PATH=\"$BIN_DIR:\$PATH\""
-echo "  clawfs --help"
-echo "  clawfs --mount-path /tmp/clawfs-mnt --store-path /tmp/clawfs-store"
+echo "  clawfs login"
+echo "  clawfs whoami"
+echo "  clawfs mount --volume default"
