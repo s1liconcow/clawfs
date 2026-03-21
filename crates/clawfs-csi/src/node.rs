@@ -1,8 +1,8 @@
-use tonic::{Request, Response, Status};
 use crate::csi::*;
-use std::process::Command;
-use std::path::Path;
 use log::{debug, error, info};
+use std::path::Path;
+use std::process::Command;
+use tonic::{Request, Response, Status};
 
 #[derive(Debug, Clone, Default)]
 pub struct ClawFSNodeService {
@@ -24,33 +24,48 @@ impl ClawFSNodeService {
         Ok(())
     }
 
-    fn mount_clawfs(&self, volume_id: &str, target_path: &str, attributes: &std::collections::HashMap<String, String>) -> Result<(), Status> {
+    fn mount_clawfs(
+        &self,
+        volume_id: &str,
+        target_path: &str,
+        attributes: &std::collections::HashMap<String, String>,
+    ) -> Result<(), Status> {
         // Parse volume attributes to get connection details
         // Expected attributes:
         // - state-path: local state directory
         // - host: clawfs daemon host (optional, defaults to localhost)
         // - port: clawfs daemon port (optional, defaults to 3049)
 
-        let state_path = attributes.get("state-path")
-            .ok_or_else(|| {
-                error!("Missing required attribute: state-path");
-                Status::invalid_argument("Missing required attribute: state-path")
-            })?;
+        let state_path = attributes.get("state-path").ok_or_else(|| {
+            error!("Missing required attribute: state-path");
+            Status::invalid_argument("Missing required attribute: state-path")
+        })?;
 
-        let host = attributes.get("host").map(|s| s.as_str()).unwrap_or("localhost");
+        let host = attributes
+            .get("host")
+            .map(|s| s.as_str())
+            .unwrap_or("localhost");
         let port = attributes.get("port").map(|s| s.as_str()).unwrap_or("3049");
 
-        info!("Mounting ClawFS volume {} at {} using daemon at {}:{}", volume_id, target_path, host, port);
+        info!(
+            "Mounting ClawFS volume {} at {} using daemon at {}:{}",
+            volume_id, target_path, host, port
+        );
 
         // Call clawfs mount command
         // Example: clawfs mount --volume-id <id> --mount-path <path> --state-path <state-path> --host <host> --port <port>
         let output = Command::new("clawfsd")
             .arg("mount")
-            .arg("--volume-id").arg(volume_id)
-            .arg("--mount-path").arg(target_path)
-            .arg("--state-path").arg(state_path)
-            .arg("--host").arg(host)
-            .arg("--port").arg(port)
+            .arg("--volume-id")
+            .arg(volume_id)
+            .arg("--mount-path")
+            .arg(target_path)
+            .arg("--state-path")
+            .arg(state_path)
+            .arg("--host")
+            .arg(host)
+            .arg("--port")
+            .arg(port)
             .output()
             .map_err(|e| {
                 error!("Failed to execute clawfsd mount: {}", e);
@@ -63,7 +78,10 @@ impl ClawFSNodeService {
             return Err(Status::internal(format!("Mount failed: {}", stderr)));
         }
 
-        info!("Successfully mounted ClawFS volume {} at {}", volume_id, target_path);
+        info!(
+            "Successfully mounted ClawFS volume {} at {}",
+            volume_id, target_path
+        );
         Ok(())
     }
 
@@ -97,10 +115,17 @@ impl node_server::Node for ClawFSNodeService {
         request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
         let req = request.into_inner();
-        debug!("NodeStageVolume: volume_id={}, staging_target_path={}", req.volume_id, req.staging_target_path);
+        debug!(
+            "NodeStageVolume: volume_id={}, staging_target_path={}",
+            req.volume_id, req.staging_target_path
+        );
 
         self.ensure_mount_point_exists(&req.staging_target_path)?;
-        self.mount_clawfs(&req.volume_id, &req.staging_target_path, &req.volume_attributes)?;
+        self.mount_clawfs(
+            &req.volume_id,
+            &req.staging_target_path,
+            &req.volume_attributes,
+        )?;
 
         Ok(Response::new(NodeStageVolumeResponse {}))
     }
@@ -110,7 +135,10 @@ impl node_server::Node for ClawFSNodeService {
         request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
         let req = request.into_inner();
-        debug!("NodeUnstageVolume: volume_id={}, staging_target_path={}", req.volume_id, req.staging_target_path);
+        debug!(
+            "NodeUnstageVolume: volume_id={}, staging_target_path={}",
+            req.volume_id, req.staging_target_path
+        );
 
         self.unmount_clawfs(&req.staging_target_path)?;
 
@@ -122,7 +150,10 @@ impl node_server::Node for ClawFSNodeService {
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        debug!("NodePublishVolume: volume_id={}, target_path={}", req.volume_id, req.target_path);
+        debug!(
+            "NodePublishVolume: volume_id={}, target_path={}",
+            req.volume_id, req.target_path
+        );
 
         // For a minimal implementation, we can either:
         // 1. Mount directly to target_path (skipping staging)
@@ -131,7 +162,7 @@ impl node_server::Node for ClawFSNodeService {
         // We'll do a bind mount from staging path to target path
         if !req.staging_target_path.is_empty() && !req.target_path.is_empty() {
             self.ensure_mount_point_exists(&req.target_path)?;
-            
+
             let output = Command::new("mount")
                 .arg("--bind")
                 .arg(&req.staging_target_path)
@@ -150,7 +181,8 @@ impl node_server::Node for ClawFSNodeService {
 
             if req.readonly {
                 let output = Command::new("mount")
-                    .arg("-o").arg("remount,ro")
+                    .arg("-o")
+                    .arg("remount,ro")
                     .arg(&req.target_path)
                     .output()
                     .map_err(|e| {
@@ -177,7 +209,10 @@ impl node_server::Node for ClawFSNodeService {
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        debug!("NodeUnpublishVolume: volume_id={}, target_path={}", req.volume_id, req.target_path);
+        debug!(
+            "NodeUnpublishVolume: volume_id={}, target_path={}",
+            req.volume_id, req.target_path
+        );
 
         self.unmount_clawfs(&req.target_path)?;
 
@@ -189,15 +224,13 @@ impl node_server::Node for ClawFSNodeService {
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
         Ok(Response::new(NodeGetCapabilitiesResponse {
-            capabilities: vec![
-                NodeServiceCapability {
-                    r#type: Some(node_service_capability::Type::Rpc(
-                        node_service_capability::Rpc {
-                            r#type: node_service_capability::rpc::Type::StageUnstageVolume as i32,
-                        },
-                    )),
-                },
-            ],
+            capabilities: vec![NodeServiceCapability {
+                r#type: Some(node_service_capability::Type::Rpc(
+                    node_service_capability::Rpc {
+                        r#type: node_service_capability::rpc::Type::StageUnstageVolume as i32,
+                    },
+                )),
+            }],
         }))
     }
 

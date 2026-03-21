@@ -53,8 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Bind Unix socket
-    let listener = UnixListener::bind(&args.endpoint)
-        .map_err(|e| format!("Failed to bind socket: {}", e))?;
+    let listener =
+        UnixListener::bind(&args.endpoint).map_err(|e| format!("Failed to bind socket: {}", e))?;
 
     info!("Created Unix socket at {}", args.endpoint);
 
