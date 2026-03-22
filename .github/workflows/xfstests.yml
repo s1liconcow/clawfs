@@ -119,7 +119,7 @@ jobs:
             cmd+=(--allow-other)
           fi
 
-          "${cmd[@]}"
+          "${cmd[@]}" >/dev/null
           EOF
           sudo sed -i "s|__CLAWFSD_BIN__|$GITHUB_WORKSPACE/target/release/clawfsd|" /sbin/mount.fuse.clawfs
           sudo chmod +x /sbin/mount.fuse.clawfs
@@ -141,8 +141,8 @@ jobs:
           export SCRATCH_DEV=/mnt/scratch
           export SCRATCH_MNT=/mnt/scratch
 
-          export TEST_FS_MOUNT_OPTS="-o source=/tmp/clawfs-test-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-test-cache,state_path=/tmp/clawfs-test-state.bin"
-          export MOUNT_OPTIONS="-o source=/tmp/clawfs-scratch-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-scratch-cache,state_path=/tmp/clawfs-scratch-state.bin"
+          export TEST_FS_MOUNT_OPTS="-o source=/tmp/clawfs-test-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-test-cache,state_path=/tmp/clawfs-test-state.bin,fuse_fsname=/mnt/test"
+          export MOUNT_OPTIONS="-o source=/tmp/clawfs-scratch-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-scratch-cache,state_path=/tmp/clawfs-scratch-state.bin,fuse_fsname=/mnt/scratch"
           EOF
 
           cat > excludes << 'EOF'
