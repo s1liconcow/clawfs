@@ -29,7 +29,8 @@ impl OsageFs {
                 };
             }
         }
-        self.metadata.lookup_cached_child(parent, name)
+        self.metadata
+            .lookup_cached_child(parent, name, self.dir_cache_ttl)
     }
 
     pub(crate) fn op_lookup(

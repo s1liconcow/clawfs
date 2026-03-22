@@ -2178,6 +2178,42 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
     );
 }
 
+#[test]
+fn lookup_cache_ttl_zero_forces_remote_file_refresh() {
+    let dir = tempdir().unwrap();
+    let writer = TestHarness::with_config(dir.path(), "ttl_zero_writer.bin", 1 << 20, |cfg| {
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+    let reader = TestHarness::with_config(dir.path(), "ttl_zero_reader.bin", 1 << 20, |cfg| {
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+
+    let file = writer.fs.nfs_create(ROOT_INODE, "testing", 0, 0).unwrap();
+    writer.fs.op_write(file.inode, 0, b"test 1\n").unwrap();
+    writer.fs.flush_pending().unwrap();
+
+    let reader_file = reader.fs.nfs_lookup(ROOT_INODE, "testing").unwrap();
+    assert_eq!(
+        reader.fs.nfs_read(reader_file.inode, 0, 7).unwrap(),
+        b"test 1\n"
+    );
+
+    writer.fs.op_write(file.inode, 7, b"test 2\n").unwrap();
+    writer.fs.flush_pending().unwrap();
+
+    assert_eq!(
+        reader.fs.nfs_getattr(reader_file.inode).unwrap().size,
+        14,
+        "ttl=0 should not pin a stale file size in the metadata cache"
+    );
+    assert_eq!(
+        reader.fs.nfs_read(reader_file.inode, 0, 14).unwrap(),
+        b"test 1\ntest 2\n"
+    );
+}
+
 /// Regression test for the FIO seq_write_1m EIO bug.
 ///
 /// Before the fix, writing to a large file at offset 0 after it had been

@@ -842,9 +842,13 @@ impl MetadataStore {
         &self,
         parent: u64,
         name: &str,
+        dir_ttl: Duration,
     ) -> Option<std::result::Result<u64, i32>> {
         let cache = self.cache.read();
         let entry = cache.get(&parent)?;
+        if dir_ttl.is_zero() || entry.refreshed.elapsed() > dir_ttl {
+            return None;
+        }
         if matches!(entry.record.kind, InodeKind::Tombstone) {
             return Some(Err(ENOENT));
         }
@@ -865,7 +869,7 @@ impl MetadataStore {
         // Fast path: positive cache hit.
         if let Some(entry) = self.cache.read().get(&inode).cloned() {
             let allowed = ttl(&entry.record);
-            if allowed.is_zero() || entry.refreshed.elapsed() <= allowed {
+            if !allowed.is_zero() && entry.refreshed.elapsed() <= allowed {
                 return Ok(Some(entry.record));
             }
         }
@@ -927,7 +931,7 @@ impl MetadataStore {
                     } else {
                         file_ttl
                     };
-                    if ttl.is_zero() || entry.refreshed.elapsed() <= ttl {
+                    if !ttl.is_zero() && entry.refreshed.elapsed() <= ttl {
                         result.insert(ino, entry.record.clone());
                         continue;
                     }

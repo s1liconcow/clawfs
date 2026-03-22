@@ -320,6 +320,24 @@ impl OsageFs {
         }
     }
 
+    #[cfg(feature = "fuse")]
+    pub(crate) fn fuse_attr_ttl(&self, record: &InodeRecord) -> Duration {
+        if record.is_dir() {
+            self.fuse_entry_ttl
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    #[cfg(feature = "fuse")]
+    pub(crate) fn fuse_attr_ttl_for_attr(&self, attr: &FileAttr) -> Duration {
+        if attr.kind == FileType::Directory {
+            self.fuse_entry_ttl
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// Check all three in-memory dirty maps for an inode.  Returns `Some(Ok(record))`,
     /// `Some(Err(ENOENT))` (tombstone), or `None` (not found in any map).
     fn load_inode_in_memory(&self, ino: u64) -> Option<std::result::Result<InodeRecord, i32>> {

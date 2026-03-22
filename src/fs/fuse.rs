@@ -34,6 +34,7 @@ impl Filesystem for OsageFs {
         // Allow deeper in-flight queues under fsync-heavy small-file workloads.
         let _ = config.set_max_background(1024);
         let _ = config.set_congestion_threshold(768);
+        let _ = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA);
         if self.config.writeback_cache {
             let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
         }
@@ -101,7 +102,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "size": size, "mode": mode, "uid": uid, "gid": gid }),
                 );
-                reply.attr(&self.fuse_entry_ttl, &attr)
+                reply.attr(&self.fuse_attr_ttl_for_attr(&attr), &attr)
             }
             Err(code) => {
                 self.log_replay(
@@ -144,7 +145,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name_str, "ino": inode.inode }),
                 );
                 let attr = Self::record_attr(&inode);
-                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_attr_ttl(&inode), &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -169,7 +170,7 @@ impl Filesystem for OsageFs {
             Ok(record) => {
                 self.log_replay("fuse", "getattr", replay, None, json!({ "ino": ino }));
                 let attr = Self::record_attr(&record);
-                reply.attr(&self.fuse_entry_ttl, &attr);
+                reply.attr(&self.fuse_attr_ttl(&record), &attr);
             }
             Err(code) => {
                 self.log_replay("fuse", "getattr", replay, Some(code), json!({ "ino": ino }));
@@ -246,7 +247,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "ino": dir.inode }),
                 );
                 let attr = Self::record_attr(&dir);
-                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_attr_ttl(&dir), &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -300,7 +301,13 @@ impl Filesystem for OsageFs {
                     }),
                 );
                 let attr = Self::record_attr(&file);
-                reply.created(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION, 0, 0);
+                reply.created(
+                    &self.fuse_attr_ttl(&file),
+                    &attr,
+                    FUSE_NODE_GENERATION,
+                    0,
+                    0,
+                );
             }
             Err(code) => {
                 self.log_replay(
@@ -354,7 +361,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "mode": mode, "rdev": rdev, "ino": node.inode }),
                 );
                 let attr = Self::record_attr(&node);
-                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_attr_ttl(&node), &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -396,7 +403,7 @@ impl Filesystem for OsageFs {
                     json!({ "parent": parent, "name": name.to_string_lossy(), "uid": uid, "gid": gid, "target_len": target_len, "ino": record.inode }),
                 );
                 let attr = Self::record_attr(&record);
-                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_attr_ttl(&record), &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(
@@ -687,7 +694,7 @@ impl Filesystem for OsageFs {
                     json!({ "ino": ino, "newparent": newparent, "newname": newname.to_string_lossy() }),
                 );
                 let attr = Self::record_attr(&record);
-                reply.entry(&self.fuse_entry_ttl, &attr, FUSE_NODE_GENERATION);
+                reply.entry(&self.fuse_attr_ttl(&record), &attr, FUSE_NODE_GENERATION);
             }
             Err(code) => {
                 self.log_replay(

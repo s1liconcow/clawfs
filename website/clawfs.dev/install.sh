@@ -12,6 +12,33 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
+resolve_latest_version() {
+  local repo="$1"
+  local resolved_url api_url version
+
+  resolved_url="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest" 2>/dev/null || true)"
+  version="${resolved_url##*/}"
+  if [[ -n "$version" && "$version" != "latest" ]]; then
+    printf '%s\n' "$version"
+    return 0
+  fi
+
+  api_url="https://api.github.com/repos/${repo}/releases/latest"
+  version="$(curl -fsSL "$api_url" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  if [[ -n "$version" ]]; then
+    printf '%s\n' "$version"
+    return 0
+  fi
+
+  version="$(curl -fsSL "https://github.com/${repo}/releases/latest" 2>/dev/null | sed -n 's@.*releases/tag/\\([^"/?]*\\).*@\\1@p' | head -n1)"
+  if [[ -n "$version" ]]; then
+    printf '%s\n' "$version"
+    return 0
+  fi
+
+  return 1
+}
+
 case "$OS" in
   Linux)  PLATFORM="linux" ;;
   *)
@@ -27,8 +54,7 @@ if [[ "$ARCH" != "x86_64" ]]; then
 fi
 
 if [[ "$VERSION" == "latest" ]]; then
-  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-  VERSION="$(curl -fsSL "$API_URL" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  VERSION="$(resolve_latest_version "$REPO")"
   if [[ -z "$VERSION" ]]; then
     echo "failed to resolve latest ClawFS release tag" >&2
     exit 1

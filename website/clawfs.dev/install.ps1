@@ -17,14 +17,49 @@ $Repo    = if ($env:CLAWFS_RELEASE_REPO)   { $env:CLAWFS_RELEASE_REPO }   else {
 $Version = if ($env:CLAWFS_INSTALL_VERSION) { $env:CLAWFS_INSTALL_VERSION } else { "latest" }
 $InstallDir = if ($env:CLAWFS_INSTALL_DIR)  { $env:CLAWFS_INSTALL_DIR }    else { Join-Path $env:LOCALAPPDATA "ClawFS\bin" }
 
+function Resolve-LatestVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Repo
+    )
+
+    try {
+        $Response = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -Method Head -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+        if ($Response.Headers.Location -match '/releases/tag/([^/?#]+)') {
+            return $Matches[1]
+        }
+    } catch {
+        $Location = $_.Exception.Response.Headers.Location
+        if ($Location -match '/releases/tag/([^/?#]+)') {
+            return $Matches[1]
+        }
+    }
+
+    try {
+        $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
+        $Release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing
+        if ($Release.tag_name) {
+            return $Release.tag_name
+        }
+    } catch {
+    }
+
+    try {
+        $ReleasePage = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -UseBasicParsing
+        if ($ReleasePage.Content -match '/releases/tag/([^"?#]+)') {
+            return $Matches[1]
+        }
+    } catch {
+    }
+
+    return $null
+}
+
 # Resolve latest version tag
 if ($Version -eq "latest") {
-    $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    try {
-        $Release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing
-        $Version = $Release.tag_name
-    } catch {
-        Write-Error "Failed to resolve latest ClawFS release tag from $ApiUrl"
+    $Version = Resolve-LatestVersion -Repo $Repo
+    if (-not $Version) {
+        Write-Error "Failed to resolve latest ClawFS release tag from GitHub"
         exit 1
     }
 }
