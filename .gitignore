@@ -11,7 +11,7 @@ micro-results-*
 pjdfstest_*
 fio-results-*
 scripts/__pycache__
-clawfs-data-plane/
+private
 
 # bv (beads viewer) local config and caches
 .bv/
