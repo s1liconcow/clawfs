@@ -141,8 +141,8 @@ jobs:
           export SCRATCH_DEV=/tmp/clawfs-scratch-store
           export SCRATCH_MNT=/mnt/scratch
 
-          export TEST_FS_MOUNT_OPTS="-o source=/tmp/clawfs-test-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-test-cache,state_path=/tmp/clawfs-test-state.bin,fuse_fsname=clawfs-test"
-          export MOUNT_OPTIONS="-o source=/tmp/clawfs-scratch-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-scratch-cache,state_path=/tmp/clawfs-scratch-state.bin,fuse_fsname=clawfs-scratch"
+          export TEST_FS_MOUNT_OPTS="-o source=/tmp/clawfs-test-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-test-cache,state_path=/tmp/clawfs-test-state.bin,fuse_fsname=/tmp/clawfs-test-store"
+          export MOUNT_OPTIONS="-o source=/tmp/clawfs-scratch-store,allow_other,default_permissions,local_cache_path=/tmp/clawfs-scratch-cache,state_path=/tmp/clawfs-scratch-state.bin,fuse_fsname=/tmp/clawfs-scratch-store"
           EOF
 
           cat > excludes << 'EOF'

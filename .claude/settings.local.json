@@ -12,7 +12,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:man7.org)",
       "mcp__mcp-agent-mail__*",
-      "mcp__mcp-agent-mail__acknowledge_message"
+      "mcp__mcp-agent-mail__acknowledge_message",
+      "WebSearch"
     ]
   }
 }

@@ -37,6 +37,8 @@ Close-time durability uses a local journal under `$STORE/journal`. Pending write
 - `src/segment.rs` owns immutable segment serialization and range reads.
 - `src/perf.rs` and `src/replay.rs` provide structured performance and replay logging.
 
+Private repo containing the nfs-gateway, preload library, and hosted CLI is under private/
+
 Keep this file focused. Put detailed implementation notes, workflow specifics, and troubleshooting expansions in the linked `docs/` files.
 
 ## Project Structure (key files by responsibility)
