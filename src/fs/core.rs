@@ -2,6 +2,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
+#[macro_use]
+#[path = "core_shared.inc.rs"]
+mod core_shared;
+
 pub(crate) fn epoch_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -266,4 +270,4 @@ impl OsageFs {
     }
 }
 
-include!("core_shared.inc.rs");
+fs_core_shared_items!();

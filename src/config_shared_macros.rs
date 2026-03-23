@@ -1,3 +1,4 @@
+#[macro_export]
 macro_rules! shared_cli_struct {
     ($($writeback_fields:tt)*) => {
         #[derive(Parser, Debug)]
@@ -219,6 +220,7 @@ macro_rules! shared_cli_struct {
     };
 }
 
+#[macro_export]
 macro_rules! shared_config_struct {
     ($($extra_fields:tt)*) => {
         #[derive(Debug, Clone)]
@@ -273,6 +275,7 @@ macro_rules! shared_config_struct {
     };
 }
 
+#[macro_export]
 macro_rules! shared_source_store_config_struct {
     () => {
         #[derive(Debug, Clone)]
@@ -292,6 +295,7 @@ macro_rules! shared_source_store_config_struct {
     };
 }
 
+#[macro_export]
 macro_rules! shared_config_with_paths_expr {
     ($mount_path:expr, $store_path:expr, $local_cache_path:expr, $state_path:expr, $writeback_cache:expr, $($extra_fields:tt)*) => {
         Self {
@@ -345,6 +349,7 @@ macro_rules! shared_config_with_paths_expr {
     };
 }
 
+#[macro_export]
 macro_rules! shared_source_from_cli_expr {
     ($cli:ident) => {
         if $cli.source_bucket.is_some() || $cli.source_store_path.is_some() {
@@ -367,6 +372,7 @@ macro_rules! shared_source_from_cli_expr {
     };
 }
 
+#[macro_export]
 macro_rules! shared_config_from_cli_expr {
     ($cli:ident, $source:ident, $log_file:ident, $store_path:ident, $local_cache_path:ident, $state_path:ident, $($extra_fields:tt)*) => {
         Config {
@@ -433,6 +439,7 @@ macro_rules! shared_config_from_cli_expr {
     };
 }
 
+#[macro_export]
 macro_rules! shared_default_path_helpers {
     () => {
         fn default_user_config_root() -> PathBuf {
@@ -458,6 +465,79 @@ macro_rules! shared_default_path_helpers {
     };
 }
 
+#[macro_export]
+macro_rules! shared_source_store_to_public_expr {
+    ($source:expr, $object_provider:expr) => {
+        $crate::config::SourceStoreConfig {
+            object_provider: $object_provider,
+            bucket: $source.bucket.clone(),
+            prefix: $source.prefix.clone(),
+            store_path: $source.store_path.clone(),
+            region: $source.region.clone(),
+            endpoint: $source.endpoint.clone(),
+            gcs_service_account: $source.gcs_service_account.clone(),
+            aws_access_key_id: $source.aws_access_key_id.clone(),
+            aws_secret_access_key: $source.aws_secret_access_key.clone(),
+            aws_allow_http: $source.aws_allow_http,
+            aws_force_path_style: $source.aws_force_path_style,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! shared_config_to_public_expr {
+    ($config:expr, $object_provider:expr, $source:expr) => {
+        $crate::config::Config {
+            mount_path: $config.mount_path.clone(),
+            store_path: $config.store_path.clone(),
+            local_cache_path: $config.local_cache_path.clone(),
+            log_storage_io: $config.log_storage_io,
+            inline_threshold: $config.inline_threshold,
+            inline_compression: $config.inline_compression,
+            inline_encryption_key: $config.inline_encryption_key.clone(),
+            segment_compression: $config.segment_compression,
+            segment_encryption_key: $config.segment_encryption_key.clone(),
+            shard_size: $config.shard_size,
+            inode_batch: $config.inode_batch,
+            segment_batch: $config.segment_batch,
+            pending_bytes: $config.pending_bytes,
+            home_prefix: $config.home_prefix.clone(),
+            object_provider: $object_provider,
+            bucket: $config.bucket.clone(),
+            region: $config.region.clone(),
+            endpoint: $config.endpoint.clone(),
+            object_prefix: $config.object_prefix.clone(),
+            telemetry_object_prefix: $config.telemetry_object_prefix.clone(),
+            gcs_service_account: $config.gcs_service_account.clone(),
+            aws_allow_http: $config.aws_allow_http,
+            aws_force_path_style: $config.aws_force_path_style,
+            source: $source,
+            state_path: $config.state_path.clone(),
+            perf_log: $config.perf_log.clone(),
+            replay_log: $config.replay_log.clone(),
+            disable_journal: $config.disable_journal,
+            fsync_on_close: $config.fsync_on_close,
+            flush_interval_ms: $config.flush_interval_ms,
+            disable_cleanup: $config.disable_cleanup,
+            cleanup_interval_secs: $config.cleanup_interval_secs,
+            lookup_cache_ttl_ms: $config.lookup_cache_ttl_ms,
+            dir_cache_ttl_ms: $config.dir_cache_ttl_ms,
+            metadata_poll_interval_ms: $config.metadata_poll_interval_ms,
+            segment_cache_bytes: $config.segment_cache_bytes,
+            foreground: $config.foreground,
+            allow_other: $config.allow_other,
+            log_file: $config.log_file.clone(),
+            debug_log: $config.debug_log,
+            imap_delta_batch: $config.imap_delta_batch,
+            writeback_cache: $config.writeback_cache,
+            fuse_threads: $config.fuse_threads,
+            entry_ttl_secs: $config.entry_ttl_secs,
+            fuse_fsname: $config.fuse_fsname.clone(),
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! shared_object_store_provider_enum {
     () => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

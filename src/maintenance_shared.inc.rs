@@ -1,3 +1,7 @@
+#[allow(clippy::crate_in_macro_def)]
+#[macro_export]
+macro_rules! maintenance_shared_items {
+    () => {
 use std::cmp::{Reverse, max};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -720,7 +724,20 @@ async fn compact_segment_batch(
         .await
         .context("committing compacted superblock")?;
 
-    maintenance_segment_delete_block!(segments, segments_to_delete);
+    // Delete old segments only AFTER the superblock CAS succeeds.
+    // If we deleted before and the CAS failed, metadata would still reference
+    // the now-deleted segments, causing permanent data corruption (404 on read).
+    for (old_gen, seg_id) in segments_to_delete {
+        if let Err(err) = segments.delete_segment(old_gen, seg_id) {
+            warn!(
+                target: "maintenance",
+                generation = old_gen,
+                segment_id = seg_id,
+                error = %err,
+                "failed to delete old segment after compaction; will be retried"
+            );
+        }
+    }
 
     Ok((merged_count, bytes_rewritten))
 }
@@ -1099,4 +1116,6 @@ mod tests {
             "vol/root/metadata/checkpoints/checkpoint-g00000000000000000042-t00000000000000000123.bin"
         );
     }
+}
+    };
 }

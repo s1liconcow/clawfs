@@ -14,9 +14,7 @@ pub const DEFAULT_MOUNT_DIR: &str = "clawfs-mnt";
 
 // CLI configuration for launching ClawFS.
 shared_cli_struct! {
-    /// Enable FUSE writeback cache (enabled by default). mmap writes require
-    /// writeback cache; without it the kernel page-cache changes never reach
-    /// the FUSE daemon and are lost on remount.
+    /// Enable FUSE writeback cache (enabled by default).
     #[arg(long, default_value_t = true)]
     pub writeback_cache: bool,
 }

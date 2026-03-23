@@ -1,3 +1,7 @@
+#[allow(clippy::crate_in_macro_def)]
+#[macro_export]
+macro_rules! fs_core_shared_items {
+    () => {
 impl OsageFs {
     pub(crate) fn block_on<F, T>(&self, fut: F) -> T
     where
@@ -1051,4 +1055,6 @@ impl OsageFs {
         }
         Ok(false)
     }
+}
+    };
 }

@@ -1,3 +1,7 @@
+#[macro_use]
+#[path = "maintenance_shared.inc.rs"]
+mod maintenance_shared;
+
 macro_rules! maintenance_cleanup_policy {
     () => {
         /// Determines whether the local cleanup worker should run.
@@ -23,25 +27,6 @@ macro_rules! maintenance_cleanup_policy {
     };
 }
 
-macro_rules! maintenance_segment_delete_block {
-    ($segments:ident, $segments_to_delete:ident) => {
-        // Delete old segments only AFTER the superblock CAS succeeds.
-        // If we deleted before and the CAS failed, metadata would still reference
-        // the now-deleted segments, causing permanent data corruption (404 on read).
-        for (old_gen, seg_id) in $segments_to_delete {
-            if let Err(err) = $segments.delete_segment(old_gen, seg_id) {
-                warn!(
-                    target: "maintenance",
-                    generation = old_gen,
-                    segment_id = seg_id,
-                    error = %err,
-                    "failed to delete old segment after compaction; will be retried"
-                );
-            }
-        }
-    };
-}
-
 #[cfg(test)]
 macro_rules! maintenance_test_imports {
     () => {};
@@ -59,4 +44,4 @@ macro_rules! maintenance_cleanup_policy_tests {
     };
 }
 
-include!("maintenance_shared.inc.rs");
+maintenance_shared_items!();
