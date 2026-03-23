@@ -633,7 +633,10 @@ fn append_file_handles_staged_pending_without_panic() {
 
     let mut stale_view = harness.fs.load_inode(inode).unwrap();
     stale_view.size = 0;
-    harness.fs.append_file(stale_view, b"xyz").unwrap();
+    harness
+        .fs
+        .write_inline_range(stale_view, None, b"xyz")
+        .unwrap();
 
     let pending_len = harness
         .fs
@@ -2022,18 +2025,24 @@ fn fuse_setattr_chmod_on_large_pending_file_preserves_content() {
     // Before the fix this called read_file_bytes on the pending record,
     // which could return empty bytes and then stage_file would corrupt the
     // file; after the fix it calls stage_inode (data preserved in-place).
-    fs.op_fuse_setattr(
-        file.inode,
-        1000,
-        1000,
-        Some(0o100640),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .expect("chmod on pending large file should succeed");
+    let attr = fs
+        .op_fuse_setattr(
+            file.inode,
+            1000,
+            1000,
+            Some(0o100640),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("chmod on pending large file should succeed");
+    assert_eq!(
+        attr.size,
+        payload.len() as u64,
+        "metadata-only setattr reply must preserve visible pending size"
+    );
 
     // Content must survive the chmod.
     let before_flush = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
@@ -2053,6 +2062,170 @@ fn fuse_setattr_chmod_on_large_pending_file_preserves_content() {
     let stored = fs.load_inode(file.inode).unwrap();
     assert_eq!(stored.mode & 0o777, 0o640, "chmod mode not persisted");
     assert_eq!(stored.size, payload.len() as u64, "size must not change");
+}
+
+#[test]
+fn stale_metadata_stage_inode_preserves_pending_file_size_and_content() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(
+        dir.path(),
+        "stale_metadata_pending_size.bin",
+        1 << 20,
+        |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+            cfg.inline_threshold = 512;
+        },
+    );
+    let fs = &harness.fs;
+
+    let file = fs
+        .nfs_create(ROOT_INODE, "race_pending.bin", 1000, 1000)
+        .unwrap();
+    let stale_record = fs.load_inode(file.inode).unwrap();
+    let payload = vec![0xA5u8; 8 * 1024];
+    fs.op_write(file.inode, 0, &payload).unwrap();
+
+    let mut metadata_only = stale_record;
+    metadata_only.mode = (metadata_only.mode & !0o7777) | 0o100640;
+    metadata_only.ctime = OffsetDateTime::now_utc();
+
+    let staged = fs.stage_inode_visible(metadata_only).unwrap();
+    assert_eq!(
+        staged.size,
+        payload.len() as u64,
+        "stale metadata-only update clobbered newer pending file size"
+    );
+    assert_eq!(staged.mode & 0o777, 0o640, "metadata update not applied");
+
+    let before_flush = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+    assert_eq!(
+        before_flush, payload,
+        "stale metadata-only update corrupted pending file content"
+    );
+
+    fs.flush_pending().unwrap();
+
+    let after = fs.load_inode(file.inode).unwrap();
+    assert_eq!(after.size, payload.len() as u64, "flushed size regressed");
+    assert_eq!(after.mode & 0o777, 0o640, "flushed metadata change missing");
+    let after_flush = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+    assert_eq!(
+        after_flush, payload,
+        "stale metadata-only update corrupted content after flush"
+    );
+}
+
+#[test]
+fn stale_metadata_stage_inode_preserves_flushing_file_size_and_content() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(
+        dir.path(),
+        "stale_metadata_flushing_size.bin",
+        1 << 20,
+        |cfg| {
+            cfg.disable_journal = true;
+            cfg.flush_interval_ms = 0;
+            cfg.inline_threshold = 512;
+        },
+    );
+    let fs = &harness.fs;
+
+    let file = fs
+        .nfs_create(ROOT_INODE, "race_flushing.bin", 1000, 1000)
+        .unwrap();
+    let stale_record = fs.load_inode(file.inode).unwrap();
+    let payload = vec![0x5Au8; 8 * 1024];
+    fs.op_write(file.inode, 0, &payload).unwrap();
+
+    let active_arc = fs.active_inodes.get(&file.inode).unwrap().clone();
+    {
+        let mut state = active_arc.lock();
+        state.flushing = state.pending.take();
+    }
+
+    let mut metadata_only = stale_record;
+    metadata_only.mode = (metadata_only.mode & !0o7777) | 0o100600;
+    metadata_only.ctime = OffsetDateTime::now_utc();
+
+    let staged = fs.stage_inode_visible(metadata_only).unwrap();
+    assert_eq!(
+        staged.size,
+        payload.len() as u64,
+        "stale metadata-only update clobbered flushing file size"
+    );
+    assert_eq!(staged.mode & 0o777, 0o600, "metadata update not applied");
+
+    let visible = fs.load_inode(file.inode).unwrap();
+    assert_eq!(
+        visible.size,
+        payload.len() as u64,
+        "load_inode must see merged size while flush is in progress"
+    );
+    let content = fs.nfs_read(file.inode, 0, payload.len() as u32).unwrap();
+    assert_eq!(
+        content, payload,
+        "stale metadata-only update corrupted flushing file content"
+    );
+}
+
+#[test]
+fn stale_metadata_stage_inode_journal_replay_preserves_pending_content() {
+    let dir = tempdir().unwrap();
+    let ino;
+    let payload = vec![0x6Bu8; 8 * 1024];
+    {
+        let harness =
+            TestHarness::with_config(dir.path(), "stale_metadata_journal.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = false;
+                cfg.flush_interval_ms = 0;
+                cfg.inline_threshold = 512;
+            });
+        let fs = &harness.fs;
+
+        let file = fs
+            .nfs_create(ROOT_INODE, "journal_race.bin", 1000, 1000)
+            .unwrap();
+        ino = file.inode;
+        let stale_record = fs.load_inode(ino).unwrap();
+        fs.op_write(ino, 0, &payload).unwrap();
+
+        let mut metadata_only = stale_record;
+        metadata_only.mode = (metadata_only.mode & !0o7777) | 0o100640;
+        metadata_only.ctime = OffsetDateTime::now_utc();
+        fs.stage_inode_visible(metadata_only).unwrap();
+        // Drop without flushing to force journal replay of the last live entry.
+    }
+
+    let harness =
+        TestHarness::with_config(dir.path(), "stale_metadata_journal.bin", 1 << 20, |cfg| {
+            cfg.disable_journal = false;
+            cfg.flush_interval_ms = 0;
+            cfg.inline_threshold = 512;
+        });
+    let replayed = harness.fs.replay_journal().unwrap();
+    assert!(
+        replayed >= 1,
+        "expected target inode to be restored from WAL, got {replayed} entries"
+    );
+
+    let restored = harness.fs.load_inode(ino).unwrap();
+    assert_eq!(
+        restored.size,
+        payload.len() as u64,
+        "journal replay restored stale metadata size instead of pending write size"
+    );
+    assert_eq!(
+        restored.mode & 0o777,
+        0o640,
+        "metadata change lost on replay"
+    );
+
+    let content = harness.fs.nfs_read(ino, 0, payload.len() as u32).unwrap();
+    assert_eq!(
+        content, payload,
+        "journal replay lost pending content after stale metadata-only update"
+    );
 }
 
 // Regression: metadata-only setattr on a large file that has already been
@@ -3389,7 +3562,7 @@ fn append_while_flushing_uses_flushing_data_len_not_stale_record_size() {
 
     let mut stale = fs.load_inode(ino).unwrap();
     stale.size = 0;
-    fs.append_file(stale, b"XYZ").unwrap();
+    fs.write_inline_range(stale, None, b"XYZ").unwrap();
 
     {
         let active_arc = fs.active_inodes.get(&ino).unwrap().clone();

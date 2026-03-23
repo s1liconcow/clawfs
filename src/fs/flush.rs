@@ -314,12 +314,14 @@ impl OsageFs {
                         // authoritative record from the metadata store (which has the
                         // correct Segments(extents) pointer) and merge our pending
                         // metadata changes on top.
-                        if record.size > 0
-                            && matches!(
-                                record.storage,
-                                FileStorage::Inline(ref v) if v.is_empty()
-                            )
-                        {
+                        let has_empty_storage = matches!(
+                            record.storage,
+                            FileStorage::Inline(ref v) if v.is_empty()
+                        ) || matches!(
+                            record.storage,
+                            FileStorage::Segments(ref v) if v.is_empty()
+                        );
+                        if record.size > 0 && has_empty_storage {
                             match self.block_on(self.metadata.get_inode(record.inode)) {
                                 Ok(Some(fresh)) => {
                                     let merged_mode = record.mode;
@@ -345,7 +347,7 @@ impl OsageFs {
                                     // changes if they were merged there.
                                     log::warn!(
                                         "flush: metadata-only entry ino={} has stale \
-                                         Inline([]) storage but inode absent from metadata \
+                                         empty storage but inode absent from metadata \
                                          store; skipping to prevent data pointer loss",
                                         record.inode
                                     );

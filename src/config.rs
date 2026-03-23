@@ -15,7 +15,7 @@ pub const DEFAULT_MOUNT_DIR: &str = "clawfs-mnt";
 // CLI configuration for launching ClawFS.
 shared_cli_struct! {
     /// Enable FUSE writeback cache (enabled by default).
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub writeback_cache: bool,
 }
 

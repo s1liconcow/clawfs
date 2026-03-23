@@ -275,7 +275,15 @@ impl OsageFs {
         match storage {
             FileStorage::Inline(bytes) => bytes.is_empty(),
             FileStorage::InlineEncoded(bytes) => bytes.payload.is_empty(),
+            FileStorage::Segments(extents) => extents.is_empty(),
             _ => false,
+        }
+    }
+
+    fn merge_active_file_fields(record: &mut InodeRecord, active: &InodeRecord) {
+        if matches!(record.kind, InodeKind::File) && matches!(active.kind, InodeKind::File) {
+            record.size = active.size;
+            record.storage = active.storage.clone();
         }
     }
 
@@ -409,15 +417,12 @@ impl OsageFs {
         decode_inline_payload_storage(storage, self.config.inline_encryption_key.as_deref())
     }
 
-    pub(crate) fn stage_inode(&self, record: InodeRecord) -> std::result::Result<(), i32> {
+    pub(crate) fn stage_inode_visible(
+        &self,
+        record: InodeRecord,
+    ) -> std::result::Result<InodeRecord, i32> {
         let inode = record.inode;
         let kind_summary = Self::summarize_inode_kind(&record.kind);
-
-        if let Some(journal) = &self.journal {
-            journal
-                .persist_record(&record, &JournalPayload::None)
-                .map_err(|_| EIO)?;
-        }
 
         let active_arc = self
             .active_inodes
@@ -425,7 +430,17 @@ impl OsageFs {
             .or_insert_with(|| Arc::new(Mutex::new(ActiveInode::default())))
             .clone();
         let mut state = active_arc.lock();
-        if let Some(occupied) = state.pending.as_mut() {
+        let journal_payload = if let Some(data) = state.pending.as_ref().and_then(|e| e.data.as_ref()) {
+            Some(self.snapshot_journal_payload(data))
+        } else {
+            state
+                .flushing
+                .as_ref()
+                .and_then(|e| e.data.as_ref())
+                .map(|data| self.snapshot_journal_payload(data))
+        };
+        let visible_record = if let Some(occupied) = state.pending.as_mut() {
+            let mut record = record;
             if Self::inode_identity_conflicts(&occupied.record, &record) {
                 Self::abort_inode_identity_conflict(&occupied.record, &record, "pending");
             }
@@ -437,8 +452,15 @@ impl OsageFs {
                 if len > 0 {
                     self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                 }
+            } else if occupied.data.is_some() {
+                // Metadata-only updates can race with a concurrent write that has
+                // already staged newer file content into pending. Preserve the
+                // visible file size/storage from that active entry while
+                // applying the newer metadata fields from `record`.
+                Self::merge_active_file_fields(&mut record, &occupied.record);
             }
             occupied.record = record;
+            occupied.record.clone()
         } else {
             if let Some(flushing) = state.flushing.as_ref()
                 && Self::inode_identity_conflicts(&flushing.record, &record)
@@ -446,6 +468,13 @@ impl OsageFs {
                 Self::abort_inode_identity_conflict(&flushing.record, &record, "flushing");
             }
             let mut record = record;
+            if let Some(flushing) = state.flushing.as_ref() {
+                // If a flush is draining an older pending file incarnation while
+                // a metadata-only update arrives, preserve the content-bearing
+                // fields from the flushing record instead of reintroducing a
+                // stale size/storage snapshot from metadata.
+                Self::merge_active_file_fields(&mut record, &flushing.record);
+            }
             if record.size > 0
                 && !matches!(record.kind, InodeKind::Tombstone)
                 && Self::is_placeholder_storage(&record.storage)
@@ -454,17 +483,32 @@ impl OsageFs {
             {
                 record.storage = committed.storage;
             }
-            state.pending = Some(PendingEntry { record, data: None });
-        }
+            state.pending = Some(PendingEntry {
+                record: record.clone(),
+                data: None,
+            });
+            record
+        };
         self.pending_inodes.insert(inode);
         drop(state);
+
+        if let Some(journal) = &self.journal {
+            let payload = journal_payload.as_ref().unwrap_or(&JournalPayload::None);
+            journal
+                .persist_record(&visible_record, payload)
+                .map_err(|_| EIO)?;
+        }
 
         debug!(
             "stage_inode inode={} kind={} metadata-staged",
             inode, kind_summary
         );
         self.flush_if_interval_elapsed()?;
-        Ok(())
+        Ok(visible_record)
+    }
+
+    pub(crate) fn stage_inode(&self, record: InodeRecord) -> std::result::Result<(), i32> {
+        self.stage_inode_visible(record).map(|_| ())
     }
 
     pub(crate) fn snapshot_journal_payload(&self, data: &PendingData) -> JournalPayload {

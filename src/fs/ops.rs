@@ -283,20 +283,34 @@ impl OsageFs {
         record.ctime = OffsetDateTime::now_utc();
 
         if let Some(target_size) = size {
+            log::debug!(
+                "op_fuse_setattr SIZE ino={} current_size={} target_size={} writeback={}",
+                record.inode,
+                record.size,
+                target_size,
+                self.config.writeback_cache
+            );
             // Size change: must read and restage file data to truncate/extend.
             if record.is_dir() {
                 return Err(EISDIR);
             }
-            if target_size > record.size && record.size == 0 {
+            if target_size > record.size && record.size == 0 && !self.config.writeback_cache {
                 // Sparse growth on an empty file: keep content holes implicit.
+                // Skip this when writeback cache is enabled: the kernel sends
+                // setattr(size=N) before the actual write data arrives.  If we
+                // stage a metadata-only entry with Segments([]) here, a timer
+                // flush can commit it as a correctly-sized file full of zeros
+                // before the write lands.  Falling through to the general path
+                // creates a zero-filled pending entry with data: Some(...), so
+                // the flush always has content (and the subsequent write
+                // overwrites it under the per-inode lock).
                 record.size = target_size;
                 record.storage = FileStorage::Segments(Vec::new());
                 if mtime.is_none() {
                     record.mtime = OffsetDateTime::now_utc();
                 }
-                let attr = Self::record_attr(&record);
-                self.stage_inode(record)?;
-                return Ok(attr);
+                let staged = self.stage_inode_visible(record)?;
+                return Ok(Self::record_attr(&staged));
             }
             let mut data = self.read_file_bytes(&record).map_err(|_| EIO)?;
             Self::resize_file_data_for_setattr(&mut data, target_size)?;
@@ -320,9 +334,8 @@ impl OsageFs {
             // already in pending_inodes (preserving the data field), and
             // creates a metadata-only pending entry otherwise (handled in
             // flush_pending_selected via stale-storage detection).
-            let attr = Self::record_attr(&record);
-            self.stage_inode(record)?;
-            Ok(attr)
+            let staged = self.stage_inode_visible(record)?;
+            Ok(Self::record_attr(&staged))
         }
     }
 
@@ -534,7 +547,22 @@ impl OsageFs {
         if record.is_dir() {
             return Err(EISDIR);
         }
-        self.read_file_range(&record, offset, size).map_err(|e| {
+        let result = self.read_file_range(&record, offset, size);
+        if let Ok(ref bytes) = result {
+            let is_zero = bytes.iter().all(|&b| b == 0);
+            if record.size > 0 && is_zero && !bytes.is_empty() {
+                log::warn!(
+                    "op_read ZERO_DATA ino={} offset={} size={} returned={} record_size={} storage={:?}",
+                    ino,
+                    offset,
+                    size,
+                    bytes.len(),
+                    record.size,
+                    record.storage
+                );
+            }
+        }
+        result.map_err(|e| {
             let storage_desc = match &record.storage {
                 FileStorage::Segments(exts) => {
                     for (i, ext) in exts.iter().enumerate() {
@@ -576,16 +604,7 @@ impl OsageFs {
             return Err(EISDIR);
         }
         record = self.copy_up_external_inode_if_needed(record)?;
-        let prev_size = record.size;
         let write_end = offset.saturating_add(data.len() as u64);
-        if offset == prev_size {
-            if write_end <= self.config.inline_threshold as u64 {
-                self.append_file(record, data)?;
-            } else {
-                self.write_large_segments(record, offset, data)?;
-            }
-            return Ok(data.len() as u32);
-        }
         // For any non-append write on a file that is already larger than the
         // inline threshold, stay on the segment path. Using the inline path
         // here would materialize and restage the full file for tiny writes
@@ -596,19 +615,7 @@ impl OsageFs {
             self.write_large_segments(record, offset, data)?;
             return Ok(data.len() as u32);
         }
-        let mut existing = self.read_file_bytes(&record).map_err(|_| EIO)?;
-        let offset = usize::try_from(offset).map_err(|_| EFBIG)?;
-        let write_end = offset.checked_add(data.len()).ok_or(EFBIG)?;
-        if write_end > existing.len() {
-            existing.resize(write_end, 0);
-        }
-        existing[offset..offset + data.len()].copy_from_slice(data);
-        record.update_times();
-        let ctx = StageWriteContext {
-            prev_size,
-            write_offset: offset as u64,
-        };
-        self.stage_file(record, existing, Some(ctx))?;
+        self.write_inline_range(record, Some(offset), data)?;
         Ok(data.len() as u32)
     }
 

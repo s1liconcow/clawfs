@@ -82,6 +82,15 @@ impl Filesystem for OsageFs {
         reply: ReplyAttr,
     ) {
         let replay = self.replay_start();
+        log::debug!(
+            "fuse setattr ino={} size={:?} mode={:?} atime={:?} mtime={:?} fh={:?}",
+            ino,
+            size,
+            mode,
+            atime,
+            mtime,
+            _fh
+        );
         let res = self.op_fuse_setattr(
             ino,
             req.uid(),
@@ -94,7 +103,8 @@ impl Filesystem for OsageFs {
             mtime,
         );
         match res {
-            Ok(attr) => {
+            Ok(ref attr) => {
+                log::debug!("fuse setattr reply ino={} returned_size={}", ino, attr.size);
                 self.log_replay(
                     "fuse",
                     "setattr",
@@ -102,7 +112,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "size": size, "mode": mode, "uid": uid, "gid": gid }),
                 );
-                reply.attr(&self.fuse_attr_ttl_for_attr(&attr), &attr)
+                reply.attr(&self.fuse_attr_ttl_for_attr(attr), attr)
             }
             Err(code) => {
                 self.log_replay(
@@ -281,7 +291,15 @@ impl Filesystem for OsageFs {
             self.fuse_create_file(parent, &name, uid, gid, mode, umask, flags)
         })();
         match res {
-            Ok((file, created)) => {
+            Ok((ref file, created)) => {
+                log::debug!(
+                    "fuse create reply parent={} name={:?} ino={} size={} created={}",
+                    parent,
+                    name.to_string_lossy(),
+                    file.inode,
+                    file.size,
+                    created
+                );
                 self.log_replay(
                     "fuse",
                     "create",
@@ -300,14 +318,8 @@ impl Filesystem for OsageFs {
                         "stored_mode": file.mode,
                     }),
                 );
-                let attr = Self::record_attr(&file);
-                reply.created(
-                    &self.fuse_attr_ttl(&file),
-                    &attr,
-                    FUSE_NODE_GENERATION,
-                    0,
-                    0,
-                );
+                let attr = Self::record_attr(file);
+                reply.created(&self.fuse_attr_ttl(file), &attr, FUSE_NODE_GENERATION, 0, 0);
             }
             Err(code) => {
                 self.log_replay(
@@ -459,9 +471,11 @@ impl Filesystem for OsageFs {
         reply: ReplyData,
     ) {
         let replay = self.replay_start();
+        log::debug!("fuse read ino={} offset={} size={}", ino, offset, size);
         let res = self.op_read(ino, offset as u64, size);
         match res {
-            Ok(bytes) => {
+            Ok(ref bytes) => {
+                log::debug!("fuse read reply ino={} returned={}", ino, bytes.len());
                 self.log_replay(
                     "fuse",
                     "read",
@@ -469,7 +483,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "offset": offset, "requested": size, "returned": bytes.len() }),
                 );
-                reply.data(&bytes)
+                reply.data(bytes)
             }
             Err(code) => {
                 self.log_replay(
@@ -523,6 +537,13 @@ impl Filesystem for OsageFs {
         reply: ReplyWrite,
     ) {
         let replay = self.replay_start();
+        log::debug!(
+            "fuse write ino={} offset={} len={} write_flags={:#x}",
+            ino,
+            offset,
+            data.len(),
+            _write_flags
+        );
         let res = self.op_write(ino, offset as u64, data);
         match res {
             Ok(size) => {

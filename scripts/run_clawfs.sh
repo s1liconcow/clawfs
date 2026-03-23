@@ -153,7 +153,7 @@ if osage_is_true "$ALLOW_OTHER"; then
 fi
 CMD+=(--fuse-threads "$FUSE_THREADS")
 if osage_is_true "${WRITEBACK_CACHE:-}"; then
-  CMD+=(--writeback-cache)
+  CMD+=(--writeback-cache true)
 fi
 # Allow callers to inject additional CLI flags (e.g. --pending-bytes, --flush-interval-ms).
 if [[ -n "${CLAWFS_EXTRA_ARGS:-}" ]]; then

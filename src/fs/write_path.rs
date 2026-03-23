@@ -140,9 +140,10 @@ impl OsageFs {
         Ok(())
     }
 
-    pub(crate) fn append_file(
+    pub(crate) fn write_inline_range(
         &self,
-        mut record: InodeRecord,
+        record: InodeRecord,
+        offset: Option<u64>,
         data: &[u8],
     ) -> std::result::Result<(), i32> {
         if data.is_empty() {
@@ -150,15 +151,8 @@ impl OsageFs {
         }
         let start = Instant::now();
         let inode = record.inode;
-        record.update_times();
-        let current_size = record.size;
-        let target_len = current_size.saturating_add(data.len() as u64);
         let inline_cap = self.config.inline_threshold as u64;
-        if target_len > inline_cap {
-            return self.write_large_segments(record, current_size, data);
-        }
 
-        // Insert placeholder into mutating_inodes BEFORE removing from pending_inodes.
         let active_arc = self
             .active_inodes
             .entry(inode)
@@ -166,87 +160,96 @@ impl OsageFs {
             .clone();
         let mut state = active_arc.lock();
         let original_entry = state.pending.take();
+        let old_pending_data = original_entry.as_ref().and_then(|entry| entry.data.clone());
+        let prev_len = old_pending_data
+            .as_ref()
+            .map(|data| data.len())
+            .or_else(|| {
+                state
+                    .flushing
+                    .as_ref()
+                    .and_then(|entry| entry.data.as_ref().map(|data| data.len()))
+            })
+            .unwrap_or(0);
 
-        let mut working_entry = original_entry.clone().unwrap_or(PendingEntry {
-            record: record.clone(),
-            data: None,
-        });
-        working_entry.record = record.clone();
-
-        if working_entry.data.is_none() {
-            if let Some(PendingEntry { data: Some(d), .. }) = &state.flushing {
-                let existing_len = d.len();
-                let existing = self.slice_pending_bytes(d, 0, existing_len).map_err(|_| {
+        let base_record = original_entry
+            .as_ref()
+            .map(|entry| entry.record.clone())
+            .or_else(|| state.flushing.as_ref().map(|entry| entry.record.clone()))
+            .unwrap_or(record);
+        let mut existing = if let Some(data) = old_pending_data.as_ref() {
+            self.slice_pending_bytes(data, 0, data.len()).map_err(|_| {
+                state.pending = original_entry.clone();
+                EIO
+            })?
+        } else if let Some(PendingEntry {
+            data: Some(flushing_data),
+            ..
+        }) = &state.flushing
+        {
+            self.slice_pending_bytes(flushing_data, 0, flushing_data.len())
+                .map_err(|_| {
                     state.pending = original_entry.clone();
                     EIO
-                })?;
-                working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
-            } else if record.size > 0 {
-                let existing = self
-                    .read_file_range_from_storage(&record, 0, record.size)
-                    .map_err(|_| {
-                        state.pending = original_entry.clone();
-                        EIO
-                    })?;
-                working_entry.data = Some(PendingData::Inline(Arc::new(existing)));
-            } else {
-                working_entry.data = Some(PendingData::Inline(Arc::new(Vec::new())));
-            }
-        }
-
-        let appended = data.len() as u64;
-        let slot = working_entry
-            .data
-            .get_or_insert_with(|| PendingData::Inline(Arc::new(Vec::new())));
-        let prev_len = slot.len();
-        match slot {
-            PendingData::Inline(buf) => {
-                let buf = Arc::make_mut(buf);
-                let fill_end = usize::try_from(record.size).map_err(|_| EFBIG)?;
-                let target_end = fill_end.saturating_add(data.len());
-                if buf.len() < fill_end {
-                    // Resize directly to the final length in one step: zero-fills the
-                    // gap and allocates space for the appended data simultaneously,
-                    // avoiding a second reallocation from extend_from_slice.
-                    buf.resize(target_end, 0);
-                    buf[fill_end..target_end].copy_from_slice(data);
-                } else {
-                    buf.extend_from_slice(data);
-                }
-                if buf.len() as u64 > inline_cap {
-                    let bytes = std::mem::take(buf);
-                    let chunk = self.segments.stage_payload(&bytes).map_err(|_| {
-                        state.pending = original_entry.clone();
-                        EIO
-                    })?;
-                    *slot = PendingData::Staged(PendingSegments::from_chunk(chunk));
-                }
-            }
-            PendingData::Staged(segments) => {
-                let chunk = self.segments.stage_payload(data).map_err(|_| {
+                })?
+        } else if base_record.size > 0 {
+            self.read_file_range(&base_record, 0, base_record.size as u32)
+                .map_err(|_| {
                     state.pending = original_entry.clone();
                     EIO
-                })?;
-                segments.append(chunk);
-            }
-        }
-        let new_len = slot.len();
-        working_entry.record.size = new_len;
-        record.size = new_len;
+                })?
+        } else {
+            Vec::new()
+        };
 
+        let write_offset = offset.unwrap_or(existing.len() as u64);
+        let target_len = write_offset.saturating_add(data.len() as u64);
+        if target_len > inline_cap {
+            state.pending = original_entry.clone();
+            drop(state);
+            return self.write_large_segments(base_record, write_offset, data);
+        }
+
+        let write_offset = usize::try_from(write_offset).map_err(|_| {
+            state.pending = original_entry.clone();
+            EFBIG
+        })?;
+        let write_end = write_offset.checked_add(data.len()).ok_or_else(|| {
+            state.pending = original_entry.clone();
+            EFBIG
+        })?;
+        if write_end > existing.len() {
+            existing.resize(write_end, 0);
+        }
+        existing[write_offset..write_end].copy_from_slice(data);
+
+        let mut working_record = base_record.clone();
+        working_record.update_times();
+        working_record.size = existing.len() as u64;
+        let pending_data = PendingData::Inline(Arc::new(existing));
         let journal_payload = self
             .journal
             .as_ref()
-            .map(|_| self.snapshot_journal_payload(slot));
+            .map(|_| self.snapshot_journal_payload(&pending_data));
 
-        state.pending = Some(working_entry);
+        state.pending = Some(PendingEntry {
+            record: working_record.clone(),
+            data: Some(pending_data),
+        });
         self.pending_inodes.insert(inode);
         drop(state);
 
-        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
-            journal.persist_record(&record, payload).map_err(|_| EIO)?;
+        if let Some(old_data) = old_pending_data {
+            self.release_pending_data(old_data);
         }
 
+        if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
+            journal
+                .persist_record(&working_record, payload)
+                .map_err(|_| EIO)?;
+        }
+
+        let new_len = working_record.size;
         let pending_total = if new_len >= prev_len {
             self.pending_bytes
                 .fetch_add(new_len - prev_len, Ordering::Relaxed)
@@ -258,14 +261,16 @@ impl OsageFs {
         };
         let should_flush = pending_total >= self.config.pending_bytes;
 
-        let path = &record.path;
+        let path = &working_record.path;
         self.log_perf(
             "stage_file",
             start.elapsed(),
             json!({
                 "inode": inode,
                 "bytes": new_len,
-                "appended_bytes": appended,
+                "write_offset": write_offset,
+                "write_len": data.len(),
+                "append": offset.is_none(),
                 "pending_total": pending_total,
                 "triggered_flush": should_flush,
                 "filename": path,
@@ -274,8 +279,16 @@ impl OsageFs {
         let pid = process::id();
         let tid = format!("{:?}", thread::current().id());
         debug!(
-            "append_file pid={} tid={} inode={} path={} appended={} new_size={} pending={} flush_triggered={}",
-            pid, tid, inode, record.path, appended, new_len, pending_total, should_flush
+            "write_inline_range pid={} tid={} inode={} path={} offset={} len={} new_size={} pending={} flush_triggered={}",
+            pid,
+            tid,
+            inode,
+            path,
+            write_offset,
+            data.len(),
+            new_len,
+            pending_total,
+            should_flush
         );
         if should_flush {
             self.trigger_async_flush();
