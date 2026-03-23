@@ -31,6 +31,8 @@ Close-time durability uses a local journal under `$STORE/journal`. Pending write
 ## Quick Pointers
 - Repo split scaffolding:
   `crates/clawfs-core` is the public/OSS facade crate used for the public repository split.
+- Config parity rule:
+  changes to public mount/runtime config in `src/config.rs` must be mirrored in `private/src/config.rs` unless the field is intentionally public-only. Document any intentional divergence in both files.
 - Add new filesystem behavior in `src/fs/ops.rs` first, then adapt transport-specific layers in `src/fs/fuse.rs` or `src/fs/nfs.rs` if needed.
 - `src/config.rs` maps CLI flags into runtime config.
 - `src/metadata.rs` owns inode caching, shard snapshots, delta logs, and superblock CAS updates.

@@ -5,7 +5,6 @@ Privileged execution must happen inside a Fly.io Sprite VM, not locally.
 
 ## Requirements
 - `sprite` must be on `PATH`.
-- Authenticate with `SPRITES_TOKEN` or `sprite login` before use.
 
 ## Hard Rules
 - Do not run privileged commands locally.
