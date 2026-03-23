@@ -43,6 +43,7 @@ const DEFAULT_DELTA_COMPACT_KEEP: usize = 32;
 const DEFAULT_SEGMENT_COMPACT_BATCH: usize = 8;
 const DEFAULT_SEGMENT_COMPACT_LAG: u64 = 3;
 const DEFAULT_LEASE_TTL_SECS: i64 = 30;
+const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
@@ -51,6 +52,7 @@ pub struct CompactionConfig {
     pub segment_compact_batch: usize,
     pub segment_compact_lag: u64,
     pub lease_ttl_secs: i64,
+    pub cleanup_interval: Duration,
 }
 
 impl Default for CompactionConfig {
@@ -61,11 +63,19 @@ impl Default for CompactionConfig {
             segment_compact_batch: DEFAULT_SEGMENT_COMPACT_BATCH,
             segment_compact_lag: DEFAULT_SEGMENT_COMPACT_LAG,
             lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
+            cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
         }
     }
 }
 
 impl CompactionConfig {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            cleanup_interval: Duration::from_secs(config.cleanup_interval_secs.max(1)),
+            ..Self::default()
+        }
+    }
+
     pub fn lease_ttl(&self) -> Duration {
         Duration::from_secs(self.lease_ttl_secs.max(0) as u64)
     }
@@ -612,6 +622,31 @@ pub async fn run_segment_compaction(
     Ok(result)
 }
 
+pub async fn has_pending_segment_compaction_work(
+    meta: &MetadataStore,
+    superblock: &SuperblockManager,
+    config: &CompactionConfig,
+) -> Result<bool> {
+    let current_generation = superblock.snapshot().generation;
+    let cutoff_generation = current_generation.saturating_sub(config.segment_compact_lag);
+    if cutoff_generation == 0 {
+        return Ok(false);
+    }
+
+    let candidates = meta.segment_candidates(config.segment_compact_batch)?;
+    let eligible = candidates
+        .into_iter()
+        .filter(|record| {
+            record
+                .segment_pointer()
+                .map(|ptr| ptr.generation < cutoff_generation)
+                .unwrap_or(false)
+        })
+        .take(2)
+        .count();
+    Ok(eligible >= 2)
+}
+
 async fn compact_segment_batch(
     meta: &MetadataStore,
     segments: &SegmentManager,
@@ -870,58 +905,64 @@ pub async fn run_maintenance_round(ctx: MaintenanceRoundContext<'_>) -> RoundSta
     // ── Segment compaction ────────────────────────────────────────────────
     // Only run if delta didn't run this cycle (avoid two heavy I/O rounds).
     if !did_delta_work {
-        let current_generation = superblock.snapshot().generation;
-        let cutoff_generation = current_generation.saturating_sub(config.segment_compact_lag);
-
-        if cutoff_generation > 0 {
-            match acquire_cleanup_lease(
-                superblock,
-                CleanupTaskKind::SegmentCompaction,
-                client_id,
-                config,
-            )
-            .await
-            {
-                Ok(true) => {
-                    match run_segment_compaction(metadata, segments, config).await {
-                        Ok(result) => {
-                            info!(
-                                target: "maintenance",
-                                segments_merged = result.segments_merged,
-                                bytes_rewritten = result.bytes_rewritten,
-                                segment_backlog = result.segment_backlog,
-                                duration_ms = result.duration_ms(),
-                                "segment_compaction_complete"
-                            );
-                            status.segment_backlog = result.segment_backlog;
+        match has_pending_segment_compaction_work(metadata, superblock, config).await {
+            Ok(true) => {
+                match acquire_cleanup_lease(
+                    superblock,
+                    CleanupTaskKind::SegmentCompaction,
+                    client_id,
+                    config,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        match run_segment_compaction(metadata, segments, config).await {
+                            Ok(result) => {
+                                info!(
+                                    target: "maintenance",
+                                    segments_merged = result.segments_merged,
+                                    bytes_rewritten = result.bytes_rewritten,
+                                    segment_backlog = result.segment_backlog,
+                                    duration_ms = result.duration_ms(),
+                                    "segment_compaction_complete"
+                                );
+                                status.segment_backlog = result.segment_backlog;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "maintenance",
+                                    kind = "segment_compaction",
+                                    error = %err,
+                                    "compaction_failed"
+                                );
+                            }
                         }
-                        Err(err) => {
-                            tracing::error!(
-                                target: "maintenance",
-                                kind = "segment_compaction",
-                                error = %err,
-                                "compaction_failed"
-                            );
+                        if let Err(err) = release_cleanup_lease(
+                            superblock,
+                            CleanupTaskKind::SegmentCompaction,
+                            client_id,
+                        )
+                        .await
+                        {
+                            warn!("failed to release segment compaction lease: {err:?}");
                         }
                     }
-                    if let Err(err) = release_cleanup_lease(
-                        superblock,
-                        CleanupTaskKind::SegmentCompaction,
-                        client_id,
-                    )
-                    .await
-                    {
-                        warn!("failed to release segment compaction lease: {err:?}");
-                    }
+                    Ok(false) => {}
+                    Err(err) => tracing::error!(
+                        target: "maintenance",
+                        kind = "segment_compaction",
+                        error = %err,
+                        "lease_acquire_failed"
+                    ),
                 }
-                Ok(false) => {}
-                Err(err) => tracing::error!(
-                    target: "maintenance",
-                    kind = "segment_compaction",
-                    error = %err,
-                    "lease_acquire_failed"
-                ),
             }
+            Ok(false) => {}
+            Err(err) => tracing::error!(
+                target: "maintenance",
+                kind = "segment_compaction_preflight",
+                error = %err,
+                "compaction_preflight_failed"
+            ),
         }
     }
 
@@ -1017,6 +1058,16 @@ mod tests {
         assert_eq!(config.segment_compact_batch, 8);
         assert_eq!(config.segment_compact_lag, 3);
         assert_eq!(config.lease_ttl_secs, 30);
+        assert_eq!(config.cleanup_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn compaction_config_uses_configured_cleanup_interval() {
+        let mut raw = base_config();
+        raw.cleanup_interval_secs = 45;
+
+        let config = CompactionConfig::from_config(&raw);
+        assert_eq!(config.cleanup_interval, Duration::from_secs(45));
     }
 
     #[test]

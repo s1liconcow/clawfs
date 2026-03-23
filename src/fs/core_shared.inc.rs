@@ -171,11 +171,8 @@ impl OsageFs {
 
         for &ino in inos {
             if let Some(r) = self.load_inode_in_memory(ino) {
-                match r {
-                    Ok(record) => {
-                        result.insert(ino, record);
-                    }
-                    Err(_) => {}
+                if let Ok(record) = r {
+                    result.insert(ino, record);
                 }
             } else {
                 remaining.push(ino);

@@ -196,6 +196,21 @@ impl TelemetryDestination {
             session_id: session_id.map(ToOwned::to_owned),
             metadata: decorate_metadata(&self.client_id, metadata),
         };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let destination = self.clone();
+            let _ = thread::Builder::new()
+                .name("clawfs-telemetry-panic".to_string())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(runtime) = runtime {
+                        let _ = write_batch(&runtime, &destination, &[event]);
+                    }
+                });
+            return;
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -522,6 +537,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -591,5 +607,35 @@ mod tests {
             normalize_prefix("/telemetry/orgs/demo/"),
             "telemetry/orgs/demo"
         );
+    }
+
+    #[test]
+    fn emit_blocking_does_not_panic_inside_tokio_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = TelemetryDestination {
+            store: Arc::new(
+                LocalFileSystem::new_with_prefix(dir.path()).expect("local telemetry store"),
+            ) as Arc<dyn ObjectStore>,
+            root_prefix: "telemetry/test".to_string(),
+            client_id: "test-client".to_string(),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            destination.emit_blocking("runtime.panic", Some("session"), json!({"ok": true}));
+        });
+
+        for _ in 0..20 {
+            let entries = fs::read_dir(dir.path()).expect("read telemetry dir");
+            if entries.count() > 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        panic!("emit_blocking did not write telemetry output");
     }
 }

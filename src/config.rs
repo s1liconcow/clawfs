@@ -169,6 +169,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub disable_cleanup: bool,
 
+    /// Interval in seconds between local background cleanup polls.
+    #[arg(long, default_value_t = 30)]
+    pub cleanup_interval_secs: u64,
+
     /// Attribute/stat cache TTL in milliseconds (0 disables caching).
     #[arg(long, default_value_t = 5000)]
     pub lookup_cache_ttl_ms: u64,
@@ -262,6 +266,7 @@ pub struct Config {
     pub fsync_on_close: bool,
     pub flush_interval_ms: u64,
     pub disable_cleanup: bool,
+    pub cleanup_interval_secs: u64,
     pub lookup_cache_ttl_ms: u64,
     pub dir_cache_ttl_ms: u64,
     pub metadata_poll_interval_ms: u64,
@@ -316,6 +321,7 @@ impl Config {
             fsync_on_close: false,
             flush_interval_ms: 5000,
             disable_cleanup: false,
+            cleanup_interval_secs: 30,
             lookup_cache_ttl_ms: 5000,
             dir_cache_ttl_ms: 5000,
             metadata_poll_interval_ms: 2000,
@@ -413,6 +419,7 @@ impl From<Cli> for Config {
             fsync_on_close: cli.fsync_on_close,
             flush_interval_ms: cli.flush_interval_ms,
             disable_cleanup: cli.disable_cleanup,
+            cleanup_interval_secs: cli.cleanup_interval_secs.max(1),
             lookup_cache_ttl_ms: cli.lookup_cache_ttl_ms,
             dir_cache_ttl_ms: cli.dir_cache_ttl_ms,
             metadata_poll_interval_ms: cli.metadata_poll_interval_ms,

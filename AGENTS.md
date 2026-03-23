@@ -59,7 +59,7 @@ Keep this file focused. Put detailed implementation notes, workflow specifics, a
 | `src/perf.rs` | | Structured performance logging |
 | `src/replay.rs` | | Replay capture |
 
-**Cleanup constants** (src/launch.rs): `DELTA_COMPACT_THRESHOLD=128` (line 39), `DELTA_COMPACT_KEEP=32` (line 40), `SEGMENT_COMPACT_BATCH=8` (line 41), `SEGMENT_COMPACT_LAG=3` (line 42), lease TTL=30s.
+**Cleanup defaults**: delta threshold `128`, delta keep `32`, segment batch `8`, segment lag `3`, lease TTL `30s`, cleanup poll interval `30s` via `--cleanup-interval-secs`.
 
 **Key design docs:**
 - `docs/clawfs-project-reference.md` — Architecture internals
