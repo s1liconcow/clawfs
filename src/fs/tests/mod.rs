@@ -4013,6 +4013,79 @@ fn readdir_batch_large_directory() {
     }
 }
 
+#[test]
+fn concurrent_allocate_inode_id_returns_unique_ids() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "inode_alloc_race.bin", 1 << 20, |cfg| {
+        cfg.inode_batch = 1;
+        cfg.segment_batch = 1;
+        cfg.flush_interval_ms = 0;
+    });
+    let fs = &harness.fs;
+    let thread_count = 24usize;
+    let ids_per_thread = 64usize;
+    let barrier = Arc::new(Barrier::new(thread_count));
+
+    let ids = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..thread_count {
+            let barrier = barrier.clone();
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                let mut ids = Vec::with_capacity(ids_per_thread);
+                for _ in 0..ids_per_thread {
+                    ids.push(fs.allocate_inode_id().unwrap());
+                }
+                ids
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    let unique: HashSet<u64> = ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "duplicate inode ids allocated under concurrent pressure"
+    );
+}
+
+#[test]
+fn inode_identity_conflict_guard_flags_directory_to_file_reuse() {
+    let directory = InodeRecord::new_directory(
+        42,
+        ROOT_INODE,
+        "dt-bindings".to_string(),
+        "/include/dt-bindings".to_string(),
+        0,
+        0,
+    );
+    let file = InodeRecord::new_file(
+        42,
+        ROOT_INODE,
+        "spear.h".to_string(),
+        "/include/linux/clk/spear.h".to_string(),
+        0,
+        0,
+    );
+    let renamed_file = InodeRecord::new_file(
+        42,
+        9,
+        "renamed.h".to_string(),
+        "/other/renamed.h".to_string(),
+        0,
+        0,
+    );
+    let tombstone = InodeRecord::tombstone(42);
+
+    assert!(OsageFs::inode_identity_conflicts(&directory, &file));
+    assert!(!OsageFs::inode_identity_conflicts(&file, &renamed_file));
+    assert!(!OsageFs::inode_identity_conflicts(&directory, &tombstone));
+}
+
 // ---------------------------------------------------------------------------
 // Coordination publisher tests
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use flatbuffers::FlatBufferBuilder;
+use log::debug;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,6 +51,7 @@ pub struct ClientStateManager {
     path: PathBuf,
     lock_path: PathBuf,
     state: Mutex<ClientState>,
+    refill_lock: Mutex<()>,
 }
 
 impl ClientStateManager {
@@ -76,6 +78,7 @@ impl ClientStateManager {
             path,
             lock_path,
             state: Mutex::new(state),
+            refill_lock: Mutex::new(()),
         })
     }
 
@@ -139,14 +142,51 @@ impl ClientStateManager {
                 self.persist_locked(&guard)?;
                 return Ok(id);
             }
-            let count = batch.max(1);
             drop(guard);
-            let start = reserve(count)?;
+
+            let _refill_guard = self.refill_lock.lock();
             let mut guard = self.state.lock();
             let (next, remaining) = selector(&mut guard);
             if *remaining == 0 {
-                *next = start;
-                *remaining = count;
+                let count = batch.max(1);
+                drop(guard);
+                let start = reserve(count)?;
+                let mut guard = self.state.lock();
+                let (installed, installed_next, installed_remaining) = {
+                    let (next, remaining) = selector(&mut guard);
+                    if *remaining == 0 {
+                        *next = start;
+                        *remaining = count;
+                        (true, *next, *remaining)
+                    } else {
+                        (false, *next, *remaining)
+                    }
+                };
+                if installed {
+                    self.persist_locked(&guard)?;
+                    debug!(
+                        "client_state refill path={} start={} batch={} next={} remaining={}",
+                        self.path.display(),
+                        start,
+                        count,
+                        installed_next,
+                        installed_remaining
+                    );
+                } else {
+                    debug!(
+                        "client_state refill path={} skipped_install existing_next={} existing_remaining={}",
+                        self.path.display(),
+                        installed_next,
+                        installed_remaining
+                    );
+                }
+            } else {
+                debug!(
+                    "client_state refill path={} waited_for_existing_pool next={} remaining={}",
+                    self.path.display(),
+                    *next,
+                    *remaining
+                );
             }
             // loop to consume newly filled pool
         }
@@ -259,6 +299,10 @@ fn lock_file_exclusive(_file: &File, _lock_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -294,5 +338,49 @@ mod tests {
         // Reconciliation should force a fresh reservation from new minimums.
         assert_eq!(manager.next_inode_id(4, |_| Ok(500)).unwrap(), 500);
         assert_eq!(manager.next_segment_id(4, |_| Ok(600)).unwrap(), 600);
+    }
+
+    #[test]
+    fn concurrent_inode_refills_are_serialized() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = Arc::new(ClientStateManager::load(&path).unwrap());
+        let reserve_calls = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let next_start = Arc::new(AtomicUsize::new(10_000));
+        let thread_count = 32usize;
+
+        let ids = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..thread_count {
+                let manager = manager.clone();
+                let reserve_calls = reserve_calls.clone();
+                let max_inflight = max_inflight.clone();
+                let inflight = inflight.clone();
+                let next_start = next_start.clone();
+                handles.push(scope.spawn(move || {
+                    manager
+                        .next_inode_id(64, |_| {
+                            reserve_calls.fetch_add(1, Ordering::SeqCst);
+                            let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_inflight.fetch_max(current, Ordering::SeqCst);
+                            thread::sleep(std::time::Duration::from_millis(20));
+                            inflight.fetch_sub(1, Ordering::SeqCst);
+                            Ok(next_start.fetch_add(64, Ordering::SeqCst) as u64)
+                        })
+                        .unwrap()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let unique: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(max_inflight.load(Ordering::SeqCst), 1);
     }
 }

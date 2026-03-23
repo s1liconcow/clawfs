@@ -56,6 +56,9 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
+          LOGFILE="/tmp/mount.fuse.clawfs.log"
+          echo "$(date -u +%T) mount.fuse.clawfs called: $*" >> "$LOGFILE"
+
           source_dev=""
           target=""
           mount_opts=""
@@ -102,6 +105,17 @@ jobs:
             esac
           done
 
+          # Unmount any existing mount at target to support remount cycles
+          if mountpoint -q "$target" 2>/dev/null; then
+            echo "$(date -u +%T) pre-unmounting $target" >> "$LOGFILE"
+            fusermount3 -u "$target" 2>/dev/null || umount "$target" 2>/dev/null || true
+            # Wait for old clawfsd to finish flush_pending() in its destroy() handler
+            for _w in $(seq 1 100); do
+              pgrep -f "clawfsd.*--mount-path $target" >/dev/null 2>&1 || break
+              sleep 0.1
+            done
+          fi
+
           mkdir -p "$store_path" "$local_cache_path" "$(dirname "$state_path")" "$target"
 
           cmd=(
@@ -113,13 +127,36 @@ jobs:
             --object-provider local
             --disable-journal
             --fuse-fsname "$fuse_fsname"
+            --foreground
           )
 
           if [[ "$allow_other" == "1" ]]; then
             cmd+=(--allow-other)
           fi
 
-          "${cmd[@]}" >/dev/null
+          echo "$(date -u +%T) launching: ${cmd[*]}" >> "$LOGFILE"
+
+          # Run clawfsd in foreground mode but backgrounded; wait for mount to appear
+          "${cmd[@]}" >>"$LOGFILE" 2>&1 &
+          FUSE_PID=$!
+
+          for i in $(seq 1 60); do
+            if ! kill -0 "$FUSE_PID" 2>/dev/null; then
+              echo "$(date -u +%T) clawfsd exited prematurely" >> "$LOGFILE"
+              echo "mount.fuse.clawfs: clawfsd exited before mount appeared" >&2
+              exit 1
+            fi
+            if mountpoint -q "$target" 2>/dev/null; then
+              echo "$(date -u +%T) mount visible at $target after ${i}s" >> "$LOGFILE"
+              exit 0
+            fi
+            sleep 0.5
+          done
+
+          echo "$(date -u +%T) timeout waiting for mount at $target" >> "$LOGFILE"
+          kill "$FUSE_PID" 2>/dev/null || true
+          echo "mount.fuse.clawfs: timeout waiting for mount at $target" >&2
+          exit 1
           EOF
           sudo sed -i "s|__CLAWFSD_BIN__|$GITHUB_WORKSPACE/target/release/clawfsd|" /sbin/mount.fuse.clawfs
           sudo chmod +x /sbin/mount.fuse.clawfs
@@ -181,7 +218,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: xfstests-results
-          path: /tmp/xfstests/results/
+          path: |
+            /tmp/xfstests/results/
+            /tmp/mount.fuse.clawfs.log
           if-no-files-found: ignore
 
       - name: Cleanup

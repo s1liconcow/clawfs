@@ -130,7 +130,7 @@ pub struct Cli {
     pub shard_size: u64,
 
     /// Number of inode numbers to reserve per allocation.
-    #[arg(long, default_value_t = 1280)]
+    #[arg(long, default_value_t = 8192)]
     pub inode_batch: u64,
 
     /// Number of segment ids to reserve per allocation.
@@ -205,15 +205,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 512)]
     pub imap_delta_batch: usize,
 
-    /// Disable FUSE writeback cache (disabled by default; writeback cache can
-    /// lose writes on file-create-write-rename patterns under some kernels).
-    #[arg(long, default_value_t = true)]
+    /// Disable FUSE writeback cache. Writeback cache is enabled by default so
+    /// that mmap writes are correctly flushed to the daemon. Disabling it may
+    /// avoid rare create-write-rename corruption on some kernels.
+    #[arg(long, default_value_t = false)]
     pub no_writeback_cache: bool,
 
-    /// Enable FUSE writeback cache for higher sequential write throughput.
-    /// WARNING: may cause data corruption for create-write-rename patterns
-    /// (e.g. git, editors) on some Linux kernels including WSL2.
-    #[arg(long, default_value_t = false)]
+    /// Enable FUSE writeback cache (enabled by default). mmap writes require
+    /// writeback cache; without it the kernel page-cache changes never reach
+    /// the FUSE daemon and are lost on remount.
+    #[arg(long, default_value_t = true)]
     pub writeback_cache: bool,
 
     /// Number of FUSE dispatch threads (0 = single-threaded legacy mode).
@@ -294,7 +295,7 @@ impl Config {
             segment_compression: true,
             segment_encryption_key: None,
             shard_size: 2048,
-            inode_batch: 1280,
+            inode_batch: 8192,
             segment_batch: 2560,
             pending_bytes: 256 * 1024 * 1024,
             home_prefix: "/home".to_string(),
@@ -324,7 +325,7 @@ impl Config {
             log_file: None,
             debug_log: false,
             imap_delta_batch: 512,
-            writeback_cache: false,
+            writeback_cache: true,
             fuse_threads: default_fuse_threads(),
             entry_ttl_secs: 5,
             fuse_fsname: "clawfs".to_string(),
