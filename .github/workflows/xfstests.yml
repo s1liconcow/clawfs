@@ -104,17 +104,76 @@ jobs:
           generic/087
           EOF
 
+      - name: Debug mount environment
+        run: |
+          mkdir -p /tmp/xfstests-debug
+          {
+            echo "== uname -a =="
+            uname -a
+            echo
+            echo "== /etc/os-release =="
+            cat /etc/os-release
+            echo
+            echo "== mount path =="
+            command -v mount
+            readlink -f "$(command -v mount)"
+            echo
+            echo "== mount --version =="
+            mount --version || true
+            echo
+            echo "== findmnt --version =="
+            findmnt --version || true
+            echo
+            echo "== package versions =="
+            dpkg-query -W mount util-linux libmount1 || true
+            echo
+            echo "== apt policy =="
+            apt-cache policy mount util-linux libmount1 || true
+            echo
+            echo "== helper scripts =="
+            ls -l /sbin/mount.fuse /sbin/mount.fuse.clawfs || true
+            echo
+            echo "== /sbin/mount.fuse =="
+            sed -n '1,120p' /sbin/mount.fuse || true
+            echo
+            echo "== /sbin/mount.fuse.clawfs =="
+            sed -n '1,120p' /sbin/mount.fuse.clawfs || true
+          } | tee /tmp/xfstests-debug/env.txt
+
       - name: Run xfstests smoke
         working-directory: /tmp/xfstests
         run: |
           sudo ./check -E excludes generic/001 generic/011 generic/023 generic/024 generic/028 generic/029 generic/030 generic/080 generic/084 generic/087 generic/088 generic/095 generic/098
+
+      - name: Debug mount results
+        if: always()
+        run: |
+          mkdir -p /tmp/xfstests-debug
+          {
+            echo "== findmnt test =="
+            findmnt -T /mnt/test -o SOURCE,FSTYPE,TARGET,OPTIONS || true
+            echo
+            echo "== findmnt scratch =="
+            findmnt -T /mnt/scratch -o SOURCE,FSTYPE,TARGET,OPTIONS || true
+            echo
+            echo "== df -T =="
+            df -T /mnt/test /mnt/scratch || true
+            echo
+            echo "== /proc/self/mountinfo =="
+            grep '/mnt/test\|/mnt/scratch' /proc/self/mountinfo || true
+            echo
+            echo "== /proc/mounts =="
+            grep '/mnt/test\|/mnt/scratch' /proc/mounts || true
+          } | tee /tmp/xfstests-debug/mount-state.txt
 
       - name: Upload xfstests results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xfstests-results
-          path: /tmp/xfstests/results/
+          path: |
+            /tmp/xfstests/results/
+            /tmp/xfstests-debug/
           if-no-files-found: ignore
 
       - name: Cleanup
