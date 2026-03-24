@@ -14,7 +14,8 @@ Continuously update this guide and the linked docs with anything that will impro
 - Before handing work off, run `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` unless the task explicitly prevents it.
 - Tests and Troubleshooting policy: always validate your change with unit and integration tests where possible, reproduce bugs with tests before solving them
 - Performance improvements: always try to quantify the lift of performance improvements.
-*important* After compaction, agents must re-read AGENTS.md
+- Duplicate any new config added to private/src/config.rs
+- *important* After compaction, agents must re-read AGENTS.md
 - *important* do not run cargo bench without the user's authorization
 
 ## ClawFS Summary
@@ -309,9 +310,10 @@ git push                # Push to remote
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests `cargo test`, linters, and `cargo build --bin clawfsd`
-3. **Fresh eyes review** Carefully read over all of the new code you just wrote and other existing code you just modified with "fresh eyes" looking super carefully for any obvious bugs, errors, problems, issues, confusion, etc. Carefully fix anything you uncover. Use ultrathink.
-4. **Update issue status** - Close finished work, update in-progress items
-5. **PUSH TO REMOTE** - This is MANDATORY:
+3. **Smoke tests** run `./scripts/stress_e2e.sh` for e2e smoke tests.
+4. **Fresh eyes review** Carefully read over all of the new code you just wrote and other existing code you just modified with "fresh eyes" looking super carefully for any obvious bugs, errors, problems, issues, confusion, etc. Carefully fix anything you uncover. Use ultrathink.
+5. **Update issue status** - Close finished work, update in-progress items
+6. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
    br sync --flush-only
@@ -320,9 +322,9 @@ git push                # Push to remote
    git push
    git status  # MUST show "up to date with origin"
    ```
-6. **Clean up** - Clear stashes, prune remote branches
-7. **Verify** - All changes committed AND pushed
-8. **Hand off** - Provide context for next session
+7. **Clean up** - Clear stashes, prune remote branches
+8. **Verify** - All changes committed AND pushed
+9. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
 - Work is NOT complete until `git push` succeeds

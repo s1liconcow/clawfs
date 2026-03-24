@@ -9,6 +9,8 @@ OSAGE_BIN="${OSAGE_BIN:-$ROOT_DIR/scripts/run_clawfs.sh}"
 CLEANUP_SCRIPT="$ROOT_DIR/scripts/cleanup.sh"
 MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REF_DIR=""
+METADATA_REF_DIR=""
+METADATA_ROUNDS="${METADATA_ROUNDS:-2}"
 
 run_cleanup_script() {
   LOG_FILE="$LOG_FILE" \
@@ -71,6 +73,9 @@ cleanup() {
   if [[ -n "${REF_DIR:-}" && -d "$REF_DIR" ]]; then
     rm -rf "$REF_DIR"
   fi
+  if [[ -n "${METADATA_REF_DIR:-}" && -d "$METADATA_REF_DIR" ]]; then
+    rm -rf "$METADATA_REF_DIR"
+  fi
   if [[ -f "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
@@ -84,6 +89,79 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_daemon() {
+  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$OSAGE_BIN"
+  sleep 2
+  if [[ -s "$PID_FILE" ]]; then
+    PID=$(cat "$PID_FILE")
+    if ! kill -0 "$PID" 2>/dev/null; then
+      echo "clawfs PID $PID not running" >&2
+      exit 1
+    fi
+  else
+    echo "Warning: PID file $PID_FILE missing; continue if you started clawfs manually."
+  fi
+  osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+}
+
+stop_daemon_preserve_store() {
+  set +e
+  local pid=""
+  if [[ -f "$PID_FILE" ]]; then
+    pid=$(cat "$PID_FILE")
+  fi
+
+  if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
+    fusermount -u "$MOUNT_PATH" 2>/dev/null || umount "$MOUNT_PATH" 2>/dev/null || true
+  fi
+
+  if [[ -f "$PID_FILE" ]]; then
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Waiting for clawfs PID $pid to exit after unmount"
+      for _ in $(seq 1 50); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Stopping clawfs PID $pid for restart"
+      kill "$pid"
+      wait "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+  mkdir -p "$MOUNT_PATH"
+  set -e
+}
+
+run_metadata_consistency_workload() {
+  local workdir="$MOUNT_PATH/home/${USER:-$(whoami)}/metadata-consistency"
+  METADATA_REF_DIR=$(mktemp -d /tmp/clawfs-metadata-ref.XXXXXX)
+
+  python3 "$ROOT_DIR/scripts/metadata_consistency_e2e.py" \
+    --mount-base "$workdir" \
+    --ref-base "$METADATA_REF_DIR" \
+    --rounds "$METADATA_ROUNDS" \
+    --mode run
+
+  sync
+  ensure_daemon_alive "metadata-consistency-run"
+
+  stop_daemon_preserve_store
+  start_daemon
+
+  python3 "$ROOT_DIR/scripts/metadata_consistency_e2e.py" \
+    --mount-base "$workdir" \
+    --ref-base "$METADATA_REF_DIR" \
+    --rounds "$METADATA_ROUNDS" \
+    --mode verify
+
+  diff -ruN "$METADATA_REF_DIR" "$workdir"
+  echo "Metadata consistency E2E completed successfully."
+}
+
 # Ensure clean slate unless user wants to keep existing mount/store
 if [[ -z "${SKIP_CLEANUP:-}" ]]; then
   run_cleanup_script >/dev/null 2>&1 || true
@@ -91,10 +169,10 @@ fi
 
 mkdir -p "$ROOT_DIR"
 if [[ -z "${SKIP_OSAGE:-}" ]]; then
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$OSAGE_BIN"
-  sleep 2
+  start_daemon
 else
   echo "SKIP_OSAGE set; assuming daemon already running and PID_FILE populated."
+  osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
 fi
 
 if [[ -s "$PID_FILE" ]]; then
@@ -173,5 +251,8 @@ run_workload "$REF_DIR" 0
 diff -ruN "$REF_DIR" "$WORKDIR"
 
 sync
+ensure_daemon_alive "post-stress-workload"
+
+run_metadata_consistency_workload
 
 echo "Stress test completed successfully."

@@ -773,37 +773,35 @@ fn spawn_cleanup_worker(
                 }
                 did_work = true;
             }
-            if !did_work {
-                let current_generation = superblock.snapshot().generation;
-                let cutoff_generation =
-                    current_generation.saturating_sub(config.segment_compact_lag);
-                if cutoff_generation > 0
-                    && maintenance::acquire_cleanup_lease(
-                        &superblock,
-                        CleanupTaskKind::SegmentCompaction,
-                        &client_id,
-                        &config,
-                    )
+            if !did_work
+                && maintenance::has_pending_segment_compaction_work(&metadata, &superblock, &config)
                     .await
                     .unwrap_or(false)
+                && maintenance::acquire_cleanup_lease(
+                    &superblock,
+                    CleanupTaskKind::SegmentCompaction,
+                    &client_id,
+                    &config,
+                )
+                .await
+                .unwrap_or(false)
+            {
+                if let Err(err) =
+                    maintenance::run_segment_compaction(&metadata, &segments, &config).await
                 {
-                    if let Err(err) =
-                        maintenance::run_segment_compaction(&metadata, &segments, &config).await
-                    {
-                        warn!("segment compaction failed: {err:?}");
-                    }
-                    if let Err(err) = maintenance::release_cleanup_lease(
-                        &superblock,
-                        CleanupTaskKind::SegmentCompaction,
-                        &client_id,
-                    )
-                    .await
-                    {
-                        warn!("cleanup lease release failed: {err:?}");
-                    }
+                    warn!("segment compaction failed: {err:?}");
+                }
+                if let Err(err) = maintenance::release_cleanup_lease(
+                    &superblock,
+                    CleanupTaskKind::SegmentCompaction,
+                    &client_id,
+                )
+                .await
+                {
+                    warn!("cleanup lease release failed: {err:?}");
                 }
             }
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(30)).await;
         }
     });
 }

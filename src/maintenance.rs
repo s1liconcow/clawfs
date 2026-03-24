@@ -612,6 +612,31 @@ pub async fn run_segment_compaction(
     Ok(result)
 }
 
+pub async fn has_pending_segment_compaction_work(
+    meta: &MetadataStore,
+    superblock: &SuperblockManager,
+    config: &CompactionConfig,
+) -> Result<bool> {
+    let current_generation = superblock.snapshot().generation;
+    let cutoff_generation = current_generation.saturating_sub(config.segment_compact_lag);
+    if cutoff_generation == 0 {
+        return Ok(false);
+    }
+
+    let candidates = meta.segment_candidates(config.segment_compact_batch)?;
+    let eligible = candidates
+        .into_iter()
+        .filter(|record| {
+            record
+                .segment_pointer()
+                .map(|ptr| ptr.generation < cutoff_generation)
+                .unwrap_or(false)
+        })
+        .take(2)
+        .count();
+    Ok(eligible >= 2)
+}
+
 async fn compact_segment_batch(
     meta: &MetadataStore,
     segments: &SegmentManager,
