@@ -1369,6 +1369,146 @@ fn flush_pending_for_inode_flushes_pending_ancestor_directories() {
 }
 
 #[test]
+fn flush_pending_for_inode_waits_for_locked_pending_ancestors() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "flush_inode_waits.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let dir_a = harness.fs.nfs_mkdir(ROOT_INODE, "a", 0, 0).unwrap();
+    let file = harness
+        .fs
+        .nfs_create(dir_a.inode, "target.bin", 0, 0)
+        .unwrap();
+    harness.fs.nfs_write(file.inode, 0, b"payload").unwrap();
+
+    let parent_active = harness
+        .fs
+        .active_inodes
+        .get(&dir_a.inode)
+        .expect("parent directory should be pending")
+        .clone();
+    let lock_acquired = Arc::new(Barrier::new(2));
+    let release_lock = Arc::new(Barrier::new(2));
+    let flush_finished = Arc::new(AtomicBool::new(false));
+
+    thread::scope(|scope| {
+        let acquired = lock_acquired.clone();
+        let release = release_lock.clone();
+        scope.spawn(move || {
+            let _guard = parent_active.lock();
+            acquired.wait();
+            release.wait();
+        });
+
+        lock_acquired.wait();
+
+        let finished = flush_finished.clone();
+        let fs = &harness.fs;
+        let flusher = scope.spawn(move || {
+            fs.flush_pending_for_inode(file.inode).unwrap();
+            finished.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !flush_finished.load(Ordering::SeqCst),
+            "inode flush must wait for locked ancestors instead of skipping them"
+        );
+
+        release_lock.wait();
+        flusher.join().unwrap();
+    });
+
+    let pending = |ino| {
+        harness
+            .fs
+            .active_inodes
+            .get(&ino)
+            .is_some_and(|arc| arc.lock().pending.is_some())
+    };
+    assert!(!pending(file.inode), "file inode should be flushed");
+    assert!(
+        !pending(dir_a.inode),
+        "locked parent should also be flushed"
+    );
+    assert!(!pending(ROOT_INODE), "root ancestor should also be flushed");
+
+    let stored_parent = harness
+        .runtime
+        .block_on(harness.metadata.get_inode(dir_a.inode))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_parent.children().unwrap().get("target.bin").copied(),
+        Some(file.inode),
+        "committed parent directory should reference the flushed child"
+    );
+}
+
+#[test]
+fn flush_pending_for_inode_persists_ancestor_chain_across_reload() {
+    let dir = tempdir().unwrap();
+    let dir_a_ino: u64;
+    let dir_b_ino: u64;
+    let file_ino: u64;
+
+    {
+        let harness =
+            TestHarness::with_config(dir.path(), "flush_inode_reload_1.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
+        let dir_a = harness.fs.nfs_mkdir(ROOT_INODE, "a", 0, 0).unwrap();
+        let dir_b = harness.fs.nfs_mkdir(dir_a.inode, "b", 0, 0).unwrap();
+        let file = harness
+            .fs
+            .nfs_create(dir_b.inode, "target.bin", 0, 0)
+            .unwrap();
+        harness.fs.nfs_write(file.inode, 0, b"payload").unwrap();
+        harness.fs.flush_pending_for_inode(file.inode).unwrap();
+
+        dir_a_ino = dir_a.inode;
+        dir_b_ino = dir_b.inode;
+        file_ino = file.inode;
+    }
+
+    {
+        let harness =
+            TestHarness::with_config(dir.path(), "flush_inode_reload_2.bin", 1 << 20, |cfg| {
+                cfg.disable_journal = true;
+                cfg.flush_interval_ms = 0;
+            });
+
+        let root = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(ROOT_INODE))
+            .unwrap()
+            .expect("root should exist after reload");
+        let dir_a = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(dir_a_ino))
+            .unwrap()
+            .expect("ancestor directory should persist after reload");
+        let dir_b = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(dir_b_ino))
+            .unwrap()
+            .expect("nested directory should persist after reload");
+        let file = harness
+            .runtime
+            .block_on(harness.metadata.get_inode(file_ino))
+            .unwrap()
+            .expect("file inode should persist after reload");
+
+        assert_eq!(root.children().unwrap().get("a"), Some(&dir_a_ino));
+        assert_eq!(dir_a.children().unwrap().get("b"), Some(&dir_b_ino));
+        assert_eq!(dir_b.children().unwrap().get("target.bin"), Some(&file_ino));
+        assert_eq!(harness.fs.read_file_bytes(&file).unwrap(), b"payload");
+    }
+}
+
+#[test]
 fn concurrent_flush_does_not_hide_pending_inodes() {
     let dir = tempdir().unwrap();
     let harness = TestHarness::with_config(dir.path(), "concurrent_flush.bin", 1 << 30, |cfg| {

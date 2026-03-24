@@ -16,30 +16,11 @@ impl OsageFs {
     }
 
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
-        self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all")
+        self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all", None)
     }
 
     pub(crate) fn flush_pending_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
-        self.flush_pending_selected(
-            |guard| {
-                let mut selected = HashMap::new();
-                let mut cursor = ino;
-                let mut seen = HashSet::new();
-                while seen.insert(cursor) {
-                    let Some(entry) = guard.remove(&cursor) else {
-                        break;
-                    };
-                    let parent = entry.record.parent;
-                    selected.insert(cursor, entry);
-                    if parent == cursor {
-                        break;
-                    }
-                    cursor = parent;
-                }
-                selected
-            },
-            "inode",
-        )
+        self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "inode", Some(ino))
     }
 
     pub(crate) fn sync_local_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
@@ -97,6 +78,7 @@ impl OsageFs {
         &self,
         selector: F,
         scope: &str,
+        target_inode: Option<u64>,
     ) -> std::result::Result<(), i32>
     where
         F: FnOnce(&mut HashMap<u64, PendingEntry>) -> HashMap<u64, PendingEntry>,
@@ -115,22 +97,81 @@ impl OsageFs {
             let mut rotate_stage_file_duration = Duration::from_secs(0);
             let pending = {
                 let mut guard = HashMap::new();
-                let keys: Vec<u64> = self
-                    .pending_inodes
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect();
-                for inode in keys {
-                    if let Some(active_arc) = self.active_inodes.get(&inode) {
-                        if let Some(mut state) = active_arc.try_lock() {
-                            if let Some(entry) = state.pending.take() {
+                if let Some(cursor) = target_inode {
+                    // fsync/flush on a single inode must drain its full pending
+                    // ancestor chain synchronously. A best-effort try_lock can
+                    // otherwise flush the file without its still-dirty parent
+                    // directory entry, leaving the name->inode map out of sync.
+                    //
+                    // Retry instead of blocking on a second inode lock while
+                    // holding the first one: metadata ops can stage the parent
+                    // and child in the opposite order, so blocking here would
+                    // deadlock under stress.
+                    loop {
+                        let mut blocked = false;
+                        let mut seen = HashSet::new();
+                        let mut next = cursor;
+                        guard.clear();
+
+                        while seen.insert(next) {
+                            let Some(active_arc) = self.active_inodes.get(&next) else {
+                                break;
+                            };
+                            let parent = {
+                                let Some(mut state) = active_arc.try_lock() else {
+                                    blocked = true;
+                                    break;
+                                };
+                                let Some(entry) = state.pending.take() else {
+                                    self.pending_inodes.remove(&next);
+                                    break;
+                                };
+                                let parent = entry.record.parent;
                                 state.flushing = Some(entry.clone());
-                                guard.insert(inode, entry);
-                            } else {
-                                self.pending_inodes.remove(&inode);
+                                guard.insert(next, entry);
+                                parent
+                            };
+                            if parent == next {
+                                break;
                             }
-                        } else {
-                            drain_skipped_locked = drain_skipped_locked.saturating_add(1);
+                            next = parent;
+                        }
+
+                        if !blocked {
+                            break;
+                        }
+
+                        drain_skipped_locked = drain_skipped_locked.saturating_add(1);
+                        for (inode, entry) in std::mem::take(&mut guard) {
+                            if let Some(active_arc) = self.active_inodes.get(&inode) {
+                                let mut state = active_arc.lock();
+                                if state.pending.is_none() {
+                                    state.pending = Some(entry);
+                                    self.pending_inodes.insert(inode);
+                                }
+                                state.flushing = None;
+                            }
+                        }
+                        std::thread::yield_now();
+                    }
+                } else {
+                    let keys: Vec<u64> = self
+                        .pending_inodes
+                        .iter()
+                        .map(|entry| *entry.key())
+                        .collect();
+                    for inode in keys {
+                        if let Some(active_arc) = self.active_inodes.get(&inode) {
+                            if let Some(mut state) = active_arc.try_lock() {
+                                if let Some(entry) = state.pending.take() {
+                                    state.flushing = Some(entry.clone());
+                                    guard.insert(inode, entry);
+                                } else {
+                                    self.pending_inodes.remove(&inode);
+                                }
+                            } else {
+                                drain_skipped_locked = drain_skipped_locked.saturating_add(1);
+                            }
                         }
                     }
                 }

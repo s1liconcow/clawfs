@@ -30,6 +30,11 @@ jobs:
           LOG_FILE: /tmp/clawfs-mount.log
         run: ./scripts/stress_e2e.sh
 
+      - name: Run metadata consistency E2E
+        env:
+          LOG_FILE: /tmp/clawfs-mount.log
+        run: ./scripts/metadata_consistency_e2e.sh
+
       - name: Upload ClawFS logs
         if: always()
         uses: actions/upload-artifact@v4
