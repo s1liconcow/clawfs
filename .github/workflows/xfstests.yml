@@ -68,6 +68,9 @@ jobs:
         run: |
           cat > local.config << 'EOF'
           export FSTYP=fuse
+          export MOUNT_PROG=/tmp/xfstests-debug/mount-wrapper
+          export UMOUNT_PROG=/tmp/xfstests-debug/umount-wrapper
+          export CLAWFS_XFSTESTS_DEBUG_LOG=/tmp/xfstests-debug/helper.log
 
           export TEST_DEV=/mnt/test
           export TEST_DIR=/mnt/test
@@ -107,6 +110,58 @@ jobs:
       - name: Debug mount environment
         run: |
           mkdir -p /tmp/xfstests-debug
+          cat > /tmp/xfstests-debug/mount-wrapper << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          log=/tmp/xfstests-debug/mount-calls.log
+          {
+            printf '[%s] mount-wrapper pid=%s\n' "$(date -Is)" "$$"
+            printf 'argv='
+            printf '%q ' /usr/bin/mount "$@"
+            printf '\n'
+            echo "env_FSTYP=${FSTYP-}"
+            echo "env_FUSE_SUBTYP=${FUSE_SUBTYP-}"
+            echo "env_MOUNT_OPTIONS=${MOUNT_OPTIONS-}"
+            echo "env_TEST_FS_MOUNT_OPTS=${TEST_FS_MOUNT_OPTS-}"
+          } >>"$log"
+          if /usr/bin/mount "$@" >>"$log" 2>&1; then
+            status=0
+          else
+            status=$?
+          fi
+          {
+            echo "status=$status"
+            echo "proc_mounts:"
+            grep '/mnt/test\|/mnt/scratch' /proc/mounts || true
+            echo
+          } >>"$log"
+          exit "$status"
+          EOF
+          chmod +x /tmp/xfstests-debug/mount-wrapper
+          cat > /tmp/xfstests-debug/umount-wrapper << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          log=/tmp/xfstests-debug/umount-calls.log
+          {
+            printf '[%s] umount-wrapper pid=%s\n' "$(date -Is)" "$$"
+            printf 'argv='
+            printf '%q ' /usr/bin/umount "$@"
+            printf '\n'
+          } >>"$log"
+          if /usr/bin/umount "$@" >>"$log" 2>&1; then
+            status=0
+          else
+            status=$?
+          fi
+          {
+            echo "status=$status"
+            echo "proc_mounts:"
+            grep '/mnt/test\|/mnt/scratch' /proc/mounts || true
+            echo
+          } >>"$log"
+          exit "$status"
+          EOF
+          chmod +x /tmp/xfstests-debug/umount-wrapper
           {
             echo "== uname -a =="
             uname -a
@@ -138,6 +193,12 @@ jobs:
             echo
             echo "== /sbin/mount.fuse.clawfs =="
             sed -n '1,120p' /sbin/mount.fuse.clawfs || true
+            echo
+            echo "== /tmp/xfstests-debug/mount-wrapper =="
+            sed -n '1,160p' /tmp/xfstests-debug/mount-wrapper || true
+            echo
+            echo "== /tmp/xfstests-debug/umount-wrapper =="
+            sed -n '1,160p' /tmp/xfstests-debug/umount-wrapper || true
           } | tee /tmp/xfstests-debug/env.txt
 
       - name: Run xfstests smoke

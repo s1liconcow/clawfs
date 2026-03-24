@@ -5,6 +5,20 @@ clawfsd_bin="__CLAWFSD_BIN__"
 source_dev=""
 target=""
 mount_opts=""
+debug_log="${CLAWFS_XFSTESTS_DEBUG_LOG:-}"
+
+log_debug() {
+  if [[ -z "$debug_log" ]]; then
+    return
+  fi
+  mkdir -p "$(dirname "$debug_log")"
+  {
+    printf '[%s] mount.fuse.clawfs pid=%s\n' "$(date -Is)" "$$"
+    printf 'argv='
+    printf '%q ' "$0" "$@"
+    printf '\n'
+  } >>"$debug_log"
+}
 
 append_mount_opts() {
   local cur="${1:-}"
@@ -17,6 +31,8 @@ append_mount_opts() {
     mount_opts="$cur"
   fi
 }
+
+log_debug "$@"
 
 while (($#)); do
   case "$1" in
@@ -43,6 +59,12 @@ while (($#)); do
 done
 
 if [[ -z "$source_dev" || -z "$target" ]]; then
+  if [[ -n "$debug_log" ]]; then
+    {
+      echo "error=missing source or target"
+      echo
+    } >>"$debug_log"
+  fi
   echo "mount.fuse.clawfs requires source and target" >&2
   exit 1
 fi
@@ -64,7 +86,23 @@ for opt in "${opt_array[@]}"; do
   esac
 done
 
+if [[ -n "$debug_log" ]]; then
+  {
+    printf 'parsed source_dev=%q target=%q store_path=%q local_cache_path=%q state_path=%q fuse_fsname=%q allow_other=%q mount_opts=%q\n' \
+      "$source_dev" "$target" "$store_path" "$local_cache_path" "$state_path" "$fuse_fsname" "$allow_other" "$mount_opts"
+    echo "mountinfo_before:"
+    grep " $target " /proc/self/mountinfo || true
+    echo
+  } >>"$debug_log"
+fi
+
 if mountpoint -q "$target"; then
+  if [[ -n "$debug_log" ]]; then
+    {
+      echo "result=already-mounted"
+      echo
+    } >>"$debug_log"
+  fi
   exit 0
 fi
 
@@ -93,8 +131,25 @@ fi
 nohup "${cmd[@]}" >"$log_path" 2>&1 &
 daemon_pid=$!
 
+if [[ -n "$debug_log" ]]; then
+  {
+    printf 'daemon_pid=%q log_path=%q\n' "$daemon_pid" "$log_path"
+    printf 'daemon_cmd='
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  } >>"$debug_log"
+fi
+
 for _ in $(seq 1 40); do
   if mountpoint -q "$target"; then
+    if [[ -n "$debug_log" ]]; then
+      {
+        echo "result=mounted"
+        echo "mountinfo_after:"
+        grep " $target " /proc/self/mountinfo || true
+        echo
+      } >>"$debug_log"
+    fi
     exit 0
   fi
   if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -103,5 +158,14 @@ for _ in $(seq 1 40); do
   fi
   sleep 1
 done
+
+if [[ -n "$debug_log" ]]; then
+  {
+    echo "result=timeout-or-daemon-exit"
+    echo "mountinfo_final:"
+    grep " $target " /proc/self/mountinfo || true
+    echo
+  } >>"$debug_log"
+fi
 
 exit 1
