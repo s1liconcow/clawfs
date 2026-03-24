@@ -1483,6 +1483,49 @@ impl MetadataStore {
         Ok(candidates)
     }
 
+    pub fn records_referencing_segments(&self, segments: &HashSet<(u64, u64)>) -> Vec<InodeRecord> {
+        let shards = self.shards.lock();
+        let mut records = Vec::new();
+        for entry in shards.values() {
+            for record in entry.shard.inodes.values() {
+                let referenced = match &record.storage {
+                    FileStorage::LegacySegment(ptr) => {
+                        segments.contains(&(ptr.generation, ptr.segment_id))
+                    }
+                    FileStorage::Segments(extents) => extents.iter().any(|extent| {
+                        segments.contains(&(extent.pointer.generation, extent.pointer.segment_id))
+                    }),
+                    _ => false,
+                };
+                if referenced {
+                    records.push(record.clone());
+                }
+            }
+        }
+        records.sort_by_key(|record| record.inode);
+        records
+    }
+
+    pub fn segment_is_referenced(&self, generation: u64, segment_id: u64) -> bool {
+        let shards = self.shards.lock();
+        shards.values().any(|entry| {
+            entry
+                .shard
+                .inodes
+                .values()
+                .any(|record| match &record.storage {
+                    FileStorage::LegacySegment(ptr) => {
+                        ptr.generation == generation && ptr.segment_id == segment_id
+                    }
+                    FileStorage::Segments(extents) => extents.iter().any(|extent| {
+                        extent.pointer.generation == generation
+                            && extent.pointer.segment_id == segment_id
+                    }),
+                    _ => false,
+                })
+        })
+    }
+
     async fn reload_shard_for_inode(&self, inode: u64) -> Result<()> {
         let shard_id = shard_for_inode(inode, self.shard_size);
         self.reload_shard(shard_id).await

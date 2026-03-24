@@ -4,6 +4,7 @@ clawfs-nfs-gateway/target
 loopback-bench/target
 *.log
 *.jsonl
+*.Identifier
 
 .local/ZeroFS/
 pjdfstest_nfs

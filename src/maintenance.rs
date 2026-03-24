@@ -581,7 +581,16 @@ pub async fn run_segment_compaction(
             break;
         }
 
-        let (merged, bytes) = compact_segment_batch(meta, segments, current, candidates).await?;
+        let segment_keys = candidates
+            .iter()
+            .filter_map(|record| {
+                record
+                    .segment_pointer()
+                    .map(|ptr| (ptr.generation, ptr.segment_id))
+            })
+            .collect::<HashSet<_>>();
+        let expanded = meta.records_referencing_segments(&segment_keys);
+        let (merged, bytes) = compact_segment_batch(meta, segments, current, expanded).await?;
         if merged == 0 {
             break;
         }
@@ -709,20 +718,13 @@ async fn compact_segment_batch(
         })?;
 
     let merged_count = dataset.len();
-    let mut segments_to_delete = HashSet::new();
     for (mut record, old_ptrs, _) in dataset {
         if let Some(new_extents) = pointer_map.get(&record.inode) {
             record.storage = FileStorage::Segments(new_extents.clone());
             meta.persist_inode(&record, generation, current.block.shard_size)
                 .await?;
-            for ptr in old_ptrs {
-                segments_to_delete.insert((ptr.generation, ptr.segment_id));
-            }
         }
-    }
-
-    for (generation, seg_id) in segments_to_delete {
-        segments.delete_segment(generation, seg_id)?;
+        let _ = old_ptrs;
     }
 
     let mut updated = current.block.clone();
