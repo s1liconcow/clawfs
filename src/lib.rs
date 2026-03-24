@@ -8,6 +8,7 @@ pub mod inode;
 pub mod journal;
 pub mod launch;
 pub mod maintenance;
+mod maintenance_shared;
 pub mod metadata;
 pub mod perf;
 pub mod perf_bench;
