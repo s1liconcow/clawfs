@@ -45,6 +45,7 @@ jobs:
             --local-cache-path /tmp/clawfs-cache \
             --state-path /tmp/clawfs-state.bin \
             --object-provider local \
+            --log-file /tmp/clawfs-mount.log \
             --allow-other \
             --disable-journal \
             --disable-cleanup \
@@ -85,6 +86,14 @@ jobs:
 
           # Run the filtered test suite
           sudo prove -rv $(cat /tmp/tests_to_run.txt)
+
+      - name: Upload ClawFS logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawfs-mount-log
+          path: /tmp/clawfs-mount.log
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
