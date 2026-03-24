@@ -8,6 +8,7 @@ members = [
     ".",
     "crates/clawfs-core",
     "crates/clawfs-csi",
+    "fuser-mt",
 ]
 default-members = [".", "crates/clawfs-core"]
 

@@ -26,10 +26,10 @@
 
 ## xfstests Notes
 - In Sprite xfstests, use `FUSE_SUBTYP`, not `FUSE_SUBTYPE`.
-- Install `/sbin/mount.fuse.clawfs` and use distinct `--fuse-fsname` values for TEST and SCRATCH.
+- Install `/sbin/mount.fuse.clawfs` via `scripts/install_xfstests_mount_helper.sh` and use distinct `--fuse-fsname` values for TEST and SCRATCH.
 - Pass CLI options before test names.
 - Set `TEST_FS_MOUNT_OPTS` and `MOUNT_OPTIONS` with `-o` included. Recommended: `-o source=/tmp/clawfs-test-store,allow_other,default_permissions`.
-- Keep `.github/workflows/xfstests.yml` and `scripts/sprite_validate_parallel.sh` mount-option formatting in sync. Drift here reintroduces `mount: bad usage` in `generic/084` and cascades into `generic/088`.
+- Keep `.github/workflows/xfstests.yml` and `scripts/mount.fuse.clawfs` in sync. The helper must merge repeated `-o` arguments and treat an already-mounted target as success, or `generic/084` and `generic/095` regress.
 - In shared sprites, clear and recreate `/tmp/clawfs-{test,scratch}-{mnt,store}` and ensure writable permissions before running `./check`; cross-user residue can break mounts.
 - `scripts/common.sh` provides `osage_assert_welcome_file` for mount validation. Tune with `MOUNT_CHECK_TIMEOUT_SEC`.
 

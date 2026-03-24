@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+clawfsd_bin="__CLAWFSD_BIN__"
+source_dev=""
+target=""
+mount_opts=""
+
+append_mount_opts() {
+  local cur="${1:-}"
+  if [[ -z "$cur" ]]; then
+    return
+  fi
+  if [[ -n "$mount_opts" ]]; then
+    mount_opts="${mount_opts},${cur}"
+  else
+    mount_opts="$cur"
+  fi
+}
+
+while (($#)); do
+  case "$1" in
+    -o)
+      append_mount_opts "${2:-}"
+      shift 2
+      ;;
+    -o*)
+      append_mount_opts "${1#-o}"
+      shift
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      if [[ -z "$source_dev" ]]; then
+        source_dev="$1"
+      elif [[ -z "$target" ]]; then
+        target="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$source_dev" || -z "$target" ]]; then
+  echo "mount.fuse.clawfs requires source and target" >&2
+  exit 1
+fi
+
+store_path="$source_dev"
+local_cache_path="${target%/}.cache"
+state_path="${target%/}.state.bin"
+fuse_fsname="clawfs"
+allow_other=0
+
+IFS=',' read -r -a opt_array <<< "$mount_opts"
+for opt in "${opt_array[@]}"; do
+  case "$opt" in
+    source=*) store_path="${opt#source=}" ;;
+    local_cache_path=*) local_cache_path="${opt#local_cache_path=}" ;;
+    state_path=*) state_path="${opt#state_path=}" ;;
+    fuse_fsname=*) fuse_fsname="${opt#fuse_fsname=}" ;;
+    allow_other) allow_other=1 ;;
+  esac
+done
+
+if mountpoint -q "$target"; then
+  exit 0
+fi
+
+name="$(basename "$target" | tr -cs 'a-zA-Z0-9' '_')"
+log_path="/tmp/clawfs-xfstests-${name}-u$(id -u).log"
+
+mkdir -p "$store_path" "$local_cache_path" "$(dirname "$state_path")" "$target"
+
+cmd=(
+  "$clawfsd_bin"
+  --mount-path "$target"
+  --store-path "$store_path"
+  --local-cache-path "$local_cache_path"
+  --state-path "$state_path"
+  --object-provider local
+  --disable-journal
+  --disable-cleanup
+  --fuse-fsname "$fuse_fsname"
+  --foreground
+)
+
+if [[ "$allow_other" == "1" ]]; then
+  cmd+=(--allow-other)
+fi
+
+nohup "${cmd[@]}" >"$log_path" 2>&1 &
+daemon_pid=$!
+
+for _ in $(seq 1 40); do
+  if mountpoint -q "$target"; then
+    exit 0
+  fi
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    wait "$daemon_pid" || true
+    break
+  fi
+  sleep 1
+done
+
+exit 1
