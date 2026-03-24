@@ -27,6 +27,7 @@
 ## xfstests Notes
 - On current GitHub Ubuntu runners, install the helper at `/sbin/mount.fuse` and keep `FSTYP=fuse` with no subtype. Newer util-linux and `df` report `fuse.clawfs` for subtype mounts, which makes `generic/095` and `generic/098` fail xfstests type checks.
 - `scripts/install_xfstests_mount_helper.sh` can install the same helper at either `/sbin/mount.fuse` or `/sbin/mount.fuse.clawfs`; use distinct `--fuse-fsname` values for TEST and SCRATCH.
+- Run `scripts/patch_xfstests_for_clawfs.sh /tmp/xfstests` against the checked-out xfstests tree in CI. It patches `_fs_type()` to normalize `fuse.clawfs` back to `fuse`, which avoids the false remount path behind the `generic/084` and `generic/095` GitHub-runner failures.
 - Pass CLI options before test names.
 - Set `TEST_FS_MOUNT_OPTS` and `MOUNT_OPTIONS` with `-o` included. Recommended: `-o source=/tmp/clawfs-test-store,allow_other,default_permissions`.
 - Keep `.github/workflows/xfstests.yml` and `scripts/mount.fuse.clawfs` in sync. The helper must merge repeated `-o` arguments and treat an already-mounted target as success, or `generic/084` regresses.

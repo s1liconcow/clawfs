@@ -35,6 +35,7 @@ jobs:
       - name: Clone and build xfstests
         run: |
           git clone https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
+          bash scripts/patch_xfstests_for_clawfs.sh /tmp/xfstests
           cd /tmp/xfstests
           make
           sudo make install
