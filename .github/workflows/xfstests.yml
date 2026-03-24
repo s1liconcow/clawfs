@@ -53,6 +53,9 @@ jobs:
       - name: Install FUSE mount helper
         run: |
           sudo env CLAWFSD_BIN="$GITHUB_WORKSPACE/target/release/clawfsd" \
+            MOUNT_HELPER_PATH=/sbin/mount.fuse \
+            bash scripts/install_xfstests_mount_helper.sh
+          sudo env CLAWFSD_BIN="$GITHUB_WORKSPACE/target/release/clawfsd" \
             bash scripts/install_xfstests_mount_helper.sh
 
       - name: Create mount points
@@ -64,7 +67,6 @@ jobs:
         run: |
           cat > local.config << 'EOF'
           export FSTYP=fuse
-          export FUSE_SUBTYP=.clawfs
 
           export TEST_DEV=/mnt/test
           export TEST_DIR=/mnt/test

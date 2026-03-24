@@ -25,11 +25,11 @@
 - Pre-commit hook: `.githooks/pre-commit` and enable with `git config core.hooksPath .githooks`.
 
 ## xfstests Notes
-- In Sprite xfstests, use `FUSE_SUBTYP`, not `FUSE_SUBTYPE`.
-- Install `/sbin/mount.fuse.clawfs` via `scripts/install_xfstests_mount_helper.sh` and use distinct `--fuse-fsname` values for TEST and SCRATCH.
+- On current GitHub Ubuntu runners, install the helper at `/sbin/mount.fuse` and keep `FSTYP=fuse` with no subtype. Newer util-linux and `df` report `fuse.clawfs` for subtype mounts, which makes `generic/095` and `generic/098` fail xfstests type checks.
+- `scripts/install_xfstests_mount_helper.sh` can install the same helper at either `/sbin/mount.fuse` or `/sbin/mount.fuse.clawfs`; use distinct `--fuse-fsname` values for TEST and SCRATCH.
 - Pass CLI options before test names.
 - Set `TEST_FS_MOUNT_OPTS` and `MOUNT_OPTIONS` with `-o` included. Recommended: `-o source=/tmp/clawfs-test-store,allow_other,default_permissions`.
-- Keep `.github/workflows/xfstests.yml` and `scripts/mount.fuse.clawfs` in sync. The helper must merge repeated `-o` arguments and treat an already-mounted target as success, or `generic/084` and `generic/095` regress.
+- Keep `.github/workflows/xfstests.yml` and `scripts/mount.fuse.clawfs` in sync. The helper must merge repeated `-o` arguments and treat an already-mounted target as success, or `generic/084` regresses.
 - In shared sprites, clear and recreate `/tmp/clawfs-{test,scratch}-{mnt,store}` and ensure writable permissions before running `./check`; cross-user residue can break mounts.
 - `scripts/common.sh` provides `osage_assert_welcome_file` for mount validation. Tune with `MOUNT_CHECK_TIMEOUT_SEC`.
 
