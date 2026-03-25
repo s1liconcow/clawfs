@@ -871,10 +871,10 @@ impl MetadataStore {
         }
 
         // Negative cache: skip shard load if we recently confirmed ENOENT.
-        if let Some(expires) = self.negative_cache.get(&inode) {
-            if Instant::now() < *expires {
-                return Ok(None);
-            }
+        if let Some(expires) = self.negative_cache.get(&inode)
+            && Instant::now() < *expires
+        {
+            return Ok(None);
         }
 
         self.reload_shard_for_inode(inode).await?;
@@ -922,10 +922,10 @@ impl MetadataStore {
                 }
             }
             // Skip if in negative cache.
-            if let Some(expires) = self.negative_cache.get(&ino) {
-                if now < *expires {
-                    continue;
-                }
+            if let Some(expires) = self.negative_cache.get(&ino)
+                && now < *expires
+            {
+                continue;
             }
             misses.push(ino);
         }
