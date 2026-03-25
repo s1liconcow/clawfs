@@ -274,21 +274,21 @@ impl SegmentManager {
                 } = entry;
 
                 match payload {
-                    SegmentPayload::Bytes(bytes) => {
+                    SegmentPayload::Bytes(ref bytes) => {
                         out.extend(encode_plain_bytes_chunked(
                             inode,
-                            path,
+                            &path,
                             logical_offset,
                             bytes,
                             &codec_config,
                         )?);
                     }
-                    SegmentPayload::SharedBytes(bytes) => {
+                    SegmentPayload::SharedBytes(ref bytes) => {
                         out.extend(encode_plain_bytes_chunked(
                             inode,
-                            path,
+                            &path,
                             logical_offset,
-                            bytes.as_ref().to_vec(),
+                            bytes.as_ref(),
                             &codec_config,
                         )?);
                     }
@@ -306,9 +306,9 @@ impl SegmentManager {
                                     self.read_staged_chunk_range(&chunk, chunk_off, piece_len)?;
                                 out.extend(encode_plain_bytes_chunked(
                                     inode,
-                                    path.clone(),
+                                    &path,
                                     chunk.logical_offset.saturating_add(chunk_off),
-                                    piece,
+                                    &piece,
                                     &codec_config,
                                 )?);
                                 chunk_off = chunk_off.saturating_add(piece_len);
@@ -397,10 +397,7 @@ impl SegmentManager {
         self.run_store(
             async move {
                 store
-                    .put(
-                        &object_path_clone,
-                        PutPayload::from_iter(chunks),
-                    )
+                    .put(&object_path_clone, PutPayload::from_iter(chunks))
                     .await
                     .map(|_| ())
             },
@@ -458,21 +455,39 @@ impl SegmentManager {
                     scope.spawn(move || -> Result<Vec<EncodedSegmentEntry>> {
                         let mut out = Vec::with_capacity(chunk.len());
                         for entry in chunk {
-                            let plain_bytes = match entry.payload {
-                                SegmentPayload::Bytes(bytes) => bytes,
-                                SegmentPayload::SharedBytes(bytes) => bytes.as_ref().to_vec(),
+                            match entry.payload {
+                                SegmentPayload::Bytes(ref bytes) => {
+                                    out.extend(encode_plain_bytes_chunked(
+                                        entry.inode,
+                                        &entry.path,
+                                        entry.logical_offset,
+                                        &bytes[..],
+                                        codec_config,
+                                    )?);
+                                }
+                                SegmentPayload::SharedBytes(ref bytes) => {
+                                    out.extend(encode_plain_bytes_chunked(
+                                        entry.inode,
+                                        &entry.path,
+                                        entry.logical_offset,
+                                        bytes.as_ref(),
+                                        codec_config,
+                                    )?);
+                                }
                                 SegmentPayload::Staged(chunks) => {
                                     let total_len = chunks.iter().map(|chunk| chunk.len).sum();
-                                    read_staged_chunks_from_disk(stage_dir, &chunks, total_len)?
+                                    let plain_bytes = read_staged_chunks_from_disk(
+                                        stage_dir, &chunks, total_len,
+                                    )?;
+                                    out.extend(encode_plain_bytes_chunked(
+                                        entry.inode,
+                                        &entry.path,
+                                        entry.logical_offset,
+                                        &plain_bytes[..],
+                                        codec_config,
+                                    )?);
                                 }
-                            };
-                            out.extend(encode_plain_bytes_chunked(
-                                entry.inode,
-                                entry.path,
-                                entry.logical_offset,
-                                plain_bytes,
-                                codec_config,
-                            )?);
+                            }
                         }
                         Ok(out)
                     })
@@ -1130,9 +1145,9 @@ impl SegmentManager {
 
 fn encode_plain_bytes_chunked(
     inode: u64,
-    path: String,
+    path: &str,
     logical_offset: u64,
-    plain_bytes: Vec<u8>,
+    plain_bytes: &[u8],
     codec_config: &InlineCodecConfig,
 ) -> Result<Vec<EncodedSegmentEntry>> {
     if plain_bytes.len() > SEGMENT_CHUNK_BYTES {
@@ -1150,7 +1165,7 @@ fn encode_plain_bytes_chunked(
             })?;
             out.push(EncodedSegmentEntry {
                 inode,
-                path: path.clone(),
+                path: path.to_owned(),
                 logical_offset: logical_offset.saturating_add(chunk_start as u64),
                 plain_len: chunk.len() as u64,
                 encoded,
@@ -1161,11 +1176,11 @@ fn encode_plain_bytes_chunked(
     }
 
     let plain_len = plain_bytes.len() as u64;
-    let encoded = encode_bytes(&plain_bytes, codec_config)
+    let encoded = encode_bytes(plain_bytes, codec_config)
         .with_context(|| format!("segment payload encoding failed for inode {inode}"))?;
     Ok(vec![EncodedSegmentEntry {
         inode,
-        path,
+        path: path.to_owned(),
         logical_offset,
         plain_len,
         encoded,

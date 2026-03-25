@@ -174,7 +174,7 @@ fn run_untar_flush_latency_once() -> RunResult {
     let snapshot = superblock.prepare_dirty_generation().expect("prepare gen");
     let generation = snapshot.generation;
     runtime
-        .block_on(metadata.persist_inodes_batch(&records, generation, shard_size, delta_batch))
+        .block_on(metadata.persist_inodes_batch(records, generation, shard_size, delta_batch))
         .expect("persist inode batch");
     runtime
         .block_on(metadata.sync_metadata_writes())
@@ -225,7 +225,7 @@ fn run_flush_metadata_batch_latency_once() -> RunResult {
     let snapshot = superblock.prepare_dirty_generation().expect("prepare gen");
     let generation = snapshot.generation;
     runtime
-        .block_on(metadata.persist_inodes_batch(&records, generation, shard_size, delta_batch))
+        .block_on(metadata.persist_inodes_batch(records, generation, shard_size, delta_batch))
         .expect("persist inode batch");
     runtime
         .block_on(metadata.sync_metadata_writes())

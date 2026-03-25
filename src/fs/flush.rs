@@ -506,7 +506,7 @@ impl OsageFs {
             let merge_duration = merge_start.elapsed();
             let persist_only_start = Instant::now();
             self.block_on(self.metadata.persist_inodes_batch(
-                &records,
+                records,
                 target_generation,
                 self.config.shard_size,
                 self.config.imap_delta_batch,
