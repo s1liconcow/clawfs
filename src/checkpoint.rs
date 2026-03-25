@@ -50,7 +50,7 @@ pub struct CheckpointResult {
     pub checkpoint_path: String,
 }
 
-pub(crate) fn encode_checkpoint_bytes(
+pub fn encode_checkpoint_bytes(
     superblock: &Superblock,
     created_at_unix: i64,
     note: Option<&str>,
