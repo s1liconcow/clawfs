@@ -23,12 +23,15 @@ pub struct Superblock {
     pub version: u32,
     pub state: FilesystemState,
     pub cleanup_leases: Vec<CleanupLease>,
-    /// Idempotency key from the retired write-back path. It remains on the
-    /// wire so older superblocks continue to deserialize cleanly.
+    /// Idempotency key of the most recently committed relay write, persisted
+    /// in the superblock so a new owner can detect takeover duplicates even
+    /// after its in-memory DedupStore is empty.  `#[serde(default)]` makes
+    /// this field backward-compatible with superblocks stored before it was
+    /// added — missing values deserialise as `None`.
     #[serde(default)]
     pub last_idempotency_key: Option<String>,
-    /// Legacy compatibility bit from the retired write-back path. The public
-    /// client preserves it but does not act on it.
+    /// When true, clients must use the relay write-back path and direct writes
+    /// must fail closed.
     #[serde(default)]
     pub relay_required: bool,
 }
@@ -112,7 +115,7 @@ impl SuperblockManager {
         self.state.lock().block.clone()
     }
 
-    pub(crate) async fn reload(&self) -> Result<()> {
+    pub async fn reload(&self) -> Result<()> {
         if let Some(wrapper) = self.store.load_superblock().await? {
             let mut guard = self.state.lock();
             // Preserve pending_generation logic?
@@ -203,6 +206,14 @@ impl SuperblockManager {
             let start = block.next_segment;
             block.next_segment = block.next_segment.saturating_add(count);
             Ok(start)
+        })
+        .await
+    }
+
+    pub async fn set_relay_required(&self, required: bool) -> Result<()> {
+        self.update_with_retry(|block| {
+            block.relay_required = required;
+            Ok(())
         })
         .await
     }

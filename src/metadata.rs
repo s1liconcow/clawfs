@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::compat::{ENOENT, ENOTDIR};
@@ -111,7 +111,7 @@ const METADATA_FB2_MAGIC: &[u8] = b"OSGFB2";
 
 /// VOffset for FlatBuffer table field at zero-based `index`: `(index + 2) * 2`.
 #[inline(always)]
-pub(crate) const fn fvt(index: u16) -> u16 {
+pub const fn fvt(index: u16) -> u16 {
     (index + 2) * 2
 }
 
@@ -130,7 +130,7 @@ fn build_seg_extent_fb<'fbb>(
     fbb.end_table(start)
 }
 
-pub(crate) fn build_inode_record_fb<'fbb>(
+pub fn build_inode_record_fb<'fbb>(
     fbb: &mut FlatBufferBuilder<'fbb>,
     record: &InodeRecord,
 ) -> WIPOffset<flatbuffers::TableFinishedWIPOffset> {
@@ -314,7 +314,7 @@ fn read_seg_extent_fb2(t: flatbuffers::Table<'_>) -> SegmentExtent {
     }
 }
 
-pub(crate) fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
+pub fn read_inode_record_fb2(t: flatbuffers::Table<'_>) -> Result<InodeRecord> {
     use flatbuffers::{ForwardsUOffset, Table, Vector};
 
     // Safety: t was produced by our own OSGFB2 writer so the schema matches.
@@ -544,6 +544,36 @@ struct ShardEntry {
     generation: u64,
 }
 
+/// A single child entry from a cached directory listing.
+#[derive(Debug, Clone)]
+pub struct MetadataDirEntry {
+    pub name: String,
+    pub inode: u64,
+}
+
+/// Optional advisory cache hook for MetadataStore.  Implementors can provide
+/// fast-path inode and directory lookups that are consulted before falling
+/// back to the authoritative object store.  All methods are advisory — misses
+/// and errors are silently ignored and the MetadataStore falls through to the
+/// object store automatically.
+#[async_trait::async_trait]
+pub trait MetadataCacheHook: Send + Sync {
+    /// Look up a single inode. `min_generation` is the last known committed
+    /// generation — implementations should return `None` for entries older
+    /// than this generation to avoid serving stale data.
+    /// Returns `(InodeRecord, entry_generation)` on a hit.
+    async fn get_inode(&self, ino: u64, min_generation: u64) -> Option<(InodeRecord, u64)>;
+
+    /// Look up a cached directory listing.  Returns `None` on any miss or error.
+    async fn get_readdir(&self, parent: u64) -> Option<Vec<MetadataDirEntry>>;
+
+    /// Invalidate specific inodes from the cache.
+    fn invalidate_inodes(&self, inodes: &[u64]);
+
+    /// Invalidate the entire cache.
+    fn invalidate_all(&self);
+}
+
 pub struct MetadataStore {
     store: Arc<dyn ObjectStore>,
     root_prefix: String,
@@ -556,6 +586,9 @@ pub struct MetadataStore {
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
     negative_cache: DashMap<u64, Instant>,
     handle: Handle,
+    /// Optional advisory metadata cache hook (e.g., hosted accelerator cache).
+    /// Uses OnceLock so the hook can be installed after Arc::new() wrapping.
+    cache_hook: OnceLock<Arc<dyn MetadataCacheHook>>,
 }
 
 impl MetadataStore {
@@ -580,6 +613,7 @@ impl MetadataStore {
             log_storage_io: config.log_storage_io,
             negative_cache: DashMap::new(),
             handle,
+            cache_hook: OnceLock::new(),
         };
 
         store.load_latest_imaps().await?;
@@ -588,6 +622,12 @@ impl MetadataStore {
         // short-lived clients see the latest namespace changes.
         let _ = store.apply_external_deltas_async().await?;
         Ok(store)
+    }
+
+    /// Attach an advisory cache hook.  May be called on a shared Arc<MetadataStore>
+    /// as long as it is called before the first lookup.  A second call is a no-op.
+    pub fn set_cache_hook(&self, hook: Arc<dyn MetadataCacheHook>) {
+        let _ = self.cache_hook.set(hook);
     }
 
     fn log_backing(&self, args: fmt::Arguments<'_>) {
@@ -805,6 +845,19 @@ impl MetadataStore {
         self.cache.get(&inode).map(|e| e.record.clone())
     }
 
+    /// Populate the positive inode cache with freshly committed records.
+    /// Clears any negative-cache entry for each inode so subsequent lookups
+    /// see the new state immediately.
+    pub fn cache_committed_records(&self, records: &[InodeRecord], generation: u64) {
+        for record in records {
+            self.negative_cache.remove(&record.inode);
+            self.cache.insert(
+                record.inode,
+                CacheEntry::with_generation(record.clone(), generation),
+            );
+        }
+    }
+
     pub fn invalidate_cached_inodes(&self, inodes: &[u64]) {
         if inodes.is_empty() {
             return;
@@ -870,6 +923,24 @@ impl MetadataStore {
             }
         }
 
+        // Advisory hosted metadata cache: consult before the object store so
+        // that hot-path lookups can be served without a shard fetch.  On any
+        // miss or error we fall through to the authoritative object store path.
+        if let Some(hook) = self.cache_hook.get() {
+            let min_gen = *self.last_delta_generation.lock();
+            if let Some((record, generation)) = hook.get_inode(inode, min_gen).await {
+                self.cache.insert(
+                    inode,
+                    CacheEntry {
+                        record: record.clone(),
+                        refreshed: Instant::now(),
+                        generation,
+                    },
+                );
+                return Ok(Some(record));
+            }
+        }
+
         // Negative cache: skip shard load if we recently confirmed ENOENT.
         if let Some(expires) = self.negative_cache.get(&inode)
             && Instant::now() < *expires
@@ -893,6 +964,26 @@ impl MetadataStore {
     pub async fn get_inode(&self, inode: u64) -> Result<Option<InodeRecord>> {
         self.get_inode_with_ttl(inode, Duration::ZERO, Duration::ZERO)
             .await
+    }
+
+    /// Advisory directory listing from the cache hook.  Returns `None` when
+    /// no hook is configured or the hook reports a miss.  Callers must fall
+    /// back to the authoritative metadata path on `None`.
+    pub async fn get_readdir(&self, parent_inode: u64) -> Option<Vec<MetadataDirEntry>> {
+        let hook = self.cache_hook.get()?;
+        hook.get_readdir(parent_inode).await
+    }
+
+    /// Invalidate the cache hook based on a set of affected inodes.
+    /// Pass `None` for `inodes` to invalidate everything.
+    pub fn invalidate_cache_hook(&self, inodes: Option<&[u64]>) {
+        let Some(hook) = self.cache_hook.get() else {
+            return;
+        };
+        match inodes {
+            Some(inodes) => hook.invalidate_inodes(inodes),
+            None => hook.invalidate_all(),
+        }
     }
 
     /// Batch-load multiple inodes from the cache, reloading shards as needed
