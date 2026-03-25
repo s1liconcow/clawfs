@@ -3,6 +3,7 @@ pub use ::clawfs::clawfs;
 pub use ::clawfs::codec;
 pub use ::clawfs::compat;
 pub use ::clawfs::config;
+pub use ::clawfs::coordination;
 pub use ::clawfs::fs;
 pub use ::clawfs::inode;
 pub use ::clawfs::journal;
