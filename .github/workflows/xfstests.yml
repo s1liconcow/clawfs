@@ -73,6 +73,10 @@ jobs:
             if mountpoint -q "$path" && ! ls "$path" >/dev/null 2>&1; then
               echo "repair_fuse_mountpoint: clearing stale mount at $path" >> /tmp/xfstests-debug/local-config.log
               fusermount3 -u "$path" >/dev/null 2>&1 || umount -l "$path" >/dev/null 2>&1 || true
+              if mountpoint -q "$path"; then
+                echo "repair_fuse_mountpoint: stale mount persists at $path" >> /tmp/xfstests-debug/local-config.log
+                return 0
+              fi
             fi
             mkdir -p "$path"
           }
