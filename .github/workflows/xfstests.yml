@@ -69,12 +69,12 @@ jobs:
           cat > local.config << 'EOF'
           repair_fuse_mountpoint() {
             local path="$1"
-            mkdir -p "$path"
+            mkdir -p "$(dirname "$path")"
             if mountpoint -q "$path" && ! ls "$path" >/dev/null 2>&1; then
               echo "repair_fuse_mountpoint: clearing stale mount at $path" >> /tmp/xfstests-debug/local-config.log
               fusermount3 -u "$path" >/dev/null 2>&1 || umount -l "$path" >/dev/null 2>&1 || true
-              mkdir -p "$path"
             fi
+            mkdir -p "$path"
           }
 
           mkdir -p /tmp/xfstests-debug
