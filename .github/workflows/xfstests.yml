@@ -67,6 +67,20 @@ jobs:
         working-directory: /tmp/xfstests
         run: |
           cat > local.config << 'EOF'
+          repair_fuse_mountpoint() {
+            local path="$1"
+            mkdir -p "$path"
+            if mountpoint -q "$path" && ! ls "$path" >/dev/null 2>&1; then
+              echo "repair_fuse_mountpoint: clearing stale mount at $path" >> /tmp/xfstests-debug/local-config.log
+              fusermount3 -u "$path" >/dev/null 2>&1 || umount -l "$path" >/dev/null 2>&1 || true
+              mkdir -p "$path"
+            fi
+          }
+
+          mkdir -p /tmp/xfstests-debug
+          repair_fuse_mountpoint /mnt/test
+          repair_fuse_mountpoint /mnt/scratch
+
           export FSTYP=fuse
           export MOUNT_PROG=/tmp/xfstests-debug/mount-wrapper
           export UMOUNT_PROG=/tmp/xfstests-debug/umount-wrapper
@@ -211,6 +225,9 @@ jobs:
         run: |
           mkdir -p /tmp/xfstests-debug
           {
+            echo "== local-config.log =="
+            cat /tmp/xfstests-debug/local-config.log || true
+            echo
             echo "== mount-calls.log =="
             cat /tmp/xfstests-debug/mount-calls.log || true
             echo
