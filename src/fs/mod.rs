@@ -73,6 +73,7 @@ pub struct OsageFs {
     replay: Option<Arc<ReplayLogger>>,
     telemetry: Option<Arc<TelemetryClient>>,
     telemetry_session_id: Option<String>,
+    coordination_publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
     mount_ready_emitted: Arc<AtomicBool>,
     fsync_on_close: bool,
     flush_interval: Option<Duration>,

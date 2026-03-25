@@ -69,6 +69,14 @@ impl OsageFs {
         }
         self.import_source_children_for_dir(&inode)?;
         inode = self.load_inode(ino)?;
+        if self.source.is_none()
+            && let Some(entries) = self.block_on(self.metadata.get_readdir(ino))
+        {
+            return Ok(entries
+                .into_iter()
+                .map(|entry| (entry.inode, entry.name))
+                .collect());
+        }
         let mut entries = Vec::new();
         if let Some(children) = inode.children() {
             entries.reserve(children.len());
@@ -94,6 +102,18 @@ impl OsageFs {
         entries.push((ino, FileType::Directory, String::from(".")));
         let parent = if ino == ROOT_INODE { ino } else { inode.parent };
         entries.push((parent, FileType::Directory, String::from("..")));
+        if self.source.is_none()
+            && let Some(hosted_entries) = self.block_on(self.metadata.get_readdir(ino))
+        {
+            let child_inos: Vec<u64> = hosted_entries.iter().map(|entry| entry.inode).collect();
+            let loaded = self.load_inodes_batch(&child_inos)?;
+            for entry in hosted_entries {
+                if let Some(child_inode) = loaded.get(&entry.inode) {
+                    entries.push((child_inode.inode, file_type(child_inode), entry.name));
+                }
+            }
+            return Ok(entries);
+        }
         if let Some(children) = inode.children() {
             let child_inos: Vec<u64> = children.values().copied().collect();
             let loaded = self.load_inodes_batch(&child_inos)?;

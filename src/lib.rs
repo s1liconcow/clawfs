@@ -3,6 +3,7 @@ pub mod clawfs;
 pub mod codec;
 pub mod compat;
 pub mod config;
+pub mod coordination;
 pub mod fs;
 pub mod inode;
 pub mod journal;

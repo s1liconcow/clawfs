@@ -69,6 +69,7 @@ impl TestHarness {
             None,
             None,
             None,
+            None,
         );
         Self {
             runtime,

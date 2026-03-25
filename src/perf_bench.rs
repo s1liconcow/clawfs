@@ -39,6 +39,7 @@ pub fn perf_osagefs_with_config(config: Config) -> (Runtime, OsageFs) {
         None,
         None,
         None,
+        None,
     );
 
     (runtime, fs)

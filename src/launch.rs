@@ -290,6 +290,7 @@ fn run_mount(mut config: Config) -> Result<()> {
         replay_logger,
         telemetry.clone(),
         telemetry_session_id.clone(),
+        None,
     );
 
     let replayed = fs.replay_journal()?;
