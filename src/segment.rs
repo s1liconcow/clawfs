@@ -66,6 +66,25 @@ pub struct StagedChunk {
 /// Default in-memory decoded-extent cache budget (256 MiB).
 const DECODED_CACHE_DEFAULT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Advisory near-bucket segment cache hook.  Implementations may serve raw
+/// (pre-decode) segment bytes from a fast near-bucket cache so that repeated
+/// hot reads skip the object store entirely.  Segments are immutable by
+/// identity so no invalidation is required.
+///
+/// `get_cached` is called synchronously from the read path.  The tokio
+/// `handle` is provided so async implementations can bridge via
+/// `block_in_place(|| handle.block_on(...))`.
+pub trait SegmentCacheHook: Send + Sync {
+    fn get_cached(
+        &self,
+        generation: u64,
+        segment_id: u64,
+        offset: u64,
+        length: u64,
+        handle: &Handle,
+    ) -> Option<Vec<u8>>;
+}
+
 pub struct SegmentManager {
     store: Arc<dyn ObjectStore>,
     handle: Handle,
@@ -84,6 +103,9 @@ pub struct SegmentManager {
     /// wrapped in `Arc` so that callers can slice without copying the full
     /// extent on every FUSE read.
     decoded_cache: Mutex<DecodedExtentCache>,
+    /// Advisory near-bucket segment cache.  Present only when a hosted
+    /// accelerator endpoint is configured.
+    segment_cache_hook: std::sync::OnceLock<Arc<dyn SegmentCacheHook>>,
 }
 
 struct EncodedSegmentEntry {
@@ -189,7 +211,14 @@ impl SegmentManager {
             segment_compression: config.segment_compression,
             segment_encryption_key: config.segment_encryption_key.clone(),
             decoded_cache: Mutex::new(DecodedExtentCache::new(decoded_budget)),
+            segment_cache_hook: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach an advisory near-bucket segment cache.  Must be called before
+    /// any reads; typically called once during mount setup.
+    pub fn set_cache_hook(&self, hook: Arc<dyn SegmentCacheHook>) {
+        let _ = self.segment_cache_hook.set(hook);
     }
 
     fn log_backing(&self, args: fmt::Arguments<'_>) {
@@ -528,7 +557,7 @@ impl SegmentManager {
             return Ok(cached);
         }
 
-        // Slow path: on-disk cache, hosted segment cache, or object store fetch + decode.
+        // Slow path: on-disk cache, advisory near-bucket hook, or object store fetch + decode.
         let decoded = if let Some(bytes) = self.read_from_cache(pointer)? {
             bytes
         } else {
@@ -536,6 +565,34 @@ impl SegmentManager {
                 .offset
                 .checked_add(pointer.length)
                 .context("segment pointer range overflow")?;
+
+            // Advisory segment cache hook: try before the object store so that
+            // repeated hot reads can be served from a near-bucket service.
+            // Segments are immutable by identity — no invalidation needed.
+            if let Some(hook) = self.segment_cache_hook.get()
+                && let Some(cached_bytes) = hook.get_cached(
+                    pointer.generation,
+                    pointer.segment_id,
+                    pointer.offset,
+                    pointer.length,
+                    &self.handle,
+                )
+            {
+                match self.decode_pointer_entry(&cached_bytes) {
+                    Ok(decoded) => {
+                        let arc = Arc::new(decoded);
+                        self.decoded_cache.lock().put(key, arc.clone());
+                        return Ok(arc);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "segment_cache_hook_decode_error gen={} seg={}: {err:#}",
+                            pointer.generation, pointer.segment_id
+                        );
+                        // Fall through to object store.
+                    }
+                }
+            }
 
             let entry = self.fetch_segment_range(
                 pointer.generation,
