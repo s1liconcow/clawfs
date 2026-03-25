@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::compat::{ENOENT, ENOTDIR};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use dashmap::DashMap;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use futures::StreamExt;
 use futures::future::try_join_all;
@@ -15,7 +16,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
 
@@ -547,13 +548,13 @@ pub struct MetadataStore {
     store: Arc<dyn ObjectStore>,
     root_prefix: String,
     shard_size: u64,
-    cache: RwLock<HashMap<u64, CacheEntry>>,
-    shards: Mutex<HashMap<u64, ShardEntry>>,
+    cache: DashMap<u64, CacheEntry>,
+    shards: DashMap<u64, ShardEntry>,
     last_delta_generation: Mutex<u64>,
     log_storage_io: bool,
     /// Short-lived cache of inode numbers known not to exist.  Avoids
     /// repeated shard loads for ENOENT lookups (git, cargo, ripgrep…).
-    negative_cache: RwLock<HashMap<u64, Instant>>,
+    negative_cache: DashMap<u64, Instant>,
     handle: Handle,
 }
 
@@ -573,11 +574,11 @@ impl MetadataStore {
             store,
             root_prefix: prefix,
             shard_size: config.shard_size,
-            cache: RwLock::new(HashMap::new()),
-            shards: Mutex::new(HashMap::new()),
+            cache: DashMap::new(),
+            shards: DashMap::new(),
             last_delta_generation: Mutex::new(0),
             log_storage_io: config.log_storage_io,
-            negative_cache: RwLock::new(HashMap::new()),
+            negative_cache: DashMap::new(),
             handle,
         };
 
@@ -801,18 +802,16 @@ impl MetadataStore {
     /// contexts (e.g. inside flush_pending under flush_lock) where callers
     /// only need extents that were committed by a prior flush.
     pub fn get_cached_inode(&self, inode: u64) -> Option<InodeRecord> {
-        self.cache.read().get(&inode).map(|e| e.record.clone())
+        self.cache.get(&inode).map(|e| e.record.clone())
     }
 
     pub fn invalidate_cached_inodes(&self, inodes: &[u64]) {
         if inodes.is_empty() {
             return;
         }
-        let mut cache = self.cache.write();
-        let mut negative_cache = self.negative_cache.write();
         for inode in inodes {
-            cache.remove(inode);
-            negative_cache.remove(inode);
+            self.cache.remove(inode);
+            self.negative_cache.remove(inode);
         }
     }
 
@@ -821,18 +820,16 @@ impl MetadataStore {
             self.invalidate_all_cached();
             return;
         }
-        {
-            let mut cache = self.cache.write();
-            cache.retain(|_, entry| !entry.record.path.starts_with(prefix));
-        }
-        self.shards.lock().clear();
-        self.negative_cache.write().clear();
+        self.cache
+            .retain(|_, entry| !entry.record.path.starts_with(prefix));
+        self.shards.clear();
+        self.negative_cache.clear();
     }
 
     pub fn invalidate_all_cached(&self) {
-        self.cache.write().clear();
-        self.shards.lock().clear();
-        self.negative_cache.write().clear();
+        self.cache.clear();
+        self.shards.clear();
+        self.negative_cache.clear();
     }
 
     /// Fast-path child lookup that avoids cloning the parent inode record.
@@ -844,8 +841,7 @@ impl MetadataStore {
         name: &str,
         dir_ttl: Duration,
     ) -> Option<std::result::Result<u64, i32>> {
-        let cache = self.cache.read();
-        let entry = cache.get(&parent)?;
+        let entry = self.cache.get(&parent)?;
         if dir_ttl.is_zero() || entry.refreshed.elapsed() > dir_ttl {
             return None;
         }
@@ -867,35 +863,27 @@ impl MetadataStore {
         let ttl = |rec: &InodeRecord| if rec.is_dir() { dir_ttl } else { file_ttl };
 
         // Fast path: positive cache hit.
-        if let Some(entry) = self.cache.read().get(&inode).cloned() {
+        if let Some(entry) = self.cache.get(&inode) {
             let allowed = ttl(&entry.record);
             if !allowed.is_zero() && entry.refreshed.elapsed() <= allowed {
-                return Ok(Some(entry.record));
+                return Ok(Some(entry.record.clone()));
             }
         }
 
         // Negative cache: skip shard load if we recently confirmed ENOENT.
-        {
-            let neg = self.negative_cache.read();
-            if let Some(&expires) = neg.get(&inode)
-                && Instant::now() < expires
-            {
+        if let Some(expires) = self.negative_cache.get(&inode) {
+            if Instant::now() < *expires {
                 return Ok(None);
             }
         }
 
         self.reload_shard_for_inode(inode).await?;
 
-        let result = self
-            .cache
-            .read()
-            .get(&inode)
-            .map(|entry| entry.record.clone());
+        let result = self.cache.get(&inode).map(|entry| entry.record.clone());
 
         // Populate the negative cache on confirmed ENOENT.
         if result.is_none() {
             self.negative_cache
-                .write()
                 .insert(inode, Instant::now() + NEGATIVE_CACHE_TTL);
         }
 
@@ -920,30 +908,26 @@ impl MetadataStore {
         let mut misses = Vec::new();
 
         // Phase 1: single read-lock pass to resolve cache hits.
-        {
-            let cache = self.cache.read();
-            let neg = self.negative_cache.read();
-            let now = Instant::now();
-            for &ino in inodes {
-                if let Some(entry) = cache.get(&ino) {
-                    let ttl = if entry.record.is_dir() {
-                        dir_ttl
-                    } else {
-                        file_ttl
-                    };
-                    if !ttl.is_zero() && entry.refreshed.elapsed() <= ttl {
-                        result.insert(ino, entry.record.clone());
-                        continue;
-                    }
-                }
-                // Skip if in negative cache.
-                if let Some(&expires) = neg.get(&ino)
-                    && now < expires
-                {
+        let now = Instant::now();
+        for &ino in inodes {
+            if let Some(entry) = self.cache.get(&ino) {
+                let ttl = if entry.record.is_dir() {
+                    dir_ttl
+                } else {
+                    file_ttl
+                };
+                if !ttl.is_zero() && entry.refreshed.elapsed() <= ttl {
+                    result.insert(ino, entry.record.clone());
                     continue;
                 }
-                misses.push(ino);
             }
+            // Skip if in negative cache.
+            if let Some(expires) = self.negative_cache.get(&ino) {
+                if now < *expires {
+                    continue;
+                }
+            }
+            misses.push(ino);
         }
 
         if misses.is_empty() {
@@ -961,21 +945,17 @@ impl MetadataStore {
 
         // Phase 3: re-check cache for previously-missed inodes.
         let mut neg_inserts = Vec::new();
-        {
-            let cache = self.cache.read();
-            for &ino in &misses {
-                if let Some(entry) = cache.get(&ino) {
-                    result.insert(ino, entry.record.clone());
-                } else {
-                    neg_inserts.push(ino);
-                }
+        for &ino in &misses {
+            if let Some(entry) = self.cache.get(&ino) {
+                result.insert(ino, entry.record.clone());
+            } else {
+                neg_inserts.push(ino);
             }
         }
         if !neg_inserts.is_empty() {
-            let mut neg = self.negative_cache.write();
             let expires = Instant::now() + NEGATIVE_CACHE_TTL;
             for ino in neg_inserts {
-                neg.insert(ino, expires);
+                self.negative_cache.insert(ino, expires);
             }
         }
 
@@ -1007,42 +987,46 @@ impl MetadataStore {
         // Normalize once and share between cache and shard to halve
         // normalization overhead.
         let mut touched_shard_ids = HashSet::new();
-        {
-            let mut cache = self.cache.write();
-            let mut shards = self.shards.lock();
-            let mut neg = self.negative_cache.write();
-            for record in records {
-                neg.remove(&record.inode);
-                let shard_id = record.shard_index(shard_size);
-                let entry = shards.entry(shard_id).or_insert_with(|| ShardEntry {
+        for record in records {
+            self.negative_cache.remove(&record.inode);
+            let shard_id = record.shard_index(shard_size);
+            touched_shard_ids.insert(shard_id);
+
+            self.shards
+                .entry(shard_id)
+                .or_insert_with(|| ShardEntry {
                     shard: InodeShard::new(shard_id),
                     generation,
-                });
-                entry.generation = generation;
-                touched_shard_ids.insert(shard_id);
-                if matches!(record.kind, InodeKind::Tombstone) {
+                })
+                .value_mut()
+                .generation = generation;
+
+            if matches!(record.kind, InodeKind::Tombstone) {
+                if let Some(mut entry) = self.shards.get_mut(&shard_id) {
                     entry.shard.inodes.remove(&record.inode);
-                    // neg.remove() already called above; manual insert ok.
-                    cache.insert(
-                        record.inode,
-                        CacheEntry::with_generation(record.clone(), generation),
-                    );
-                } else {
-                    // Normalize once, clone for cache, move into shard.
-                    let mut normalized = record.clone();
-                    normalized.normalize_storage();
-                    let for_cache = normalized.clone();
-                    entry.shard.inodes.insert(normalized.inode, normalized);
-                    // neg.remove() already called above; manual insert ok.
-                    cache.insert(
-                        record.inode,
-                        CacheEntry {
-                            record: for_cache,
-                            refreshed: Instant::now(),
-                            generation,
-                        },
-                    );
                 }
+                // neg.remove() already called above; manual insert ok.
+                self.cache.insert(
+                    record.inode,
+                    CacheEntry::with_generation(record.clone(), generation),
+                );
+            } else {
+                // Normalize once, clone for cache, move into shard.
+                let mut normalized = record.clone();
+                normalized.normalize_storage();
+                let for_cache = normalized.clone();
+                if let Some(mut entry) = self.shards.get_mut(&shard_id) {
+                    entry.shard.inodes.insert(normalized.inode, normalized);
+                }
+                // neg.remove() already called above; manual insert ok.
+                self.cache.insert(
+                    record.inode,
+                    CacheEntry {
+                        record: for_cache,
+                        refreshed: Instant::now(),
+                        generation,
+                    },
+                );
             }
         }
 
@@ -1098,14 +1082,13 @@ impl MetadataStore {
             // Serialize shards under lock (sequential — the delta thread
             // already runs in parallel with this block).
             let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
-                let shards = self.shards.lock();
                 let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
                 shard_ids.sort_unstable();
 
                 shard_ids
                     .iter()
                     .filter_map(|&shard_id| {
-                        let entry = shards.get(&shard_id)?;
+                        let entry = self.shards.get(&shard_id)?;
                         let data = serialize_inodes_fb2(
                             METADATA_FORMAT_VERSION,
                             generation,
@@ -1199,12 +1182,11 @@ impl MetadataStore {
     }
 
     pub async fn remove_inode(&self, inode: u64, generation: u64, shard_size: u64) -> Result<()> {
-        self.cache.write().remove(&inode);
-        self.negative_cache.write().remove(&inode);
+        self.cache.remove(&inode);
+        self.negative_cache.remove(&inode);
         let shard_id = shard_for_inode(inode, shard_size);
         {
-            let mut shards = self.shards.lock();
-            if let Some(entry) = shards.get_mut(&shard_id) {
+            if let Some(mut entry) = self.shards.get_mut(&shard_id) {
                 entry.shard.inodes.remove(&inode);
                 entry.generation = generation;
             }
@@ -1218,8 +1200,7 @@ impl MetadataStore {
         let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
         let path = self.imap_prefix().child(filename.as_str());
         let (data, count) = {
-            let shards = self.shards.lock();
-            let entry = match shards.get(&shard_id) {
+            let entry = match self.shards.get(&shard_id) {
                 Some(e) => e,
                 None => return Ok(()),
             };
@@ -1313,23 +1294,20 @@ impl MetadataStore {
             loaded_shards.push((shard_id, stored));
         }
 
-        let mut cache = self.cache.write();
-        let mut neg = self.negative_cache.write();
-        let mut shard_map = self.shards.lock();
         for (shard_id, stored) in loaded_shards {
             let mut shard = InodeShard::new(shard_id);
             for (ino, record) in stored.entries {
                 shard.inodes.insert(ino, record);
             }
             for (ino, record) in &shard.inodes {
-                cache.insert(
+                self.cache.insert(
                     *ino,
                     CacheEntry::with_generation(record.clone(), stored.generation),
                 );
-                neg.remove(ino);
+                self.negative_cache.remove(ino);
             }
             max_generation = max_generation.max(stored.generation);
-            shard_map.insert(
+            self.shards.insert(
                 shard_id,
                 ShardEntry {
                     shard,
@@ -1379,27 +1357,25 @@ impl MetadataStore {
                 );
                 for record in stored.records {
                     if matches!(record.kind, crate::inode::InodeKind::Tombstone) {
-                        let mut cache = self.cache.write();
-                        let dominated = cache
+                        let dominated = self.cache
                             .get(&record.inode)
                             .map(|existing| existing.generation > generation)
                             .unwrap_or(false);
                         if !dominated {
-                            cache.remove(&record.inode);
-                            self.negative_cache.write().remove(&record.inode);
+                            self.cache.remove(&record.inode);
+                            self.negative_cache.remove(&record.inode);
                         }
                     } else {
-                        let mut cache = self.cache.write();
-                        let dominated = cache
+                        let dominated = self.cache
                             .get(&record.inode)
                             .map(|existing| existing.generation > generation)
                             .unwrap_or(false);
                         if !dominated {
-                            cache.insert(
+                            self.cache.insert(
                                 record.inode,
                                 CacheEntry::with_generation(record.clone(), generation),
                             );
-                            self.negative_cache.write().remove(&record.inode);
+                            self.negative_cache.remove(&record.inode);
                             updated_records.push(record.clone());
                         }
                     }
@@ -1459,8 +1435,7 @@ impl MetadataStore {
 
     pub fn segment_candidates(&self, max: usize) -> Result<Vec<InodeRecord>> {
         let mut candidates = Vec::new();
-        let shards = self.shards.lock();
-        for entry in shards.values() {
+        for entry in self.shards.iter() {
             for record in entry.shard.inodes.values() {
                 if matches!(
                     record.storage,
@@ -1470,7 +1445,6 @@ impl MetadataStore {
                 }
             }
         }
-        drop(shards);
         candidates.sort_by_key(|record| {
             record
                 .segment_pointer()
@@ -1484,9 +1458,8 @@ impl MetadataStore {
     }
 
     pub fn records_referencing_segments(&self, segments: &HashSet<(u64, u64)>) -> Vec<InodeRecord> {
-        let shards = self.shards.lock();
         let mut records = Vec::new();
-        for entry in shards.values() {
+        for entry in self.shards.iter() {
             for record in entry.shard.inodes.values() {
                 let referenced = match &record.storage {
                     FileStorage::LegacySegment(ptr) => {
@@ -1507,8 +1480,7 @@ impl MetadataStore {
     }
 
     pub fn segment_is_referenced(&self, generation: u64, segment_id: u64) -> bool {
-        let shards = self.shards.lock();
-        shards.values().any(|entry| {
+        self.shards.iter().any(|entry| {
             entry
                 .shard
                 .inodes
@@ -1567,8 +1539,6 @@ impl MetadataStore {
             for (ino, record) in stored.entries {
                 shard.inodes.insert(ino, record);
             }
-            let mut cache = self.cache.write();
-            let mut neg = self.negative_cache.write();
             for (ino, record) in &shard.inodes {
                 // Only update the cache if this shard reload is at least as
                 // fresh as the existing entry.  A concurrent
@@ -1576,25 +1546,24 @@ impl MetadataStore {
                 // generation between our directory listing and this point;
                 // overwriting that entry would revert directory children or
                 // file storage to a stale snapshot.
-                let dominated = cache
+                let dominated = self.cache
                     .get(ino)
                     .map(|existing| existing.generation > generation)
                     .unwrap_or(false);
                 if !dominated {
-                    cache.insert(
+                    self.cache.insert(
                         *ino,
                         CacheEntry::with_generation(record.clone(), generation),
                     );
-                    neg.remove(ino);
+                    self.negative_cache.remove(ino);
                 }
             }
-            let mut shard_map = self.shards.lock();
-            let dominated_shard = shard_map
+            let dominated_shard = self.shards
                 .get(&shard_id)
                 .map(|existing| existing.generation > generation)
                 .unwrap_or(false);
             if !dominated_shard {
-                shard_map.insert(shard_id, ShardEntry { shard, generation });
+                self.shards.insert(shard_id, ShardEntry { shard, generation });
             }
         }
         Ok(())

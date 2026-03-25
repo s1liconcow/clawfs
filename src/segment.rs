@@ -260,44 +260,11 @@ impl SegmentManager {
         let codec_config = self.segment_codec_config();
         let use_parallel = !has_staged_payloads
             && self.should_parallel_encode(original_entry_count, estimated_size);
-        let mut buffer = Vec::with_capacity(estimated_size);
-        buffer.extend_from_slice(SEGMENT_MAGIC_V2);
-        // Placeholder for encoded entry count; updated after encoding.
-        buffer.extend_from_slice(&0u64.to_le_bytes());
-        let mut pointers = Vec::with_capacity(original_entry_count);
-        let mut encoded_entry_count: u64 = 0;
-        if use_parallel {
-            let encoded_entries =
-                self.encode_entries_parallel(entries, &codec_config, original_entry_count)?;
-            for encoded_entry in encoded_entries {
-                buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
-                let path_bytes = encoded_entry.path.as_bytes();
-                buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
-                buffer.extend_from_slice(path_bytes);
-                let offset = buffer.len() as u64;
-                buffer.push(codec_to_u8(encoded_entry.encoded.codec));
-                buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
-                buffer
-                    .extend_from_slice(&(encoded_entry.encoded.payload.len() as u64).to_le_bytes());
-                buffer.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
-                buffer.extend_from_slice(&encoded_entry.encoded.payload);
-                encoded_entry_count = encoded_entry_count.saturating_add(1);
-                pointers.push((
-                    encoded_entry.inode,
-                    SegmentExtent::new(
-                        encoded_entry.logical_offset,
-                        SegmentPointer {
-                            segment_id,
-                            generation,
-                            offset,
-                            length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
-                                + encoded_entry.encoded.payload.len())
-                                as u64,
-                        },
-                    ),
-                ));
-            }
+
+        let encoded_entries = if use_parallel {
+            self.encode_entries_parallel(entries, &codec_config, original_entry_count)?
         } else {
+            let mut out = Vec::with_capacity(original_entry_count);
             for entry in entries {
                 let SegmentEntry {
                     inode,
@@ -306,62 +273,24 @@ impl SegmentManager {
                     payload,
                 } = entry;
 
-                let mut emit_encoded_entries =
-                    |encoded_entries: Vec<EncodedSegmentEntry>| -> Result<()> {
-                        for encoded_entry in encoded_entries {
-                            buffer.extend_from_slice(&encoded_entry.inode.to_le_bytes());
-                            let path_bytes = encoded_entry.path.as_bytes();
-                            buffer.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
-                            buffer.extend_from_slice(path_bytes);
-                            let offset = buffer.len() as u64;
-                            buffer.push(codec_to_u8(encoded_entry.encoded.codec));
-                            buffer.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
-                            buffer.extend_from_slice(
-                                &(encoded_entry.encoded.payload.len() as u64).to_le_bytes(),
-                            );
-                            buffer.extend_from_slice(
-                                &encoded_entry.encoded.nonce.unwrap_or([0u8; 12]),
-                            );
-                            buffer.extend_from_slice(&encoded_entry.encoded.payload);
-                            encoded_entry_count = encoded_entry_count.saturating_add(1);
-                            pointers.push((
-                                encoded_entry.inode,
-                                SegmentExtent::new(
-                                    encoded_entry.logical_offset,
-                                    SegmentPointer {
-                                        segment_id,
-                                        generation,
-                                        offset,
-                                        length: (SEGMENT_ENTRY_CODEC_HEADER_LEN
-                                            + encoded_entry.encoded.payload.len())
-                                            as u64,
-                                    },
-                                ),
-                            ));
-                        }
-                        Ok(())
-                    };
-
                 match payload {
                     SegmentPayload::Bytes(bytes) => {
-                        let encoded_entries = encode_plain_bytes_chunked(
+                        out.extend(encode_plain_bytes_chunked(
                             inode,
                             path,
                             logical_offset,
                             bytes,
                             &codec_config,
-                        )?;
-                        emit_encoded_entries(encoded_entries)?;
+                        )?);
                     }
                     SegmentPayload::SharedBytes(bytes) => {
-                        let encoded_entries = encode_plain_bytes_chunked(
+                        out.extend(encode_plain_bytes_chunked(
                             inode,
                             path,
                             logical_offset,
                             bytes.as_ref().to_vec(),
                             &codec_config,
-                        )?;
-                        emit_encoded_entries(encoded_entries)?;
+                        )?);
                     }
                     SegmentPayload::Staged(mut chunks) => {
                         chunks.sort_by_key(|chunk| chunk.logical_offset);
@@ -375,51 +304,103 @@ impl SegmentManager {
                                     (chunk.len - chunk_off).min(SEGMENT_CHUNK_BYTES as u64);
                                 let piece =
                                     self.read_staged_chunk_range(&chunk, chunk_off, piece_len)?;
-                                let encoded_entries = encode_plain_bytes_chunked(
+                                out.extend(encode_plain_bytes_chunked(
                                     inode,
                                     path.clone(),
                                     chunk.logical_offset.saturating_add(chunk_off),
                                     piece,
                                     &codec_config,
-                                )?;
-                                emit_encoded_entries(encoded_entries)?;
+                                )?);
                                 chunk_off = chunk_off.saturating_add(piece_len);
                             }
                         }
                     }
                 }
             }
+            out
+        };
+
+        let total_count = encoded_entries.len() as u64;
+        let mut pointers = Vec::with_capacity(encoded_entries.len());
+        let mut chunks = Vec::with_capacity(encoded_entries.len() * 3 + 1);
+        let mut offset = 12u64; // Magic (4) + Count (8)
+
+        let mut header = Vec::with_capacity(12);
+        header.extend_from_slice(SEGMENT_MAGIC_V2);
+        header.extend_from_slice(&total_count.to_le_bytes());
+        chunks.push(Bytes::from(header));
+
+        for encoded_entry in encoded_entries {
+            let path_bytes = encoded_entry.path.into_bytes();
+            let path_len = path_bytes.len() as u64;
+            let payload_len = encoded_entry.encoded.payload.len() as u64;
+
+            // Inode (8) + PathLen (8) + Path + Codec (1) + PlainLen (8) + EncLen (8) + Nonce (12)
+            let entry_header_len = 8 + 8 + path_len as usize + 1 + 8 + 8 + 12;
+            let mut entry_buf = Vec::with_capacity(entry_header_len);
+
+            entry_buf.extend_from_slice(&encoded_entry.inode.to_le_bytes());
+            entry_buf.extend_from_slice(&path_len.to_le_bytes());
+            entry_buf.extend_from_slice(&path_bytes);
+            entry_buf.push(codec_to_u8(encoded_entry.encoded.codec));
+            entry_buf.extend_from_slice(&encoded_entry.plain_len.to_le_bytes());
+            entry_buf.extend_from_slice(&payload_len.to_le_bytes());
+            entry_buf.extend_from_slice(&encoded_entry.encoded.nonce.unwrap_or([0u8; 12]));
+
+            let payload_bytes = Bytes::from(encoded_entry.encoded.payload);
+            let entry_len = entry_header_len as u64 + payload_len;
+            let metadata_len = 8 + 8 + path_len as usize;
+
+            chunks.push(Bytes::from(entry_buf));
+            chunks.push(payload_bytes);
+
+            pointers.push((
+                encoded_entry.inode,
+                SegmentExtent::new(
+                    encoded_entry.logical_offset,
+                    SegmentPointer {
+                        segment_id,
+                        generation,
+                        offset: offset + metadata_len as u64,
+                        length: entry_len - metadata_len as u64,
+                    },
+                ),
+            ));
+            offset += entry_len;
         }
-        buffer[4..12].copy_from_slice(&encoded_entry_count.to_le_bytes());
-        let total_bytes = buffer.len();
+
         let object_path = self.segment_path(generation, segment_id);
         let object_path_clone = object_path.clone();
         let store = self.store.clone();
-        let payload = Bytes::from(buffer);
-        // Write the local cache file from the in-memory buffer instead of
+
+        // Write the local cache file from the chunks instead of
         // re-fetching from the store via enqueue_cache_fill.  We share the
         // refcounted Bytes handle so there is no extra copy, and spawn the
         // I/O on the runtime so the flush path is not blocked.
         if self.cache_limit > 0 {
-            let cache_payload = payload.clone();
+            let cache_chunks = chunks.clone();
             let cache_dir = self.cache_dir.clone();
             let cache_limit = self.cache_limit;
             let cache_state = self.cache_state.clone();
             self.handle.spawn_blocking(move || {
-                let _ = Self::write_cache_file_with_state(
+                let _ = Self::write_cache_file_from_chunks(
                     &cache_dir,
                     cache_limit,
                     &cache_state,
                     generation,
                     segment_id,
-                    &cache_payload,
+                    &cache_chunks,
                 );
             });
         }
+
         self.run_store(
             async move {
                 store
-                    .put(&object_path_clone, PutPayload::from_bytes(payload))
+                    .put(
+                        &object_path_clone,
+                        PutPayload::from_iter(chunks),
+                    )
                     .await
                     .map(|_| ())
             },
@@ -431,7 +412,7 @@ impl SegmentManager {
             generation,
             segment_id,
             pointers.len(),
-            total_bytes
+            offset
         ));
         Ok(pointers)
     }
@@ -1063,6 +1044,45 @@ impl SegmentManager {
         let mut cache = cache_state.lock();
         cache.entries.push_back((path.clone(), data.len() as u64));
         cache.total_bytes = cache.total_bytes.saturating_add(data.len() as u64);
+        while cache.total_bytes > cache_limit {
+            if let Some((old_path, size)) = cache.entries.pop_front() {
+                cache.total_bytes = cache.total_bytes.saturating_sub(size);
+                let _ = fs::remove_file(old_path);
+            } else {
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    fn write_cache_file_from_chunks(
+        cache_dir: &Path,
+        cache_limit: u64,
+        cache_state: &Mutex<SegmentCache>,
+        generation: u64,
+        segment_id: u64,
+        chunks: &[Bytes],
+    ) -> Result<bool> {
+        if cache_limit == 0 {
+            return Ok(false);
+        }
+        let path = Self::cache_path_for(cache_dir, generation, segment_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("bin.tmp");
+        {
+            let mut file = File::create(&tmp_path)?;
+            for chunk in chunks {
+                file.write_all(chunk)?;
+            }
+        }
+        fs::rename(&tmp_path, &path)?;
+
+        let total_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let mut cache = cache_state.lock();
+        cache.entries.push_back((path.clone(), total_len));
+        cache.total_bytes = cache.total_bytes.saturating_add(total_len);
         while cache.total_bytes > cache_limit {
             if let Some((old_path, size)) = cache.entries.pop_front() {
                 cache.total_bytes = cache.total_bytes.saturating_sub(size);
