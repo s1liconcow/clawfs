@@ -20,9 +20,9 @@ needle = (
     "        sed -e 's/nfs4/nfs/' -e 's/fuse.glusterfs/glusterfs/' \\\n"
     "            -e 's/fuse.ceph-fuse/ceph-fuse/'"
 )
-replacement = needle + " \\\n            -e 's/fuse.clawfs/fuse/'"
+replacement = needle + " \\\n            -e 's/fuse\\..*/fuse/'"
 
-if "fuse.clawfs" in text:
+if "fuse\\..*/fuse" in text:
     sys.exit(0)
 
 if needle not in text:

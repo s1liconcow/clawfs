@@ -211,6 +211,15 @@ jobs:
         run: |
           mkdir -p /tmp/xfstests-debug
           {
+            echo "== mount-calls.log =="
+            cat /tmp/xfstests-debug/mount-calls.log || true
+            echo
+            echo "== umount-calls.log =="
+            cat /tmp/xfstests-debug/umount-calls.log || true
+            echo
+            echo "== helper.log =="
+            cat /tmp/xfstests-debug/helper.log || true
+            echo
             echo "== findmnt test =="
             findmnt -T /mnt/test -o SOURCE,FSTYPE,TARGET,OPTIONS || true
             echo

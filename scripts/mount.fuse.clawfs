@@ -20,6 +20,34 @@ log_debug() {
   } >>"$debug_log"
 }
 
+is_usable_dir() {
+  local path="$1"
+  [[ -d "$path" ]] && ls "$path" >/dev/null 2>&1
+}
+
+cleanup_stale_mount() {
+  local path="$1"
+
+  if ! mountpoint -q "$path"; then
+    return 0
+  fi
+  if is_usable_dir "$path"; then
+    return 0
+  fi
+
+  if [[ -n "$debug_log" ]]; then
+    {
+      echo "stale_mount_detected=$path"
+      echo "mountinfo_stale:"
+      grep " $path " /proc/self/mountinfo || true
+      echo
+    } >>"$debug_log"
+  fi
+
+  fusermount3 -u "$path" >/dev/null 2>&1 || umount -l "$path" >/dev/null 2>&1 || true
+  sleep 1
+}
+
 append_mount_opts() {
   local cur="${1:-}"
   if [[ -z "$cur" ]]; then
@@ -96,7 +124,9 @@ if [[ -n "$debug_log" ]]; then
   } >>"$debug_log"
 fi
 
-if mountpoint -q "$target"; then
+cleanup_stale_mount "$target"
+
+if mountpoint -q "$target" && is_usable_dir "$target"; then
   if [[ -n "$debug_log" ]]; then
     {
       echo "result=already-mounted"
@@ -141,7 +171,7 @@ if [[ -n "$debug_log" ]]; then
 fi
 
 for _ in $(seq 1 40); do
-  if mountpoint -q "$target"; then
+  if mountpoint -q "$target" && is_usable_dir "$target"; then
     if [[ -n "$debug_log" ]]; then
       {
         echo "result=mounted"
@@ -156,8 +186,11 @@ for _ in $(seq 1 40); do
     wait "$daemon_pid" || true
     break
   fi
+  cleanup_stale_mount "$target"
   sleep 1
 done
+
+cleanup_stale_mount "$target"
 
 if [[ -n "$debug_log" ]]; then
   {
