@@ -216,6 +216,74 @@ impl Default for AcceleratorContract {
     }
 }
 
+/// Default in-memory relay write queue depth when `QueueAndRetry` policy is active.
+pub const DEFAULT_RELAY_QUEUE_DEPTH: usize = 32;
+
+/// Wire-protocol status returned by the relay write endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayStatus {
+    Accepted,
+    Committed,
+    Failed,
+    Duplicate,
+}
+
+/// How the client should behave when the relay write endpoint is unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayOutagePolicy {
+    FailClosed,
+    DirectWriteFallback,
+    QueueAndRetry,
+}
+
+impl RelayOutagePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::DirectWriteFallback => "direct_write_fallback",
+            Self::QueueAndRetry => "queue_and_retry",
+        }
+    }
+
+    pub const fn default_for_mode(mode: AcceleratorMode) -> Self {
+        match mode {
+            AcceleratorMode::RelayWrite => Self::FailClosed,
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => Self::FailClosed,
+        }
+    }
+
+    pub const fn normalize_for_mode(self, mode: AcceleratorMode) -> Self {
+        match mode {
+            AcceleratorMode::RelayWrite => self,
+            AcceleratorMode::Direct | AcceleratorMode::DirectPlusCache => Self::FailClosed,
+        }
+    }
+
+    pub const fn queue_limit(self) -> Option<usize> {
+        match self {
+            Self::QueueAndRetry => Some(DEFAULT_RELAY_QUEUE_DEPTH),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for RelayOutagePolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_closed" => Ok(Self::FailClosed),
+            "direct_write_fallback" => Ok(Self::DirectWriteFallback),
+            "queue_and_retry" => Ok(Self::QueueAndRetry),
+            other => bail!(
+                "unsupported relay outage policy {other:?}; expected fail_closed, direct_write_fallback, or queue_and_retry"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostedFreeLimits {
     pub max_pending_bytes: Option<u64>,

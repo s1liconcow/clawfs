@@ -19,10 +19,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use serde_json;
 
 use crate::inode::{InodeKind, InodeRecord};
 use crate::metadata::{build_inode_record_fb, fvt, read_inode_record_fb2};
-use crate::segment::StagedChunk;
+use crate::segment::{SegmentEntry, StagedChunk};
 
 const JOURNAL_VERSION: u32 = 1;
 /// Maximum number of total WAL records (live + tombstones) before we rewrite
@@ -63,6 +67,104 @@ pub struct JournalEntry {
     pub payload: JournalPayload,
 }
 
+/// A relay write request that has been durably staged in the local journal.
+/// Carried to the accelerator endpoint for atomic remote commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayWriteRequest {
+    pub idempotency_key: String,
+    pub client_id: String,
+    pub volume_prefix: String,
+    pub journal_sequence: u64,
+    pub segment_data: Vec<SegmentEntry>,
+    pub metadata_deltas: Vec<InodeRecord>,
+    pub expected_parent_generation: u64,
+}
+
+impl RelayWriteRequest {
+    pub fn new(
+        client_id: impl Into<String>,
+        volume_prefix: impl Into<String>,
+        journal_sequence: u64,
+        expected_parent_generation: u64,
+        segment_data: Vec<SegmentEntry>,
+        metadata_deltas: Vec<InodeRecord>,
+    ) -> Self {
+        let client_id = client_id.into();
+        let volume_prefix = volume_prefix.into();
+        let idempotency_key =
+            Self::derive_idempotency_key(&client_id, &volume_prefix, journal_sequence);
+        Self {
+            idempotency_key,
+            client_id,
+            volume_prefix,
+            journal_sequence,
+            segment_data,
+            metadata_deltas,
+            expected_parent_generation,
+        }
+    }
+
+    pub fn derive_idempotency_key(
+        client_id: &str,
+        volume_prefix: &str,
+        journal_sequence: u64,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(client_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(volume_prefix.as_bytes());
+        hasher.update([0]);
+        hasher.update(journal_sequence.to_string().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expected = Self::derive_idempotency_key(
+            &self.client_id,
+            &self.volume_prefix,
+            self.journal_sequence,
+        );
+        if self.idempotency_key != expected {
+            anyhow::bail!(
+                "relay write idempotency key mismatch for client={} volume_prefix={} sequence={}",
+                self.client_id,
+                self.volume_prefix,
+                self.journal_sequence
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Journal-durable state for a relay write that was submitted but not yet
+/// confirmed committed.  Written atomically to `journal/relay_pending.json`
+/// so recovery can re-submit or reconcile on restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPendingState {
+    pub request: RelayWriteRequest,
+    #[serde(default)]
+    pub committed_generation: Option<u64>,
+}
+
+impl RelayPendingState {
+    pub fn new(request: RelayWriteRequest) -> Self {
+        Self {
+            request,
+            committed_generation: None,
+        }
+    }
+
+    pub fn with_committed_generation(
+        request: RelayWriteRequest,
+        committed_generation: u64,
+    ) -> Self {
+        Self {
+            request,
+            committed_generation: Some(committed_generation),
+        }
+    }
+}
+
 // ── WAL state held under the lock ─────────────────────────────────────────
 
 struct WalState {
@@ -78,6 +180,8 @@ struct WalState {
 pub struct JournalManager {
     dir: PathBuf,
     wal_path: PathBuf,
+    relay_pending_path: PathBuf,
+    relay_pending_state: Mutex<Option<RelayPendingState>>,
     state: Mutex<WalState>,
 }
 
@@ -87,9 +191,15 @@ impl JournalManager {
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating journal dir {}", dir.display()))?;
         let wal_path = dir.join("wal.bin");
+        let relay_pending_path = dir.join("relay_pending.json");
+        let relay_pending_state = Mutex::new(Self::load_relay_pending_state_from_disk(
+            &relay_pending_path,
+        )?);
         Ok(Self {
             dir,
             wal_path,
+            relay_pending_path,
+            relay_pending_state,
             state: Mutex::new(WalState {
                 writer: None,
                 live_count: 0,
@@ -130,6 +240,35 @@ impl JournalManager {
             writer.flush().context("flushing WAL buffer")?;
             writer.get_ref().sync_data().context("fdatasync WAL file")?;
         }
+        self.sync_dir()
+    }
+
+    // ── Relay pending state ─────────────────────────────────────────────────
+
+    pub fn relay_pending_state(&self) -> Option<RelayPendingState> {
+        self.relay_pending_state.lock().clone()
+    }
+
+    pub fn store_relay_pending_state(&self, state: RelayPendingState) -> Result<()> {
+        self.write_relay_pending_state(&state)?;
+        *self.relay_pending_state.lock() = Some(state);
+        Ok(())
+    }
+
+    pub fn mark_relay_committed(&self, committed_generation: u64) -> Result<()> {
+        let mut guard = self.relay_pending_state.lock();
+        let Some(mut state) = guard.clone() else {
+            return Ok(());
+        };
+        state.committed_generation = Some(committed_generation);
+        self.write_relay_pending_state(&state)?;
+        *guard = Some(state);
+        Ok(())
+    }
+
+    pub fn clear_relay_pending_state(&self) -> Result<()> {
+        let _ = fs::remove_file(&self.relay_pending_path);
+        *self.relay_pending_state.lock() = None;
         self.sync_dir()
     }
 
@@ -308,6 +447,44 @@ impl JournalManager {
             .with_context(|| format!("opening journal dir {}", self.dir.display()))?;
         dir.sync_all()
             .with_context(|| format!("syncing journal dir {}", self.dir.display()))
+    }
+
+    fn load_relay_pending_state_from_disk(
+        relay_pending_path: &Path,
+    ) -> Result<Option<RelayPendingState>> {
+        if !relay_pending_path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(relay_pending_path)
+            .with_context(|| format!("reading {}", relay_pending_path.display()))?;
+        let state: RelayPendingState = serde_json::from_slice(&raw)
+            .with_context(|| format!("decoding {}", relay_pending_path.display()))?;
+        Ok(Some(state))
+    }
+
+    fn write_relay_pending_state(&self, state: &RelayPendingState) -> Result<()> {
+        let tmp_path = self.relay_pending_path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(state).context("encoding relay pending state")?;
+        {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .with_context(|| format!("opening {}", tmp_path.display()))?;
+            file.write_all(&bytes)
+                .with_context(|| format!("writing {}", tmp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing {}", tmp_path.display()))?;
+        }
+        fs::rename(&tmp_path, &self.relay_pending_path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                tmp_path.display(),
+                self.relay_pending_path.display()
+            )
+        })?;
+        self.sync_dir()
     }
 }
 
