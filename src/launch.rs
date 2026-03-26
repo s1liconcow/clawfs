@@ -62,7 +62,7 @@ pub fn run_mount_entry(config: Config, args: &[OsString]) -> Result<()> {
 }
 
 #[cfg(feature = "fuse")]
-fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
+pub fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
     let existing_mounts = current_mount_count(mount_path);
     if existing_mounts > 0 {
         anyhow::bail!(
@@ -126,7 +126,7 @@ fn spawn_background_mount(args: &[OsString], mount_path: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "fuse")]
-fn current_mount_count(mount_path: &Path) -> usize {
+pub fn current_mount_count(mount_path: &Path) -> usize {
     #[cfg(target_os = "linux")]
     {
         let mount_str = mount_path.to_string_lossy();
@@ -142,7 +142,7 @@ fn current_mount_count(mount_path: &Path) -> usize {
 }
 
 #[cfg(feature = "fuse")]
-fn count_mounts_for_target(contents: &str, mount_target: &str, field_index: usize) -> usize {
+pub fn count_mounts_for_target(contents: &str, mount_target: &str, field_index: usize) -> usize {
     contents
         .lines()
         .filter_map(|line| line.split_whitespace().nth(field_index))
@@ -358,7 +358,7 @@ fn run_mount(mut config: Config) -> Result<()> {
     Ok(())
 }
 
-fn log_boot_config(config: &Config, allow_other: bool) {
+pub fn log_boot_config(config: &Config, allow_other: bool) {
     info!(
         target: "startup",
         "fs_boot_config {}",
@@ -411,7 +411,7 @@ fn log_boot_config(config: &Config, allow_other: bool) {
     );
 }
 
-fn ensure_root(
+pub fn ensure_root(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,
     superblock: Arc<SuperblockManager>,
@@ -484,7 +484,7 @@ fn ensure_root(
     Ok(())
 }
 
-fn ensure_welcome_file(
+pub fn ensure_welcome_file(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,
     superblock: Arc<SuperblockManager>,
@@ -539,7 +539,7 @@ fn ensure_welcome_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ensure_directory_path(
+pub fn ensure_directory_path(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,
     superblock: Arc<SuperblockManager>,
@@ -655,7 +655,7 @@ impl Write for TracingWriter {
     }
 }
 
-fn ignore_broken_pipe(result: std::io::Result<()>) -> std::io::Result<()> {
+pub fn ignore_broken_pipe(result: std::io::Result<()>) -> std::io::Result<()> {
     match result {
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         other => other,
@@ -692,7 +692,7 @@ pub(crate) fn init_logging(log_path: Option<&Path>, force_debug: bool) -> Result
     Ok(())
 }
 
-fn spawn_metadata_poller(
+pub fn spawn_metadata_poller(
     handle: Handle,
     metadata: Arc<MetadataStore>,
     segments: Arc<SegmentManager>,
@@ -807,6 +807,7 @@ fn spawn_cleanup_worker(
     });
 }
 
-fn sanitize_error(error: String) -> String {
-    error.trim().to_string()
+pub fn sanitize_error(error: String) -> String {
+    let first_line = error.lines().next().unwrap_or("unknown error").trim();
+    first_line.chars().take(160).collect()
 }
