@@ -130,7 +130,7 @@ pub struct Cli {
     pub shard_size: u64,
 
     /// Number of inode numbers to reserve per allocation.
-    #[arg(long, default_value_t = 1280)]
+    #[arg(long, default_value_t = 8192)]
     pub inode_batch: u64,
 
     /// Number of segment ids to reserve per allocation.

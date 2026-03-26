@@ -4014,6 +4014,179 @@ fn readdir_batch_large_directory() {
     }
 }
 
+#[test]
+fn shared_state_clients_do_not_reuse_inodes_or_flip_types() {
+    let dir = tempdir().unwrap();
+    let shared_state = "shared-client-state.bin";
+    let writer_a = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+    let writer_b = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+
+    let dir_a = writer_a.fs.op_mkdir(ROOT_INODE, "include", 0, 0).unwrap();
+    let file_b = writer_b
+        .fs
+        .op_create(ROOT_INODE, "hci_core.c", 0, 0)
+        .unwrap();
+    writer_b
+        .fs
+        .op_write(file_b.inode, 0, b"int main(void) { return 0; }\n")
+        .unwrap();
+
+    assert_ne!(
+        dir_a.inode, file_b.inode,
+        "directory and file created by shared-state clients must not reuse the same inode",
+    );
+
+    let dt_bindings = writer_a
+        .fs
+        .op_mkdir(dir_a.inode, "dt-bindings", 0, 0)
+        .unwrap();
+    let (header, _) = writer_a
+        .fs
+        .op_create_fuse(dt_bindings.inode, "input.h", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    writer_a
+        .fs
+        .op_write(header.inode, 0, b"#define BTN_LEFT 0x110\n")
+        .unwrap();
+
+    writer_a.fs.flush_pending().unwrap();
+    writer_b.fs.flush_pending().unwrap();
+
+    let reader = TestHarness::with_config(dir.path(), "shared-reader-state.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+
+    let include = reader.fs.load_inode(dir_a.inode).unwrap();
+    assert!(
+        include.is_dir(),
+        "include inode must remain a directory after reload"
+    );
+    let include_children = include.children().unwrap();
+    let dt_bindings_ino = *include_children
+        .get("dt-bindings")
+        .expect("include must keep dt-bindings child");
+
+    let dt_bindings_record = reader.fs.load_inode(dt_bindings_ino).unwrap();
+    assert!(
+        dt_bindings_record.is_dir(),
+        "dt-bindings inode must remain a directory after shared-state flush/reload",
+    );
+
+    let file_record = reader.fs.load_inode(file_b.inode).unwrap();
+    assert!(
+        matches!(file_record.kind, InodeKind::File),
+        "shared-state file inode must remain a regular file after reload",
+    );
+    let file_data = reader
+        .fs
+        .op_read(file_b.inode, 0, file_record.size as u32)
+        .unwrap();
+    assert_eq!(file_data, b"int main(void) { return 0; }\n");
+}
+
+#[test]
+fn shared_state_clients_preserve_directory_tree_during_disjoint_writes() {
+    let dir = tempdir().unwrap();
+    let shared_state = "shared-kernel-state.bin";
+    let tree_builder = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+        cfg.inline_compression = true;
+    });
+    let file_writer = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+        cfg.inline_compression = true;
+    });
+
+    let include = tree_builder
+        .fs
+        .op_mkdir(ROOT_INODE, "include", 0, 0)
+        .unwrap();
+    let linux = tree_builder
+        .fs
+        .op_mkdir(include.inode, "linux", 0, 0)
+        .unwrap();
+    let dt_bindings = tree_builder
+        .fs
+        .op_mkdir(include.inode, "dt-bindings", 0, 0)
+        .unwrap();
+    let input = tree_builder
+        .fs
+        .op_mkdir(dt_bindings.inode, "input", 0, 0)
+        .unwrap();
+    let (header, _) = tree_builder
+        .fs
+        .op_create_fuse(linux.inode, "uprobes.h", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    tree_builder
+        .fs
+        .op_write(header.inode, 0, b"/* kernel header */\n")
+        .unwrap();
+
+    let writer_root = file_writer.fs.op_mkdir(ROOT_INODE, "net", 0, 0).unwrap();
+    let bluetooth = file_writer
+        .fs
+        .op_mkdir(writer_root.inode, "bluetooth", 0, 0)
+        .unwrap();
+    let (source, _) = file_writer
+        .fs
+        .op_create_fuse(bluetooth.inode, "hci_core.c", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    for _ in 0..8 {
+        file_writer
+            .fs
+            .op_write(source.inode, source.inode % 7, b"0123456789abcdef")
+            .unwrap();
+    }
+
+    tree_builder.fs.flush_pending().unwrap();
+    file_writer.fs.flush_pending().unwrap();
+
+    let reloader =
+        TestHarness::with_config(dir.path(), "shared-kernel-reload.bin", 1 << 20, |cfg| {
+            cfg.disable_journal = true;
+            cfg.lookup_cache_ttl_ms = 0;
+            cfg.dir_cache_ttl_ms = 0;
+            cfg.inline_compression = true;
+        });
+
+    let include_reload = reloader.fs.load_inode(include.inode).unwrap();
+    let include_children = include_reload.children().unwrap();
+    assert!(
+        include_children.contains_key("dt-bindings"),
+        "include must still contain dt-bindings after disjoint shared-state writes",
+    );
+    let dt_bindings_reload = reloader.fs.load_inode(dt_bindings.inode).unwrap();
+    assert!(
+        dt_bindings_reload.is_dir(),
+        "dt-bindings must still be a directory"
+    );
+    let input_reload = reloader.fs.load_inode(input.inode).unwrap();
+    assert!(
+        input_reload.is_dir(),
+        "dt-bindings/input must still be a directory"
+    );
+
+    let source_reload = reloader.fs.load_inode(source.inode).unwrap();
+    assert!(
+        matches!(source_reload.kind, InodeKind::File),
+        "disjoint writer inode must remain a file",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Coordination publisher tests
 // ---------------------------------------------------------------------------

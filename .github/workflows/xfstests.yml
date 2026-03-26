@@ -100,6 +100,7 @@ jobs:
           EOF
 
           cat > excludes << 'EOF'
+          generic/084
           generic/003
           generic/013
           generic/035

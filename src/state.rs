@@ -88,6 +88,7 @@ impl ClientStateManager {
         F: FnMut(u64) -> Result<u64>,
     {
         self.next_id(
+            "inode",
             |state| (&mut state.inode_next, &mut state.inode_remaining),
             batch,
             reserve,
@@ -99,6 +100,7 @@ impl ClientStateManager {
         F: FnMut(u64) -> Result<u64>,
     {
         self.next_id(
+            "segment",
             |state| (&mut state.segment_next, &mut state.segment_remaining),
             batch,
             reserve,
@@ -106,55 +108,76 @@ impl ClientStateManager {
     }
 
     pub fn reconcile_with_minimums(&self, min_inode: u64, min_segment: u64) -> Result<()> {
-        let mut guard = self.state.lock();
+        let mut state_guard = self.state.lock();
+        let _lock = self.lock_file()?;
+        let mut disk_state = self.load_state_from_disk_locked()?;
         let mut changed = false;
-        if guard.inode_next < min_inode {
-            guard.inode_next = min_inode;
-            guard.inode_remaining = 0;
+        if disk_state.inode_next < min_inode {
+            disk_state.inode_next = min_inode;
+            disk_state.inode_remaining = 0;
             changed = true;
         }
-        if guard.segment_next < min_segment {
-            guard.segment_next = min_segment;
-            guard.segment_remaining = 0;
+        if disk_state.segment_next < min_segment {
+            disk_state.segment_next = min_segment;
+            disk_state.segment_remaining = 0;
             changed = true;
         }
         if changed {
-            self.persist_locked(&guard)?;
+            self.persist_state_locked(&disk_state)?;
         }
+        *state_guard = disk_state;
         Ok(())
     }
 
-    fn next_id<F, G>(&self, selector: F, batch: u64, mut reserve: G) -> Result<u64>
+    fn next_id<F, G>(
+        &self,
+        kind: &'static str,
+        selector: F,
+        batch: u64,
+        mut reserve: G,
+    ) -> Result<u64>
     where
         F: Fn(&mut ClientState) -> (&mut u64, &mut u64),
         G: FnMut(u64) -> Result<u64>,
     {
-        loop {
-            let mut guard = self.state.lock();
-            let (next, remaining) = selector(&mut guard);
-            if *remaining > 0 {
-                let id = *next;
-                *next += 1;
-                *remaining -= 1;
-                self.persist_locked(&guard)?;
-                return Ok(id);
-            }
-            let count = batch.max(1);
-            drop(guard);
+        let mut state_guard = self.state.lock();
+        let _lock = self.lock_file()?;
+        let mut disk_state = self.load_state_from_disk_locked()?;
+        let count = batch.max(1);
+        let client_id = disk_state.client_id.clone();
+        let (next, remaining) = selector(&mut disk_state);
+
+        if *remaining == 0 {
             let start = reserve(count)?;
-            let mut guard = self.state.lock();
-            let (next, remaining) = selector(&mut guard);
-            if *remaining == 0 {
-                *next = start;
-                *remaining = count;
-            }
-            // loop to consume newly filled pool
+            *next = start;
+            *remaining = count;
+            log::debug!(
+                "client_state reserve kind={} start={} count={} client_id={}",
+                kind,
+                start,
+                count,
+                client_id
+            );
         }
+
+        let id = *next;
+        *next += 1;
+        *remaining -= 1;
+        log::debug!(
+            "client_state consume kind={} id={} next={} remaining={} client_id={}",
+            kind,
+            id,
+            *next,
+            *remaining,
+            client_id
+        );
+        self.persist_state_locked(&disk_state)?;
+        *state_guard = disk_state;
+        Ok(id)
     }
 
-    fn persist_locked(&self, state: &ClientState) -> Result<()> {
+    fn persist_state_locked(&self, state: &ClientState) -> Result<()> {
         let data = serialize_state_fb(state);
-        let _lock = self.lock_file()?;
         let tmp_path = self.path.with_extension("tmp");
         {
             let mut file = File::create(&tmp_path)?;
@@ -175,6 +198,23 @@ impl ClientStateManager {
             .with_context(|| format!("opening client state lock {}", self.lock_path.display()))?;
         lock_file_exclusive(&file, &self.lock_path)?;
         Ok(file)
+    }
+
+    fn load_state_from_disk_locked(&self) -> Result<ClientState> {
+        if self.path.exists() {
+            let mut buf = Vec::new();
+            File::open(&self.path)
+                .with_context(|| format!("opening client state {}", self.path.display()))?
+                .read_to_end(&mut buf)?;
+            deserialize_state_fb(&buf).with_context(|| "parsing client state")
+        } else {
+            let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating client state dir {}", parent.display()))?;
+            let state = ClientState::default();
+            self.persist_state_locked(&state)?;
+            Ok(state)
+        }
     }
 }
 
@@ -294,5 +334,71 @@ mod tests {
         // Reconciliation should force a fresh reservation from new minimums.
         assert_eq!(manager.next_inode_id(4, |_| Ok(500)).unwrap(), 500);
         assert_eq!(manager.next_segment_id(4, |_| Ok(600)).unwrap(), 600);
+    }
+
+    #[test]
+    fn two_instances_sharing_state_file_do_not_reuse_inode_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shared-state.bin");
+
+        let manager_a = ClientStateManager::load(&path).unwrap();
+        assert_eq!(manager_a.next_inode_id(4, |_| Ok(100)).unwrap(), 100);
+
+        let manager_b = ClientStateManager::load(&path).unwrap();
+
+        let a_second = manager_a.next_inode_id(4, |_| Ok(200)).unwrap();
+        let b_first = manager_b.next_inode_id(4, |_| Ok(300)).unwrap();
+        let a_third = manager_a.next_inode_id(4, |_| Ok(400)).unwrap();
+        let b_second = manager_b.next_inode_id(4, |_| Ok(500)).unwrap();
+
+        assert_eq!(a_second, 101);
+        assert_eq!(b_first, 102);
+        assert_eq!(a_third, 103);
+        assert!(
+            b_second > a_third,
+            "refilled range must advance past live ids"
+        );
+    }
+
+    #[test]
+    fn two_instances_sharing_state_file_do_not_reuse_segment_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shared-state.bin");
+
+        let manager_a = ClientStateManager::load(&path).unwrap();
+        assert_eq!(manager_a.next_segment_id(4, |_| Ok(700)).unwrap(), 700);
+
+        let manager_b = ClientStateManager::load(&path).unwrap();
+
+        let a_second = manager_a.next_segment_id(4, |_| Ok(800)).unwrap();
+        let b_first = manager_b.next_segment_id(4, |_| Ok(900)).unwrap();
+        let a_third = manager_a.next_segment_id(4, |_| Ok(1000)).unwrap();
+        let b_second = manager_b.next_segment_id(4, |_| Ok(1100)).unwrap();
+
+        assert_eq!(a_second, 701);
+        assert_eq!(b_first, 702);
+        assert_eq!(a_third, 703);
+        assert!(
+            b_second > a_third,
+            "refilled range must advance past live ids"
+        );
+    }
+
+    #[test]
+    fn reconcile_under_shared_state_reloads_instead_of_clobbering_live_pool() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shared-state.bin");
+
+        let manager_a = ClientStateManager::load(&path).unwrap();
+        assert_eq!(manager_a.next_inode_id(4, |_| Ok(100)).unwrap(), 100);
+
+        let manager_b = ClientStateManager::load(&path).unwrap();
+
+        assert_eq!(manager_a.next_inode_id(4, |_| Ok(200)).unwrap(), 101);
+
+        manager_b.reconcile_with_minimums(101, 0).unwrap();
+
+        assert_eq!(manager_b.next_inode_id(4, |_| Ok(300)).unwrap(), 102);
+        assert_eq!(manager_a.next_inode_id(4, |_| Ok(400)).unwrap(), 103);
     }
 }
