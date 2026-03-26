@@ -218,6 +218,20 @@ impl SuperblockManager {
         .await
     }
 
+    /// Accept a generation that was committed by an external party (e.g. the
+    /// relay server).  Reloads the on-disk superblock to get the current
+    /// version, then clears the local `pending_generation` flag without
+    /// writing to object storage.  The local superblock state is authoritative
+    /// after the reload.
+    pub async fn accept_externally_committed_generation(&self, generation: u64) -> Result<()> {
+        self.reload().await?;
+        let mut guard = self.state.lock();
+        if guard.pending_generation == Some(generation) {
+            guard.pending_generation = None;
+        }
+        Ok(())
+    }
+
     pub async fn commit_generation(&self, generation: u64) -> Result<()> {
         self.commit_generation_idempotent(generation, None).await
     }

@@ -85,10 +85,12 @@ pub struct OsageFs {
     lookup_cache_ttl: Duration,
     dir_cache_ttl: Duration,
     journal: Option<Arc<JournalManager>>,
+    flush_commit_hook: Arc<std::sync::OnceLock<Arc<dyn flush::FlushCommitHook>>>,
 }
 
 mod core;
 mod flush;
+pub use flush::{FlushCommitDecision, FlushCommitHook};
 #[cfg(feature = "fuse")]
 mod fuse;
 mod nfs;

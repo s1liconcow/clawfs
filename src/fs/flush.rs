@@ -1,6 +1,52 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+/// Decision returned by a [`FlushCommitHook`] after `pre_commit`.
+pub enum FlushCommitDecision {
+    /// Use the standard direct write path (`persist_inodes_batch` + sync + commit).
+    Direct,
+    /// The hook already committed on behalf of this client.
+    /// `generation` is the committed superblock generation.
+    Committed(u64),
+    /// Abort this flush with `EIO`.
+    Abort,
+}
+
+/// Extension hook called during the flush commit pipeline.
+///
+/// Implementors may route the commit through an alternate path (e.g. a relay
+/// server) and signal back the outcome via [`FlushCommitDecision`].  When
+/// `pre_commit` returns `Committed`, the core flush logic skips
+/// `persist_inodes_batch` / `sync_metadata_writes` / `commit_generation` and
+/// instead accepts the relay-committed generation via the superblock manager.
+///
+/// All methods are synchronous; use `tokio::task::block_in_place` (or the
+/// provided `handle`) to bridge async operations if needed.
+pub trait FlushCommitHook: Send + Sync {
+    /// Called after segments are written and storage pointers merged into
+    /// `records`, but before metadata is persisted locally.
+    ///
+    /// `segment_entries` is a clone of the entries that were passed to
+    /// `write_batch` (captured before the write loop so the hook can build a
+    /// relay request containing the raw segment data).
+    fn pre_commit(
+        &self,
+        target_generation: u64,
+        segment_entries: Vec<SegmentEntry>,
+        records: &[InodeRecord],
+        journal: Option<&Arc<JournalManager>>,
+        handle: &Handle,
+    ) -> FlushCommitDecision;
+
+    /// Called after a successful direct-path `commit_generation`.
+    /// Used by relay implementations to handle fallback-to-direct cleanup.
+    fn on_direct_commit(&self, committed_generation: u64, journal: Option<&Arc<JournalManager>>);
+
+    /// Called at the end of flush finalization (after per-inode journal clears).
+    /// Used by relay implementations to clear persistent relay state.
+    fn on_finalize(&self, committed_generation: u64, journal: Option<&Arc<JournalManager>>);
+}
+
 impl OsageFs {
     // Bound per-object segment serialization working set during flush. We keep
     // each write_batch call under this approximate payload budget and emit
@@ -201,6 +247,19 @@ impl OsageFs {
             let target_generation = snapshot.generation;
             let prepare_duration = prepare_start.elapsed();
             prepared_generation = Some(target_generation);
+            // If relay is required by the superblock but no hook is installed,
+            // the direct write path would bypass the relay server — fail closed.
+            if snapshot.relay_required && self.flush_commit_hook.get().is_none() {
+                log::error!(
+                    "flush_pending relay_required=true but no FlushCommitHook installed; refusing direct write pid={} tid={} scope={}",
+                    pid,
+                    tid,
+                    scope
+                );
+                self.superblock.abort_generation(target_generation);
+                prepared_generation = None;
+                return Err(EIO);
+            }
             let mut segment_entries = Vec::new();
             let mut segment_data_inodes = HashSet::new();
             // Map from inode -> base committed extents captured when pending data
@@ -366,6 +425,14 @@ impl OsageFs {
                 }
             }
             let classify_duration = classify_start.elapsed();
+            // Capture a clone of segment entries for any installed FlushCommitHook before
+            // write_batch consumes them.  Only clones when a hook is present.
+            let hook_segment_entries: Vec<SegmentEntry> = if self.flush_commit_hook.get().is_some()
+            {
+                segment_entries.clone()
+            } else {
+                Vec::new()
+            };
             let mut pointer_map: HashMap<u64, Vec<SegmentExtent>> = HashMap::new();
             let mut segment_id_logged = None;
             let mut segment_write_duration = Duration::from_secs(0);
@@ -504,33 +571,66 @@ impl OsageFs {
                 }
             }
             let merge_duration = merge_start.elapsed();
-            let persist_only_start = Instant::now();
-            self.block_on(self.metadata.persist_inodes_batch(
-                records,
-                target_generation,
-                self.config.shard_size,
-                self.config.imap_delta_batch,
-            ))
-            .map_err(|err| {
-                log::error!(
-                    "flush_pending metadata persist failed pid={} tid={} scope={} gen={} err={err:?}",
-                    pid,
-                    tid,
-                    scope,
-                    target_generation
-                );
-                EIO
-            })?;
-            let persist_only_duration = persist_only_start.elapsed();
-            // Flush all shard/delta writes to disk with a single directory
-            // fsync on each metadata subdirectory before advancing the
-            // superblock.  This replaces per-file fsyncs inside write_shard /
-            // write_delta, reducing O(N) fsyncs to O(2) per flush cycle.
-            let sync_metadata_start = Instant::now();
-            self.block_on(self.metadata.sync_metadata_writes())
+
+            // --- FlushCommitHook: called after segments are written and storage
+            // pointers are merged into records, before metadata is persisted.
+            let hook = self.flush_commit_hook.get().cloned();
+            let hook_decision = if let Some(ref h) = hook {
+                h.pre_commit(
+                    target_generation,
+                    hook_segment_entries,
+                    &records,
+                    self.journal.as_ref(),
+                    &self.handle,
+                )
+            } else {
+                FlushCommitDecision::Direct
+            };
+            let relay_committed_gen: Option<u64> = match hook_decision {
+                FlushCommitDecision::Committed(relay_gen) => Some(relay_gen),
+                FlushCommitDecision::Abort => return Err(EIO),
+                FlushCommitDecision::Direct => None,
+            };
+
+            let persist_only_duration;
+            let sync_metadata_duration;
+            let metadata_duration;
+            let commit_duration;
+            let committed_gen: u64;
+
+            if let Some(relay_gen) = relay_committed_gen {
+                // Relay path: hook already committed on our behalf.  Accept the
+                // externally committed generation (reloads the superblock to get
+                // the current version) and skip the local persist/sync/commit.
+                self.block_on(self.superblock.accept_externally_committed_generation(relay_gen))
+                    .map_err(|err| {
+                        log::error!(
+                            "flush_pending accept_externally_committed_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                            pid,
+                            tid,
+                            scope,
+                            relay_gen
+                        );
+                        EIO
+                    })?;
+                prepared_generation = None;
+                committed_gen = relay_gen;
+                persist_only_duration = Duration::ZERO;
+                sync_metadata_duration = Duration::ZERO;
+                metadata_duration = Duration::ZERO;
+                commit_duration = Duration::ZERO;
+            } else {
+                // Direct path: persist metadata locally, sync, and commit.
+                let persist_only_start = Instant::now();
+                self.block_on(self.metadata.persist_inodes_batch(
+                    records,
+                    target_generation,
+                    self.config.shard_size,
+                    self.config.imap_delta_batch,
+                ))
                 .map_err(|err| {
                     log::error!(
-                        "flush_pending sync_metadata_writes failed pid={} tid={} scope={} gen={} err={err:?}",
+                        "flush_pending metadata persist failed pid={} tid={} scope={} gen={} err={err:?}",
                         pid,
                         tid,
                         scope,
@@ -538,63 +638,86 @@ impl OsageFs {
                     );
                     EIO
                 })?;
-            let sync_metadata_duration = sync_metadata_start.elapsed();
-            let metadata_duration = persist_start.elapsed();
-            let commit_start = Instant::now();
-            if self
-                .block_on(self.superblock.commit_generation(target_generation))
-                .map_err(|err| {
-                    log::error!(
-                        "flush_pending commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
-                        pid,
-                        tid,
-                        scope,
-                        target_generation
-                    );
-                    err
-                })
-                .is_err()
-            {
-                self.superblock.abort_generation(target_generation);
+                persist_only_duration = persist_only_start.elapsed();
+                // Flush all shard/delta writes to disk with a single directory
+                // fsync on each metadata subdirectory before advancing the
+                // superblock.  This replaces per-file fsyncs inside write_shard /
+                // write_delta, reducing O(N) fsyncs to O(2) per flush cycle.
+                let sync_metadata_start = Instant::now();
+                self.block_on(self.metadata.sync_metadata_writes())
+                    .map_err(|err| {
+                        log::error!(
+                            "flush_pending sync_metadata_writes failed pid={} tid={} scope={} gen={} err={err:?}",
+                            pid,
+                            tid,
+                            scope,
+                            target_generation
+                        );
+                        EIO
+                    })?;
+                sync_metadata_duration = sync_metadata_start.elapsed();
+                metadata_duration = persist_start.elapsed();
+                let commit_start_inner = Instant::now();
+                if self
+                    .block_on(self.superblock.commit_generation(target_generation))
+                    .map_err(|err| {
+                        log::error!(
+                            "flush_pending commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                            pid,
+                            tid,
+                            scope,
+                            target_generation
+                        );
+                        err
+                    })
+                    .is_err()
+                {
+                    self.superblock.abort_generation(target_generation);
+                    prepared_generation = None;
+                    return Err(EIO);
+                }
                 prepared_generation = None;
-                return Err(EIO);
+                committed_gen = target_generation;
+                if let Some(ref h) = hook {
+                    h.on_direct_commit(committed_gen, self.journal.as_ref());
+                }
+                commit_duration = commit_start_inner.elapsed();
             }
-            prepared_generation = None;
-            let commit_duration = commit_start.elapsed();
 
             // Post-commit coordination event emission (advisory, fire-and-forget).
-            // Only emitted after the CAS-based commit_generation succeeds.
+            // Only emitted after the commit succeeds (direct or relay path).
             if let Some(publisher) = self.coordination_publisher.clone() {
                 use crate::coordination::{GenerationHint, InvalidationEvent, InvalidationScope};
                 let volume_prefix = self.config.object_prefix.clone();
                 let committer_id = self.client_state.client_id();
                 let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
                 let affected: Vec<u64> = flushed_inodes.clone();
+                let emit_gen = committed_gen;
                 self.handle.spawn(async move {
                     let hint = GenerationHint {
                         volume_prefix: volume_prefix.clone(),
-                        generation: target_generation,
+                        generation: emit_gen,
                         committer_id,
                         timestamp,
                     };
                     if let Err(err) = publisher.publish_generation_advance(hint).await {
                         tracing::warn!(
                             target: "coordination",
-                            generation = target_generation,
+                            generation = emit_gen,
                             err = %err,
                             "publish_generation_advance failed (advisory; commit already succeeded)"
                         );
                     }
                     let inv = InvalidationEvent {
                         volume_prefix,
-                        generation: target_generation,
+                        generation: emit_gen,
                         affected_inodes: Some(affected.clone()),
                         scope: InvalidationScope::Inodes(affected),
                     };
                     if let Err(err) = publisher.publish_invalidation(inv).await {
                         tracing::warn!(
                             target: "coordination",
-                            generation = target_generation,
+                            generation = emit_gen,
                             err = %err,
                             "publish_invalidation failed (advisory; commit already succeeded)"
                         );
@@ -678,13 +801,16 @@ impl OsageFs {
                 finalize_journal_clear_duration = journal_clear_start.elapsed();
             }
             let finalize_journal_phase_duration = finalize_journal_phase_start.elapsed();
+            if let Some(ref h) = hook {
+                h.on_finalize(committed_gen, self.journal.as_ref());
+            }
             let finalize_duration = finalize_start.elapsed();
             self.log_perf(
                 "flush_pending",
                 start.elapsed(),
                 json!({
                     "scope": scope,
-                    "target_generation": target_generation,
+                    "committed_generation": committed_gen,
                     "files": inline_files + segment_files,
                     "inline_files": inline_files,
                     "segment_files": segment_files,
@@ -723,7 +849,7 @@ impl OsageFs {
                 pid,
                 tid,
                 scope,
-                target_generation,
+                committed_gen,
                 inline_files,
                 segment_files,
                 metadata_only,

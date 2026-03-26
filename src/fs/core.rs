@@ -141,7 +141,12 @@ impl OsageFs {
             lookup_cache_ttl,
             dir_cache_ttl,
             journal,
+            flush_commit_hook: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    pub fn set_flush_commit_hook(&self, hook: Arc<dyn flush::FlushCommitHook>) {
+        let _ = self.flush_commit_hook.set(hook);
     }
 
     pub fn replay_journal(&self) -> Result<usize> {

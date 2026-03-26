@@ -34,10 +34,10 @@ impl Filesystem for OsageFs {
         // Allow deeper in-flight queues under fsync-heavy small-file workloads.
         let _ = config.set_max_background(1024);
         let _ = config.set_congestion_threshold(768);
-        let _ = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA);
         if self.config.writeback_cache {
             let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
         }
+        let _ = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA);
         if !self.mount_ready_emitted.swap(true, Ordering::AcqRel)
             && let Some(telemetry) = &self.telemetry
         {
@@ -170,7 +170,7 @@ impl Filesystem for OsageFs {
             Ok(record) => {
                 self.log_replay("fuse", "getattr", replay, None, json!({ "ino": ino }));
                 let attr = Self::record_attr(&record);
-                reply.attr(&self.fuse_attr_ttl(&record), &attr);
+                reply.attr(&self.fuse_attr_ttl_for_attr(&attr), &attr);
             }
             Err(code) => {
                 self.log_replay("fuse", "getattr", replay, Some(code), json!({ "ino": ino }));
