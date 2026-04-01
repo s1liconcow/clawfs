@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use object_store::{ObjectStore, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 
 use crate::clawfs;
 use crate::config::{Config, ObjectStoreProvider};
@@ -1485,11 +1487,11 @@ impl MetadataStore {
     }
 
     pub fn apply_external_deltas(&self) -> Result<Vec<InodeRecord>> {
-        self.handle.block_on(self.apply_external_deltas_async())
+        self.run_on_handle(self.apply_external_deltas_async())
     }
 
     pub fn delta_file_count(&self) -> Result<usize> {
-        self.handle.block_on(async {
+        self.run_on_handle(async {
             let prefix = self.delta_prefix();
             let mut count = 0;
             let mut stream = self.store.list(Some(&prefix));
@@ -1502,7 +1504,7 @@ impl MetadataStore {
     }
 
     pub fn prune_deltas(&self, keep: usize) -> Result<usize> {
-        self.handle.block_on(async {
+        self.run_on_handle(async {
             let prefix = self.delta_prefix();
             let mut files: Vec<(u64, ObjectPath)> = Vec::new();
 
@@ -1526,6 +1528,17 @@ impl MetadataStore {
             }
             Ok(removed)
         })
+    }
+
+    fn run_on_handle<F, T>(&self, fut: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        if Handle::try_current().is_ok() {
+            block_in_place(|| self.handle.block_on(fut))
+        } else {
+            self.handle.block_on(fut)
+        }
     }
 
     pub fn segment_candidates(&self, max: usize) -> Result<Vec<InodeRecord>> {
@@ -2286,5 +2299,81 @@ mod tests {
             FileStorage::Inline(bytes) => assert_eq!(bytes, b"newest!".to_vec()),
             other => panic!("expected inline storage from newest shard, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_delta_helpers_work_inside_tokio_runtime_without_nested_runtime_panics() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let runtime = Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let writer = MetadataStore::new(&config, runtime.handle().clone())
+                .await
+                .unwrap();
+            let inode_v1 = InodeRecord::new_file(
+                77,
+                ROOT_INODE,
+                "runtime-safe.txt".to_string(),
+                "/runtime-safe.txt".to_string(),
+                1000,
+                1000,
+            );
+            writer
+                .write_delta_ref(1, std::slice::from_ref(&inode_v1))
+                .await
+                .unwrap();
+
+            let reader = MetadataStore::new(&config, runtime.handle().clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                reader
+                    .delta_file_count()
+                    .expect("delta count should work inside tokio"),
+                1
+            );
+            assert_eq!(
+                reader
+                    .apply_external_deltas()
+                    .expect("delta replay should work inside tokio")
+                    .len(),
+                0
+            );
+            let mut inode_v2 = inode_v1.clone();
+            inode_v2.size = 12;
+            inode_v2.storage = FileStorage::Inline(b"runtime-safe".to_vec());
+
+            writer.write_delta_ref(2, &[inode_v2.clone()]).await.unwrap();
+
+            assert_eq!(
+                reader
+                    .delta_file_count()
+                    .expect("delta count should see newly written deltas"),
+                2
+            );
+
+            let updated = reader
+                .apply_external_deltas()
+                .expect("delta replay should not panic inside tokio");
+            assert_eq!(updated.len(), 1);
+            assert!(
+                updated.iter().any(|record| record.inode == inode_v2.inode
+                    && matches!(&record.storage, FileStorage::Inline(bytes) if bytes == b"runtime-safe")),
+                "expected replayed inode payload to be visible after runtime-safe delta replay"
+            );
+
+            let pruned = reader
+                .prune_deltas(1)
+                .expect("delta pruning should not panic inside tokio");
+            assert_eq!(pruned, 1);
+            assert_eq!(
+                reader
+                    .delta_file_count()
+                    .expect("delta count should reflect pruning inside tokio"),
+                1
+            );
+        });
     }
 }
