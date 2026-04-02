@@ -166,9 +166,15 @@ impl Filesystem for OsageFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let replay = self.replay_start();
-        match self.op_getattr(ino) {
+        match self.load_inode_for_fuse_getattr(ino) {
             Ok(record) => {
-                self.log_replay("fuse", "getattr", replay, None, json!({ "ino": ino }));
+                self.log_replay(
+                    "fuse",
+                    "getattr",
+                    replay,
+                    None,
+                    json!({ "ino": ino, "size": record.size }),
+                );
                 let attr = Self::record_attr(&record);
                 reply.attr(&self.fuse_attr_ttl_for_attr(&attr), &attr);
             }
@@ -430,7 +436,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "flags": flags }),
                 );
-                reply.opened(0, 0)
+                reply.opened(flags as u32 as u64, fuser::consts::FOPEN_DIRECT_IO)
             }
             Err(code) => {
                 self.log_replay(
@@ -514,16 +520,45 @@ impl Filesystem for OsageFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         let replay = self.replay_start();
-        let res = self.op_write(ino, offset as u64, data);
+        let open_flags = flags | (fh as u32 as i32);
+        let effective_offset = if open_flags & libc::O_APPEND != 0 {
+            match self.load_inode_for_fuse_getattr(ino) {
+                Ok(record) => record.size,
+                Err(code) => {
+                    self.log_replay(
+                        "fuse",
+                        "write",
+                        replay,
+                        Some(code),
+                        json!({ "ino": ino, "offset": offset, "effective_offset": serde_json::Value::Null, "len": data.len(), "flags": flags, "fh": fh, "open_flags": open_flags }),
+                    );
+                    let detail = format!(
+                        "ino={} offset={} len={} flags={} fh={} open_flags={}",
+                        ino,
+                        offset,
+                        data.len(),
+                        flags,
+                        fh,
+                        open_flags
+                    );
+                    self.log_fuse_error("write", &detail, code);
+                    reply.error(code);
+                    return;
+                }
+            }
+        } else {
+            offset as u64
+        };
+        let res = self.op_write(ino, effective_offset, data);
         match res {
             Ok(size) => {
                 self.log_replay(
@@ -531,7 +566,7 @@ impl Filesystem for OsageFs {
                     "write",
                     replay,
                     None,
-                    json!({ "ino": ino, "offset": offset, "len": data.len(), "written": size }),
+                    json!({ "ino": ino, "offset": offset, "effective_offset": effective_offset, "len": data.len(), "written": size, "flags": flags, "fh": fh, "open_flags": open_flags }),
                 );
                 reply.written(size)
             }
@@ -541,9 +576,18 @@ impl Filesystem for OsageFs {
                     "write",
                     replay,
                     Some(code),
-                    json!({ "ino": ino, "offset": offset, "len": data.len() }),
+                    json!({ "ino": ino, "offset": offset, "effective_offset": effective_offset, "len": data.len(), "flags": flags, "fh": fh, "open_flags": open_flags }),
                 );
-                let detail = format!("ino={} offset={} len={}", ino, offset, data.len());
+                let detail = format!(
+                    "ino={} offset={} effective_offset={} len={} flags={} fh={} open_flags={}",
+                    ino,
+                    offset,
+                    effective_offset,
+                    data.len(),
+                    flags,
+                    fh,
+                    open_flags
+                );
                 self.log_fuse_error("write", &detail, code);
                 reply.error(code);
             }

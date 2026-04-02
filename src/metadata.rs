@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
 
@@ -540,6 +543,76 @@ struct CacheEntry {
     generation: u64,
 }
 
+struct LocalSuperblockLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl LocalSuperblockLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating local superblock lock dir {}", parent.display())
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("opening local superblock lock {}", path.display()))?;
+        lock_file_exclusive(&file, path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File, path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(anyhow!(
+            "locking local superblock {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+impl Drop for LocalSuperblockLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            if result != 0 {
+                debug!(
+                    "unlocking local superblock {} failed: {}",
+                    self.path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+fn superblock_version(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
 #[derive(Clone)]
 struct ShardEntry {
     shard: InodeShard,
@@ -579,6 +652,7 @@ pub trait MetadataCacheHook: Send + Sync {
 pub struct MetadataStore {
     store: Arc<dyn ObjectStore>,
     root_prefix: String,
+    local_store_root: Option<PathBuf>,
     shard_size: u64,
     cache: DashMap<u64, CacheEntry>,
     shards: DashMap<u64, ShardEntry>,
@@ -608,6 +682,8 @@ impl MetadataStore {
         let store = Self {
             store,
             root_prefix: prefix,
+            local_store_root: (config.object_provider == ObjectStoreProvider::Local)
+                .then(|| config.store_path.clone()),
             shard_size: config.shard_size,
             cache: DashMap::new(),
             shards: DashMap::new(),
@@ -693,15 +769,9 @@ impl MetadataStore {
         let result = self.store.get(&path).await;
         match result {
             Ok(get_result) => {
-                let version = get_result.meta.e_tag.clone().unwrap_or_else(|| {
-                    get_result
-                        .meta
-                        .last_modified
-                        .timestamp_nanos_opt()
-                        .unwrap_or(0)
-                        .to_string()
-                });
+                let e_tag = get_result.meta.e_tag.clone();
                 let bytes = get_result.bytes().await?;
+                let version = e_tag.unwrap_or_else(|| superblock_version(&bytes));
                 let stored: StoredSuperblock = deserialize_metadata(&bytes)?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
@@ -770,15 +840,61 @@ impl MetadataStore {
                 Ok(put_result.e_tag.unwrap_or_default())
             }
             Err(object_store::Error::NotImplemented) => {
-                // Fallback for stores that don't support conditional put (like LocalFileSystem)
-                // Note: This loses atomicity guarantees in concurrent environments.
-                self.store_superblock(sb).await
+                self.store_superblock_conditional_local(sb, expected_version)
+                    .await
             }
             Err(e) => Err(anyhow::Error::from(e).context(format!(
                 "conditional put failed for superblock at version {}",
                 expected_version
             ))),
         }
+    }
+
+    async fn store_superblock_conditional_local(
+        &self,
+        sb: &Superblock,
+        expected_version: &str,
+    ) -> Result<String> {
+        let Some(lock_path) = self.local_superblock_lock_path() else {
+            return self.store_superblock(sb).await;
+        };
+        let _guard = LocalSuperblockLock::acquire(&lock_path)?;
+        let current = self.load_superblock().await?;
+        let current_version = current
+            .as_ref()
+            .map(|versioned| versioned.version.as_str())
+            .ok_or_else(|| anyhow!("conditional put failed for missing local superblock"))?;
+        if current_version != expected_version {
+            anyhow::bail!(
+                "conditional put failed for superblock at version {} (found {})",
+                expected_version,
+                current_version
+            );
+        }
+        self.store_superblock(sb).await?;
+        let version = self
+            .load_superblock()
+            .await?
+            .map(|versioned| versioned.version)
+            .ok_or_else(|| anyhow!("reloading local superblock after write returned None"))?;
+        Ok(version)
+    }
+
+    fn local_superblock_lock_path(&self) -> Option<PathBuf> {
+        let root = self.local_store_root.as_ref()?;
+        let mut path = root.clone();
+        if !self.root_prefix.is_empty() {
+            for segment in self
+                .root_prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
+                path.push(segment);
+            }
+        }
+        path.push("metadata");
+        path.push("superblock.lock");
+        Some(path)
     }
 
     pub async fn compare_and_swap_superblock(

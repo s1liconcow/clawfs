@@ -142,11 +142,23 @@ impl OsageFs {
             dir_cache_ttl,
             journal,
             flush_commit_hook: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "fuse")]
+            kernel_notifier: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     pub fn set_flush_commit_hook(&self, hook: Arc<dyn flush::FlushCommitHook>) {
         let _ = self.flush_commit_hook.set(hook);
+    }
+
+    #[cfg(feature = "fuse")]
+    pub fn set_kernel_notifier(&self, notifier: Arc<Notifier>) {
+        let _ = self.kernel_notifier.set(notifier);
+    }
+
+    #[cfg(feature = "fuse")]
+    pub fn kernel_notifier_slot(&self) -> Arc<std::sync::OnceLock<Arc<Notifier>>> {
+        self.kernel_notifier.clone()
     }
 
     pub fn replay_journal(&self) -> Result<usize> {
@@ -399,6 +411,45 @@ impl OsageFs {
         }
         debug!(
             "load_inode miss ino={} active={}",
+            ino,
+            self.active_inodes.contains_key(&ino)
+        );
+        Err(ENOENT)
+    }
+
+    #[cfg(feature = "fuse")]
+    pub(crate) fn load_inode_for_fuse_getattr(
+        &self,
+        ino: u64,
+    ) -> std::result::Result<InodeRecord, i32> {
+        if let Some(result) = self.load_inode_in_memory(ino) {
+            return result;
+        }
+        let fetched = self.block_on(self.metadata.get_inode_with_ttl(
+            ino,
+            Duration::ZERO,
+            self.dir_cache_ttl,
+        ));
+        let fetched = match fetched {
+            Ok(record) => record,
+            Err(err) => {
+                error!(
+                    "load_inode_for_fuse_getattr metadata error ino={} active={} err={:#}",
+                    ino,
+                    self.active_inodes.contains_key(&ino),
+                    err
+                );
+                return Err(EIO);
+            }
+        };
+        if let Some(record) = fetched {
+            return Ok(record);
+        }
+        if let Some(result) = self.load_inode_in_memory(ino) {
+            return result;
+        }
+        debug!(
+            "load_inode_for_fuse_getattr miss ino={} active={}",
             ino,
             self.active_inodes.contains_key(&ino)
         );

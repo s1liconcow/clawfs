@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 #[cfg(feature = "fuse")]
-use fuser::MountOption;
+use fuser::{MountOption, Notifier};
 use log::{info, warn};
 use serde_json::json;
 #[cfg(unix)]
@@ -184,15 +184,8 @@ fn run_mount(mut config: Config) -> Result<()> {
     ))?);
     ensure_root(&runtime, metadata.clone(), superblock.clone(), &config)?;
 
-    if config.metadata_poll_interval_ms > 0 {
-        let poll_interval = Duration::from_millis(config.metadata_poll_interval_ms);
-        spawn_metadata_poller(
-            handle.clone(),
-            metadata.clone(),
-            segments.clone(),
-            poll_interval,
-        );
-    }
+    let poll_interval = (config.metadata_poll_interval_ms > 0)
+        .then(|| Duration::from_millis(config.metadata_poll_interval_ms));
 
     let client_state = Arc::new(ClientStateManager::load(&config.state_path)?);
     let superblock_snapshot = superblock.snapshot();
@@ -281,10 +274,10 @@ fn run_mount(mut config: Config) -> Result<()> {
         config.clone(),
         metadata.clone(),
         superblock.clone(),
-        segments,
+        segments.clone(),
         source,
         journal,
-        handle,
+        handle.clone(),
         client_state,
         perf_logger,
         replay_logger,
@@ -292,6 +285,7 @@ fn run_mount(mut config: Config) -> Result<()> {
         telemetry_session_id.clone(),
         None,
     );
+    let notifier_slot = fs.kernel_notifier_slot();
 
     let replayed = fs.replay_journal()?;
     if replayed > 0 {
@@ -325,11 +319,25 @@ fn run_mount(mut config: Config) -> Result<()> {
         fuse_threads,
         config.writeback_cache,
     );
+    let mut session = fuser::Session::new(fs, &config.mount_path, &options)?;
+    if let Some(poll_interval) = poll_interval {
+        let notifier = Arc::new(session.notifier());
+        let _ = notifier_slot.set(notifier.clone());
+        spawn_metadata_poller(
+            handle.clone(),
+            metadata.clone(),
+            segments.clone(),
+            poll_interval,
+            Some(notifier),
+        );
+    } else {
+        let notifier = Arc::new(session.notifier());
+        let _ = notifier_slot.set(notifier);
+    }
     let mount_result = if fuse_threads > 0 {
-        let mut session = fuser::Session::new(fs, &config.mount_path, &options)?;
         session.run_multithreaded(fuse_threads)
     } else {
-        fuser::mount2(fs, &config.mount_path, &options)
+        session.run()
     };
 
     if let Err(err) = mount_result {
@@ -697,11 +705,14 @@ pub fn spawn_metadata_poller(
     metadata: Arc<MetadataStore>,
     segments: Arc<SegmentManager>,
     interval: Duration,
+    #[cfg(feature = "fuse")] notifier: Option<Arc<Notifier>>,
 ) {
     handle.spawn(async move {
         loop {
             let md = metadata.clone();
             let segs = segments.clone();
+            #[cfg(feature = "fuse")]
+            let notifier = notifier.clone();
             let result = tokio::task::spawn_blocking(move || md.apply_external_deltas()).await;
             match result {
                 Ok(Ok(records)) => {
@@ -720,6 +731,18 @@ pub fn spawn_metadata_poller(
                                 }
                             }
                             _ => {}
+                        }
+                        #[cfg(feature = "fuse")]
+                        if let Some(notifier) = notifier.as_ref() {
+                            if let Err(err) = notifier.inval_inode(record.inode, -1, 0) {
+                                warn!(
+                                    "inode attribute invalidation failed ino={}: {err}",
+                                    record.inode
+                                );
+                            }
+                            if let Err(err) = notifier.inval_inode(record.inode, 0, 0) {
+                                warn!("inode data invalidation failed ino={}: {err}", record.inode);
+                            }
                         }
                     }
                 }

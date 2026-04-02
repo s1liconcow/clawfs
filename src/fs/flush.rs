@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+use crate::superblock::StaleGenerationError;
+
 /// Decision returned by a [`FlushCommitHook`] after `pre_commit`.
 pub enum FlushCommitDecision {
     /// Use the standard direct write path (`persist_inodes_batch` + sync + commit).
@@ -52,6 +54,7 @@ impl OsageFs {
     // each write_batch call under this approximate payload budget and emit
     // multiple segment objects when needed.
     const FLUSH_SEGMENT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
+    const FLUSH_STALE_RETRY_LIMIT: usize = 3;
 
     fn segment_entry_payload_bytes(entry: &SegmentEntry) -> u64 {
         match &entry.payload {
@@ -62,30 +65,54 @@ impl OsageFs {
     }
 
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
-        self.flush_pending_selected(|guard| std::mem::take(&mut *guard), "all")
+        for attempt in 0..=Self::FLUSH_STALE_RETRY_LIMIT {
+            let result =
+                self.flush_pending_selected_once(|guard| std::mem::take(&mut *guard), "all");
+            if result != Err(libc::EAGAIN) || attempt == Self::FLUSH_STALE_RETRY_LIMIT {
+                return result;
+            }
+            debug!(
+                "flush_pending retrying after stale generation conflict attempt={}/{}",
+                attempt + 1,
+                Self::FLUSH_STALE_RETRY_LIMIT
+            );
+        }
+        Err(EIO)
     }
 
     pub(crate) fn flush_pending_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
-        self.flush_pending_selected(
-            |guard| {
-                let mut selected = HashMap::new();
-                let mut cursor = ino;
-                let mut seen = HashSet::new();
-                while seen.insert(cursor) {
-                    let Some(entry) = guard.remove(&cursor) else {
-                        break;
-                    };
-                    let parent = entry.record.parent;
-                    selected.insert(cursor, entry);
-                    if parent == cursor {
-                        break;
+        for attempt in 0..=Self::FLUSH_STALE_RETRY_LIMIT {
+            let result = self.flush_pending_selected_once(
+                |guard| {
+                    let mut selected = HashMap::new();
+                    let mut cursor = ino;
+                    let mut seen = HashSet::new();
+                    while seen.insert(cursor) {
+                        let Some(entry) = guard.remove(&cursor) else {
+                            break;
+                        };
+                        let parent = entry.record.parent;
+                        selected.insert(cursor, entry);
+                        if parent == cursor {
+                            break;
+                        }
+                        cursor = parent;
                     }
-                    cursor = parent;
-                }
-                selected
-            },
-            "inode",
-        )
+                    selected
+                },
+                "inode",
+            );
+            if result != Err(libc::EAGAIN) || attempt == Self::FLUSH_STALE_RETRY_LIMIT {
+                return result;
+            }
+            debug!(
+                "flush_pending_for_inode retrying after stale generation conflict ino={} attempt={}/{}",
+                ino,
+                attempt + 1,
+                Self::FLUSH_STALE_RETRY_LIMIT
+            );
+        }
+        Err(EIO)
     }
 
     pub(crate) fn sync_local_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
@@ -139,7 +166,7 @@ impl OsageFs {
         Ok(())
     }
 
-    pub(crate) fn flush_pending_selected<F>(
+    pub(crate) fn flush_pending_selected_once<F>(
         &self,
         selector: F,
         scope: &str,
@@ -658,23 +685,30 @@ impl OsageFs {
                 sync_metadata_duration = sync_metadata_start.elapsed();
                 metadata_duration = persist_start.elapsed();
                 let commit_start_inner = Instant::now();
-                if self
-                    .block_on(self.superblock.commit_generation(target_generation))
-                    .map_err(|err| {
-                        log::error!(
-                            "flush_pending commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                if let Err(code) = self.block_on(self.superblock.commit_generation(target_generation)).map_err(|err| {
+                    if let Some(stale) = err.downcast_ref::<StaleGenerationError>() {
+                        log::warn!(
+                            "flush_pending stale generation conflict pid={} tid={} scope={} attempted_gen={} current_gen={}",
                             pid,
                             tid,
                             scope,
-                            target_generation
+                            stale.attempted,
+                            stale.current
                         );
-                        err
-                    })
-                    .is_err()
-                {
+                        return libc::EAGAIN;
+                    }
+                    log::error!(
+                        "flush_pending commit_generation failed pid={} tid={} scope={} gen={} err={err:?}",
+                        pid,
+                        tid,
+                        scope,
+                        target_generation
+                    );
+                    EIO
+                }) {
                     self.superblock.abort_generation(target_generation);
                     prepared_generation = None;
-                    return Err(EIO);
+                    return Err(code);
                 }
                 prepared_generation = None;
                 committed_gen = target_generation;
@@ -760,6 +794,22 @@ impl OsageFs {
                 }
             }
             let finalize_clear_flushing_duration = finalize_clear_flushing_start.elapsed();
+            #[cfg(feature = "fuse")]
+            if let Some(notifier) = self.kernel_notifier.get() {
+                for inode in self.active_inodes.iter().filter_map(|entry| {
+                    let inode = *entry.key();
+                    self.pending_inodes.contains(&inode).then_some(inode)
+                }) {
+                    let _ = notifier.inval_inode(inode, 0, 0);
+                }
+            }
+            #[cfg(feature = "fuse")]
+            if let Some(notifier) = self.kernel_notifier.get() {
+                for inode in flushed_inodes.iter().copied() {
+                    let _ = notifier.inval_inode(inode, -1, 0);
+                    let _ = notifier.inval_inode(inode, 0, 0);
+                }
+            }
             let finalize_release_data_start = Instant::now();
             let mut released_staged_chunks = 0u64;
             for pending_entry in flushed_entries.into_values() {

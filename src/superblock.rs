@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::metadata::MetadataStore;
@@ -83,6 +84,13 @@ struct SuperblockState {
 pub struct SuperblockManager {
     store: Arc<MetadataStore>,
     state: Mutex<SuperblockState>,
+}
+
+#[derive(Debug, Error)]
+#[error("stale generation {attempted}; current superblock generation is {current}")]
+pub struct StaleGenerationError {
+    pub attempted: u64,
+    pub current: u64,
 }
 
 impl SuperblockManager {
@@ -247,6 +255,14 @@ impl SuperblockManager {
                 if guard.pending_generation != Some(generation) {
                     bail!("generation {} not pending", generation);
                 }
+                if guard.block.generation >= generation {
+                    guard.pending_generation = None;
+                    return Err(StaleGenerationError {
+                        attempted: generation,
+                        current: guard.block.generation,
+                    }
+                    .into());
+                }
 
                 let expected_version = guard.version.clone();
                 guard.block.generation = generation;
@@ -312,6 +328,38 @@ impl SuperblockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+
+    use crate::config::Config;
+    use crate::metadata::MetadataStore;
+
+    fn test_config(root: &std::path::Path) -> Config {
+        Config {
+            inline_threshold: 512,
+            shard_size: 64,
+            inode_batch: 8,
+            segment_batch: 8,
+            pending_bytes: 8 * 1024 * 1024,
+            entry_ttl_secs: 5,
+            home_prefix: "/home".into(),
+            disable_journal: true,
+            flush_interval_ms: 0,
+            disable_cleanup: true,
+            lookup_cache_ttl_ms: 0,
+            dir_cache_ttl_ms: 0,
+            metadata_poll_interval_ms: 0,
+            segment_cache_bytes: 0,
+            imap_delta_batch: 32,
+            fuse_threads: 0,
+            ..Config::with_paths(
+                root.join("mnt"),
+                root.join("store"),
+                root.join("cache"),
+                root.join("state.bin"),
+            )
+        }
+    }
 
     /// Superblocks stored before `last_idempotency_key` was added did not
     /// include that field in their JSON.  Without `#[serde(default)]` the
@@ -374,5 +422,57 @@ mod tests {
         let decoded: Superblock = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.last_idempotency_key, Some("abc123".to_string()));
         assert!(decoded.relay_required);
+    }
+
+    #[test]
+    fn stale_local_generation_commit_is_rejected_instead_of_regressing_superblock() {
+        let dir = tempdir().unwrap();
+        let runtime = Runtime::new().unwrap();
+        let config = test_config(dir.path());
+        let store_a = Arc::new(
+            runtime
+                .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+                .unwrap(),
+        );
+        let store_b = Arc::new(
+            runtime
+                .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+                .unwrap(),
+        );
+        let manager_a = runtime
+            .block_on(SuperblockManager::load_or_init(store_a, config.shard_size))
+            .unwrap();
+        let manager_b = runtime
+            .block_on(SuperblockManager::load_or_init(store_b, config.shard_size))
+            .unwrap();
+
+        let generation_b = manager_b.prepare_dirty_generation().unwrap().generation;
+        let generation_a = manager_a.prepare_dirty_generation().unwrap().generation;
+        assert_eq!(generation_a, generation_b);
+
+        runtime
+            .block_on(manager_a.commit_generation(generation_a))
+            .unwrap();
+        let err = runtime
+            .block_on(manager_b.commit_generation(generation_b))
+            .unwrap_err();
+        let stale = err
+            .downcast_ref::<StaleGenerationError>()
+            .expect("stale local commit must be rejected explicitly");
+        assert_eq!(stale.attempted, generation_b);
+        assert_eq!(stale.current, generation_a);
+
+        let final_store = Arc::new(
+            runtime
+                .block_on(MetadataStore::new(&config, runtime.handle().clone()))
+                .unwrap(),
+        );
+        let final_manager = runtime
+            .block_on(SuperblockManager::load_or_init(
+                final_store,
+                config.shard_size,
+            ))
+            .unwrap();
+        assert_eq!(final_manager.snapshot().generation, generation_a);
     }
 }

@@ -2215,6 +2215,48 @@ fn lookup_cache_ttl_zero_forces_remote_file_refresh() {
     );
 }
 
+#[cfg(feature = "fuse")]
+#[test]
+fn fuse_getattr_bypasses_stale_file_ttl_for_shared_append() {
+    let dir = tempdir().unwrap();
+    let writer = TestHarness::with_config(dir.path(), "fuse_getattr_writer.bin", 1 << 20, |cfg| {
+        cfg.lookup_cache_ttl_ms = 60_000;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+    let reader = TestHarness::with_config(dir.path(), "fuse_getattr_reader.bin", 1 << 20, |cfg| {
+        cfg.lookup_cache_ttl_ms = 60_000;
+        cfg.dir_cache_ttl_ms = 0;
+    });
+
+    let file = writer
+        .fs
+        .nfs_create(ROOT_INODE, "tail-demo.log", 0, 0)
+        .unwrap();
+    writer.fs.op_write(file.inode, 0, b"line 1\n").unwrap();
+    writer.fs.flush_pending().unwrap();
+
+    let reader_file = reader.fs.nfs_lookup(ROOT_INODE, "tail-demo.log").unwrap();
+    assert_eq!(reader.fs.load_inode(reader_file.inode).unwrap().size, 7);
+
+    writer.fs.op_write(file.inode, 7, b"line 2\n").unwrap();
+    writer.fs.flush_pending().unwrap();
+
+    assert_eq!(
+        reader.fs.load_inode(reader_file.inode).unwrap().size,
+        7,
+        "baseline load_inode should remain stale while the file TTL is still active"
+    );
+    assert_eq!(
+        reader
+            .fs
+            .load_inode_for_fuse_getattr(reader_file.inode)
+            .unwrap()
+            .size,
+        14,
+        "FUSE getattr should bypass the stale file TTL so tail-style polling sees the append"
+    );
+}
+
 /// Regression test for the FIO seq_write_1m EIO bug.
 ///
 /// Before the fix, writing to a large file at offset 0 after it had been
@@ -4184,6 +4226,63 @@ fn shared_state_clients_preserve_directory_tree_during_disjoint_writes() {
     assert!(
         matches!(source_reload.kind, InodeKind::File),
         "disjoint writer inode must remain a file",
+    );
+}
+
+#[test]
+fn shared_state_stale_generation_flush_retries_and_preserves_remote_append() {
+    let dir = tempdir().unwrap();
+    let shared_state = "shared-stale-generation.bin";
+    let writer_a = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+        cfg.flush_interval_ms = 0;
+    });
+    let writer_b = TestHarness::with_config(dir.path(), shared_state, 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+        cfg.flush_interval_ms = 0;
+    });
+
+    let (file_a, _) = writer_a
+        .fs
+        .op_create_fuse(ROOT_INODE, "shared.log", 0, 0, 0o100644, 0o022, 0)
+        .unwrap();
+    writer_a
+        .fs
+        .op_write(file_a.inode, 0, b"writer-a:one\n")
+        .unwrap();
+    writer_a.fs.flush_pending().unwrap();
+
+    let file_b = writer_b.fs.op_lookup(ROOT_INODE, "shared.log").unwrap();
+
+    let record_a = writer_a.fs.load_inode(file_a.inode).unwrap();
+    writer_a
+        .fs
+        .op_write(file_a.inode, record_a.size, b"writer-a:two\n")
+        .unwrap();
+    writer_a.fs.flush_pending().unwrap();
+
+    let record_b = writer_b.fs.load_inode(file_b.inode).unwrap();
+    writer_b
+        .fs
+        .op_write(file_b.inode, record_b.size, b"writer-b:three\n")
+        .unwrap();
+    writer_b.fs.flush_pending().unwrap();
+
+    let reader = TestHarness::with_config(dir.path(), "shared-stale-reader.bin", 1 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.lookup_cache_ttl_ms = 0;
+        cfg.dir_cache_ttl_ms = 0;
+        cfg.flush_interval_ms = 0;
+    });
+    let record = reader.fs.load_inode(file_a.inode).unwrap();
+    let bytes = reader.fs.read_file_bytes(&record).unwrap();
+    assert_eq!(
+        bytes, b"writer-a:one\nwriter-a:two\nwriter-b:three\n",
+        "stale-generation retry path must preserve both clients' appends",
     );
 }
 

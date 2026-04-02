@@ -11,6 +11,15 @@ MOUNT_CHECK_TIMEOUT_SEC="${MOUNT_CHECK_TIMEOUT_SEC:-10}"
 REF_DIR=""
 METADATA_REF_DIR=""
 METADATA_ROUNDS="${METADATA_ROUNDS:-2}"
+SHARED_STATE_MULTI_CLIENT="${SHARED_STATE_MULTI_CLIENT:-0}"
+CLIENT_B_PID_FILE="${CLIENT_B_PID_FILE:-/tmp/clawfs-stress-b.pid}"
+CLIENT_B_MOUNT_PATH="${CLIENT_B_MOUNT_PATH:-/tmp/clawfs-mnt-b}"
+CLIENT_B_LOCAL_CACHE_PATH="${CLIENT_B_LOCAL_CACHE_PATH:-$HOME/.clawfs/cache-b}"
+CLIENT_B_STATE_PATH="${CLIENT_B_STATE_PATH:-$HOME/.clawfs/state/client_state_b.bin}"
+CLIENT_B_LOG_FILE="${CLIENT_B_LOG_FILE:-$ROOT_DIR/clawfs-b.log}"
+CLIENT_B_PERF_LOG_PATH="${CLIENT_B_PERF_LOG_PATH:-}"
+TAIL_PID=""
+MULTI_CLIENT_CLAWFS_EXTRA_ARGS="${MULTI_CLIENT_CLAWFS_EXTRA_ARGS:---lookup-cache-ttl-ms 0 --dir-cache-ttl-ms 0 --metadata-poll-interval-ms 250 --entry-ttl-secs 0 --flush-interval-ms 250 --fsync-on-close}"
 
 run_cleanup_script() {
   LOG_FILE="$LOG_FILE" \
@@ -20,6 +29,33 @@ run_cleanup_script() {
   LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" \
   STATE_PATH="$STATE_PATH" \
   "$CLEANUP_SCRIPT"
+}
+
+cleanup_client_b_artifacts() {
+  if [[ -f "$CLIENT_B_PID_FILE" ]]; then
+    local client_b_pid=""
+    client_b_pid=$(cat "$CLIENT_B_PID_FILE" 2>/dev/null || true)
+    if [[ -n "$client_b_pid" ]] && kill -0 "$client_b_pid" 2>/dev/null; then
+      kill "$client_b_pid" 2>/dev/null || true
+      wait "$client_b_pid" 2>/dev/null || true
+    fi
+    rm -f "$CLIENT_B_PID_FILE"
+  fi
+  if mountpoint -q "$CLIENT_B_MOUNT_PATH" 2>/dev/null; then
+    fusermount -u "$CLIENT_B_MOUNT_PATH" 2>/dev/null \
+      || umount "$CLIENT_B_MOUNT_PATH" 2>/dev/null \
+      || umount -l "$CLIENT_B_MOUNT_PATH" 2>/dev/null \
+      || true
+  fi
+  if [[ -d "$CLIENT_B_LOCAL_CACHE_PATH" ]]; then
+    rm -rf "$CLIENT_B_LOCAL_CACHE_PATH"
+  fi
+  if [[ -f "$CLIENT_B_STATE_PATH" ]]; then
+    rm -f "$CLIENT_B_STATE_PATH"
+  fi
+  if [[ -d "$CLIENT_B_MOUNT_PATH" ]]; then
+    rm -rf "$CLIENT_B_MOUNT_PATH"
+  fi
 }
 
 write_payload() {
@@ -68,14 +104,47 @@ assert_eq() {
   fi
 }
 
+wait_for_condition() {
+  local timeout_sec=$1
+  shift
+  local start=$SECONDS
+  while (( SECONDS - start < timeout_sec )); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+assert_file_contains_line() {
+  local path=$1 line=$2
+  stat "$path" >/dev/null 2>&1 || return 1
+  grep -Fxq "$line" "$path"
+}
+
 cleanup() {
   set +e
+  if [[ -n "${TAIL_PID:-}" ]] && kill -0 "$TAIL_PID" 2>/dev/null; then
+    kill "$TAIL_PID" 2>/dev/null || true
+    wait "$TAIL_PID" 2>/dev/null || true
+  fi
   if [[ -n "${REF_DIR:-}" && -d "$REF_DIR" ]]; then
     rm -rf "$REF_DIR"
   fi
   if [[ -n "${METADATA_REF_DIR:-}" && -d "$METADATA_REF_DIR" ]]; then
     rm -rf "$METADATA_REF_DIR"
   fi
+  if [[ -f "$CLIENT_B_PID_FILE" ]]; then
+    CLIENT_B_PID=$(cat "$CLIENT_B_PID_FILE")
+    if kill -0 "$CLIENT_B_PID" 2>/dev/null; then
+      echo "Stopping clawfs client B PID $CLIENT_B_PID"
+      kill "$CLIENT_B_PID"
+      wait "$CLIENT_B_PID" 2>/dev/null || true
+    fi
+    rm -f "$CLIENT_B_PID_FILE"
+  fi
+  cleanup_client_b_artifacts >/dev/null 2>&1 || true
   if [[ -f "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
@@ -90,7 +159,11 @@ cleanup() {
 trap cleanup EXIT
 
 start_daemon() {
-  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" "$OSAGE_BIN"
+  local extra_args="${CLAWFS_EXTRA_ARGS:-}"
+  if osage_is_true "$SHARED_STATE_MULTI_CLIENT"; then
+    extra_args="${extra_args:+$extra_args }$MULTI_CLIENT_CLAWFS_EXTRA_ARGS"
+  fi
+  LOG_FILE="$LOG_FILE" PERF_LOG_PATH="$PERF_LOG_PATH" PID_FILE="$PID_FILE" MOUNT_PATH="$MOUNT_PATH" STORE_PATH="$STORE_PATH" LOCAL_CACHE_PATH="$LOCAL_CACHE_PATH" STATE_PATH="$STATE_PATH" CLAWFS_EXTRA_ARGS="$extra_args" "$OSAGE_BIN"
   sleep 2
   if [[ -s "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
@@ -102,6 +175,89 @@ start_daemon() {
     echo "Warning: PID file $PID_FILE missing; continue if you started clawfs manually."
   fi
   osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+}
+
+start_daemon_client_b() {
+  local extra_args="${CLAWFS_EXTRA_ARGS:-}"
+  extra_args="${extra_args:+$extra_args }$MULTI_CLIENT_CLAWFS_EXTRA_ARGS"
+  LOG_FILE="$CLIENT_B_LOG_FILE" \
+  PERF_LOG_PATH="$CLIENT_B_PERF_LOG_PATH" \
+  PID_FILE="$CLIENT_B_PID_FILE" \
+  MOUNT_PATH="$CLIENT_B_MOUNT_PATH" \
+  STORE_PATH="$STORE_PATH" \
+  LOCAL_CACHE_PATH="$CLIENT_B_LOCAL_CACHE_PATH" \
+  STATE_PATH="$CLIENT_B_STATE_PATH" \
+  CLAWFS_EXTRA_ARGS="$extra_args" \
+  "$OSAGE_BIN"
+  sleep 2
+  if [[ -s "$CLIENT_B_PID_FILE" ]]; then
+    CLIENT_B_PID=$(cat "$CLIENT_B_PID_FILE")
+    if ! kill -0 "$CLIENT_B_PID" 2>/dev/null; then
+      echo "clawfs client B PID $CLIENT_B_PID not running" >&2
+      exit 1
+    fi
+  else
+    echo "Warning: client B PID file $CLIENT_B_PID_FILE missing." >&2
+  fi
+  osage_assert_welcome_file "$CLIENT_B_MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+}
+
+run_multi_client_smoke() {
+  local shared_dir_rel="home/${USER:-$(whoami)}/multi-client-smoke"
+  local dir_a="$MOUNT_PATH/$shared_dir_rel"
+  local dir_b="$CLIENT_B_MOUNT_PATH/$shared_dir_rel"
+  local file_a="$dir_a/shared.log"
+  local file_b="$dir_b/shared.log"
+  local tail_capture
+  tail_capture=$(mktemp /tmp/clawfs-tail-b.XXXXXX)
+
+  mkdir -p "$dir_a"
+  if ! wait_for_condition 10 test -d "$dir_b"; then
+    echo "client B did not observe directory creation from client A" >&2
+    exit 1
+  fi
+
+  printf "writer-a:hello\n" > "$file_a"
+  sync
+  if ! wait_for_condition 10 assert_file_contains_line "$file_b" "writer-a:hello"; then
+    echo "client B did not observe initial file content from client A" >&2
+    exit 1
+  fi
+
+  stdbuf -oL tail -n 0 -f "$file_b" >"$tail_capture" &
+  TAIL_PID=$!
+  sleep 1
+
+  printf "writer-a:tail-1\n" >> "$file_a"
+  sync
+  if ! wait_for_condition 10 assert_file_contains_line "$tail_capture" "writer-a:tail-1"; then
+    echo "client B tail -f did not observe append from client A" >&2
+    echo "--- tail capture ---" >&2
+    cat "$tail_capture" >&2 || true
+    exit 1
+  fi
+
+  printf "writer-b:append-1\n" >> "$file_b"
+  sync
+  if ! wait_for_condition 10 assert_file_contains_line "$file_a" "writer-b:append-1"; then
+    echo "client A did not observe append from client B" >&2
+    exit 1
+  fi
+
+  if ! wait_for_condition 10 assert_file_contains_line "$tail_capture" "writer-b:append-1"; then
+    echo "client B tail output did not include its local append" >&2
+    exit 1
+  fi
+
+  local expected=$'writer-a:hello\nwriter-a:tail-1\nwriter-b:append-1'
+  assert_eq "$(cat "$file_a")" "$expected" "client A final shared log contents mismatch"
+  assert_eq "$(cat "$file_b")" "$expected" "client B final shared log contents mismatch"
+
+  kill "$TAIL_PID" 2>/dev/null || true
+  wait "$TAIL_PID" 2>/dev/null || true
+  TAIL_PID=""
+  rm -f "$tail_capture"
+  echo "Two-client smoke test completed successfully."
 }
 
 stop_daemon_preserve_store() {
@@ -165,6 +321,7 @@ run_metadata_consistency_workload() {
 # Ensure clean slate unless user wants to keep existing mount/store
 if [[ -z "${SKIP_CLEANUP:-}" ]]; then
   run_cleanup_script >/dev/null 2>&1 || true
+  cleanup_client_b_artifacts >/dev/null 2>&1 || true
 fi
 
 mkdir -p "$ROOT_DIR"
@@ -186,6 +343,11 @@ else
 fi
 
 osage_assert_welcome_file "$MOUNT_PATH" "$MOUNT_CHECK_TIMEOUT_SEC"
+
+if osage_is_true "$SHARED_STATE_MULTI_CLIENT"; then
+  start_daemon_client_b
+  run_multi_client_smoke
+fi
 
 run_workload() {
   local dir=$1

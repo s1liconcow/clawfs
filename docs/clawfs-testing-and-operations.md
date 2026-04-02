@@ -38,7 +38,7 @@
 - FUSE `allow_other`: ensure `user_allow_other` exists in `/etc/fuse.conf`. CLI flag: `--allow-other`. Scripts: `ALLOW_OTHER=1`.
 - Root-owned leftovers: unmount and `sudo rm -rf` mount and store directories before rerunning.
 - `scripts/stress_e2e.sh` cleans up on exit and removes logs; copy logs first if needed.
-- `scripts/stress_e2e.sh` supports `SHARED_STATE_MULTI_CLIENT=1` to launch a second daemon against the same `STORE_PATH` and `STATE_PATH` with a separate mount/cache. Use it as the fast regression path for shared-state allocator and file-vs-directory corruption issues that would otherwise only surface in longer remote kernel workloads.
+- `scripts/stress_e2e.sh` supports `SHARED_STATE_MULTI_CLIENT=1` to launch a second daemon against the same `STORE_PATH` with a separate mount, cache, log, pid file, and client `STATE_PATH`. The smoke path validates cross-client visibility in both directions, including a `tail -f` style append-follow check.
 - `scripts/micro_workflows.sh` preserves a caller-provided `PERF_LOG_PATH` on exit; perf logging is opt-in.
 - Troubleshooting policy: reproduce with a failing automated test in `src/fs/tests/mod.rs` before fixing.
 - Sprite quirk: `fusermount -u` may fail without `/etc/mtab`; fall back to `umount -l`.

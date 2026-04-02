@@ -17,7 +17,7 @@ use crate::compat::{
 use anyhow::{Result, anyhow};
 #[cfg(feature = "fuse")]
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    FileAttr, FileType, Filesystem, KernelConfig, Notifier, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use parking_lot::Mutex;
@@ -86,6 +86,8 @@ pub struct OsageFs {
     dir_cache_ttl: Duration,
     journal: Option<Arc<JournalManager>>,
     flush_commit_hook: Arc<std::sync::OnceLock<Arc<dyn flush::FlushCommitHook>>>,
+    #[cfg(feature = "fuse")]
+    kernel_notifier: Arc<std::sync::OnceLock<Arc<Notifier>>>,
 }
 
 mod core;
