@@ -794,21 +794,26 @@ impl OsageFs {
                 }
             }
             let finalize_clear_flushing_duration = finalize_clear_flushing_start.elapsed();
+            // Dispatch FUSE kernel cache invalidation to a background task so
+            // the flush path is never blocked waiting on the /dev/fuse channel.
+            // inval_inode is synchronous and can block when the channel buffer
+            // is full; the kernel may also send getattr/read callbacks in
+            // response, which need a free FUSE worker thread.  Doing this
+            // inline with thousands of inodes (stress-ng, kernel compile)
+            // saturates the channel and deadlocks.
             #[cfg(feature = "fuse")]
             if let Some(notifier) = self.kernel_notifier.get() {
-                for inode in self.active_inodes.iter().filter_map(|entry| {
-                    let inode = *entry.key();
-                    self.pending_inodes.contains(&inode).then_some(inode)
-                }) {
-                    let _ = notifier.inval_inode(inode, 0, 0);
-                }
-            }
-            #[cfg(feature = "fuse")]
-            if let Some(notifier) = self.kernel_notifier.get() {
-                for inode in flushed_inodes.iter().copied() {
-                    let _ = notifier.inval_inode(inode, -1, 0);
-                    let _ = notifier.inval_inode(inode, 0, 0);
-                }
+                let notifier = notifier.clone();
+                let flushed: Vec<u64> = flushed_inodes.clone();
+                self.handle.spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        for inode in flushed {
+                            let _ = notifier.inval_inode(inode, 0, 0);
+                        }
+                    })
+                    .await
+                    .ok();
+                });
             }
             let finalize_release_data_start = Instant::now();
             let mut released_staged_chunks = 0u64;

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+set -x
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 WORKDIR_REMOTE="${WORKDIR_REMOTE:-/work/clawfs}"
 SYNC_REPO=1
 SKIP_BOOTSTRAP=0
-TASKS_CSV="linux,pjdfstest"
+TASKS_CSV="linux,pjdfstest,stress-ng"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/validation-results-$(date +%Y%m%d-%H%M%S)}"
 
 usage() {
@@ -15,9 +16,10 @@ Usage: scripts/sprite_validate_parallel.sh [options]
 Run validation suites in parallel on dedicated sprites:
   - linux kernel compile perf script
   - pjdfstest
+  - stress-ng CI repro
 
 Options:
-  --tasks <csv>        Comma-separated list: linux,pjdfstest
+  --tasks <csv>        Comma-separated list: linux,pjdfstest,stress-ng
   --no-sync            Skip tar sync into sprites (assume /work/clawfs is current)
   --skip-bootstrap     Skip apt/bootstrap steps inside sprites
   --log-dir <path>     Local directory for per-task logs
@@ -25,7 +27,7 @@ Options:
 
 Examples:
   scripts/sprite_validate_parallel.sh
-  scripts/sprite_validate_parallel.sh --tasks linux,pjdfstest
+  scripts/sprite_validate_parallel.sh --tasks linux,pjdfstest,stress-ng
   scripts/sprite_validate_parallel.sh --no-sync --skip-bootstrap
 USAGE
 }
@@ -79,7 +81,7 @@ ensure_sprite() {
   local sprite="$1"
   if ! sprite list | rg -qx "$sprite"; then
     echo "Creating sprite $sprite"
-    sprite create "$sprite" >/dev/null
+    sprite create --skip-console "$sprite" >/dev/null
   fi
 }
 
@@ -138,6 +140,18 @@ PJDFSTEST_DIR=/tmp/pjdfstest TESTDIR=/tmp/clawfs-mnt JOBS=8 ./scripts/run_pjdfst
 EOF
 }
 
+run_stress_ng_cmd() {
+  cat <<EOF
+set -euo pipefail
+cd '$WORKDIR_REMOTE'
+if [[ "$SKIP_BOOTSTRAP" -eq 0 ]]; then
+  $(bootstrap_common_cmd)
+  sudo apt-get install -y stress-ng
+fi
+./scripts/repro_stress_ng_ci.sh
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tasks)
@@ -188,7 +202,7 @@ declare -A SPRITE_BY_TASK
 declare -A PID_BY_TASK
 declare -A LOG_BY_TASK
 
-for task in linux pjdfstest; do
+for task in linux pjdfstest stress-ng; do
   if ! contains_task "$task"; then
     continue
   fi
@@ -213,6 +227,7 @@ launch_task() {
   case "$task" in
     linux) cmd="$(run_linux_cmd)" ;;
     pjdfstest) cmd="$(run_pjdfstest_cmd)" ;;
+    stress-ng) cmd="$(run_stress_ng_cmd)" ;;
     *) echo "Unknown task $task" >&2; return 1 ;;
   esac
 

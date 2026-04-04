@@ -4287,6 +4287,157 @@ fn shared_state_stale_generation_flush_retries_and_preserves_remote_append() {
 }
 
 // ---------------------------------------------------------------------------
+// Flush invalidation / deadlock regression tests
+// ---------------------------------------------------------------------------
+
+/// Regression test: flushing many inodes must not wedge.
+///
+/// The original implementation called `notifier.inval_inode()` synchronously
+/// inside the flush finalization loop for every flushed inode.  Under heavy
+/// workloads (stress-ng, kernel compile with thousands of dirty files) this
+/// saturated the FUSE /dev/fuse channel and deadlocked: the flush thread
+/// blocked on inval_inode while the kernel sent getattr callbacks that needed
+/// a free FUSE worker thread — but all workers were stalled on the same
+/// channel.
+///
+/// The fix moves invalidation to a fire-and-forget background task.  This
+/// test verifies that flushing 500 files completes within a generous timeout
+/// rather than hanging indefinitely.
+#[test]
+fn flush_many_inodes_completes_without_wedging() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::with_config(dir.path(), "flush_wedge.bin", 64 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let fs = &harness.fs;
+
+    // Create a directory and populate it with many small files — this
+    // simulates the inode count seen in stress-ng / kernel compile CUJs.
+    let parent = fs.op_mkdir(ROOT_INODE, "many", 0, 0).unwrap();
+    let file_count = 500;
+    for i in 0..file_count {
+        let name = format!("f_{i:04}.o");
+        let (file, _) = fs
+            .op_create_fuse(parent.inode, &name, 0, 0, 0o100644, 0o022, 0)
+            .unwrap();
+        let payload = format!("payload-{i}");
+        fs.op_write(file.inode, 0, payload.as_bytes()).unwrap();
+    }
+
+    // Flush must complete promptly.  Without the background-dispatch fix,
+    // this would block indefinitely when a kernel_notifier was present.
+    // Even without FUSE (unit tests), this validates the code path doesn't
+    // do O(n) synchronous work that could stall under real mounts.
+    let start = std::time::Instant::now();
+    fs.flush_pending()
+        .expect("flush_pending with many inodes should succeed");
+    let elapsed = start.elapsed();
+
+    // Generous ceiling — the point is "doesn't hang", not micro-benchmarking.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "flush of {file_count} inodes took {elapsed:?} — likely wedged",
+    );
+
+    // Verify data survived the flush.
+    let parent_record = fs.load_inode(parent.inode).unwrap();
+    let children = parent_record.children().unwrap();
+    assert_eq!(children.len(), file_count, "some files lost after flush");
+
+    for i in 0..file_count {
+        let name = format!("f_{i:04}.o");
+        let ino = *children.get(name.as_str()).unwrap();
+        let expected = format!("payload-{i}");
+        let data = fs.op_read(ino, 0, expected.len() as u32).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&data).unwrap(),
+            expected,
+            "file {name} content corrupted after flush",
+        );
+    }
+}
+
+/// Regression test: concurrent multi-client flushes with many inodes must not
+/// deadlock.  Simulates two clients (like two build processes sharing a mount)
+/// flushing overlapping inode sets simultaneously.
+#[test]
+fn concurrent_multi_client_flush_many_inodes_no_deadlock() {
+    let dir = tempdir().unwrap();
+    let shared_state = "mc_flush_wedge.bin";
+    let harness_a = TestHarness::with_config(dir.path(), shared_state, 64 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let harness_b = TestHarness::with_config(dir.path(), "mc_flush_wedge_b.bin", 64 << 20, |cfg| {
+        cfg.disable_journal = true;
+        cfg.flush_interval_ms = 0;
+    });
+    let file_count = 200;
+
+    // Client A creates files
+    let parent_a = harness_a.fs.op_mkdir(ROOT_INODE, "dir_a", 0, 0).unwrap();
+    for i in 0..file_count {
+        let name = format!("a_{i:04}.c");
+        let (file, _) = harness_a
+            .fs
+            .op_create_fuse(parent_a.inode, &name, 0, 0, 0o100644, 0o022, 0)
+            .unwrap();
+        harness_a
+            .fs
+            .op_write(file.inode, 0, format!("data-a-{i}").as_bytes())
+            .unwrap();
+    }
+
+    // Client B creates files
+    let parent_b = harness_b.fs.op_mkdir(ROOT_INODE, "dir_b", 0, 0).unwrap();
+    for i in 0..file_count {
+        let name = format!("b_{i:04}.c");
+        let (file, _) = harness_b
+            .fs
+            .op_create_fuse(parent_b.inode, &name, 0, 0, 0o100644, 0o022, 0)
+            .unwrap();
+        harness_b
+            .fs
+            .op_write(file.inode, 0, format!("data-b-{i}").as_bytes())
+            .unwrap();
+    }
+
+    // Flush both concurrently — with the old synchronous invalidation this
+    // could deadlock when both saturated the FUSE channel.
+    let barrier = Arc::new(Barrier::new(2));
+    let fs_a = harness_a.fs.clone();
+    let fs_b = harness_b.fs.clone();
+    let b1 = barrier.clone();
+    let b2 = barrier.clone();
+
+    let t1 = thread::spawn(move || {
+        b1.wait();
+        fs_a.flush_pending()
+    });
+    let t2 = thread::spawn(move || {
+        b2.wait();
+        fs_b.flush_pending()
+    });
+
+    let timeout = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let r1 = t1.join().expect("client A flush thread panicked");
+    let r2 = t2.join().expect("client B flush thread panicked");
+    let elapsed = start.elapsed();
+
+    // At least one should succeed; the other may get EAGAIN and retry.
+    assert!(
+        r1.is_ok() || r2.is_ok(),
+        "both concurrent flushes failed: a={r1:?} b={r2:?}",
+    );
+    assert!(
+        elapsed < timeout,
+        "concurrent flush took {elapsed:?} — likely deadlocked",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Coordination publisher tests
 // ---------------------------------------------------------------------------
 

@@ -734,15 +734,15 @@ pub fn spawn_metadata_poller(
                         }
                         #[cfg(feature = "fuse")]
                         if let Some(notifier) = notifier.as_ref() {
-                            if let Err(err) = notifier.inval_inode(record.inode, -1, 0) {
-                                warn!(
-                                    "inode attribute invalidation failed ino={}: {err}",
-                                    record.inode
-                                );
-                            }
-                            if let Err(err) = notifier.inval_inode(record.inode, 0, 0) {
-                                warn!("inode data invalidation failed ino={}: {err}", record.inode);
-                            }
+                            let notifier = notifier.clone();
+                            let ino = record.inode;
+                            // Fire-and-forget: inval_inode can block on the
+                            // FUSE channel and must not stall the poll loop.
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(err) = notifier.inval_inode(ino, 0, 0) {
+                                    warn!("inode attribute invalidation failed ino={}: {err}", ino);
+                                }
+                            });
                         }
                     }
                 }
