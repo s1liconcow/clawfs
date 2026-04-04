@@ -42,6 +42,7 @@ jobs:
             --state-path /tmp/clawfs-state.bin \
             --object-provider local \
             --log-file /tmp/clawfs-mount.log \
+            --debug-log \
             --allow-other \
             --disable-journal \
             --disable-cleanup \
@@ -100,6 +101,14 @@ jobs:
         with:
           name: clawfs-mount-log
           path: /tmp/clawfs-mount.log
+          if-no-files-found: ignore
+
+      - name: Upload kernel build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log
+          path: /tmp/kernel-build.log
           if-no-files-found: ignore
 
       - name: Cleanup
