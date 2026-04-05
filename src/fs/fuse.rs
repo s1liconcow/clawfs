@@ -2,6 +2,15 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl OsageFs {
+    #[cfg(feature = "fuse")]
+    pub(crate) fn fuse_open_reply_flags(open_flags: i32) -> u32 {
+        if open_flags & libc::O_DIRECT != 0 {
+            fuser::consts::FOPEN_DIRECT_IO
+        } else {
+            0
+        }
+    }
+
     // FUSE create semantics differ from nfs_create: O_CREAT without O_EXCL should open
     // an existing file instead of returning EEXIST when a parallel creator won the race.
     #[allow(clippy::too_many_arguments)]
@@ -436,7 +445,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "flags": flags }),
                 );
-                reply.opened(flags as u32 as u64, fuser::consts::FOPEN_DIRECT_IO)
+                reply.opened(flags as u32 as u64, Self::fuse_open_reply_flags(flags))
             }
             Err(code) => {
                 self.log_replay(

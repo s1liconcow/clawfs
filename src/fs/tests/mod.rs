@@ -119,6 +119,20 @@ fn summarize_inode_kind_truncates_directory_children() {
     assert!(summary.len() < 300);
 }
 
+#[cfg(feature = "fuse")]
+#[test]
+fn fuse_open_reply_flags_only_enable_direct_io_for_odirect() {
+    assert_eq!(OsageFs::fuse_open_reply_flags(libc::O_RDONLY), 0);
+    assert_eq!(
+        OsageFs::fuse_open_reply_flags(libc::O_RDWR | libc::O_APPEND),
+        0
+    );
+    assert_eq!(
+        OsageFs::fuse_open_reply_flags(libc::O_RDWR | libc::O_DIRECT),
+        fuser::consts::FOPEN_DIRECT_IO
+    );
+}
+
 fn ensure_root_for_tests(
     runtime: &tokio::runtime::Runtime,
     metadata: Arc<MetadataStore>,
