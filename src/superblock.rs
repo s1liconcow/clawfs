@@ -265,10 +265,11 @@ impl SuperblockManager {
                 }
 
                 let expected_version = guard.version.clone();
-                guard.block.generation = generation;
-                guard.block.state = FilesystemState::Clean;
-                guard.block.last_idempotency_key = idempotency_key.clone();
-                (expected_version, guard.block.clone())
+                let mut snapshot = guard.block.clone();
+                snapshot.generation = generation;
+                snapshot.state = FilesystemState::Clean;
+                snapshot.last_idempotency_key = idempotency_key.clone();
+                (expected_version, snapshot)
             };
 
             // Use true storage CAS via ETag check (If-Match)
@@ -280,6 +281,7 @@ impl SuperblockManager {
                 Ok(new_version) => {
                     let mut guard = self.state.lock();
                     guard.version = new_version;
+                    guard.block = snapshot;
                     guard.pending_generation = None;
                     return Ok(());
                 }
@@ -328,11 +330,145 @@ impl SuperblockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
+    use tokio::sync::Barrier;
 
     use crate::config::Config;
     use crate::metadata::MetadataStore;
+
+    #[derive(Debug)]
+    struct DelayFirstConditionalStore {
+        inner: Arc<dyn ObjectStore>,
+        delay_first_update: AtomicBool,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl DelayFirstConditionalStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                delay_first_update: AtomicBool::new(true),
+                entered: Arc::new(Barrier::new(2)),
+                release: Arc::new(Barrier::new(2)),
+            }
+        }
+    }
+
+    impl std::fmt::Display for DelayFirstConditionalStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DelayFirstConditionalStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DelayFirstConditionalStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let delay_this_write = matches!(opts.mode, PutMode::Update(_))
+                && self
+                    .delay_first_update
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+            if delay_this_write {
+                self.entered.wait().await;
+                self.release.wait().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_range(
+            &self,
+            location: &ObjectPath,
+            range: Range<u64>,
+        ) -> ObjectStoreResult<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn head(&self, location: &ObjectPath) -> ObjectStoreResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     fn test_config(root: &std::path::Path) -> Config {
         Config {
@@ -474,5 +610,61 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(final_manager.snapshot().generation, generation_a);
+    }
+
+    #[test]
+    fn concurrent_inode_reservation_during_commit_retries_instead_of_going_stale() {
+        let dir = tempdir().unwrap();
+        let runtime = Runtime::new().unwrap();
+        let config = test_config(dir.path());
+        let delayed_store = Arc::new(DelayFirstConditionalStore::new(Arc::new(InMemory::new())));
+        let metadata = Arc::new(
+            runtime
+                .block_on(MetadataStore::new_with_store(
+                    delayed_store.clone(),
+                    String::new(),
+                    &config,
+                    runtime.handle().clone(),
+                ))
+                .unwrap(),
+        );
+        let manager = Arc::new(
+            runtime
+                .block_on(SuperblockManager::load_or_init(metadata, config.shard_size))
+                .unwrap(),
+        );
+
+        let generation = manager.prepare_dirty_generation().unwrap().generation;
+        let initial = manager.snapshot();
+
+        runtime.block_on(async {
+            let commit_manager = Arc::clone(&manager);
+            let commit_task =
+                tokio::spawn(async move { commit_manager.commit_generation(generation).await });
+
+            delayed_store.entered.wait().await;
+
+            let in_flight = manager.snapshot();
+            assert_eq!(
+                in_flight.generation, initial.generation,
+                "generation must not advance in memory before the conditional store succeeds"
+            );
+            assert_eq!(
+                in_flight.state,
+                FilesystemState::Dirty,
+                "flush state should remain dirty while the commit is still in flight"
+            );
+
+            let reserved = manager.reserve_inodes(1).await.unwrap();
+            assert_eq!(reserved, initial.next_inode);
+
+            delayed_store.release.wait().await;
+            commit_task.await.unwrap().unwrap();
+        });
+
+        let committed = manager.snapshot();
+        assert_eq!(committed.generation, generation);
+        assert_eq!(committed.next_inode, initial.next_inode + 1);
+        assert_eq!(committed.state, FilesystemState::Clean);
     }
 }
