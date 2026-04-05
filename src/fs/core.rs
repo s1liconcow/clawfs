@@ -123,7 +123,7 @@ impl OsageFs {
             handle,
             client_state,
             active_inodes: Arc::new(DashMap::new()),
-            pending_inodes: Arc::new(DashSet::new()),
+            pending_queue: Arc::new(crossbeam_queue::SegQueue::new()),
             pending_bytes: Arc::new(AtomicU64::new(0)),
             perf,
             replay,
@@ -232,7 +232,10 @@ impl OsageFs {
                 record,
                 data: data_opt,
             });
-            self.pending_inodes.insert(inode);
+            if !state.is_queued {
+                state.is_queued = true;
+                self.pending_queue.push(inode);
+            }
             if let Some(old_entry) = old
                 && let Some(old_data) = old_entry.data
             {
@@ -769,7 +772,10 @@ impl OsageFs {
             }
             state.pending = Some(PendingEntry { record, data: None });
         }
-        self.pending_inodes.insert(inode);
+        if !state.is_queued {
+            state.is_queued = true;
+            self.pending_queue.push(inode);
+        }
         drop(state);
 
         debug!(

@@ -37,6 +37,7 @@ time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
+crossbeam-queue = "0.3"
 chacha20poly1305 = "0.10"
 lz4_flex = "0.11"
 sha2 = "0.10"

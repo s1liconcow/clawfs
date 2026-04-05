@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -67,7 +67,7 @@ pub struct OsageFs {
     handle: Handle,
     client_state: Arc<ClientStateManager>,
     active_inodes: Arc<DashMap<u64, Arc<Mutex<ActiveInode>>>>,
-    pending_inodes: Arc<DashSet<u64>>,
+    pending_queue: Arc<crossbeam_queue::SegQueue<u64>>,
     pending_bytes: Arc<AtomicU64>,
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
@@ -181,6 +181,7 @@ pub(crate) struct PendingEntry {
 pub(crate) struct ActiveInode {
     pub pending: Option<PendingEntry>,
     pub flushing: Option<PendingEntry>,
+    pub is_queued: bool,
 }
 
 #[derive(Clone, Copy)]

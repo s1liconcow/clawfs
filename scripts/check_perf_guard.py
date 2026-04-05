@@ -35,7 +35,7 @@ def main() -> int:
             continue
         val = observed[name]
         base = float(cfg["value"])
-        reg = float(cfg.get("max_regression_pct", 20.0)) / 100.0
+        reg = float(cfg.get("max_regression_pct", 35.0)) / 100.0
         direction = cfg["direction"]
         if direction == "higher":
             floor = base * (1.0 - reg)

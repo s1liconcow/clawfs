@@ -1381,7 +1381,7 @@ fn flush_pending_for_inode_flushes_pending_ancestor_directories() {
 }
 
 #[test]
-fn concurrent_flush_does_not_hide_pending_inodes() {
+fn concurrent_flush_does_not_hide_pending_queue() {
     let dir = tempdir().unwrap();
     let harness = TestHarness::with_config(dir.path(), "concurrent_flush.bin", 1 << 30, |cfg| {
         cfg.disable_journal = true;
@@ -2167,11 +2167,14 @@ fn flush_stale_setattr_entry_merges_storage_from_metadata_store() {
             std::sync::Arc::new(parking_lot::Mutex::new(crate::fs::ActiveInode::default()))
         })
         .clone();
-    active_arc.lock().pending = Some(PendingEntry {
+    let mut state = active_arc.lock();
+    state.pending = Some(PendingEntry {
         record: stale_record,
         data: None,
     });
-    fs.pending_inodes.insert(file.inode);
+    state.is_queued = true;
+    fs.pending_queue.push(file.inode);
+    drop(state);
 
     // flush_pending_selected must detect the stale Inline([]) storage,
     // reload from metadata store, and persist the merged record.
@@ -2812,7 +2815,8 @@ fn rename_during_flushing_preserves_file_data() {
             data: None, // metadata-only entry
         });
         state.flushing = None; // flush completed
-        fs.pending_inodes.insert(source.inode);
+        state.is_queued = true;
+        fs.pending_queue.push(source.inode);
     }
 
     // Read the file — without the fix, this returns all zeros

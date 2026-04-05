@@ -66,8 +66,26 @@ impl OsageFs {
 
     pub(crate) fn flush_pending(&self) -> std::result::Result<(), i32> {
         for attempt in 0..=Self::FLUSH_STALE_RETRY_LIMIT {
-            let result =
-                self.flush_pending_selected_once(|guard| std::mem::take(&mut *guard), "all");
+            let result = self.flush_pending_selected_once(
+                || {
+                    let mut guard = HashMap::new();
+                    while let Some(inode) = self.pending_queue.pop() {
+                        if let Some(active_arc) = self.active_inodes.get(&inode) {
+                            if let Some(mut state) = active_arc.try_lock() {
+                                state.is_queued = false;
+                                if let Some(entry) = state.pending.take() {
+                                    state.flushing = Some(entry.clone());
+                                    guard.insert(inode, entry);
+                                }
+                            } else {
+                                self.pending_queue.push(inode);
+                            }
+                        }
+                    }
+                    guard
+                },
+                "all",
+            );
             if result != Err(libc::EAGAIN) || attempt == Self::FLUSH_STALE_RETRY_LIMIT {
                 return result;
             }
@@ -83,22 +101,30 @@ impl OsageFs {
     pub(crate) fn flush_pending_for_inode(&self, ino: u64) -> std::result::Result<(), i32> {
         for attempt in 0..=Self::FLUSH_STALE_RETRY_LIMIT {
             let result = self.flush_pending_selected_once(
-                |guard| {
-                    let mut selected = HashMap::new();
+                || {
+                    let mut guard = HashMap::new();
                     let mut cursor = ino;
                     let mut seen = HashSet::new();
                     while seen.insert(cursor) {
-                        let Some(entry) = guard.remove(&cursor) else {
-                            break;
-                        };
-                        let parent = entry.record.parent;
-                        selected.insert(cursor, entry);
-                        if parent == cursor {
-                            break;
+                        if let Some(active_arc) = self.active_inodes.get(&cursor) {
+                            let mut state = active_arc.lock();
+                            state.is_queued = false;
+                            if let Some(entry) = state.pending.take() {
+                                state.flushing = Some(entry.clone());
+                                guard.insert(cursor, entry);
+                            }
+                            let parent_opt = guard.get(&cursor).map(|e| e.record.parent);
+                            if let Some(parent) = parent_opt {
+                                if parent == cursor {
+                                    break;
+                                }
+                                cursor = parent;
+                                continue;
+                            }
                         }
-                        cursor = parent;
+                        break;
                     }
-                    selected
+                    guard
                 },
                 "inode",
             );
@@ -168,11 +194,11 @@ impl OsageFs {
 
     pub(crate) fn flush_pending_selected_once<F>(
         &self,
-        selector: F,
+        extractor: F,
         scope: &str,
     ) -> std::result::Result<(), i32>
     where
-        F: FnOnce(&mut HashMap<u64, PendingEntry>) -> HashMap<u64, PendingEntry>,
+        F: FnOnce() -> HashMap<u64, PendingEntry>,
     {
         let flush_lock_wait_start = Instant::now();
         let _flush_guard = self.flush_lock.lock();
@@ -184,51 +210,9 @@ impl OsageFs {
         let result = (|| {
             let start = Instant::now();
             let drain_start = Instant::now();
-            let mut drain_skipped_locked = 0usize;
             let mut rotate_stage_file_duration = Duration::from_secs(0);
             let pending = {
-                let mut guard = HashMap::new();
-                let keys: Vec<u64> = self
-                    .pending_inodes
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect();
-                for inode in keys {
-                    if let Some(active_arc) = self.active_inodes.get(&inode) {
-                        if let Some(mut state) = active_arc.try_lock() {
-                            if let Some(entry) = state.pending.take() {
-                                state.flushing = Some(entry.clone());
-                                guard.insert(inode, entry);
-                            } else {
-                                self.pending_inodes.remove(&inode);
-                            }
-                        } else {
-                            drain_skipped_locked = drain_skipped_locked.saturating_add(1);
-                        }
-                    }
-                }
-                if drain_skipped_locked > 0 {
-                    debug!(
-                        "flush_pending pid={} tid={} scope={} skipped_locked_inodes={}",
-                        pid, tid, scope, drain_skipped_locked
-                    );
-                }
-                if guard.is_empty() {
-                    self.touch_last_flush();
-                    return Ok(());
-                }
-                let drained = selector(&mut guard);
-                // Reinsert non-selected
-                for (inode, entry) in guard {
-                    if let Some(active_arc) = self.active_inodes.get(&inode) {
-                        let mut state = active_arc.lock();
-                        if state.pending.is_none() {
-                            state.pending = Some(entry);
-                            self.pending_inodes.insert(inode);
-                        }
-                        state.flushing = None;
-                    }
-                }
+                let drained = extractor();
                 if drained.is_empty() {
                     self.touch_last_flush();
                     return Ok(());
@@ -788,9 +772,6 @@ impl OsageFs {
                     let mut state = active_arc.lock();
                     finalize_flushing_lock_wait += lock_start.elapsed();
                     state.flushing = None;
-                    if state.pending.is_none() {
-                        self.pending_inodes.remove(inode);
-                    }
                 }
             }
             let finalize_clear_flushing_duration = finalize_clear_flushing_start.elapsed();
@@ -874,7 +855,7 @@ impl OsageFs {
                     "segment_bytes": segment_bytes,
                     "flushed_bytes": flushed_bytes,
                     "drained_inodes": drained_inodes,
-                    "drain_skipped_locked": drain_skipped_locked,
+
                     "segment_id": segment_id_logged,
                     "flush_lock_wait_ms": flush_lock_wait.as_secs_f64() * 1000.0,
                     "drain_select_ms": drain_duration.as_secs_f64() * 1000.0,
@@ -937,7 +918,10 @@ impl OsageFs {
                 let mut state = active_arc.lock();
                 if state.pending.is_none() {
                     state.pending = Some(entry);
-                    self.pending_inodes.insert(inode);
+                    if !state.is_queued {
+                        state.is_queued = true;
+                        self.pending_queue.push(inode);
+                    }
                 } else if let Some(data) = entry.data {
                     dropped_bytes = dropped_bytes.saturating_add(data.len());
                     self.release_pending_data(data);

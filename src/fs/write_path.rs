@@ -99,7 +99,10 @@ impl OsageFs {
             record: record.clone(),
             data: Some(pending_data),
         });
-        self.pending_inodes.insert(inode);
+        if !state.is_queued {
+            state.is_queued = true;
+            self.pending_queue.push(inode);
+        }
         drop(state);
 
         if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
@@ -240,7 +243,10 @@ impl OsageFs {
             .map(|_| self.snapshot_journal_payload(slot));
 
         state.pending = Some(working_entry);
-        self.pending_inodes.insert(inode);
+        if !state.is_queued {
+            state.is_queued = true;
+            self.pending_queue.push(inode);
+        }
         drop(state);
 
         if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {
@@ -484,7 +490,10 @@ impl OsageFs {
         };
 
         state.pending = Some(entry);
-        self.pending_inodes.insert(inode);
+        if !state.is_queued {
+            state.is_queued = true;
+            self.pending_queue.push(inode);
+        }
         drop(state);
 
         if let (Some(journal), Some(payload)) = (&self.journal, &journal_payload) {

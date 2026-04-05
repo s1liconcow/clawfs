@@ -48,17 +48,17 @@ fn configured_criterion() -> Criterion {
         .plotting_backend(PlottingBackend::Plotters);
     match profile.as_str() {
         "fast" => base
-            .sample_size(20)
-            .warm_up_time(Duration::from_secs(1))
-            .measurement_time(Duration::from_secs(13)),
+            .sample_size(10)
+            .warm_up_time(Duration::from_secs(2))
+            .measurement_time(Duration::from_secs(26)),
         "thorough" => base
-            .sample_size(40)
+            .sample_size(20)
             .warm_up_time(Duration::from_secs(4))
-            .measurement_time(Duration::from_secs(12)),
+            .measurement_time(Duration::from_secs(30)),
         _ => base
-            .sample_size(24)
-            .warm_up_time(Duration::from_secs(1))
-            .measurement_time(Duration::from_secs(4)),
+            .sample_size(10)
+            .warm_up_time(Duration::from_secs(2))
+            .measurement_time(Duration::from_secs(26)),
     }
 }
 
