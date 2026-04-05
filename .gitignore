@@ -11,6 +11,7 @@ pjdfstest_nfs
 micro-results-*
 pjdfstest_*
 fio-results-*
+*.zip
 scripts/__pycache__
 private
 

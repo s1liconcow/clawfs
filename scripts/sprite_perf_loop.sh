@@ -136,7 +136,7 @@ fi
 
 if ! sprite list | rg -qx "$SPRITE_NAME"; then
   echo "Creating sprite '$SPRITE_NAME'..."
-  sprite create "$SPRITE_NAME" >/dev/null
+  sprite create --skip-console "$SPRITE_NAME" >/dev/null
   CREATED_SPRITE=1
 fi
 

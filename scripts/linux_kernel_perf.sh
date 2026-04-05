@@ -30,6 +30,51 @@ Usage: ${0##*/} [--no_cleanup]
 USAGE
 }
 
+append_missing_package() {
+  local pkg=$1
+  local existing
+  for existing in "${MISSING_PACKAGES[@]:-}"; do
+    [[ "$existing" == "$pkg" ]] && return 0
+  done
+  MISSING_PACKAGES+=("$pkg")
+}
+
+ensure_linux_kernel_perf_deps() {
+  MISSING_PACKAGES=()
+
+  command -v curl >/dev/null 2>&1 || append_missing_package curl
+  command -v python3 >/dev/null 2>&1 || append_missing_package python3
+  command -v pv >/dev/null 2>&1 || append_missing_package pv
+  command -v tar >/dev/null 2>&1 || append_missing_package tar
+  command -v xz >/dev/null 2>&1 || append_missing_package xz-utils
+  command -v make >/dev/null 2>&1 || append_missing_package build-essential
+  command -v gcc >/dev/null 2>&1 || append_missing_package build-essential
+  command -v ld >/dev/null 2>&1 || append_missing_package binutils
+  command -v bc >/dev/null 2>&1 || append_missing_package bc
+  command -v bison >/dev/null 2>&1 || append_missing_package bison
+  command -v flex >/dev/null 2>&1 || append_missing_package flex
+  command -v perl >/dev/null 2>&1 || append_missing_package perl
+  command -v rsync >/dev/null 2>&1 || append_missing_package rsync
+  command -v cpio >/dev/null 2>&1 || append_missing_package cpio
+  [[ -x /usr/bin/time ]] || append_missing_package time
+  [[ -f /usr/include/libelf.h ]] || append_missing_package libelf-dev
+  [[ -f /usr/include/openssl/ssl.h ]] || append_missing_package libssl-dev
+  command -v pahole >/dev/null 2>&1 || append_missing_package dwarves
+
+  if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+    append_missing_package fuse3
+    command -v umount >/dev/null 2>&1 || append_missing_package util-linux
+  fi
+
+  if [[ "${#MISSING_PACKAGES[@]}" -gt 0 ]]; then
+    echo "Installing missing dependencies: ${MISSING_PACKAGES[*]}" >&2
+    if ! osage_apt_install_packages "${MISSING_PACKAGES[@]}"; then
+      echo "Failed to install dependencies with apt-get. Set ALLOW_SYSTEM_INSTALL=0 to disable auto-install." >&2
+      exit 1
+    fi
+  fi
+}
+
 while [[ ${1:-} != "" ]]; do
   case "$1" in
     --no_cleanup)
@@ -83,6 +128,8 @@ if [[ $DO_CLEANUP -eq 1 ]]; then
 fi
 
 mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
+
+ensure_linux_kernel_perf_deps
 
 osage_require_cmd curl
 osage_require_cmd python3

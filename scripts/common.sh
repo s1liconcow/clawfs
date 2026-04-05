@@ -36,6 +36,24 @@ osage_require_path() {
   fi
 }
 
+osage_apt_install_packages() {
+  local packages=("$@")
+  [[ "${#packages[@]}" -eq 0 ]] && return 0
+  if [[ "${ALLOW_SYSTEM_INSTALL:-1}" != "1" ]]; then
+    return 1
+  fi
+
+  local apt_prefix=()
+  if command -v sudo >/dev/null 2>&1 && [[ $EUID -ne 0 ]]; then
+    apt_prefix=(sudo env DEBIAN_FRONTEND=noninteractive)
+  else
+    apt_prefix=(env DEBIAN_FRONTEND=noninteractive)
+  fi
+
+  "${apt_prefix[@]}" apt-get update
+  "${apt_prefix[@]}" apt-get install -y "${packages[@]}"
+}
+
 osage_ensure_release_binary() {
   local osage_bin=${1:-"$ROOT_DIR/target/release/clawfsd"}
   local needs_build=0

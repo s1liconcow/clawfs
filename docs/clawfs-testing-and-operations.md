@@ -46,6 +46,7 @@
 - Sprite xfstests may print `System has not been booted with systemd...` from `systemd-run`; treat it as noise unless `./check` fails or exits non-zero.
 - Linux kernel build dependencies in sprites: `flex`, `bison`, `libelf-dev`, `dwarves`.
 - `scripts/linux_kernel_perf.sh` fails fast on stale or inaccessible mounts and on an already-running daemon.
+- `scripts/linux_kernel_perf.sh` auto-installs missing apt packages by default; set `ALLOW_SYSTEM_INSTALL=0` to keep dependency checks fail-fast.
 - `scripts/checkpoint.sh` process guards can false-positive match; run checkpoint phases in separate shells.
 - Checkpoints snapshot only the superblock pointer, not data objects.
 - EIO during builds usually means daemon liveness or mount health is broken; verify those before debugging the data path.

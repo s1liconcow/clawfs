@@ -175,7 +175,7 @@ impl Filesystem for OsageFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let replay = self.replay_start();
-        match self.load_inode_for_fuse_getattr(ino) {
+        match self.op_getattr(ino) {
             Ok(record) => {
                 self.log_replay(
                     "fuse",
@@ -445,7 +445,7 @@ impl Filesystem for OsageFs {
                     None,
                     json!({ "ino": ino, "flags": flags }),
                 );
-                reply.opened(flags as u32 as u64, Self::fuse_open_reply_flags(flags))
+                reply.opened(0, Self::fuse_open_reply_flags(flags))
             }
             Err(code) => {
                 self.log_replay(
