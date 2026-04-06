@@ -932,12 +932,19 @@ impl SegmentManager {
         F: Future<Output = object_store::Result<T>> + Send + 'static,
         C: FnOnce() -> String,
     {
+        let ctx = ctx();
         let result = if Handle::try_current().is_ok() {
             block_in_place(|| self.handle.block_on(fut))
         } else {
             self.handle.block_on(fut)
         };
-        result.map_err(anyhow::Error::from).with_context(ctx)
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                debug!(target: "backing", "backing store op failed ctx={} err={:#}", ctx, err);
+                Err(anyhow::Error::from(err)).with_context(|| ctx)
+            }
+        }
     }
 
     fn cache_path(&self, generation: u64, segment_id: u64) -> PathBuf {

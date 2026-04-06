@@ -770,9 +770,29 @@ impl MetadataStore {
         match result {
             Ok(get_result) => {
                 let e_tag = get_result.meta.e_tag.clone();
-                let bytes = get_result.bytes().await?;
+                let bytes = match get_result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        debug!(
+                            target: "backing",
+                            "backing read failed op=load_superblock path={} err={:#}",
+                            path,
+                            err
+                        );
+                        return Err(anyhow::Error::from(err)
+                            .context(format!("reading superblock bytes {}", path)));
+                    }
+                };
                 let version = e_tag.unwrap_or_else(|| superblock_version(&bytes));
-                let stored: StoredSuperblock = deserialize_metadata(&bytes)?;
+                let stored: StoredSuperblock = deserialize_metadata(&bytes).map_err(|err| {
+                    debug!(
+                        target: "backing",
+                        "backing decode failed op=load_superblock path={} err={:#}",
+                        path,
+                        err
+                    );
+                    err
+                })?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
                     "unsupported superblock format version {}",
@@ -784,7 +804,15 @@ impl MetadataStore {
                 }))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("reading superblock {}", path))),
+            Err(e) => {
+                debug!(
+                    target: "backing",
+                    "backing get failed op=load_superblock path={} err={:#}",
+                    path,
+                    e
+                );
+                Err(anyhow::Error::from(e).context(format!("reading superblock {}", path)))
+            }
         }
     }
 
@@ -1487,13 +1515,58 @@ impl MetadataStore {
             let Some((generation, path)) = files.into_iter().next() else {
                 continue;
             };
-            let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_shard(&bytes).with_context(|| {
-                format!(
-                    "decoding newest shard failed shard={} generation={} path={}",
-                    shard_id, generation, path
-                )
-            })?;
+            let get_result = match self.store.get(&path).await {
+                Ok(result) => result,
+                Err(err) => {
+                    debug!(
+                        target: "backing",
+                        "backing get failed op=load_latest_imap shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "reading imap shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )));
+                }
+            };
+            let bytes = match get_result.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    debug!(
+                        target: "backing",
+                        "backing read failed op=load_latest_imap shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "reading imap bytes shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )));
+                }
+            };
+            let stored: StoredShard = deserialize_shard(&bytes)
+                .map_err(|err| {
+                    debug!(
+                        target: "backing",
+                        "backing decode failed op=load_latest_imap shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    err
+                })
+                .with_context(|| {
+                    format!(
+                        "decoding newest shard failed shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )
+                })?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
                 "unsupported shard version {} for shard={} generation={} path={}",
@@ -1559,8 +1632,48 @@ impl MetadataStore {
 
             while idx < files.len() && files[idx].0 == generation {
                 let (_, path) = &files[idx];
-                let bytes = self.store.get(path).await?.bytes().await?;
-                let stored: StoredDelta = deserialize_delta(&bytes)?;
+                let get_result = match self.store.get(path).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        debug!(
+                            target: "backing",
+                            "backing get failed op=apply_external_delta generation={} path={} err={:#}",
+                            generation,
+                            path,
+                            err
+                        );
+                        return Err(anyhow::Error::from(err).context(format!(
+                            "reading delta generation={} path={}",
+                            generation, path
+                        )));
+                    }
+                };
+                let bytes = match get_result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        debug!(
+                            target: "backing",
+                            "backing read failed op=apply_external_delta generation={} path={} err={:#}",
+                            generation,
+                            path,
+                            err
+                        );
+                        return Err(anyhow::Error::from(err).context(format!(
+                            "reading delta bytes generation={} path={}",
+                            generation, path
+                        )));
+                    }
+                };
+                let stored: StoredDelta = deserialize_delta(&bytes).map_err(|err| {
+                    debug!(
+                        target: "backing",
+                        "backing decode failed op=apply_external_delta generation={} path={} err={:#}",
+                        generation,
+                        path,
+                        err
+                    );
+                    err
+                })?;
                 anyhow::ensure!(
                     stored.version == METADATA_FORMAT_VERSION,
                     "unsupported delta version {}",
@@ -1744,13 +1857,58 @@ impl MetadataStore {
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
         if let Some((generation, path)) = candidates.into_iter().next() {
-            let bytes = self.store.get(&path).await?.bytes().await?;
-            let stored: StoredShard = deserialize_shard(&bytes).with_context(|| {
-                format!(
-                    "decoding newest shard failed shard={} generation={} path={}",
-                    shard_id, generation, path
-                )
-            })?;
+            let get_result = match self.store.get(&path).await {
+                Ok(result) => result,
+                Err(err) => {
+                    debug!(
+                        target: "backing",
+                        "backing get failed op=reload_shard shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "reading imap shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )));
+                }
+            };
+            let bytes = match get_result.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    debug!(
+                        target: "backing",
+                        "backing read failed op=reload_shard shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    return Err(anyhow::Error::from(err).context(format!(
+                        "reading imap bytes shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )));
+                }
+            };
+            let stored: StoredShard = deserialize_shard(&bytes)
+                .map_err(|err| {
+                    debug!(
+                        target: "backing",
+                        "backing decode failed op=reload_shard shard={} generation={} path={} err={:#}",
+                        shard_id,
+                        generation,
+                        path,
+                        err
+                    );
+                    err
+                })
+                .with_context(|| {
+                    format!(
+                        "decoding newest shard failed shard={} generation={} path={}",
+                        shard_id, generation, path
+                    )
+                })?;
             anyhow::ensure!(
                 stored.version == METADATA_FORMAT_VERSION,
                 "unsupported shard version {} for shard={} generation={} path={}",
@@ -1759,6 +1917,7 @@ impl MetadataStore {
                 generation,
                 path
             );
+            let generation = stored.generation;
             let mut shard = InodeShard::new(shard_id);
             for (ino, record) in stored.entries {
                 shard.inodes.insert(ino, record);
