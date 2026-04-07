@@ -397,12 +397,7 @@ pub fn aws_session_token() -> Option<String> {
     env_var(CLAWFS_AWS_SESSION_TOKEN_ENV).or_else(|| env_var("AWS_SESSION_TOKEN"))
 }
 
-fn validate_runtime_config(storage_mode: StorageMode, config: &Config) -> Result<()> {
-    if storage_mode == StorageMode::HostedFree
-        && config.object_prefix.trim().trim_matches('/').is_empty()
-    {
-        bail!("{OBJECT_PREFIX_ENV} is required for hosted_free volumes");
-    }
+fn validate_runtime_config(_storage_mode: StorageMode, config: &Config) -> Result<()> {
     match config.object_provider {
         ObjectStoreProvider::Local => {}
         ObjectStoreProvider::Aws | ObjectStoreProvider::Gcs => {
@@ -529,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_free_requires_prefix() {
+    fn hosted_free_allows_bucket_root_without_prefix() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_test_env();
         set_env(STORAGE_MODE_ENV, "hosted_free");
@@ -537,11 +532,13 @@ mod tests {
         set_env(BUCKET_ENV, "clawfs-free");
 
         let mut config = base_config();
-        let err = apply_env_runtime_spec(&mut config).expect_err("missing prefix should fail");
-        assert!(
-            err.to_string().contains(OBJECT_PREFIX_ENV),
-            "unexpected error: {err:#}"
-        );
+        let spec = apply_env_runtime_spec(&mut config)
+            .expect("bucket-root hosted_free should be valid")
+            .expect("spec missing");
+
+        assert_eq!(spec.storage_mode, StorageMode::HostedFree);
+        assert_eq!(config.bucket.as_deref(), Some("clawfs-free"));
+        assert!(config.object_prefix.is_empty());
     }
     fn base_config() -> Config {
         Config::from(Cli::parse_from([
