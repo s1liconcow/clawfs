@@ -633,29 +633,18 @@ impl SegmentManager {
         let payload_base = pointer.offset + SEGMENT_ENTRY_CODEC_HEADER_LEN as u64;
         let store_start = payload_base + local_start;
         let store_end = payload_base + local_end;
-        self.fetch_segment_range(
+        if let Some(cached) =
+            self.read_payload_subrange_from_cache(pointer, local_start..local_end)?
+        {
+            return Ok(cached);
+        }
+        let bytes = self.fetch_segment_range(
             pointer.generation,
             pointer.segment_id,
             store_start..store_end,
-        )
-    }
-
-    fn decode_pointer_from_segment(
-        &self,
-        full: &[u8],
-        pointer: &SegmentPointer,
-    ) -> Result<Vec<u8>> {
-        if full.len() < 4 {
-            anyhow::bail!("segment too small");
-        }
-        if !full.starts_with(SEGMENT_MAGIC_V2) {
-            anyhow::bail!("unsupported segment magic");
-        }
-        let start = pointer.offset as usize;
-        let end = start + pointer.length as usize;
-        anyhow::ensure!(end <= full.len(), "segment pointer out of bounds");
-        let slice = &full[start..end];
-        self.decode_pointer_entry(slice)
+        )?;
+        self.enqueue_cache_fill(pointer.generation, pointer.segment_id);
+        Ok(bytes)
     }
 
     fn decode_pointer_entry(&self, slice: &[u8]) -> Result<Vec<u8>> {
@@ -977,14 +966,28 @@ impl SegmentManager {
         if !path.exists() {
             return Ok(None);
         }
-        let full = match fs::read(&path) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
+        let range_end = pointer
+            .offset
+            .checked_add(pointer.length)
+            .context("cache pointer range overflow")?;
+        let slice = match Self::read_cache_range(&path, pointer.offset..range_end) {
+            Ok(Some(slice)) => slice,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                log::debug!(
+                    "cache range read failed gen={} seg={} path={}: {:#}; falling back to backing store",
+                    pointer.generation,
+                    pointer.segment_id,
+                    path.display(),
+                    err
+                );
+                return Ok(None);
+            }
         };
         // The cache file may be partially written (async cache fill races with
-        // reads) or corrupt.  Fall back to the range-read path instead of
+        // reads) or corrupt. Fall back to the backing store path instead of
         // propagating the error.
-        match self.decode_pointer_from_segment(&full, pointer) {
+        match self.decode_pointer_entry(&slice) {
             Ok(decoded) => Ok(Some(decoded)),
             Err(e) => {
                 log::debug!(
@@ -997,6 +1000,83 @@ impl SegmentManager {
                 Ok(None)
             }
         }
+    }
+
+    fn read_payload_subrange_from_cache(
+        &self,
+        pointer: &SegmentPointer,
+        local_range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.cache_path(pointer.generation, pointer.segment_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let payload_base = pointer.offset + SEGMENT_ENTRY_CODEC_HEADER_LEN as u64;
+        let range_start = payload_base
+            .checked_add(local_range.start)
+            .context("cache payload subrange start overflow")?;
+        let range_end = payload_base
+            .checked_add(local_range.end)
+            .context("cache payload subrange end overflow")?;
+        Self::read_cache_range(&path, range_start..range_end)
+    }
+
+    fn read_cache_range(path: &Path, range: Range<u64>) -> Result<Option<Vec<u8>>> {
+        anyhow::ensure!(range.end >= range.start, "cache range underflow");
+        let len = range.end - range.start;
+        let len = usize::try_from(len).context("cache range exceeds usize")?;
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        if file.seek(SeekFrom::Start(range.start)).is_err() {
+            return Ok(None);
+        }
+        let mut buffer = vec![0u8; len];
+        if file.read_exact(&mut buffer).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(buffer))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn benchmark_read_from_cache_full_file(
+        &self,
+        pointer: &SegmentPointer,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.cache_path(pointer.generation, pointer.segment_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let full = match fs::read(&path) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        if full.len() < 4 || !full.starts_with(SEGMENT_MAGIC_V2) {
+            return Ok(None);
+        }
+        let start = pointer.offset as usize;
+        let end = start + pointer.length as usize;
+        if end > full.len() {
+            return Ok(None);
+        }
+        match self.decode_pointer_entry(&full[start..end]) {
+            Ok(decoded) => Ok(Some(decoded)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn benchmark_read_from_cache_range(
+        &self,
+        pointer: &SegmentPointer,
+    ) -> Result<Option<Vec<u8>>> {
+        self.read_from_cache(pointer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn benchmark_cache_path(&self, generation: u64, segment_id: u64) -> PathBuf {
+        self.cache_path(generation, segment_id)
     }
 
     fn fetch_segment(&self, generation: u64, segment_id: u64) -> Result<Vec<u8>> {
@@ -1359,6 +1439,7 @@ fn codec_from_u8(raw: u8) -> Result<InlinePayloadCodec> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use object_store::path::Path as ObjectPath;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1435,6 +1516,88 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("expected cache prefetch to create {}", cache_path.display());
+    }
+
+    #[test]
+    fn cached_pointer_read_survives_missing_backing_segment() {
+        let dir = tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut config = build_config(dir.path());
+        config.segment_cache_bytes = 4 * 1024 * 1024;
+        let manager = SegmentManager::new(&config, handle).unwrap();
+        let entries = vec![SegmentEntry {
+            inode: 11,
+            path: "/cached.bin".into(),
+            logical_offset: 0,
+            payload: SegmentPayload::Bytes(b"cached pointer data".to_vec()),
+        }];
+        let pointers = manager.write_batch(5, 12, entries).unwrap();
+        let ptr = &pointers[0].1.pointer;
+
+        let cache_path = manager.cache_path(ptr.generation, ptr.segment_id);
+        for _ in 0..20 {
+            if cache_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            cache_path.exists(),
+            "expected cache file {}",
+            cache_path.display()
+        );
+
+        let segment_path = ObjectPath::from(format!(
+            "test/segs/s_{:020}_{:020}",
+            ptr.generation, ptr.segment_id
+        ));
+        rt.block_on(manager.store.delete(&segment_path)).unwrap();
+
+        let bytes = manager.read_pointer(ptr).unwrap();
+        assert_eq!(bytes, b"cached pointer data");
+    }
+
+    #[test]
+    fn cached_plain_subrange_read_survives_missing_backing_segment() {
+        let dir = tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut config = build_config(dir.path());
+        config.segment_cache_bytes = 4 * 1024 * 1024;
+        config.segment_compression = false;
+        let manager = SegmentManager::new(&config, handle).unwrap();
+        let payload = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+        let entries = vec![SegmentEntry {
+            inode: 21,
+            path: "/plain.bin".into(),
+            logical_offset: 0,
+            payload: SegmentPayload::Bytes(payload.clone()),
+        }];
+        let pointers = manager.write_batch(8, 3, entries).unwrap();
+        let ptr = &pointers[0].1.pointer;
+
+        let cache_path = manager.cache_path(ptr.generation, ptr.segment_id);
+        for _ in 0..20 {
+            if cache_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            cache_path.exists(),
+            "expected cache file {}",
+            cache_path.display()
+        );
+
+        let segment_path = ObjectPath::from(format!(
+            "test/segs/s_{:020}_{:020}",
+            ptr.generation, ptr.segment_id
+        ));
+        rt.block_on(manager.store.delete(&segment_path)).unwrap();
+
+        let bytes = manager.read_pointer_subrange(ptr, 10, 20).unwrap();
+        assert_eq!(bytes, payload[10..20].to_vec());
     }
 
     #[test]

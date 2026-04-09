@@ -248,3 +248,121 @@ impl PerfLogger {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use tempfile::tempdir;
+
+    use crate::perf_bench::{generate_incompressible_payload, perf_config, summarize_samples};
+    use crate::segment::{SegmentEntry, SegmentManager, SegmentPayload};
+
+    fn wait_for_cache_file(path: &Path) {
+        for _ in 0..50 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("expected cache file {}", path.display());
+    }
+
+    #[test]
+    fn perf_segment_cache_range_read_lift() {
+        if env::var("CLAWFS_RUN_PERF").is_err() {
+            eprintln!(
+                "skipping perf_segment_cache_range_read_lift; set CLAWFS_RUN_PERF=1 to enable"
+            );
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut config = perf_config(dir.path());
+        config.segment_cache_bytes = 256 * 1024 * 1024;
+        config.segment_compression = false;
+        let manager = SegmentManager::new(&config, runtime.handle().clone()).unwrap();
+
+        let entry_count = 16u64;
+        let entry_bytes = 4 * 1024 * 1024usize;
+        let payload = generate_incompressible_payload(entry_bytes);
+        let entries = (0..entry_count)
+            .map(|i| SegmentEntry {
+                inode: i + 1,
+                path: format!("/bench_{i:02}.bin"),
+                logical_offset: 0,
+                payload: SegmentPayload::Bytes(payload.clone()),
+            })
+            .collect::<Vec<_>>();
+        let pointers = manager.write_batch(1, 1, entries).unwrap();
+        let target_pointer = pointers[(entry_count as usize) / 2].1.pointer.clone();
+
+        let cache_path =
+            manager.benchmark_cache_path(target_pointer.generation, target_pointer.segment_id);
+        wait_for_cache_file(&cache_path);
+
+        let warmups = 5usize;
+        for _ in 0..warmups {
+            let baseline = manager
+                .benchmark_read_from_cache_full_file(&target_pointer)
+                .unwrap()
+                .unwrap();
+            let optimized = manager
+                .benchmark_read_from_cache_range(&target_pointer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(baseline, optimized);
+        }
+
+        let iterations = 30usize;
+        let mut baseline_ms = Vec::with_capacity(iterations);
+        let mut optimized_ms = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let baseline = manager
+                .benchmark_read_from_cache_full_file(&target_pointer)
+                .unwrap()
+                .unwrap();
+            baseline_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            let start = Instant::now();
+            let optimized = manager
+                .benchmark_read_from_cache_range(&target_pointer)
+                .unwrap()
+                .unwrap();
+            optimized_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+            assert_eq!(baseline, optimized);
+        }
+
+        let baseline = summarize_samples(&baseline_ms);
+        let optimized = summarize_samples(&optimized_ms);
+        let speedup = baseline.mean / optimized.mean;
+        eprintln!(
+            concat!(
+                "perf_segment_cache_range_read_lift ",
+                "segment_entries={} entry_bytes={} cache_file_mb={:.1} ",
+                "baseline_mean_ms={:.3} optimized_mean_ms={:.3} speedup={:.2}x ",
+                "baseline_p50_ms={:.3} optimized_p50_ms={:.3}"
+            ),
+            entry_count,
+            entry_bytes,
+            (entry_count as f64 * entry_bytes as f64) / (1024.0 * 1024.0),
+            baseline.mean,
+            optimized.mean,
+            speedup,
+            baseline.median,
+            optimized.median,
+        );
+
+        assert!(
+            speedup > 1.2,
+            "expected range cache read benchmark to improve over full-file cache read: baseline_mean_ms={:.3} optimized_mean_ms={:.3}",
+            baseline.mean,
+            optimized.mean
+        );
+    }
+}
