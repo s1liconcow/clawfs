@@ -1219,6 +1219,7 @@ impl MetadataStore {
         if records.is_empty() {
             return Ok(());
         }
+        let record_count = records.len();
 
         // Phase 1: pre-serialize deltas FIRST before consuming records.
         // Delta serialization only needs &[InodeRecord] and is lighter weight.
@@ -1281,45 +1282,51 @@ impl MetadataStore {
 
         // Phase 2: update in-memory caches + shards under lock.
         // Now we consume records by-value with only ONE clone per record.
+        let refreshed = Instant::now();
         for mut record in records {
             self.negative_cache.remove(&record.inode);
             let shard_id = record.shard_index(shard_size);
-
-            self.shards
-                .entry(shard_id)
-                .or_insert_with(|| ShardEntry {
-                    shard: InodeShard::new(shard_id),
-                    generation,
-                })
-                .value_mut()
-                .generation = generation;
-
-            if matches!(record.kind, InodeKind::Tombstone) {
-                if let Some(mut entry) = self.shards.get_mut(&shard_id) {
-                    entry.shard.inodes.remove(&record.inode);
-                }
-                // neg.remove() already called above; manual insert ok.
-                self.cache.insert(
-                    record.inode,
-                    CacheEntry::with_generation(record, generation),
-                );
-            } else {
-                // Normalize, clone once for cache, move into shard.
-                let inode = record.inode;
+            let inode = record.inode;
+            let tombstone = matches!(record.kind, InodeKind::Tombstone);
+            if !tombstone {
                 record.normalize_storage();
-                let for_cache = record.clone();
-                if let Some(mut entry) = self.shards.get_mut(&shard_id) {
-                    entry.shard.inodes.insert(inode, record);
-                }
-                // neg.remove() already called above; manual insert ok.
+            }
+            let cache_record = if record_count >= 512
+                && matches!(record.kind, InodeKind::File)
+                && matches!(
+                    record.storage,
+                    FileStorage::Inline(_) | FileStorage::InlineEncoded(_)
+                ) {
+                None
+            } else {
+                Some(record.clone())
+            };
+
+            let mut entry = self.shards.entry(shard_id).or_insert_with(|| ShardEntry {
+                shard: InodeShard::new(shard_id),
+                generation,
+            });
+            let entry = entry.value_mut();
+            entry.generation = generation;
+            if tombstone {
+                entry.shard.inodes.remove(&inode);
+            } else {
+                entry.shard.inodes.insert(inode, record);
+            }
+
+            // negative_cache.remove() already ran above; update the positive cache
+            // from the same normalized/tombstoned record we applied to the shard.
+            if let Some(record) = cache_record {
                 self.cache.insert(
                     inode,
                     CacheEntry {
-                        record: for_cache,
-                        refreshed: Instant::now(),
+                        record,
+                        refreshed,
                         generation,
                     },
                 );
+            } else {
+                self.cache.remove(&inode);
             }
         }
 
@@ -1327,22 +1334,52 @@ impl MetadataStore {
         let shard_writes: Vec<(ObjectPath, Bytes, u64, usize)> = {
             let mut shard_ids: Vec<u64> = touched_shard_ids.into_iter().collect();
             shard_ids.sort_unstable();
+            let use_parallel_shard_serialize = record_count >= 512 && shard_ids.len() > 1;
+            let mut writes: Vec<_> = if use_parallel_shard_serialize {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = shard_ids
+                        .into_iter()
+                        .map(|shard_id| {
+                            let imap_prefix = imap_prefix.clone();
+                            scope.spawn(move || {
+                                let entry = self.shards.get(&shard_id)?;
+                                let data = serialize_inodes_fb2(
+                                    METADATA_FORMAT_VERSION,
+                                    generation,
+                                    entry.shard.inodes.values(),
+                                );
+                                let count = entry.shard.inodes.len();
+                                let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
+                                let path = imap_prefix.child(filename.as_str());
+                                Some((path, Bytes::from(data), shard_id, count))
+                            })
+                        })
+                        .collect();
 
-            shard_ids
-                .iter()
-                .filter_map(|&shard_id| {
-                    let entry = self.shards.get(&shard_id)?;
-                    let data = serialize_inodes_fb2(
-                        METADATA_FORMAT_VERSION,
-                        generation,
-                        entry.shard.inodes.values(),
-                    );
-                    let count = entry.shard.inodes.len();
-                    let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
-                    let path = imap_prefix.child(filename.as_str());
-                    Some((path, Bytes::from(data), shard_id, count))
+                    handles
+                        .into_iter()
+                        .filter_map(|handle| handle.join().expect("shard serialize thread"))
+                        .collect()
                 })
-                .collect()
+            } else {
+                shard_ids
+                    .into_iter()
+                    .filter_map(|shard_id| {
+                        let entry = self.shards.get(&shard_id)?;
+                        let data = serialize_inodes_fb2(
+                            METADATA_FORMAT_VERSION,
+                            generation,
+                            entry.shard.inodes.values(),
+                        );
+                        let count = entry.shard.inodes.len();
+                        let filename = format!("i_{generation:020}_{:08x}.bin", shard_id);
+                        let path = imap_prefix.child(filename.as_str());
+                        Some((path, Bytes::from(data), shard_id, count))
+                    })
+                    .collect()
+            };
+            writes.sort_by_key(|(_, _, shard_id, _)| *shard_id);
+            writes
         };
 
         // Update last_delta_generation before issuing writes.

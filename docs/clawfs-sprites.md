@@ -41,6 +41,7 @@ tar -czf - . | sprite exec -s "$SPRITE_NAME" -- bash -lc 'rm -rf /work/clawfs &&
 ## Common Workflows
 - Smoke build: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && cargo build --release && ./target/release/clawfs --help >/dev/null'`
 - E2E: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && ./scripts/stress_e2e.sh'`
+- Perf guard: run `./scripts/perf_guard.sh` locally; it creates or reuses a dedicated perf sprite, syncs `/work/clawfs`, and runs the suite there by default.
 - Fio: `sprite exec -s "$SPRITE_NAME" -- bash -lc 'cd /work/clawfs && RESULTS_DIR=/work/clawfs/fio-results/compact LOG_FILE=/work/clawfs/clawfs.log PERF_LOG_PATH=/work/clawfs/clawfs-perf.jsonl RUNTIME_SEC=5 SEQ_SIZE=64M RAND_SIZE=64M RAND_NUMJOBS=2 RAND_IODEPTH=8 SMALLFILE_COUNT=200 SMALLFILE_NUMJOBS=4 SMALLFILE_SIZE=8k ./scripts/fio_workloads.sh'`
 
 ## Troubleshooting

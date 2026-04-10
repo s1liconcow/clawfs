@@ -3,16 +3,23 @@
 ## Validation And Benchmarking
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
 - The repo root is a Cargo workspace; `cargo build --release` from the root builds the public `clawfs` packages.
-- Local performance suite: `CLAWFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion`.
-- `CLAWFS_PERF_PROFILE=fast` in `benches/perf_local_criterion.rs` keeps `sample_size=20` and increases `measurement_time` to 13s to avoid Criterion sample warnings on slower hosts.
+- Local bench entrypoint: `scripts/perf_guard.sh` now runs the Criterion suite in a sprite by default, syncs the repo into `/work/clawfs`, and copies metrics/report artifacts back locally.
+- `benches/perf_local_criterion.rs` now defaults to a small core suite: `untar_flush_latency`, `large_segment_staged_flush_latency`, `segment_sequential_read_throughput`, and `create_write_close_iops_with_flush`.
+- Use `CLAWFS_PERF_SUITE=full ./scripts/perf_guard.sh` for the expanded microbenchmark pass.
+- Use `PERF_GUARD_MODE=local` only for debugging when a sprite run is unavailable.
+- `CLAWFS_PERF_PROFILE=fast` in `benches/perf_local_criterion.rs` uses `sample_size=10`, `warm_up_time=2s`, and `measurement_time=26s`; `thorough` raises those to `20`, `4s`, and `30s`.
 - Perf guard uses `scripts/perf_guard.sh` together with `CLAWFS_BENCH_METRICS_FILE`, which is emitted as JSONL by `benches/perf_local_criterion.rs`.
+- Baseline policy: for follow-on perf work, treat the checked-in sprite baseline in `bench-artifacts/perf_guard_baseline.json` as the current core-suite baseline. The 2026-04-10 refresh records `untar_flush_latency_ms=7.561786`, `large_segment_staged_flush_mib_per_s=1880.1709198752383`, `segment_sequential_read_mib_per_s=3592478.2486668536`, and `preload_create_write_close_iops_with_flush=310.387003614438`.
+- Do not spend a separate run re-establishing that baseline unless one of these changed: the core benchmark list in `benches/perf_local_criterion.rs`, the sprite perf environment in `scripts/perf_guard.sh`, or the perf harness methodology itself.
 - `scripts/perf_guard.sh` copies Criterion HTML reports from `target/criterion/report` into `bench-artifacts/perf_guard_graphs/<commit5>/` by default. Override with `PERF_GUARD_GRAPH_ROOT` or `PERF_GUARD_GRAPH_DIR`.
+- Sprite knobs for perf guard: `PERF_GUARD_SPRITE_NAME`, `PERF_GUARD_SPRITE_SYNC=0`, and `PERF_GUARD_SKIP_BOOTSTRAP=1`.
 - Hook runs can skip graph artifact copies with `PERF_GUARD_WRITE_GRAPHS=0`. `.githooks/pre-push` uses this to avoid staging large report trees.
 - `.githooks/pre-push` also skips perf guard entirely when the pushed ref updates do not touch filesystem core paths under `src/fs/` plus `src/metadata.rs` and `src/segment.rs`.
 - `.githooks/pre-push` skips perf guard when the pushed diff includes `bench-artifacts/`, because those pushes already include a completed perf-guard run.
 - `.github/workflows/perf-reports-pages.yml` publishes `website/clawfs.dev` at the Pages root and copies `bench-artifacts/perf_guard_graphs` to `/perf`, with `/perf/index.html` linking each `<date>-<commit5>/report/index.html`.
 - CI note: Criterion `html_reports` requires native `fontconfig`; keep `pkg-config` and `libfontconfig1-dev` installed in Rust CI jobs that build tests or benches.
 - `segment_sequential_read_throughput` in `benches/perf_local_criterion.rs` must treat `write_batch` output as a logical extent list sorted by `logical_offset`, not a single pointer, because large payloads are chunked into 4 MiB extents.
+- The core suite is intentionally workload-oriented; keep low-level cases in the `full` suite unless a change specifically targets those internals.
 
 ## Script Notes
 - `./ship.sh` bumps the local package version (`patch` by default, or `--major`/`--minor`/explicit `vX.Y.Z`), updates the workspace crate versions plus `Cargo.lock`, commits `release: vX.Y.Z`, tags, and pushes. Run it only from a clean branch you intend to publish.

@@ -36,8 +36,42 @@ fn guard_metrics() -> &'static Mutex<GuardMetrics> {
     GUARD_METRICS.get_or_init(|| Mutex::new(GuardMetrics::default()))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PerfSuite {
+    Core,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+enum BenchThroughput {
+    Bytes(u64),
+    Elements(u64),
+}
+
+#[derive(Clone, Copy)]
+struct PerfCase {
+    core: bool,
+    group: &'static str,
+    bench_name: &'static str,
+    guard_metric: &'static str,
+    throughput: Option<BenchThroughput>,
+    run_once: fn() -> RunResult,
+}
+
 fn perf_profile() -> String {
     std::env::var("CLAWFS_PERF_PROFILE").unwrap_or_else(|_| "fast".to_string())
+}
+
+fn perf_suite() -> PerfSuite {
+    match std::env::var("CLAWFS_PERF_SUITE") {
+        Ok(value) if value.eq_ignore_ascii_case("full") => PerfSuite::Full,
+        Ok(value) if value.eq_ignore_ascii_case("core") => PerfSuite::Core,
+        Ok(value) => {
+            eprintln!("[perf] unknown CLAWFS_PERF_SUITE={value:?}; defaulting to core suite");
+            PerfSuite::Core
+        }
+        Err(_) => PerfSuite::Core,
+    }
 }
 
 fn configured_criterion() -> Criterion {
@@ -549,154 +583,6 @@ fn run_inline_resize_strategy_speedup_once() -> RunResult {
     }
 }
 
-fn bench_untar_flush_latency(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.bench_function("untar_flush_latency", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_untar_flush_latency_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_flush_metadata_batch_latency(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.bench_function("flush_metadata_batch_latency", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_flush_metadata_batch_latency_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_large_segment_staged_flush_latency(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Bytes((128 * 1024 * 1024) as u64));
-    group.bench_function("large_segment_staged_flush_latency", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_large_segment_staged_flush_latency_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_journal_write_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Elements(5_000));
-    group.bench_function("journal_write_throughput", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_journal_write_iops_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_local_disk_stage_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Bytes((40 * 1024 * 1024) as u64));
-    group.bench_function("local_disk_stage_throughput", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_local_disk_stage_mib_per_s_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_local_segment_batch_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Bytes((128 * 256 * 1024 * 4) as u64));
-    group.bench_function("local_segment_batch_throughput", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_local_segment_batch_mib_per_s_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_local_segment_small_file_iops(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Elements(8_000));
-    group.bench_function("local_segment_small_file_iops", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_local_segment_small_file_iops_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_segment_sequential_read_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Bytes((128 * 1024 * 1024) as u64));
-    group.bench_function("segment_sequential_read_throughput", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_segment_sequential_read_mib_per_s_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_inode_clone_directory_heavy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Elements(4_000));
-    group.bench_function("inode_clone_directory_heavy", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_inode_clone_directory_heavy_clones_per_s_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
-fn bench_inline_resize_strategy_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perf_local");
-    group.throughput(Throughput::Elements(200_000));
-    group.bench_function("inline_resize_strategy_benchmark", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_inline_resize_strategy_speedup_once().duration;
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
 // ---------------------------------------------------------------------------
 // Preload-path benchmarks
 // ---------------------------------------------------------------------------
@@ -782,62 +668,169 @@ fn run_preload_read_throughput_once() -> RunResult {
     }
 }
 
-fn bench_preload_create_write_close_iops(c: &mut Criterion) {
-    let mut group = c.benchmark_group("preload");
-    group.throughput(Throughput::Elements(100));
-    group.bench_function("create_write_close_iops_with_flush", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_preload_create_write_close_iops_once(true).duration;
-            }
-            total
-        });
-    });
-    group.bench_function("create_write_close_iops_no_flush", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_preload_create_write_close_iops_once(false).duration;
-            }
-            total
-        });
-    });
-    group.finish();
+fn run_preload_create_write_close_iops_with_flush_once() -> RunResult {
+    run_preload_create_write_close_iops_once(true)
 }
 
-fn bench_preload_mkdir_iops(c: &mut Criterion) {
-    let mut group = c.benchmark_group("preload");
-    group.throughput(Throughput::Elements(100));
-    group.bench_function("mkdir_iops_with_flush", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_preload_mkdir_iops_once(true).duration;
-            }
-            total
-        });
-    });
-    group.bench_function("mkdir_iops_no_flush", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += run_preload_mkdir_iops_once(false).duration;
-            }
-            total
-        });
-    });
-    group.finish();
+fn run_preload_create_write_close_iops_no_flush_once() -> RunResult {
+    run_preload_create_write_close_iops_once(false)
 }
 
-fn bench_preload_read_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("preload");
-    group.throughput(Throughput::Bytes(64 * 1024 * 100));
-    group.bench_function("read_throughput", |b| {
+fn run_preload_mkdir_iops_with_flush_once() -> RunResult {
+    run_preload_mkdir_iops_once(true)
+}
+
+fn run_preload_mkdir_iops_no_flush_once() -> RunResult {
+    run_preload_mkdir_iops_once(false)
+}
+
+const PERF_CASES: &[PerfCase] = &[
+    // Keep the default suite focused on representative workloads that expose
+    // the main user-visible optimization surfaces. Specialized microbenchmarks
+    // stay available behind CLAWFS_PERF_SUITE=full for root-cause work.
+    PerfCase {
+        core: true,
+        group: "perf_local",
+        bench_name: "untar_flush_latency",
+        guard_metric: "untar_flush_latency_ms",
+        throughput: None,
+        run_once: run_untar_flush_latency_once,
+    },
+    PerfCase {
+        core: true,
+        group: "perf_local",
+        bench_name: "large_segment_staged_flush_latency",
+        guard_metric: "large_segment_staged_flush_mib_per_s",
+        throughput: Some(BenchThroughput::Bytes((128 * 1024 * 1024) as u64)),
+        run_once: run_large_segment_staged_flush_latency_once,
+    },
+    PerfCase {
+        core: true,
+        group: "perf_local",
+        bench_name: "segment_sequential_read_throughput",
+        guard_metric: "segment_sequential_read_mib_per_s",
+        throughput: Some(BenchThroughput::Bytes((128 * 1024 * 1024) as u64)),
+        run_once: run_segment_sequential_read_mib_per_s_once,
+    },
+    PerfCase {
+        core: true,
+        group: "preload",
+        bench_name: "create_write_close_iops_with_flush",
+        guard_metric: "preload_create_write_close_iops_with_flush",
+        throughput: Some(BenchThroughput::Elements(100)),
+        run_once: run_preload_create_write_close_iops_with_flush_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "flush_metadata_batch_latency",
+        guard_metric: "flush_metadata_batch_latency_ms",
+        throughput: None,
+        run_once: run_flush_metadata_batch_latency_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "journal_write_throughput",
+        guard_metric: "journal_write_iops",
+        throughput: Some(BenchThroughput::Elements(5_000)),
+        run_once: run_journal_write_iops_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "local_disk_stage_throughput",
+        guard_metric: "local_disk_stage_mib_per_s",
+        throughput: Some(BenchThroughput::Bytes((40 * 1024 * 1024) as u64)),
+        run_once: run_local_disk_stage_mib_per_s_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "local_segment_batch_throughput",
+        guard_metric: "local_segment_batch_mib_per_s",
+        throughput: Some(BenchThroughput::Bytes((128 * 256 * 1024 * 4) as u64)),
+        run_once: run_local_segment_batch_mib_per_s_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "local_segment_small_file_iops",
+        guard_metric: "local_segment_small_file_iops",
+        throughput: Some(BenchThroughput::Elements(8_000)),
+        run_once: run_local_segment_small_file_iops_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "inode_clone_directory_heavy",
+        guard_metric: "inode_clone_directory_heavy_clones_per_s",
+        throughput: Some(BenchThroughput::Elements(4_000)),
+        run_once: run_inode_clone_directory_heavy_clones_per_s_once,
+    },
+    PerfCase {
+        core: false,
+        group: "perf_local",
+        bench_name: "inline_resize_strategy_benchmark",
+        guard_metric: "inline_resize_strategy_speedup_x",
+        throughput: Some(BenchThroughput::Elements(200_000)),
+        run_once: run_inline_resize_strategy_speedup_once,
+    },
+    PerfCase {
+        core: false,
+        group: "preload",
+        bench_name: "create_write_close_iops_no_flush",
+        guard_metric: "preload_create_write_close_iops_no_flush",
+        throughput: Some(BenchThroughput::Elements(100)),
+        run_once: run_preload_create_write_close_iops_no_flush_once,
+    },
+    PerfCase {
+        core: false,
+        group: "preload",
+        bench_name: "mkdir_iops_with_flush",
+        guard_metric: "preload_mkdir_iops_with_flush",
+        throughput: Some(BenchThroughput::Elements(100)),
+        run_once: run_preload_mkdir_iops_with_flush_once,
+    },
+    PerfCase {
+        core: false,
+        group: "preload",
+        bench_name: "mkdir_iops_no_flush",
+        guard_metric: "preload_mkdir_iops_no_flush",
+        throughput: Some(BenchThroughput::Elements(100)),
+        run_once: run_preload_mkdir_iops_no_flush_once,
+    },
+    PerfCase {
+        core: false,
+        group: "preload",
+        bench_name: "read_throughput",
+        guard_metric: "preload_read_throughput_mib_per_s",
+        throughput: Some(BenchThroughput::Bytes(64 * 1024 * 100)),
+        run_once: run_preload_read_throughput_once,
+    },
+];
+
+fn selected_perf_cases() -> impl Iterator<Item = &'static PerfCase> {
+    let suite = perf_suite();
+    PERF_CASES
+        .iter()
+        .filter(move |case| suite == PerfSuite::Full || case.core)
+}
+
+fn bench_case(c: &mut Criterion, case: &PerfCase) {
+    let mut group = c.benchmark_group(case.group);
+    if let Some(throughput) = case.throughput {
+        match throughput {
+            BenchThroughput::Bytes(bytes) => group.throughput(Throughput::Bytes(bytes)),
+            BenchThroughput::Elements(count) => group.throughput(Throughput::Elements(count)),
+        };
+    }
+    let run_once = case.run_once;
+    group.bench_function(case.bench_name, |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += run_preload_read_throughput_once().duration;
+                total += run_once().duration;
             }
             total
         });
@@ -846,73 +839,25 @@ fn bench_preload_read_throughput(c: &mut Criterion) {
 }
 
 fn collect_guard_metrics() {
-    collect_guard_metric(
-        "flush_metadata_batch_latency_ms",
-        run_flush_metadata_batch_latency_once,
-    );
-    collect_guard_metric(
-        "large_segment_staged_flush_mib_per_s",
-        run_large_segment_staged_flush_latency_once,
-    );
-    collect_guard_metric("journal_write_iops", run_journal_write_iops_once);
-    collect_guard_metric(
-        "local_disk_stage_mib_per_s",
-        run_local_disk_stage_mib_per_s_once,
-    );
-    collect_guard_metric(
-        "local_segment_batch_mib_per_s",
-        run_local_segment_batch_mib_per_s_once,
-    );
-    collect_guard_metric(
-        "local_segment_small_file_iops",
-        run_local_segment_small_file_iops_once,
-    );
-    collect_guard_metric(
-        "segment_sequential_read_mib_per_s",
-        run_segment_sequential_read_mib_per_s_once,
-    );
-    collect_guard_metric(
-        "inode_clone_directory_heavy_clones_per_s",
-        run_inode_clone_directory_heavy_clones_per_s_once,
-    );
-    collect_guard_metric(
-        "inline_resize_strategy_speedup_x",
-        run_inline_resize_strategy_speedup_once,
-    );
-    collect_guard_metric("untar_flush_latency_ms", run_untar_flush_latency_once);
-    collect_guard_metric("preload_create_write_close_iops_with_flush", || {
-        run_preload_create_write_close_iops_once(true)
-    });
-    collect_guard_metric("preload_create_write_close_iops_no_flush", || {
-        run_preload_create_write_close_iops_once(false)
-    });
-    collect_guard_metric("preload_mkdir_iops_with_flush", || {
-        run_preload_mkdir_iops_once(true)
-    });
-    collect_guard_metric("preload_mkdir_iops_no_flush", || {
-        run_preload_mkdir_iops_once(false)
-    });
-    collect_guard_metric(
-        "preload_read_throughput_mib_per_s",
-        run_preload_read_throughput_once,
-    );
+    for case in selected_perf_cases() {
+        collect_guard_metric(case.guard_metric, case.run_once);
+    }
 }
 
 fn main() {
+    let suite = perf_suite();
+    eprintln!(
+        "[perf] running {} suite (set CLAWFS_PERF_SUITE=full for the expanded microbenchmark set)",
+        match suite {
+            PerfSuite::Core => "core",
+            PerfSuite::Full => "full",
+        }
+    );
+
     let mut criterion = configured_criterion();
-    bench_flush_metadata_batch_latency(&mut criterion);
-    bench_large_segment_staged_flush_latency(&mut criterion);
-    bench_journal_write_throughput(&mut criterion);
-    bench_local_disk_stage_throughput(&mut criterion);
-    bench_local_segment_batch_throughput(&mut criterion);
-    bench_local_segment_small_file_iops(&mut criterion);
-    bench_segment_sequential_read_throughput(&mut criterion);
-    bench_inode_clone_directory_heavy(&mut criterion);
-    bench_inline_resize_strategy_benchmark(&mut criterion);
-    bench_untar_flush_latency(&mut criterion);
-    bench_preload_create_write_close_iops(&mut criterion);
-    bench_preload_mkdir_iops(&mut criterion);
-    bench_preload_read_throughput(&mut criterion);
+    for case in selected_perf_cases() {
+        bench_case(&mut criterion, case);
+    }
     criterion.final_summary();
 
     collect_guard_metrics();

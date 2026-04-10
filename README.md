@@ -275,12 +275,19 @@ tests (e.g. `./scripts/run_clawfs.sh`, which now defaults to `$ROOT/clawfs-perf.
 The Linux kernel perf harness (`scripts/linux_kernel_perf.sh`) enables perf
 logging by default via `$PERF_LOG_PATH` (set it to an empty string to disable).
 
-For local microbenchmarks and regression tracking, use Criterion:
+For perf regression tracking, use the sprite-backed guard entrypoint:
 
 ```bash
-CLAWFS_PERF_PROFILE=balanced cargo bench --bench perf_local_criterion
 scripts/perf_guard.sh
+CLAWFS_PERF_SUITE=full ./scripts/perf_guard.sh
+PERF_GUARD_MODE=local ./scripts/perf_guard.sh
 ```
+
+`scripts/perf_guard.sh` runs in a sprite by default so perf loops do not trash a
+developer workstation. The default benchmark suite is intentionally small and
+workload-oriented; use `CLAWFS_PERF_SUITE=full` when you need the
+microbenchmark-heavy diagnostic pass, and reserve `PERF_GUARD_MODE=local` for
+debugging when a sprite run is unavailable.
 
 Close-time durability normally relies on the local journal under
 `$STORE/journal`. Each staged inode writes a record so a crash can replay pending

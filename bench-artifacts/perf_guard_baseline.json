@@ -1,45 +1,25 @@
 {
-  "description": "Baseline performance guard for tests/perf_local.rs metrics",
+  "description": "Baseline performance guard for the default perf_local core suite (sprite, 2026-04-10)",
   "metrics": {
-    "flush_metadata_batch_latency_ms": {
+    "untar_flush_latency_ms": {
       "direction": "lower",
-      "value": 35.915,
-      "max_regression_pct": 80.0
+      "value": 7.561786,
+      "max_regression_pct": 70.0
     },
     "large_segment_staged_flush_mib_per_s": {
       "direction": "higher",
-      "value": 771.95,
+      "value": 1880.1709198752383,
       "max_regression_pct": 70.0
     },
-    "journal_write_iops": {
+    "segment_sequential_read_mib_per_s": {
       "direction": "higher",
-      "value": 100686.83,
+      "value": 3592478.2486668536,
       "max_regression_pct": 70.0
     },
-    "local_disk_stage_mib_per_s": {
+    "preload_create_write_close_iops_with_flush": {
       "direction": "higher",
-      "value": 1892.67,
+      "value": 310.387003614438,
       "max_regression_pct": 70.0
-    },
-    "local_segment_batch_mib_per_s": {
-      "direction": "higher",
-      "value": 2416.66,
-      "max_regression_pct": 70.0
-    },
-    "local_segment_small_file_iops": {
-      "direction": "higher",
-      "value": 1028624.56,
-      "max_regression_pct": 70.0
-    },
-    "inode_clone_directory_heavy_clones_per_s": {
-      "direction": "higher",
-      "value": 42996882.73,
-      "max_regression_pct": 70.0
-    },
-    "inline_resize_strategy_speedup_x": {
-      "direction": "higher",
-      "value": 1.204,
-      "max_regression_pct": 50.0
     }
   }
 }

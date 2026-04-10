@@ -14,6 +14,7 @@ Continuously update this guide and the linked docs with anything that will impro
 - Before handing work off, run `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` unless the task explicitly prevents it.
 - Tests and Troubleshooting policy: always validate your change with unit and integration tests where possible, reproduce bugs with tests before solving them
 - Performance improvements: always try to quantify the lift of performance improvements.
+- Perf workflow: the current core-suite sprite baseline is checked in at `bench-artifacts/perf_guard_baseline.json` (refreshed 2026-04-10). Reuse that baseline for follow-on perf work unless the benchmark suite or sprite environment changes materially.
 - Duplicate any new config added to private/src/config.rs
 - *important* After compaction, agents must re-read AGENTS.md
 - *important* do not run cargo bench without the user's authorization
