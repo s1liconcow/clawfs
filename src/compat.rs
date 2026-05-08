@@ -46,22 +46,12 @@ pub const O_TRUNC: i32 = 0x0200;
 
 // ── stat(2) mode‐type bits ─────────────────────────────────────────────
 
-#[cfg(unix)]
-pub use libc::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK};
-
-#[cfg(not(unix))]
 pub const S_IFMT: u32 = 0o170000;
-#[cfg(not(unix))]
 pub const S_IFREG: u32 = 0o100000;
-#[cfg(not(unix))]
 pub const S_IFDIR: u32 = 0o040000;
-#[cfg(not(unix))]
 pub const S_IFCHR: u32 = 0o020000;
-#[cfg(not(unix))]
 pub const S_IFBLK: u32 = 0o060000;
-#[cfg(not(unix))]
 pub const S_IFIFO: u32 = 0o010000;
-#[cfg(not(unix))]
 pub const S_IFSOCK: u32 = 0o140000;
 
 // ── d_type constants (readdir) ─────────────────────────────────────────
