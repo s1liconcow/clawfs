@@ -154,8 +154,10 @@ impl SuperblockManager {
             {
                 Ok(new_version) => {
                     let mut guard = self.state.lock();
-                    guard.block = block;
-                    guard.version = new_version;
+                    if guard.version == expected_version {
+                        guard.block = block;
+                        guard.version = new_version;
+                    }
                     return Ok(result);
                 }
                 Err(_) => {
@@ -280,9 +282,15 @@ impl SuperblockManager {
             {
                 Ok(new_version) => {
                     let mut guard = self.state.lock();
-                    guard.version = new_version;
-                    guard.block = snapshot;
-                    guard.pending_generation = None;
+                    if guard.version == expected_version {
+                        guard.version = new_version;
+                        guard.block = snapshot;
+                    }
+                    if guard.pending_generation == Some(generation)
+                        && guard.block.generation >= generation
+                    {
+                        guard.pending_generation = None;
+                    }
                     return Ok(());
                 }
                 Err(_) => {
@@ -665,6 +673,68 @@ mod tests {
         let committed = manager.snapshot();
         assert_eq!(committed.generation, generation);
         assert_eq!(committed.next_inode, initial.next_inode + 1);
+        assert_eq!(committed.state, FilesystemState::Clean);
+    }
+
+    #[test]
+    fn concurrent_batch_reservation_during_commit_does_not_reuse_id_ranges() {
+        let dir = tempdir().unwrap();
+        let runtime = Runtime::new().unwrap();
+        let config = test_config(dir.path());
+        let delayed_store = Arc::new(DelayFirstConditionalStore::new(Arc::new(InMemory::new())));
+        let metadata = Arc::new(
+            runtime
+                .block_on(MetadataStore::new_with_store(
+                    delayed_store.clone(),
+                    String::new(),
+                    &config,
+                    runtime.handle().clone(),
+                ))
+                .unwrap(),
+        );
+        let manager = Arc::new(
+            runtime
+                .block_on(SuperblockManager::load_or_init(metadata, config.shard_size))
+                .unwrap(),
+        );
+
+        let generation = manager.prepare_dirty_generation().unwrap().generation;
+        let initial = manager.snapshot();
+        let batch = 8192;
+
+        runtime.block_on(async {
+            let commit_manager = Arc::clone(&manager);
+            let commit_task =
+                tokio::spawn(async move { commit_manager.commit_generation(generation).await });
+
+            delayed_store.entered.wait().await;
+
+            let first_inode_range = manager.reserve_inodes(batch).await.unwrap();
+            let first_segment_range = manager.reserve_segments(batch).await.unwrap();
+            assert_eq!(first_inode_range, initial.next_inode);
+            assert_eq!(first_segment_range, initial.next_segment);
+
+            delayed_store.release.wait().await;
+            commit_task.await.unwrap().unwrap();
+
+            let second_inode_range = manager.reserve_inodes(batch).await.unwrap();
+            let second_segment_range = manager.reserve_segments(batch).await.unwrap();
+            assert_eq!(
+                second_inode_range,
+                first_inode_range + batch,
+                "inode allocation batch was reused after commit retry"
+            );
+            assert_eq!(
+                second_segment_range,
+                first_segment_range + batch,
+                "segment allocation batch was reused after commit retry"
+            );
+        });
+
+        let committed = manager.snapshot();
+        assert_eq!(committed.generation, generation);
+        assert_eq!(committed.next_inode, initial.next_inode + (batch * 2));
+        assert_eq!(committed.next_segment, initial.next_segment + (batch * 2));
         assert_eq!(committed.state, FilesystemState::Clean);
     }
 }
