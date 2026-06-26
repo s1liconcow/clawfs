@@ -1,0 +1,25 @@
+{
+  "description": "Baseline performance guard for the default perf_local core suite (sprite, 2026-04-10)",
+  "metrics": {
+    "untar_flush_latency_ms": {
+      "direction": "lower",
+      "value": 7.561786,
+      "max_regression_pct": 70.0
+    },
+    "large_segment_staged_flush_mib_per_s": {
+      "direction": "higher",
+      "value": 1880.1709198752383,
+      "max_regression_pct": 70.0
+    },
+    "segment_sequential_read_mib_per_s": {
+      "direction": "higher",
+      "value": 3592478.2486668536,
+      "max_regression_pct": 70.0
+    },
+    "preload_create_write_close_iops_with_flush": {
+      "direction": "higher",
+      "value": 310.387003614438,
+      "max_regression_pct": 70.0
+    }
+  }
+}

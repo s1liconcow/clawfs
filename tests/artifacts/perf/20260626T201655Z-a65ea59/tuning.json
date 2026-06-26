@@ -1,0 +1,4 @@
+{
+  "os_tuning_applied": false,
+  "reason": "No fresh benchmark or profiler run was executed, and no sudo/kernel tuning was requested."
+}
