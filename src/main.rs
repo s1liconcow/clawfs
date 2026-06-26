@@ -1,8 +1,11 @@
+#[cfg(feature = "fuse")]
 use std::env;
 
 use anyhow::Result;
+#[cfg(feature = "fuse")]
 use clap::Parser;
 
+#[cfg(feature = "fuse")]
 use clawfs::config::{Cli, Config};
 #[cfg(feature = "fuse")]
 use clawfs::launch;
@@ -10,9 +13,9 @@ use clawfs::telemetry::install_panic_hook;
 
 fn main() -> Result<()> {
     install_panic_hook();
-    let args: Vec<_> = env::args_os().collect();
     #[cfg(feature = "fuse")]
     {
+        let args: Vec<_> = env::args_os().collect();
         let cli = Cli::parse();
         let config: Config = cli.into();
         launch::run_mount_entry(config, &args)

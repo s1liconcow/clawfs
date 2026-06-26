@@ -7,6 +7,7 @@ pub use ::clawfs::coordination;
 pub use ::clawfs::fs;
 pub use ::clawfs::inode;
 pub use ::clawfs::journal;
+#[cfg(feature = "fuse")]
 pub use ::clawfs::launch;
 pub use ::clawfs::maintenance;
 pub use ::clawfs::metadata;

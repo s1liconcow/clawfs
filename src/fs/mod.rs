@@ -2,18 +2,24 @@ use std::collections::{HashMap, HashSet};
 
 use dashmap::DashMap;
 use std::convert::TryFrom;
+#[cfg(feature = "fuse")]
 use std::ffi::OsStr;
+#[cfg(feature = "fuse")]
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(feature = "fuse")]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use crate::compat::{
-    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL,
-    O_TRUNC, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, O_EXCL, O_TRUNC, S_IFMT,
+    S_IFREG,
 };
+#[cfg(feature = "fuse")]
+use crate::compat::{ENAMETOOLONG, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFSOCK};
 use anyhow::{Result, anyhow};
 #[cfg(feature = "fuse")]
 use fuser::{
@@ -39,23 +45,45 @@ use crate::source::{DiscoveredEntry, SourceObjectStore};
 use crate::state::ClientStateManager;
 use crate::superblock::SuperblockManager;
 use crate::telemetry::TelemetryClient;
-use log::{debug, error, info};
+#[cfg(feature = "fuse")]
+use log::info;
+use log::{debug, error};
 use serde_json::json;
 
+#[cfg(feature = "fuse")]
 const FUSE_NODE_GENERATION: u64 = 1;
+#[cfg(feature = "fuse")]
 const STATFS_BLOCK_SIZE: u32 = 4096;
+#[cfg(feature = "fuse")]
 const STATFS_BLOCKS: u64 = 1u64 << 48; // 1 exabyte of 4KiB blocks
+#[cfg(feature = "fuse")]
 const STATFS_FILES: u64 = 1u64 << 52; // generous inode pool to appear "infinite"
 const ADAPTIVE_PENDING_MULTIPLIER: u64 = 16;
 const ADAPTIVE_PENDING_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const ADAPTIVE_LARGE_WRITE_MIN_BYTES: u64 = 256 * 1024;
+#[cfg(feature = "fuse")]
 const NAME_MAX_BYTES: usize = 255;
 static PROCESS_EXITING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(unix, target_os = "linux"))]
-const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE;
+fn unsupported_rename_flags(flags: u32) -> u32 {
+    flags & !libc::RENAME_NOREPLACE
+}
+
 #[cfg(not(all(unix, target_os = "linux")))]
-const RENAME_NOREPLACE_FLAG: u32 = 0;
+fn unsupported_rename_flags(flags: u32) -> u32 {
+    flags
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn rename_noreplace_requested(flags: u32) -> bool {
+    flags & libc::RENAME_NOREPLACE != 0
+}
+
+#[cfg(not(all(unix, target_os = "linux")))]
+fn rename_noreplace_requested(_flags: u32) -> bool {
+    false
+}
 
 #[derive(Clone)]
 pub struct OsageFs {
@@ -72,15 +100,19 @@ pub struct OsageFs {
     perf: Option<Arc<PerfLogger>>,
     replay: Option<Arc<ReplayLogger>>,
     telemetry: Option<Arc<TelemetryClient>>,
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     telemetry_session_id: Option<String>,
     coordination_publisher: Option<Arc<dyn crate::coordination::CoordinationPublisher>>,
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     mount_ready_emitted: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     fsync_on_close: bool,
     flush_interval: Option<Duration>,
     last_flush: Arc<AtomicU64>,
     flush_lock: Arc<Mutex<()>>,
     dir_locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
     flush_scheduled: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     fuse_entry_ttl: Duration,
     lookup_cache_ttl: Duration,
     dir_cache_ttl: Duration,
@@ -109,18 +141,19 @@ fn file_type(record: &InodeRecord) -> FileType {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "fuse", unix))]
 fn path_to_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
 
     path.as_os_str().as_bytes().to_vec()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "fuse", not(unix)))]
 fn path_to_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
 
+#[cfg(feature = "fuse")]
 fn to_system_time(ts: OffsetDateTime) -> SystemTime {
     let secs = ts.unix_timestamp();
     let nanos = ts.nanosecond();
@@ -149,6 +182,7 @@ pub(crate) fn current_thread_label() -> String {
     }
 }
 
+#[cfg(feature = "fuse")]
 fn from_system_time(ts: SystemTime) -> OffsetDateTime {
     match ts.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(duration) => {

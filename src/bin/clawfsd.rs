@@ -1,8 +1,11 @@
+#[cfg(feature = "fuse")]
 use std::env;
 
 use anyhow::Result;
+#[cfg(feature = "fuse")]
 use clap::Parser;
 
+#[cfg(feature = "fuse")]
 use clawfs::config::{Cli, Config};
 
 fn main() -> Result<()> {

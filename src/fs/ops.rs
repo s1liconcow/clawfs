@@ -2,6 +2,7 @@ use super::*;
 
 const S_ISVTX: u32 = 0o1000;
 const S_ISGID: u32 = 0o2000;
+#[cfg(feature = "fuse")]
 const S_ISUID: u32 = 0o4000;
 
 impl OsageFs {
@@ -377,6 +378,7 @@ impl OsageFs {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub(crate) fn op_create_fuse(
         &self,
         parent: u64,
@@ -451,6 +453,7 @@ impl OsageFs {
         Ok(dir)
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn op_mkdir_fuse(
         &self,
         parent: u64,
@@ -474,6 +477,7 @@ impl OsageFs {
         Ok(dir)
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn op_mknod(
         &self,
         parent: u64,
@@ -632,6 +636,7 @@ impl OsageFs {
         Ok(data.len() as u32)
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn op_open(&self, ino: u64, flags: i32) -> std::result::Result<(), i32> {
         let mut record = self.load_inode(ino)?;
         if flags & O_TRUNC != 0 && !record.is_dir() {

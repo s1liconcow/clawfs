@@ -1147,6 +1147,7 @@ fn script_style_workload_without_fuse() {
     assert_eq!(attrs_after.gid, 888);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn fuse_create_allows_existing_without_excl() {
     let dir = tempdir().unwrap();
@@ -1172,6 +1173,7 @@ fn fuse_create_allows_existing_without_excl() {
     assert!(matches!(result, Err(code) if code == EEXIST));
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn fuse_create_truncates_existing_when_requested() {
     let dir = tempdir().unwrap();
@@ -1518,6 +1520,7 @@ fn load_inode_visible_during_large_segment_mutation() {
 // ===== Permission / POSIX semantics tests =====
 
 /// Helper: create a directory under parent with a given uid/gid, then set its mode bits.
+#[cfg(feature = "fuse")]
 fn make_dir_with_mode(
     fs: &OsageFs,
     parent: u64,
@@ -1543,6 +1546,7 @@ fn make_dir_with_mode(
     fs.load_inode(dir.inode).unwrap()
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chmod_by_owner_succeeds() {
     let dir = tempdir().unwrap();
@@ -1566,6 +1570,7 @@ fn chmod_by_owner_succeeds() {
     assert_eq!(updated.mode & 0o777, 0o644);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chmod_by_non_owner_returns_eperm() {
     let dir = tempdir().unwrap();
@@ -1587,6 +1592,7 @@ fn chmod_by_non_owner_returns_eperm() {
     assert_eq!(result.unwrap_err(), EPERM);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chmod_by_root_always_succeeds() {
     let dir = tempdir().unwrap();
@@ -1600,6 +1606,7 @@ fn chmod_by_root_always_succeeds() {
     assert_eq!(updated.mode & 0o777, 0o600);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chown_uid_by_non_root_returns_eperm() {
     let dir = tempdir().unwrap();
@@ -1634,6 +1641,7 @@ fn chown_uid_by_non_root_returns_eperm() {
     assert_eq!(result.unwrap_err(), EPERM);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chown_uid_by_root_succeeds() {
     let dir = tempdir().unwrap();
@@ -1647,6 +1655,7 @@ fn chown_uid_by_root_succeeds() {
     assert_eq!(updated.uid, 2000);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chown_gid_by_owner_succeeds() {
     let dir = tempdir().unwrap();
@@ -1670,6 +1679,7 @@ fn chown_gid_by_owner_succeeds() {
     assert_eq!(updated.gid, 2000);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chown_gid_by_non_owner_returns_eperm() {
     let dir = tempdir().unwrap();
@@ -1691,6 +1701,7 @@ fn chown_gid_by_non_owner_returns_eperm() {
     assert_eq!(result.unwrap_err(), EPERM);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chown_clears_suid_sgid_for_non_root_owner_change() {
     let dir = tempdir().unwrap();
@@ -1757,6 +1768,7 @@ fn chown_clears_suid_sgid_for_non_root_owner_change() {
     );
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_blocks_unlink_by_third_party() {
     let dir = tempdir().unwrap();
@@ -1772,6 +1784,7 @@ fn sticky_bit_blocks_unlink_by_third_party() {
     assert_eq!(result.unwrap_err(), EPERM);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_allows_unlink_by_file_owner() {
     let dir = tempdir().unwrap();
@@ -1786,6 +1799,7 @@ fn sticky_bit_allows_unlink_by_file_owner() {
     assert!(result.is_ok());
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_allows_unlink_by_dir_owner() {
     let dir = tempdir().unwrap();
@@ -1800,6 +1814,7 @@ fn sticky_bit_allows_unlink_by_dir_owner() {
     assert!(result.is_ok());
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_blocks_rmdir_by_third_party() {
     let dir = tempdir().unwrap();
@@ -1812,6 +1827,7 @@ fn sticky_bit_blocks_rmdir_by_third_party() {
     assert_eq!(result.unwrap_err(), EPERM);
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_blocks_rename_by_third_party() {
     let dir = tempdir().unwrap();
@@ -1902,6 +1918,7 @@ fn unlink_persists_across_fresh_metadata_store() {
     }
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sticky_bit_allows_rename_by_file_owner() {
     let dir = tempdir().unwrap();
@@ -1924,6 +1941,7 @@ fn sticky_bit_allows_rename_by_file_owner() {
     assert!(result.is_ok());
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sgid_dir_new_file_inherits_parent_gid() {
     let dir = tempdir().unwrap();
@@ -1943,6 +1961,7 @@ fn sgid_dir_new_file_inherits_parent_gid() {
     );
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn sgid_dir_new_subdir_inherits_gid_and_sgid_bit() {
     let dir = tempdir().unwrap();
@@ -1968,6 +1987,7 @@ fn sgid_dir_new_subdir_inherits_gid_and_sgid_bit() {
 // chmod/12.t: writing to a SUID/SGID file by a non-owner clears those bits.
 // The kernel sends a FUSE setattr (req.uid = writer) stripping SUID/SGID; we
 // must allow it or the write() syscall itself fails.
+#[cfg(feature = "fuse")]
 #[test]
 fn write_by_non_owner_clears_suid_bit() {
     let dir = tempdir().unwrap();
@@ -1997,6 +2017,7 @@ fn write_by_non_owner_clears_suid_bit() {
     assert_eq!(attr.perm & 0o0777, 0o0777, "rwx bits should be unchanged");
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn write_by_non_owner_clears_sgid_bit() {
     let dir = tempdir().unwrap();
@@ -2024,6 +2045,7 @@ fn write_by_non_owner_clears_sgid_bit() {
     assert_eq!(attr.perm & 0o0777, 0o0777, "rwx bits should be unchanged");
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn chmod_by_non_owner_non_strip_still_fails() {
     // Arbitrary mode change (not just stripping SUID/SGID) by non-owner → EPERM
@@ -2051,6 +2073,7 @@ fn chmod_by_non_owner_non_strip_still_fails() {
     assert_eq!(err, libc::EPERM, "non-owner rwx change should be EPERM");
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn non_sgid_dir_file_uses_caller_gid() {
     let dir = tempdir().unwrap();
@@ -2071,6 +2094,7 @@ fn non_sgid_dir_file_uses_caller_gid() {
 // corrupt content by reading a stale Inline([]) placeholder).
 // After the fix, op_fuse_setattr uses stage_inode for size=None, preserving
 // the staged data in-place.
+#[cfg(feature = "fuse")]
 #[test]
 fn fuse_setattr_chmod_on_large_pending_file_preserves_content() {
     let dir = tempdir().unwrap();
@@ -2127,6 +2151,7 @@ fn fuse_setattr_chmod_on_large_pending_file_preserves_content() {
 // Regression: metadata-only setattr on a large file that has already been
 // flushed (inode lives in the metadata store with correct Segments storage)
 // must persist both the correct storage pointer AND the metadata change.
+#[cfg(feature = "fuse")]
 #[test]
 fn fuse_setattr_chmod_after_flush_preserves_large_file_content() {
     let dir = tempdir().unwrap();
@@ -3244,6 +3269,7 @@ fn concurrent_create_and_flush_preserves_directory_children() {
 /// committed segment extents without verifying that `record.size > 0`.  After
 /// O_TRUNC (size=0), the stale `Segments([...])` storage was inherited as
 /// `base_extents`, causing old segment data to bleed into the new file content.
+#[cfg(feature = "fuse")]
 #[test]
 fn truncate_then_write_does_not_inherit_old_segment_extents() {
     let dir = tempdir().unwrap();
@@ -3306,6 +3332,7 @@ fn truncate_then_write_does_not_inherit_old_segment_extents() {
 /// when a new write arrives at a HIGH offset.  The old committed extents
 /// (covering offset 0..2048) must NOT be inherited as base_extents, otherwise
 /// old 0xAA data bleeds through at offset 0 where there is no new write.
+#[cfg(feature = "fuse")]
 #[test]
 fn truncate_flushing_then_write_does_not_inherit_old_extents() {
     let dir = tempdir().unwrap();
@@ -3367,6 +3394,7 @@ fn truncate_flushing_then_write_does_not_inherit_old_extents() {
 
 /// Tests that O_TRUNC followed by non-sequential writes (mimicking assembler
 /// object file generation) produces correct content after flush.
+#[cfg(feature = "fuse")]
 #[test]
 fn truncate_then_nonsequential_writes_correct_after_flush() {
     let dir = tempdir().unwrap();
@@ -4082,6 +4110,7 @@ fn source_write_copies_up_and_does_not_mutate_source_object() {
     );
 }
 
+#[cfg(feature = "fuse")]
 #[test]
 fn readdir_batch_large_directory() {
     let tmp = tempdir().unwrap();

@@ -22,6 +22,7 @@ impl OsageFs {
         }
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub(crate) fn apply_umask(mode: u32, umask: u32) -> u32 {
         let type_bits = mode & S_IFMT;
         let perm_bits = (mode & 0o7777) & !umask;
@@ -29,12 +30,14 @@ impl OsageFs {
         inode_type | perm_bits
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn normalize_node_mode(mode: u32) -> u32 {
         let type_bits = mode & S_IFMT;
         let inode_type = if type_bits == 0 { S_IFREG } else { type_bits };
         inode_type | (mode & 0o7777)
     }
 
+    #[cfg(feature = "fuse")]
     pub(crate) fn validate_os_name(name: &OsStr) -> std::result::Result<String, i32> {
         #[cfg(unix)]
         {
@@ -462,6 +465,7 @@ impl OsageFs {
     /// Batch-load multiple inodes. Checks active_inodes first, then fetches
     /// remaining inodes from the metadata cache in a single batch (one cache
     /// lock acquisition + grouped shard reloads for misses).
+    #[cfg(feature = "fuse")]
     pub(crate) fn load_inodes_batch(
         &self,
         inos: &[u64],
@@ -1076,7 +1080,7 @@ impl OsageFs {
         newname: &str,
         flags: u32,
     ) -> std::result::Result<(), i32> {
-        if flags & !(RENAME_NOREPLACE_FLAG) != 0 {
+        if unsupported_rename_flags(flags) != 0 {
             return Err(EINVAL);
         }
         let old_name = name.to_string();
@@ -1102,7 +1106,7 @@ impl OsageFs {
                 .children()
                 .and_then(|children| children.get(&new_name).copied())
             {
-                if flags & RENAME_NOREPLACE_FLAG != 0 {
+                if rename_noreplace_requested(flags) {
                     return Err(EEXIST);
                 }
                 if existing != target.inode {
@@ -1155,7 +1159,7 @@ impl OsageFs {
             .children()
             .and_then(|children| children.get(&new_name).copied())
         {
-            if flags & RENAME_NOREPLACE_FLAG != 0 {
+            if rename_noreplace_requested(flags) {
                 return Err(EEXIST);
             }
             if existing != target.inode {

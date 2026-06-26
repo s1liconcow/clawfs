@@ -2,6 +2,11 @@
 
 ## Validation And Benchmarking
 - Default validation: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test`.
+- macOS/no-FUSE public validation: `cargo check --no-default-features`,
+  `cargo clippy --no-default-features -p clawfs-core -- -D warnings`, and focused
+  NFS/core tests such as
+  `cargo test --no-default-features nfs_link_updates_reference_counts_and_directory_entries`.
+  Default-feature FUSE commands still require a host with libfuse/FUSE support.
 - The repo root is a Cargo workspace; `cargo build --release` from the root builds the public `clawfs` packages.
 - Local bench entrypoint: `scripts/perf_guard.sh` now runs the Criterion suite in a sprite by default, syncs the repo into `/work/clawfs`, and copies metrics/report artifacts back locally.
 - `benches/perf_local_criterion.rs` now defaults to a small core suite: `untar_flush_latency`, `large_segment_staged_flush_latency`, `segment_sequential_read_throughput`, and `create_write_close_iops_with_flush`.

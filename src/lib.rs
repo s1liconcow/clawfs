@@ -7,6 +7,7 @@ pub mod coordination;
 pub mod fs;
 pub mod inode;
 pub mod journal;
+#[cfg(feature = "fuse")]
 pub mod launch;
 pub mod maintenance;
 mod maintenance_shared;

@@ -1548,7 +1548,7 @@ impl MetadataStore {
         let mut max_generation = 0;
 
         for (shard_id, mut files) in candidates {
-            files.sort_by(|a, b| b.0.cmp(&a.0));
+            files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
             let Some((generation, path)) = files.into_iter().next() else {
                 continue;
             };
@@ -1891,7 +1891,7 @@ impl MetadataStore {
                 candidates.push((generation, meta.location));
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         if let Some((generation, path)) = candidates.into_iter().next() {
             let get_result = match self.store.get(&path).await {
@@ -1994,11 +1994,7 @@ impl MetadataStore {
 }
 
 fn shard_for_inode(inode: u64, shard_size: u64) -> u64 {
-    if shard_size == 0 {
-        0
-    } else {
-        inode / shard_size
-    }
+    inode.checked_div(shard_size).unwrap_or(0)
 }
 
 fn bloom_mask(inode: u64) -> u128 {
