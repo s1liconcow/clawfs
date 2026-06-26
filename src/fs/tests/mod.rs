@@ -934,6 +934,60 @@ fn hardlinks_update_reference_counts() {
 }
 
 #[test]
+fn nfs_link_updates_reference_counts_and_directory_entries() {
+    let dir = tempdir().unwrap();
+    let harness = TestHarness::new(dir.path(), "nfs_link.bin", 8 * 1024 * 1024);
+
+    let file = harness
+        .fs
+        .nfs_create(ROOT_INODE, "file_a", 1000, 1000)
+        .unwrap();
+    harness
+        .fs
+        .nfs_write(file.inode, 0, b"payload")
+        .expect("write primary link");
+    let linked = harness
+        .fs
+        .nfs_link(file.inode, ROOT_INODE, "file_b")
+        .expect("create hard link through NFS wrapper");
+
+    assert_eq!(linked.inode, file.inode);
+    assert_eq!(linked.link_count, 2);
+    assert_eq!(
+        harness
+            .fs
+            .nfs_lookup(ROOT_INODE, "file_b")
+            .expect("lookup second link")
+            .inode,
+        file.inode
+    );
+    assert_eq!(
+        harness
+            .fs
+            .nfs_read(file.inode, 0, 32)
+            .expect("read linked inode"),
+        b"payload"
+    );
+
+    harness.fs.nfs_flush().unwrap();
+    let stored = harness
+        .runtime
+        .block_on(harness.metadata.get_inode(file.inode))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.link_count, 2);
+
+    harness
+        .fs
+        .nfs_remove_file(ROOT_INODE, "file_b", 1000)
+        .unwrap();
+    let stored = harness.fs.nfs_getattr(file.inode).unwrap();
+    assert_eq!(stored.link_count, 1);
+    assert!(harness.fs.nfs_lookup(ROOT_INODE, "file_b").is_err());
+    assert!(harness.fs.nfs_lookup(ROOT_INODE, "file_a").is_ok());
+}
+
+#[test]
 fn stress_varied_workloads() {
     let dir = tempdir().unwrap();
     let harness = TestHarness::new(dir.path(), "stresswork.bin", 64 * 1024 * 1024);

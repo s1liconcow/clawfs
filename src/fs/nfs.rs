@@ -285,6 +285,30 @@ impl OsageFs {
         result
     }
 
+    pub fn nfs_link(
+        &self,
+        ino: u64,
+        newparent: u64,
+        newname: &str,
+    ) -> std::result::Result<InodeRecord, i32> {
+        let replay = self.replay_start();
+        let _dir_guard = self.lock_dir(newparent);
+        let result = self.op_link(ino, newparent, newname);
+        let errno = result.as_ref().err().copied();
+        if replay.is_some() {
+            self.log_replay(
+                "nfs",
+                "link",
+                replay,
+                errno,
+                json!({ "ino": ino, "newparent": newparent, "newname": newname }),
+            );
+        } else {
+            self.emit_errno_only("nfs", "link", errno);
+        }
+        result
+    }
+
     pub fn nfs_write(&self, ino: u64, offset: u64, data: &[u8]) -> std::result::Result<u32, i32> {
         let replay = self.replay_start();
         let _dir_guard = self.lock_dir(ino);
